@@ -484,12 +484,12 @@ function AdminShell() {
     <nav class="mob-nav">${allowed.slice(0, 5).map(([k, t, i]) => `<a class="${sub === k ? 'on' : ''}" href="#/admin/${k}">${ic(i)}${t}</a>`).join('')}</nav>
   </div>`;
 }
-function Login(title = 'Organizer sign in') {
+function Login(title = 'Organizer sign in', sub = 'explore the back office') {
   const l = S.ui.login;
   return `<div style="min-height:100vh;display:grid;place-items:center;background:var(--ink);padding:20px">
     <div class="card" style="width:min(420px,100%)"><div style="height:44px;margin-bottom:18px">${logo()}</div>
       <h1 class="display" style="font-size:32px">${esc(title)}</h1>
-      <p class="muted" style="margin:6px 0 20px">${DB.live ? 'We\'ll email you a one-time code.' : 'Demo mode: enter any email to explore the back office.'}</p>
+      <p class="muted" style="margin:6px 0 20px">${DB.live ? 'We\'ll email you a one-time code.' : `Demo mode: enter any email to ${esc(sub)}.`}</p>
       <div class="field"><label class="fl">Work email</label><input class="inp" type="email" data-input="loginEmail" value="${esc(l.email)}" autocomplete="email"></div>
       ${l.sent ? `<div class="field"><label class="fl">6-digit code</label><input class="inp" data-input="loginCode" inputmode="numeric" value="${esc(l.code)}" autocomplete="one-time-code"></div>` : ''}
       ${l.err ? `<p class="small" style="color:var(--bad);margin-bottom:10px">${esc(l.err)}</p>` : ''}
@@ -779,7 +779,7 @@ const checkStats = evId => { const tk = S.adm.tickets.filter(t => t.event_id ===
 //  DOOR SCANNER APP  (#/scan — phone-first, installable, works offline)
 // ══════════════════════════════════════════════════════════════════════════════
 function ScanApp() {
-  if (!S.user || !S.adm) return Login('Door staff sign in', 'Scan tickets at the door.');
+  if (!S.user || !S.adm) return Login('Door staff sign in', 'start scanning tickets');
   const ev = S.adm.events.find(e => e.id === S.sc.evId);
   return `<div class="sc">${ev ? ScanEvent(ev) : ScanPick()}</div>${S.sc.last ? ScanResult(S.sc.last) : ''}`;
 }
@@ -1264,7 +1264,7 @@ async function reloadAdmin() {
 }
 async function boot() {
   try {
-    LOGO = (await (await fetch('set-logo.svg')).text()).replace('<svg ', '<svg role="img" aria-label="SET" ');
+    LOGO = (await (await fetch('set-logo.svg')).text()).replace('<svg ', '<svg class="set-logo" role="img" aria-label="SET" ');
   } catch (e) { }
   try {
     const { settings, events } = await DB.init();
