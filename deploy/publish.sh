@@ -7,5 +7,5 @@ export GH_TOKEN=$(~/.local/bin/gh auth token -h github.com -u moishsonn-tech)
 git push -q origin main
 git push -q -f origin "$(git subtree split --prefix frontend main)":refs/heads/gh-pages
 ~/.local/bin/gh api repos/moishsonn-tech/set-tickets/pages >/dev/null 2>&1 \
-  || ~/.local/bin/gh api -X POST repos/moishsonn-tech/set-tickets/pages -f 'source[branch]=gh-pages' -f 'source[path]=/' >/dev/null
+  || ~/.local/bin/gh api -X POST repos/moishsonn-tech/set-tickets/pages -f 'source[branch]=gh-pages' -f 'source[path]=/' >/dev/null 2>&1 || true
 echo "Published → https://moishsonn-tech.github.io/set-tickets/ (live in ~1 minute)"
