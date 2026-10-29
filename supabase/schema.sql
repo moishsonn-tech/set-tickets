@@ -224,13 +224,14 @@ begin
 end $$;
 
 -- Door check-in by QR code (team only). Returns the ticket + whether it was already scanned.
-create or replace function checkin(p_code text, p_undo boolean default false) returns jsonb language plpgsql security definer set search_path = public as $$
+create or replace function checkin(p_code text, p_undo boolean default false, p_event uuid default null) returns jsonb language plpgsql security definer set search_path = public as $$
 declare t tickets%rowtype; was timestamptz;
 begin
   if not is_team() then raise exception 'not allowed'; end if;
   select * into t from tickets where code = upper(trim(p_code));
   if not found then return jsonb_build_object('result','unknown'); end if;
   if t.status <> 'valid' then return jsonb_build_object('result','cancelled','ticket',to_jsonb(t)); end if;
+  if p_event is not null and t.event_id <> p_event then return jsonb_build_object('result','wrong_event','ticket',to_jsonb(t)); end if;
   was := t.checked_in_at;
   update tickets set checked_in_at = case when p_undo then null else coalesce(checked_in_at, now()) end where id = t.id returning * into t;
   return jsonb_build_object('result', case when p_undo then 'undone' when was is not null then 'already' else 'ok' end, 'ticket', to_jsonb(t));
@@ -238,8 +239,8 @@ end $$;
 
 grant execute on function availability(uuid), check_discount(uuid,text), unlock(uuid,text), join_waitlist(uuid,text,text),
   get_order(uuid,uuid), lookup_order(text,text), place_order(jsonb) to anon, authenticated;
-grant execute on function checkin(text,boolean) to authenticated;
-revoke execute on function checkin(text,boolean) from anon;
+grant execute on function checkin(text,boolean,uuid) to authenticated;
+revoke execute on function checkin(text,boolean,uuid) from anon;
 
 -- First organizer (owner). Add more from the app's Team page.
 insert into team(email, role, name) values ('moishsonn@gmail.com', 'admin', 'Owner') on conflict do nothing;

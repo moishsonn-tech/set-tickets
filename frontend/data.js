@@ -18,10 +18,10 @@ const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 const ROLES = { admin: 'Admin', event_manager: 'Event manager', order_manager: 'Order manager', overview: 'Overview' };
 const DEFAULT_SETTINGS = {
-  name: 'SING Entertainment', currency: 'USD', feePct: 0, feeFixed: 0, feeMode: 'buyer', taxPct: 0,
+  name: 'SET Tickets', currency: 'USD', feePct: 0, feeFixed: 0, feeMode: 'buyer', taxPct: 0,
   terms: 'All sales are final. Tickets are non-refundable except if the event is cancelled. Event schedule and line-up subject to change.',
   payments: { card: true, offline: true, door: true }, donations: true, pixels: { ga4: '', meta: '', tiktok: '' },
-  contactEmail: 'info@singentertainment.net', reminderHours: 24,
+  contactEmail: '', reminderHours: 24,
 };
 
 /* ── Pricing: the one quote function (display everywhere; authoritative in DEMO mode). ── */
@@ -65,7 +65,7 @@ function availabilityFrom(tickets, eventId) {
 }
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v1';
+const DEMO_KEY = 'set_demo_v2';
 const Demo = {
   st: null,
   load() {
@@ -214,15 +214,17 @@ const DB = {
     await must(sb.from('orders').update({ status }).eq('id', id));
     if (cancel) await must(sb.from('tickets').update({ status: 'cancelled' }).eq('order_id', id));
   },
-  async checkin(code, undo = false) {
+  // eventId (optional): the event being scanned — a valid ticket for another event is rejected, not checked in.
+  async checkin(code, undo = false, eventId = null) {
     if (!LIVE) {
       const t = Demo.st.tickets.find(x => x.code === String(code).trim().toUpperCase());
       if (!t) return { result: 'unknown' };
       if (t.status !== 'valid') return { result: 'cancelled', ticket: clone(t) };
+      if (eventId && t.event_id !== eventId) return { result: 'wrong_event', ticket: clone(t) };
       const was = t.checked_in_at; t.checked_in_at = undo ? null : (t.checked_in_at || new Date().toISOString()); Demo.save();
       return { result: undo ? 'undone' : was ? 'already' : 'ok', ticket: clone(t) };
     }
-    return must(sb.rpc('checkin', { p_code: code, p_undo: undo }));
+    return must(sb.rpc('checkin', { p_code: code, p_undo: undo, p_event: eventId }));
   },
   async saveTeam(member, remove = false) {
     if (!LIVE) { const st = Demo.st; st.team = st.team.filter(t => t.email !== member.email); if (!remove) st.team.push(member); Demo.save(); return; }
@@ -273,56 +275,55 @@ const DB = {
 
 /* ════════════ Sample data (DEMO only) ════════════ */
 function seedDemo() {
-  const IMG = 'https://cdn.prod.website-files.com/66f304c478ed3ab1f7a42667/';
   const day = (d, h = 20, m = 0) => { const x = new Date(); x.setDate(x.getDate() + d); x.setHours(h, m, 0, 0); return x.toISOString(); };
   const tt = (name, price, qty, extra = {}) => ({ id: shortId('tt_'), name, price, qty, min: 1, max: 10, admits: 1, desc: '', hidden: false, ...extra });
-  const base = { capacity: 0, timezone: 'America/New_York', currency: 'USD', visibility: 'public', online: false, onlineUrl: '',
+  const base = { capacity: 0, timezone: 'America/New_York', currency: 'USD', visibility: 'public', online: false, onlineUrl: '', image: '',
     timeSlots: [], seating: { enabled: false }, addons: [], questions: [], waitlist: true, emails: { confirmation: '', reminders: [] } };
   const mk = (o) => ({ ...base, id: uid(), status: 'published', created_at: day(-30), secrets: { password: '', ticketPasswords: {}, discounts: [] }, ...o });
 
-  const vipTT = tt('VIP — front rows', 18000, 0, { desc: 'Reserved seat in rows A–C + meet & greet', max: 8 });
-  const orchTT = tt('Orchestra', 9500, 0, { desc: 'Reserved seat, rows D–H' });
-  const balTT = tt('Balcony', 6500, 0, { desc: 'Reserved seat, rows J–L' });
-  const ev1 = mk({ slug: 'chanukah-spectacular', name: 'Chanukah Spectacular 2026', category: 'Concert', image: IMG + '68cca51d73608f02f8c8f6b0_Concert%2054-61_Marcus%20Tour.jpg',
-    summary: 'A night of lights, music and simcha with full orchestra.', start: day(41, 19, 30), end: day(41, 22, 30), doors: '6:45 PM',
-    venue: 'Kings Theatre', address: '1027 Flatbush Ave, Brooklyn, NY 11226', audience: 'Mixed seating',
-    description: 'Celebrate Chanukah with SING Entertainment\'s biggest production of the year — a full orchestra, choir and special guests on one stage.\n\nDoors open 6:45 PM. Show starts promptly at 7:30 PM. Seats are reserved — pick yours on the seat map.',
-    ticketTypes: [vipTT, orchTT, balTT],
-    seating: { enabled: true, rows: 'ABCDEFGHJKL', cols: 16, aisleAfter: [4, 12], tiers: { A: vipTT.id, B: vipTT.id, C: vipTT.id, D: orchTT.id, E: orchTT.id, F: orchTT.id, G: orchTT.id, H: orchTT.id, J: balTT.id, K: balTT.id, L: balTT.id }, blocked: ['A1', 'A16', 'L1', 'L16'] },
-    addons: [{ id: shortId('ad_'), name: 'Official event program', price: 1000, qty: 0 }, { id: shortId('ad_'), name: 'Parking pass', price: 2500, qty: 150 }],
-    questions: [{ id: shortId('q_'), label: 'How did you hear about us?', type: 'select', options: 'Instagram, WhatsApp, Friend, Poster, Other', required: false }],
-    secrets: { password: '', ticketPasswords: {}, discounts: [{ id: shortId('dc_'), code: 'EARLYLIGHT', type: 'pct', amount: 15, limit: 100, expires: day(20), ticketTypeIds: [] }] } });
-  const ev2 = mk({ slug: 'higia-hazman', name: 'Higia Hazman', category: 'Concert', image: 'https://cdn.prod.website-files.com/66f304c478ed3ab1f7a42640/6ac3dadab4be9c40f29d6891_PHOTO-2026-10-04-20-11-26.jpg',
-    summary: 'Shmili Landau & Sruly Green — one night only.', start: day(9, 20, 45), end: day(9, 22, 45), doors: '8:00 PM',
-    venue: 'Sterling Hall', address: '1247 38th St, Brooklyn, NY 11218', audience: 'Men & boys only',
-    description: 'The time has come! Sruly Green and Shmili Landau together on one stage for a night of energetic music and dancing.\n\nStreet parking available. Food and drinks for purchase.',
-    capacity: 450, ticketTypes: [tt('General admission', 5000, 380), tt('Premium standing', 9000, 60, { desc: 'Closest to the stage' }), tt('Group of 5', 20000, 30, { admits: 5, desc: 'Admits five — save $50', max: 4 }),
-      tt('Sponsor table', 150000, 5, { hidden: true, desc: 'Table for 10 with name recognition', max: 1 })],
-    secrets: { password: '', ticketPasswords: {}, discounts: [{ id: shortId('dc_'), code: 'SING10', type: 'fixed', amount: 1000, limit: 0, expires: '', ticketTypeIds: [] }] } });
-  ev2.secrets.ticketPasswords[ev2.ticketTypes[3].id] = 'SPONSOR';
-  const ev3 = mk({ slug: 'kumzitz-under-the-stars', name: 'Kumzitz Under the Stars', category: 'Kumzitz', image: IMG + '67ef54fc9eafe28f85828bdd_Baruch_Kumzitz%20Alive%20Tour%20dates.png',
-    summary: 'An intimate acoustic kumzitz — two seatings.', start: day(18, 19, 0), end: day(18, 23, 0), venue: 'The Loft at Ateres', address: '1 Ateres Ave, Lakewood, NJ 08701', audience: 'Mixed',
-    description: 'Two intimate seatings of acoustic kumzitz. Choose your seating time at checkout. Light refreshments included.',
-    ticketTypes: [tt('Adult', 3600, 0), tt('Student', 1800, 0, { desc: 'Valid student ID required at the door' })],
-    timeSlots: [{ id: shortId('ts_'), start: day(18, 19, 0), capacity: 120 }, { id: shortId('ts_'), start: day(18, 21, 30), capacity: 120 }] });
-  const ev4 = mk({ slug: 'womens-night-riverside', name: 'A Riverside Experience', category: 'Women only', image: IMG + '67c5ebc62b9b9090feffb23b_women%20web.png',
-    summary: 'A women\'s show by the water.', start: day(27, 19, 30), end: day(27, 22, 0), venue: 'Riverside Pavilion', address: '500 Riverside Dr, New York, NY 10027', audience: 'Women & girls only',
-    description: 'An evening concert for women and girls with a full live band.', capacity: 300,
-    ticketTypes: [tt('General admission', 4500, 0), tt('Front section', 7500, 60)], questions: [{ id: shortId('q_'), label: 'Seating preference', type: 'select', options: 'With my group, Anywhere', required: false }] });
-  const ev5 = mk({ slug: 'chol-hamoed-family', name: 'Chol Hamoed Family Show', category: 'Family', image: IMG + '67c5eb22812ae23644d08f5c_family%20web.png',
-    summary: 'Hourly family shows all afternoon.', start: day(55, 11, 0), end: day(55, 17, 0), venue: 'Brooklyn Center Stage', address: '2900 Campus Rd, Brooklyn, NY 11210', audience: 'Families',
-    description: 'Fun for the whole family — hourly 45-minute shows from 11 AM to 4 PM. Kids under 2 free (no ticket needed).',
-    ticketTypes: [tt('Adult', 2500, 0), tt('Child (2–12)', 1500, 0), tt('Family 4-pack', 7000, 0, { admits: 4 })],
+  const vipTT = tt('Premium — front rows', 12000, 0, { desc: 'Rows A–C, best sightlines', max: 8 });
+  const stallsTT = tt('Stalls', 6500, 0, { desc: 'Rows D–H' });
+  const circleTT = tt('Circle', 4500, 0, { desc: 'Rows J–L' });
+  const ev1 = mk({ slug: 'winter-orchestra-gala', name: 'Winter Orchestra Gala', category: 'Concert',
+    summary: 'A full symphony orchestra with guest soloists.', start: day(41, 19, 30), end: day(41, 22, 0), doors: '6:45 PM',
+    venue: 'Grand Lyric Theatre', address: '1500 Broadway, New York, NY 10036',
+    description: 'An evening of seasonal favourites performed by a 60-piece orchestra and guest soloists.\n\nDoors open 6:45 PM. The performance begins promptly at 7:30 PM. Seats are reserved — pick yours on the seat map.',
+    ticketTypes: [vipTT, stallsTT, circleTT],
+    seating: { enabled: true, rows: 'ABCDEFGHJKL', cols: 16, aisleAfter: [4, 12], tiers: { A: vipTT.id, B: vipTT.id, C: vipTT.id, D: stallsTT.id, E: stallsTT.id, F: stallsTT.id, G: stallsTT.id, H: stallsTT.id, J: circleTT.id, K: circleTT.id, L: circleTT.id }, blocked: ['A1', 'A16', 'L1', 'L16'] },
+    addons: [{ id: shortId('ad_'), name: 'Printed programme', price: 800, qty: 0 }, { id: shortId('ad_'), name: 'Parking pass', price: 2500, qty: 150 }],
+    questions: [{ id: shortId('q_'), label: 'How did you hear about us?', type: 'select', options: 'Instagram, Email, Friend, Poster, Other', required: false }],
+    secrets: { password: '', ticketPasswords: {}, discounts: [{ id: shortId('dc_'), code: 'EARLYBIRD', type: 'pct', amount: 15, limit: 100, expires: day(20), ticketTypeIds: [] }] } });
+  const ev2 = mk({ slug: 'neon-nights-live', name: 'Neon Nights Live', category: 'Live music', start: day(0, 20, 0), end: day(0, 23, 30), doors: '7:00 PM',
+    summary: 'Tonight — three bands, one stage.', venue: 'The Warehouse', address: '210 Kent Ave, Brooklyn, NY 11249', audience: '18+ · ID required',
+    description: 'Three of the city\'s best live acts on one stage. Standing room, full bar.\n\nPhoto ID required at the door.',
+    capacity: 450, ticketTypes: [tt('General admission', 3500, 380), tt('Early entry', 5500, 60, { desc: 'Doors 30 minutes early' }), tt('Group of 5', 15000, 30, { admits: 5, desc: 'Admits five — save $25', max: 4 }),
+      tt('VIP table', 60000, 5, { hidden: true, desc: 'Reserved table for 6 with bottle service', max: 1 })],
+    secrets: { password: '', ticketPasswords: {}, discounts: [{ id: shortId('dc_'), code: 'WELCOME10', type: 'fixed', amount: 1000, limit: 0, expires: '', ticketTypeIds: [] }] } });
+  ev2.secrets.ticketPasswords[ev2.ticketTypes[3].id] = 'VIPACCESS';
+  const ev3 = mk({ slug: 'city-food-festival', name: 'City Food & Wine Festival', category: 'Food & drink',
+    summary: 'Two tasting sessions, 40 vendors.', start: day(18, 12, 0), end: day(18, 20, 0), venue: 'Pier 36', address: '299 South St, New York, NY 10002',
+    description: 'Taste your way through 40 local restaurants, bakeries and wineries. Choose your session at checkout. Unlimited tastings included.',
+    ticketTypes: [tt('Tasting pass', 4900, 0), tt('Designated driver', 1900, 0, { desc: 'Food only — no alcohol' })],
+    timeSlots: [{ id: shortId('ts_'), start: day(18, 12, 0), capacity: 250 }, { id: shortId('ts_'), start: day(18, 16, 30), capacity: 250 }] });
+  const ev4 = mk({ slug: 'founders-summit', name: 'Founders Summit 2026', category: 'Conference', start: day(27, 9, 0), end: day(27, 17, 30),
+    summary: 'A one-day conference for early-stage founders.', venue: 'Hudson Conference Center', address: '75 Hudson Yards, New York, NY 10001',
+    description: 'Talks, workshops and investor office hours. Lunch and coffee included.', capacity: 300,
+    ticketTypes: [tt('Standard', 19900, 0), tt('Student', 4900, 60, { desc: 'Valid student ID required' })],
+    questions: [{ id: shortId('q_'), label: 'Company name', type: 'text', required: true }, { id: shortId('q_'), label: 'Dietary requirements', type: 'select', options: 'None, Vegetarian, Vegan, Gluten-free, Kosher, Halal', required: false }] });
+  const ev5 = mk({ slug: 'kids-science-show', name: 'Big Bang Science Show', category: 'Family', start: day(55, 11, 0), end: day(55, 17, 0),
+    summary: 'Hourly hands-on science shows for kids.', venue: 'Discovery Hall', address: '2900 Campus Rd, Brooklyn, NY 11210', audience: 'Ages 4+',
+    description: 'Explosions, slime and liquid nitrogen — hourly 45-minute shows from 11 AM to 4 PM. Under 2s free (no ticket needed).',
+    ticketTypes: [tt('Adult', 2000, 0), tt('Child (2–12)', 1500, 0), tt('Family 4-pack', 6000, 0, { admits: 4 })],
     timeSlots: [11, 12, 13, 14, 15, 16].map(h => ({ id: shortId('ts_'), start: day(55, h, 0), capacity: 180 })) });
-  const ev6 = mk({ slug: 'hatzalah-gala', name: 'Hatzalah Benefit Concert', category: 'Benefit', status: 'draft', image: IMG + '67cd1a5abca3340026c8e9e0_Concert%2035_Hatzalah.jpg',
-    summary: 'Annual benefit concert.', start: day(70, 19, 0), end: day(70, 22, 0), venue: 'TBA', address: '', description: 'Details coming soon.', ticketTypes: [tt('General', 7500, 500)] });
+  const ev6 = mk({ slug: 'comedy-night', name: 'Late Night Comedy Club', category: 'Comedy', status: 'draft', start: day(70, 21, 0), end: day(70, 23, 0),
+    summary: 'Five comics, one mic.', venue: 'TBA', address: '', description: 'Line-up coming soon.', ticketTypes: [tt('General', 2500, 120)] });
   const events = [ev1, ev2, ev3, ev4, ev5, ev6];
 
   // A few weeks of realistic sales so the dashboard has something to show.
   Demo.st = { settings: { ...DEFAULT_SETTINGS, feePct: 3, feeFixed: 99 }, events, orders: [], tickets: [], waitlist: [], broadcasts: [],
-    team: [{ email: 'moishsonn@gmail.com', role: 'admin', name: 'Owner' }, { email: 'door@singentertainment.net', role: 'order_manager', name: 'Door staff' }] };
-  const first = ['Yossi', 'Chaim', 'Rivka', 'Sara', 'Moshe', 'Leah', 'Dovid', 'Esti', 'Shmuel', 'Malky', 'Avi', 'Chani', 'Eli', 'Miri', 'Benny', 'Tzippy'];
-  const last = ['Klein', 'Weiss', 'Friedman', 'Schwartz', 'Rosen', 'Katz', 'Gold', 'Stern', 'Berger', 'Adler', 'Green', 'Levy'];
+    team: [{ email: 'moishsonn@gmail.com', role: 'admin', name: 'Owner' }, { email: 'door@example.com', role: 'order_manager', name: 'Door staff' }] };
+  const first = ['Alex', 'Jordan', 'Sam', 'Maya', 'Chris', 'Priya', 'Daniel', 'Emma', 'Luis', 'Grace', 'Noah', 'Aisha', 'Ben', 'Chloe', 'Omar', 'Zoe'];
+  const last = ['Carter', 'Nguyen', 'Patel', 'Rivera', 'Kim', 'Brooks', 'Cohen', 'Okafor', 'Silva', 'Hughes', 'Morgan', 'Reyes'];
   let n = 0; const rnd = a => a[Math.floor(Math.random() * a.length)];
   for (const ev of events.filter(e => e.status === 'published')) {
     const count = ev === ev1 ? 46 : ev === ev2 ? 60 : 24;
@@ -340,12 +341,14 @@ function seedDemo() {
       }
       try {
         const r = demoPlaceOrder({ buyer: { name, email, phone: '' }, items: [item], addons: [], payment: Math.random() < .85 ? 'card' : 'offline', optIn: Math.random() < .6,
-          code: Math.random() < .12 ? (ev.secrets.discounts[0]?.code || '') : '', source: rnd(['', '', 'instagram', 'whatsapp', 'newsletter']) }, true);
+          code: Math.random() < .12 ? (ev.secrets.discounts[0]?.code || '') : '', source: rnd(['', '', 'instagram', 'facebook', 'newsletter']) }, true);
         const o = Demo.st.orders.find(x => x.id === r.id); o.created_at = day(-Math.floor(Math.random() * 28), 8 + Math.floor(Math.random() * 14), Math.floor(Math.random() * 60));
         if (Math.random() < .04) { o.status = 'refunded'; Demo.st.tickets.forEach(t => { if (t.order_id === o.id) t.status = 'cancelled'; }); }
       } catch (e) { /* sold out etc. — skip */ }
     }
   }
-  Demo.st.waitlist.push({ id: uid(), event_id: ev2.id, name: 'Shloimy Kahan', email: 'shloimy@example.com', created_at: day(-1) });
+  // ev2 is tonight: doors are open and some guests are already in (for the scanner app).
+  Demo.st.tickets.filter(t => t.event_id === ev2.id && t.status === 'valid').forEach(t => { if (Math.random() < .4) t.checked_in_at = new Date(Date.now() - Math.pow(Math.random(), .6) * 110 * 6e4).toISOString(); });
+  Demo.st.waitlist.push({ id: uid(), event_id: ev3.id, name: 'Jamie Fox', email: 'jamie@example.com', created_at: day(-1) });
   return Demo.st;
 }

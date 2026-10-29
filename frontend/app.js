@@ -44,11 +44,20 @@ const ICON = {
   pin: '<path d="M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   x: '<path d="M6 6l12 12M18 6L6 18"/>', plus: '<path d="M12 5v14M5 12h14"/>', ext: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
-  search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>', lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>', check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>', alert: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.4v.2"/>',
+  bolt: '<path d="M13 2L4.5 13.5H11l-1 8.5 8.5-11.5H12z"/>', sound: '<path d="M11 5L6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/>', mute: '<path d="M11 5L6 9H3v6h3l5 4zM22 9l-6 6M16 9l6 6"/>',
+  wifi: '<path d="M2 8.5a15 15 0 0 1 20 0M5 12a10 10 0 0 1 14 0M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1"/>', keyboard: '<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/>', lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
 };
 const ic = (n, s = 18) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[n]}</svg>`;
 let LOGO = '<b style="font-family:var(--display);font-size:28px">set</b>';
 const logo = () => LOGO;
+// Event artwork: the organizer's image, or a generated typographic poster (no stock photos).
+const safeUrl = u => /^https:\/\/[^\s'"()\\<>]+$/.test(u || '') ? u : '';
+const ART = ['#13294b', '#3b1238', '#0f3a33', '#4a1a12', '#24224f', '#3a300c'];
+const artBg = ev => { const u = safeUrl(ev.image); if (u) return `background-image:url('${u}')`;
+  const h = [...(ev.name || '')].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+  return `background:radial-gradient(110% 80% at 88% 8%,rgba(244,205,94,.28),transparent 55%),linear-gradient(155deg,${ART[h % ART.length]},#020a16 78%)`; };
+const artTitle = (ev, cls = 'art-t') => safeUrl(ev.image) ? '' : `<div class="${cls}">${esc(ev.name)}</div>`;
 
 // ── State (single source of truth) ────────────────────────────────────────────
 const S = {
@@ -56,7 +65,8 @@ const S = {
   home: { view: 'list', cat: 'All', q: '', month: null },
   avail: {}, sel: null, cart: loadCart(), co: { name: '', email: '', phone: '', answers: {}, optIn: false, terms: false, payment: '', code: '', disc: null, busy: false, err: '' },
   user: null, adm: null, draft: null, dirty: false,
-  ui: { q: '', ev: '', status: '', picked: {}, attEv: '', scanEv: '', scan: null, scans: [], repEv: '', login: { email: '', code: '', sent: false } },
+  ui: { q: '', ev: '', status: '', picked: {}, attEv: '', repEv: '', login: { email: '', code: '', sent: false } },
+  sc: { evId: '', tab: 'scan', last: null, q: '', filter: 'all', recent: [], sound: true, queue: [], err: '' },  // door scanner app
 };
 function loadCart() { try { return JSON.parse(localStorage.getItem('set_cart')) || { items: [], addons: [], donation: 0, unlock: {} }; } catch (e) { return { items: [], addons: [], donation: 0, unlock: {} }; } }
 function saveCart() { try { localStorage.setItem('set_cart', JSON.stringify(S.cart)); } catch (e) { } }
@@ -73,9 +83,11 @@ function parseRoute() {
   return { page: parts[0] || 'home', params: parts.slice(1) };
 }
 async function onRoute() {
-  stopScanner();
-  S.route = parseRoute();
+  const next = parseRoute();
+  if (next.page !== 'scan') camStop();
+  S.route = next;
   document.body.classList.toggle('embed', S.route.page === 'embed');
+  document.body.classList.toggle('scan-mode', S.route.page === 'scan');
   const r = S.route;
   if (r.page === 'e' || r.page === 'embed') {
     const ev = S.events.find(e => e.slug === r.params[0]) || S.adm?.events.find(e => e.slug === r.params[0]);
@@ -97,6 +109,7 @@ function render() {
   let html;
   if (S.loading) html = `<div class="empty" style="padding-top:30vh"><div style="height:60px;color:var(--ink);display:inline-block">${logo()}</div></div>`;
   else if (r.page === 'admin') html = AdminShell();
+  else if (r.page === 'scan') html = ScanApp();
   else html = PubShell();
   $('#app').innerHTML = html;
   if (key) { const el = document.querySelector(`[data-bind="${CSS.escape(key)}"],[data-input="${CSS.escape(key)}"],#${CSS.escape(key)}`); if (el && el !== document.activeElement) { el.focus(); try { if (pos != null) el.setSelectionRange(pos, pos); } catch (e) { } } }
@@ -105,7 +118,7 @@ function render() {
 function hydrate() {
   document.querySelectorAll('[data-qr]').forEach(el => { if (!el.childElementCount && window.QRCode) new QRCode(el, { text: el.dataset.qr, width: 300, height: 300, colorDark: '#020a16', correctLevel: QRCode.CorrectLevel.M }); });
   if (S.route.page === 'home') startHeroCanvas();
-  if (S.route.page === 'admin' && S.route.sub === 'checkin' && S.ui.scan === 'on') startScanner();
+  if (S.route.page === 'scan') camMount();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -119,13 +132,14 @@ function PubShell() {
     <a href="#/" class="logo" aria-label="SET home">${logo()}<small>SING Entertainment Tickets</small></a>
     <div class="links">
       <a class="btn glass btn-sm hide-sm" href="#/tickets">${ic('ticket', 15)} My tickets</a>
+      <a class="btn glass btn-sm hide-sm" href="#/admin">Sell tickets</a>
       <a class="btn btn-accent btn-sm" href="#/cart">${ic('cart', 15)} Cart ${cartCount() ? `<span class="cart-dot">${cartCount()}</span>` : ''}</a>
     </div>
   </nav>
   ${body()}
   <footer class="pub-foot"><div class="container">
     <div class="row" style="gap:16px"><div class="logo">${logo()}</div><span class="small">© ${new Date().getFullYear()} ${esc(S.settings.name)} · Secure checkout</span></div>
-    <div><a href="#/tickets">Find my tickets</a><a href="mailto:${esc(S.settings.contactEmail)}">Contact</a><a href="#/admin">Organizer login</a></div>
+    <div><a href="#/tickets">Find my tickets</a>${S.settings.contactEmail ? `<a href="mailto:${esc(S.settings.contactEmail)}">Contact</a>` : ''}<a href="#/scan">Scanner app</a><a href="#/admin">Organizer login</a></div>
   </div></footer>`;
 }
 const NotFound = () => `<div class="container section"><div class="empty"><div class="display">Page not found</div><a class="btn btn-dark" href="#/">Back to events</a></div></div>`;
@@ -151,15 +165,21 @@ function Home() {
   const cats = ['All', ...new Set(all.map(e => e.category).filter(Boolean))];
   const q = h.q.trim().toLowerCase();
   const evs = all.filter(e => (h.cat === 'All' || e.category === h.cat) && (!q || [e.name, e.venue, e.address, e.category, e.summary].join(' ').toLowerCase().includes(q)));
-  const marq = ['Concerts', 'Kumzitzes', 'Chol Hamoed shows', 'Benefit galas', 'Women\'s events', 'Family shows', 'Reserved seating', 'Instant e-tickets'];
+  const marq = ['Reserved seating', 'Timed entry', 'Discount codes', 'QR e-tickets', 'Door scanner app', 'Waitlists', 'Embeddable checkout', 'Team permissions', 'Sales reports'];
+  const feats = [['cal', 'Every kind of event', 'One-off shows, multi-day festivals, timed entry slots and recurring sessions.'],
+    ['ticket', 'Reserved seating', 'Draw your room, price it by section, and let buyers pick their own seats.'],
+    ['cart', 'Checkout that converts', 'Bundles, add-ons, discount codes, donations and custom questions.'],
+    ['scan', 'Door scanner app', 'Any phone becomes a scanner. Works offline, flags duplicates instantly.'],
+    ['chart', 'Live reporting', 'Revenue by event, ticket type and channel. Export everything to CSV.'],
+    ['users', 'Built for teams', 'Admins, event managers, box office and door staff — each with the right access.']];
   return `
   <header class="hero">
     <canvas id="heroCanvas" aria-hidden="true"></canvas><div class="glow"></div>
     <div class="hero-inner">
       <div class="mark">${logo()}</div>
-      <h1>Experience the best in <em>Jewish music</em></h1>
-      <p class="lede">Official tickets for every ${esc(S.settings.name)} production. Pick your seats, check out in seconds, and get your tickets instantly.</p>
-      <div class="search"><input class="inp" data-input="homeq" placeholder="Search events, artists, venues…" value="${esc(h.q)}"><a class="btn btn-accent btn-lg" href="#events">Browse <span class="arr">→</span></a></div>
+      <h1>Sell tickets. <em>Fill every seat.</em></h1>
+      <p class="lede">Ticketing for concerts, conferences, festivals and everything in between — a beautiful box office, instant QR e-tickets and a door scanner app.</p>
+      <div class="row wrap" style="margin-top:30px"><a class="btn btn-accent btn-lg" href="#events">Find events <span class="arr">→</span></a><a class="btn glass btn-lg" href="#/admin">Start selling</a></div>
     </div>
   </header>
   <div class="deck">
@@ -167,10 +187,28 @@ function Home() {
     <div class="container section" id="events">
       <div class="section-head">
         <div><div class="eyebrow dash">On sale now</div><h2 style="margin-top:8px">Upcoming events</h2></div>
-        <div class="tabs"><button class="${h.view === 'list' ? 'on' : ''}" data-action="homeView" data-v="list">Grid</button><button class="${h.view === 'cal' ? 'on' : ''}" data-action="homeView" data-v="cal">Calendar</button></div>
+        <div class="row wrap"><input class="inp pill-inp" data-input="homeq" placeholder="Search events or venues…" value="${esc(h.q)}">
+        <div class="tabs"><button class="${h.view === 'list' ? 'on' : ''}" data-action="homeView" data-v="list">Grid</button><button class="${h.view === 'cal' ? 'on' : ''}" data-action="homeView" data-v="cal">Calendar</button></div></div>
       </div>
       <div class="cat-row">${cats.map(c => `<button class="${h.cat === c ? 'on' : ''}" data-action="homeCat" data-v="${esc(c)}">${esc(c)}</button>`).join('')}</div>
       ${h.view === 'cal' ? Calendar(evs) : evs.length ? `<div class="ev-grid">${evs.map(EvCard).join('')}</div>` : `<div class="empty"><div class="display">No events found</div><p>Try a different search or category.</p></div>`}
+    </div>
+    <div class="container section">
+      <div class="section-head"><div><div class="eyebrow dash">For organizers</div><h2 style="margin-top:8px">Everything you need to sell out</h2></div><a class="btn btn-dark" href="#/admin">Open the box office →</a></div>
+      <div class="feat-grid">${feats.map(([i, t, d]) => `<div class="feat"><span class="feat-ic">${ic(i, 20)}</span><h3>${t}</h3><p>${d}</p></div>`).join('')}</div>
+    </div>
+    <div class="container" style="padding-bottom:60px">
+      <div class="promo">
+        <div class="promo-copy">
+          <div class="eyebrow dash" style="color:var(--mut)">Door scanner app</div>
+          <h2>Scan tickets from any phone</h2>
+          <ul class="ticks"><li>Instant green / amber / red — valid, already used, wrong event</li><li>Keeps scanning when the Wi-Fi drops, syncs when it's back</li><li>Guest search, live arrivals and Bluetooth scanner support</li><li>No app store — add it to the home screen in one tap</li></ul>
+          <a class="btn btn-accent btn-lg" href="#/scan">Try the scanner <span class="arr">→</span></a>
+        </div>
+        <div class="mock-phone" aria-hidden="true"><div class="mock-screen">
+          <div class="sc-result ok mock"><div class="sc-res-icon">${ic('check', 54)}</div><div class="sc-res-t">Valid ticket</div><div class="sc-res-name">Maya Patel</div><div class="sc-res-meta">Stalls · Seat F12</div><div class="sc-res-note">212 of 412 checked in</div></div>
+        </div></div>
+      </div>
     </div>
   </div>`;
 }
@@ -178,7 +216,7 @@ function EvCard(ev) {
   const d = D(ev.start), av = S.avail[ev.id]; if (!av) refreshAvailOnce(ev.id);
   const out = soldOut(ev, av);
   return `<a class="ev-card" href="#/e/${esc(ev.slug)}">
-    <div class="ev-img" style="background-image:url('${esc(ev.image)}')">
+    <div class="ev-img" style="${artBg(ev)}">${artTitle(ev)}
       <div class="chips">${out ? '<span class="chip bad">Sold out</span>' : ''}${ev.category ? `<span class="chip gold">${esc(ev.category)}</span>` : ''}</div>
       <div class="datebadge"><div class="m">${esc(fmtDate(ev.start, { month: 'short' }))}</div><div class="d">${d.getDate()}</div></div>
     </div>
@@ -212,7 +250,7 @@ function EventPage() {
   const sel = S.sel, av = S.avail[ev.id];
   const preview = ev.status !== 'published';
   return `
-  <section class="ev-hero"><div class="bg" style="background-image:url('${esc(ev.image)}')"></div>
+  <section class="ev-hero"><div class="bg" style="${artBg(ev)}"></div>
     <div class="inner">
       <div>
         ${preview ? '<span class="chip warn" style="margin-bottom:14px">Preview — not published</span>' : ''}
@@ -229,7 +267,7 @@ function EventPage() {
           <button class="btn glass btn-sm" data-action="copyLink" data-v="${esc(shareUrl(ev.slug))}">Copy link</button>
         </div>
       </div>
-      <div class="poster hide-sm" style="background-image:url('${esc(ev.image)}')"></div>
+      <div class="poster hide-sm" style="${artBg(ev)}">${artTitle(ev, 'art-t lg')}</div>
     </div>
   </section>
   <div class="container"><div class="ev-layout">
@@ -428,7 +466,7 @@ function FindTickets() {
 // ══════════════════════════════════════════════════════════════════════════════
 const NAV = [
   ['dashboard', 'Dashboard', 'home'], ['events', 'Events', 'cal'], ['orders', 'Orders', 'cart', 'orders'], ['attendees', 'Door list', 'users', 'orders'],
-  ['checkin', 'Check-in', 'scan', 'checkin'], ['reports', 'Reports', 'chart'], ['marketing', 'Marketing', 'mega', 'events'], ['team', 'Team', 'team', 'admin'], ['settings', 'Settings', 'gear', 'admin'],
+  ['checkin', 'Scanner app', 'scan', 'checkin'], ['reports', 'Reports', 'chart'], ['marketing', 'Marketing', 'mega', 'events'], ['team', 'Team', 'team', 'admin'], ['settings', 'Settings', 'gear', 'admin'],
 ];
 function AdminShell() {
   if (!S.user || !S.adm) return Login();
@@ -446,11 +484,11 @@ function AdminShell() {
     <nav class="mob-nav">${allowed.slice(0, 5).map(([k, t, i]) => `<a class="${sub === k ? 'on' : ''}" href="#/admin/${k}">${ic(i)}${t}</a>`).join('')}</nav>
   </div>`;
 }
-function Login() {
+function Login(title = 'Organizer sign in') {
   const l = S.ui.login;
   return `<div style="min-height:100vh;display:grid;place-items:center;background:var(--ink);padding:20px">
     <div class="card" style="width:min(420px,100%)"><div style="height:44px;margin-bottom:18px">${logo()}</div>
-      <h1 class="display" style="font-size:32px">Organizer sign in</h1>
+      <h1 class="display" style="font-size:32px">${esc(title)}</h1>
       <p class="muted" style="margin:6px 0 20px">${DB.live ? 'We\'ll email you a one-time code.' : 'Demo mode: enter any email to explore the back office.'}</p>
       <div class="field"><label class="fl">Work email</label><input class="inp" type="email" data-input="loginEmail" value="${esc(l.email)}" autocomplete="email"></div>
       ${l.sent ? `<div class="field"><label class="fl">6-digit code</label><input class="inp" data-input="loginCode" inputmode="numeric" value="${esc(l.code)}" autocomplete="one-time-code"></div>` : ''}
@@ -516,7 +554,7 @@ function EventsList() {
   <div class="toolbar"><input class="inp" data-input="q" placeholder="Search events…" value="${esc(S.ui.q)}"></div>
   <div class="tbl-wrap"><table class="tbl"><thead><tr><th></th><th>Event</th><th>Date</th><th>Status</th><th>Sold</th><th>Revenue</th><th></th></tr></thead><tbody>
   ${evs.map(e => { const s = evStats(e); return `<tr class="click" data-action="go" data-v="#/admin/event/${e.id}/details">
-    <td style="width:66px"><div style="width:54px;height:38px;border-radius:8px;background:var(--ink-2) center/cover url('${esc(e.image)}')"></div></td>
+    <td style="width:66px"><div class="thumb" style="${artBg(e)}"></div></td>
     <td><b>${esc(e.name)}</b><div class="small muted">${esc(e.venue || '')}</div></td><td>${esc(fmtDT(e.start))}</td><td>${evChip(e)}</td>
     <td class="tnum">${s.sold}${s.cap ? ' / ' + s.cap : ''}</td><td class="tnum">${money(s.rev)}</td>
     <td style="white-space:nowrap"><a class="btn btn-ghost btn-sm" href="#/e/${esc(e.slug)}" target="_blank" data-stop="1">View</a> ${can('events') ? `<button class="btn btn-ghost btn-sm" data-action="dupEvent" data-id="${e.id}">Duplicate</button>` : ''}</td></tr>`; }).join('')}
@@ -647,7 +685,7 @@ function EdShare(ev) {
       <a class="btn btn-ghost btn-sm" target="_blank" rel="noopener" href="https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(url)}">Facebook</a>
       <a class="btn btn-ghost btn-sm" target="_blank" rel="noopener" href="https://twitter.com/intent/tweet?url=${encodeURIComponent(url)}&text=${encodeURIComponent(ev.name)}">X</a>
       <a class="btn btn-ghost btn-sm" href="mailto:?subject=${encodeURIComponent(ev.name)}&body=${encodeURIComponent(url)}">Email</a></div></div>
-    <div class="card"><h3>Embed on your website</h3><p class="small muted" style="margin:4px 0 10px">Paste into singentertainment.net (Webflow → Embed element). Full checkout inside your site.</p>
+    <div class="card"><h3>Embed on your website</h3><p class="small muted" style="margin:4px 0 10px">Paste into any website builder (Webflow, Wix, Squarespace, WordPress) as an HTML/embed block. Full checkout inside your site.</p>
       <pre class="code">&lt;iframe src="${esc(embed)}" style="width:100%;min-height:900px;border:0" title="${esc(ev.name)} tickets"&gt;&lt;/iframe&gt;</pre>
       <p class="small muted" style="margin:12px 0 8px">Or a "Buy tickets" button:</p><pre class="code">&lt;a href="${esc(url)}" style="background:#f4cd5e;color:#2a2006;padding:14px 26px;border-radius:999px;font-weight:700;text-decoration:none"&gt;Buy tickets&lt;/a&gt;</pre></div>
     <div class="card"><h3>Tracking links</h3><p class="small muted" style="margin:4px 0 10px">Tag links per channel — Reports shows sales by source.</p>
@@ -719,52 +757,173 @@ function Attendees() {
   </tbody></table></div>`;
 }
 function CheckIn() {
-  const evId = S.ui.scanEv || S.ui.attEv || ''; const ev = evById(evId);
-  const tks = S.adm.tickets.filter(t => (!evId || t.event_id === evId) && t.status === 'valid'), inn = tks.filter(t => t.checked_in_at).length, r = S.ui.lastScan;
-  return head('Check-in', 'Scan QR codes at the door, or type a ticket code.') + `
-  <div class="cols"><div>
-    <div class="scanner">${S.ui.scan === 'on' ? '<video id="scanVideo" playsinline muted></video><div class="frame"></div>' : `<div style="position:absolute;inset:0;display:grid;place-items:center;color:#fff;text-align:center"><div><div style="opacity:.6;margin-bottom:12px">${ic('scan', 46)}</div><button class="btn btn-accent btn-lg" data-action="scanOn">Start camera</button></div></div>`}</div>
-    ${S.ui.scan === 'on' ? '<button class="btn btn-ghost btn-block" style="margin-top:10px" data-action="scanOff">Stop camera</button>' : ''}
-    ${r ? `<div class="scan-result ${r.result === 'ok' ? 'ok' : r.result === 'already' ? 'already' : 'bad'}"><div class="display">${{ ok: 'Valid — welcome', already: 'Already checked in', unknown: 'Not a valid ticket', cancelled: 'Ticket cancelled', undone: 'Check-in undone' }[r.result]}</div>
-      ${r.ticket ? `<div style="margin-top:6px;font-weight:600">${esc(r.ticket.holder)} · ${esc(evById(r.ticket.event_id)?.ticketTypes.find(x => x.id === r.ticket.ticket_type_id)?.name || '')}${r.ticket.seat ? ' · Seat ' + esc(r.ticket.seat) : ''}</div><div class="small">${esc(r.ticket.code)}${r.result === 'already' ? ' · first scanned ' + esc(fmtTime(r.ticket.checked_in_at)) : ''}</div>` : ''}
-      ${evId && r.ticket && r.ticket.event_id !== evId ? '<div class="small" style="margin-top:6px"><b>Warning: this ticket is for a different event.</b></div>' : ''}</div>` : ''}
-  </div><div class="stack">
-    <div class="card"><label class="fl">Event</label><select class="inp" data-input="scanEv">${evOptions(evId, 'Any event')}</select>
-      <div class="between" style="margin-top:14px"><span class="display" style="font-size:42px">${inn}<span class="muted" style="font-size:22px"> / ${tks.length}</span></span><span class="muted">checked in</span></div>
-      <div class="bar"><i style="width:${tks.length ? inn / tks.length * 100 : 0}%;background:var(--accent)"></i></div></div>
-    <div class="card"><label class="fl">Manual entry</label><div class="row"><input class="inp" id="manualCode" placeholder="Ticket code" style="text-transform:uppercase"><button class="btn btn-dark" data-action="manualCheck">Check in</button></div></div>
-    <div class="card"><h3>Recent scans</h3>${S.ui.scans.slice(0, 8).map(s => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span>${esc(s.ticket?.holder || s.code)}</span><span class="chip ${s.result === 'ok' ? 'ok' : s.result === 'already' ? 'warn' : 'bad'}">${esc(s.result)}</span></div>`).join('') || '<p class="small muted">Nothing scanned yet.</p>'}</div>
-  </div></div>`;
+  const url = location.origin + location.pathname + '#/scan';
+  const evs = S.adm.events.filter(e => e.status === 'published' && D(e.end || e.start) >= Date.now() - 12 * 3600e3).sort((a, b) => D(a.start) - D(b.start));
+  return head('Scanner app', 'Check guests in at the door from any phone — no app store needed.', `<a class="btn btn-accent" href="#/scan" target="_blank">Open scanner ${ic('ext', 14)}</a>`) + `
+  <div class="cols"><div class="stack">
+    <div class="card"><div class="row" style="gap:22px;align-items:flex-start;flex-wrap:wrap"><div class="qr qr-sm" data-qr="${esc(url)}"></div>
+      <div style="flex:1;min-width:220px"><h3>Put it on your door staff's phones</h3><ol class="steps"><li>Scan this code with the phone's camera.</li><li>Sign in with an email on the <a href="#/admin/team">Team</a> page.</li><li>Tap <b>Share → Add to Home Screen</b> — it opens full-screen like a native app.</li></ol>
+      <p class="small muted">Scans with the phone camera, Bluetooth/USB barcode scanners, or typed codes. Keeps working when the venue Wi-Fi drops and syncs when it's back.</p></div></div></div>
+    <div class="card" style="padding:0"><div style="padding:18px 22px 8px"><h3>Live door status</h3></div><div style="overflow:auto"><table class="tbl"><thead><tr><th>Event</th><th>Starts</th><th style="width:40%">Checked in</th></tr></thead><tbody>
+      ${evs.map(e => { const st = checkStats(e.id); return `<tr><td><b>${esc(e.name)}</b></td><td class="small">${esc(fmtDT(e.start))}</td><td><div class="between small"><span>${st.inn} / ${st.total}</span><span class="muted">${st.total ? Math.round(st.inn / st.total * 100) : 0}%</span></div><div class="bar"><i style="width:${st.total ? st.inn / st.total * 100 : 0}%;background:var(--accent)"></i></div></td></tr>`; }).join('') || '<tr><td colspan="3" class="muted">No upcoming events.</td></tr>'}
+    </tbody></table></div></div>
+  </div><div><div class="phone"><iframe src="${esc(location.pathname)}#/scan" title="Scanner app preview" allow="camera"></iframe></div><p class="small muted" style="text-align:center;margin-top:10px">Live preview — this is the real app.</p></div></div>`;
 }
-let _scan = null;
-async function startScanner() {
-  const v = $('#scanVideo'); if (!v || _scan?.video === v) return;
-  try {
-    const stream = _scan?.stream || await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-    v.srcObject = stream; await v.play();
-    _scan = { stream, video: v, last: '', at: 0 };
-    const c = document.createElement('canvas'), ctx = c.getContext('2d', { willReadFrequently: true });
-    const tick = async () => {
-      if (!_scan || _scan.video !== v || !document.body.contains(v)) return;
-      if (v.readyState >= 2 && window.jsQR) {
-        c.width = v.videoWidth; c.height = v.videoHeight; ctx.drawImage(v, 0, 0);
-        const r = jsQR(ctx.getImageData(0, 0, c.width, c.height).data, c.width, c.height, { inversionAttempts: 'dontInvert' });
-        if (r?.data && (r.data !== _scan.last || Date.now() - _scan.at > 4000)) { _scan.last = r.data; _scan.at = Date.now(); await doCheckin(r.data); }
-      }
-      requestAnimationFrame(tick);
-    };
-    tick();
-  } catch (e) { S.ui.scan = null; toast('Camera unavailable: ' + e.message, true); render(); }
-}
-function stopScanner() { if (_scan?.stream && !(S.route?.sub === 'checkin' && S.ui.scan === 'on' && parseRoute().sub === 'checkin')) { _scan.stream.getTracks().forEach(t => t.stop()); _scan = null; } }
 async function doCheckin(code, undo) {
-  try {
-    const r = await DB.checkin(code, undo); S.ui.lastScan = r; S.ui.scans.unshift({ ...r, code });
-    if (r.ticket) { const t = S.adm.tickets.find(x => x.id === r.ticket.id); if (t) t.checked_in_at = r.ticket.checked_in_at; }
-    if (navigator.vibrate) navigator.vibrate(r.result === 'ok' ? 80 : [60, 60, 60]);
-    render();
-  } catch (e) { toast(e.message, true); }
+  try { const r = await DB.checkin(code, undo); applyTicket(r); render(); } catch (e) { toast(e.message, true); }
 }
+function applyTicket(r) { if (!r?.ticket) return; const t = S.adm.tickets.find(x => x.id === r.ticket.id); if (t) t.checked_in_at = r.ticket.checked_in_at; }
+const checkStats = evId => { const tk = S.adm.tickets.filter(t => t.event_id === evId && t.status === 'valid'); return { tk, total: tk.length, inn: tk.filter(t => t.checked_in_at).length }; };
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  DOOR SCANNER APP  (#/scan — phone-first, installable, works offline)
+// ══════════════════════════════════════════════════════════════════════════════
+function ScanApp() {
+  if (!S.user || !S.adm) return Login('Door staff sign in', 'Scan tickets at the door.');
+  const ev = S.adm.events.find(e => e.id === S.sc.evId);
+  return `<div class="sc">${ev ? ScanEvent(ev) : ScanPick()}</div>${S.sc.last ? ScanResult(S.sc.last) : ''}`;
+}
+function ScanPick() {
+  const today = new Date().toDateString();
+  const evs = S.adm.events.filter(e => e.status === 'published' && D(e.end || e.start) >= Date.now() - 12 * 3600e3).sort((a, b) => D(a.start) - D(b.start));
+  return `<header class="sc-top"><div class="sc-logo">${logo()}</div><span class="sc-badge">Scanner</span><span style="flex:1"></span><a href="#/admin" class="sc-link">Box office</a></header>
+  <div class="sc-pad"><div class="sc-eyebrow">Choose an event</div><h1 class="sc-h">Who's coming in?</h1>
+  ${evs.map(e => { const st = checkStats(e.id), tonight = D(e.start).toDateString() === today;
+    return `<button class="sc-ev" data-action="scPick" data-id="${e.id}"><div class="sc-ev-art" style="${artBg(e)}"></div><div class="sc-ev-body">
+      <div class="row" style="gap:6px">${tonight ? '<span class="chip gold">Tonight</span>' : ''}<span class="sc-dim">${esc(fmtDT(e.start))}</span></div>
+      <b>${esc(e.name)}</b><span class="sc-dim">${esc(e.venue || '')}</span>
+      <div class="sc-bar"><i style="width:${st.total ? st.inn / st.total * 100 : 0}%"></i></div><span class="sc-dim">${st.inn} of ${st.total} checked in</span></div><span class="sc-chev">›</span></button>`; }).join('') || '<p class="sc-dim">No upcoming events.</p>'}
+  </div><div class="sc-foot"><span>${esc(S.user.email)}</span><a href="#" data-action="signOut">Sign out</a></div>`;
+}
+function ScanEvent(ev) {
+  const st = checkStats(ev.id), tab = S.sc.tab, on = navigator.onLine;
+  return `<header class="sc-top"><button class="sc-back" data-action="scBack" aria-label="All events">‹</button>
+    <div class="sc-title"><b>${esc(ev.name)}</b><span>${esc(fmtTime(ev.start))}${ev.venue ? ' · ' + esc(ev.venue) : ''}</span></div>
+    <span class="sc-net ${on ? '' : 'off'}">${ic('wifi', 13)} ${on ? 'Online' : 'Offline'}${S.sc.queue.length ? ' · ' + S.sc.queue.length + ' queued' : ''}</span></header>
+  <div class="sc-count"><div><span class="n">${st.inn}</span><span class="d"> / ${st.total} checked in</span></div><span class="d">${st.total - st.inn} to come</span></div>
+  <div class="sc-progress"><i style="width:${st.total ? st.inn / st.total * 100 : 0}%"></i></div>
+  <main class="sc-body">${tab === 'guests' ? ScanGuests(ev, st) : tab === 'stats' ? ScanStats(ev, st) : ScanCam()}</main>
+  <nav class="sc-tabs">${[['scan', 'Scan', 'scan'], ['guests', 'Guests', 'users'], ['stats', 'Stats', 'chart']].map(([k, t, i]) => `<button class="${tab === k ? 'on' : ''}" data-action="scTab" data-v="${k}">${ic(i, 21)}<span>${t}</span></button>`).join('')}</nav>`;
+}
+function ScanCam() {
+  const live = !!CAM.stream;
+  return `<div class="sc-cam">${live ? '<div id="camSlot" class="sc-slot"></div>' : `<div class="sc-cam-off"><div class="sc-cam-ic">${ic('scan', 44)}</div><p>Point the camera at the QR code on a ticket</p>
+      <button class="btn btn-accent btn-lg" data-action="scCam">Start scanning</button>${S.sc.err ? `<p class="sc-err">${esc(S.sc.err)}</p>` : ''}</div>`}
+    <div class="sc-frame ${live ? 'live' : ''}"><i></i><i></i><i></i><i></i>${live ? '<span class="sc-line"></span>' : ''}</div></div>
+  <div class="sc-tools">
+    <button class="sc-tool" data-action="scManual">${ic('keyboard', 20)}<span>Enter code</span></button>
+    <button class="sc-tool ${CAM.torch ? 'on' : ''}" data-action="scTorch" ${live ? '' : 'disabled'}>${ic('bolt', 20)}<span>Torch</span></button>
+    <button class="sc-tool ${S.sc.sound ? 'on' : ''}" data-action="scSound">${ic(S.sc.sound ? 'sound' : 'mute', 20)}<span>Sound</span></button></div>
+  ${S.sc.recent.length ? `<div class="sc-recent"><div class="sc-eyebrow">Recent</div>${S.sc.recent.slice(0, 5).map(r => `<div class="sc-rec"><span class="dot ${resKind(r.result)}"></span><b>${esc(r.ticket?.holder || r.code)}</b><span class="sc-dim">${esc(RES_TITLE[r.result])} · ${esc(fmtTime(new Date(r.at).toISOString()))}</span></div>`).join('')}</div>` : ''}`;
+}
+const RES_TITLE = { ok: 'Valid ticket', already: 'Already checked in', unknown: 'Not a valid ticket', cancelled: 'Ticket cancelled', wrong_event: 'Wrong event', undone: 'Check-in undone' };
+const resKind = r => r === 'ok' ? 'ok' : r === 'already' ? 'warn' : r === 'undone' ? 'info' : 'bad';
+function ScanResult(r) {
+  const kind = resKind(r.result), t = r.ticket, ev = t && evById(t.event_id), tt = ev?.ticketTypes.find(x => x.id === t.ticket_type_id);
+  const o = t && S.adm.orders.find(x => x.id === t.order_id), slot = t?.slot_id && ev?.timeSlots?.find(s => s.id === t.slot_id);
+  return `<div class="sc-result ${kind}" data-action="scDismiss" role="alert"><div class="sc-res-icon">${ic(kind === 'ok' ? 'check' : kind === 'bad' ? 'x' : 'alert', 58)}</div>
+    <div class="sc-res-t">${esc(RES_TITLE[r.result])}</div>
+    ${t ? `<div class="sc-res-name">${esc(t.holder)}</div><div class="sc-res-meta">${esc(tt?.name || '')}${t.seat ? ' · Seat ' + esc(t.seat) : ''}${slot ? ' · ' + esc(fmtTime(slot.start)) : ''}</div><div class="sc-res-code">${esc(t.code)}${o ? ' · ' + esc(o.ref) : ''}</div>` : `<div class="sc-res-code">${esc(r.code || '')}</div>`}
+    ${r.result === 'already' ? `<div class="sc-res-note">First scanned at ${esc(fmtTime(t.checked_in_at))}</div>` : ''}
+    ${r.result === 'wrong_event' && ev ? `<div class="sc-res-note">This ticket is for ${esc(ev.name)} · ${esc(fmtDT(ev.start))}</div>` : ''}
+    ${r.result === 'ok' && o?.status === 'pending' ? `<div class="sc-res-note">Unpaid order — collect ${money(o.data.total, o.data.currency)}</div>` : ''}
+    ${r.offline ? '<div class="sc-res-note">Saved offline — syncs when back online</div>' : ''}
+    <div class="sc-res-actions">${r.result === 'ok' ? `<button class="btn glass" data-action="scUndo" data-v="${esc(t.code)}">Undo</button>` : ''}<button class="btn sc-next" data-action="scDismiss">Next scan</button></div></div>`;
+}
+function ScanGuests(ev, st) {
+  const q = S.sc.q.trim().toLowerCase(), f = S.sc.filter;
+  const rows = st.tk.filter(t => (f === 'all' || (f === 'in') === !!t.checked_in_at) && (!q || [t.holder, t.code, t.seat, S.adm.orders.find(o => o.id === t.order_id)?.buyer_email].join(' ').toLowerCase().includes(q)))
+    .sort((a, b) => (a.holder || '').localeCompare(b.holder || ''));
+  return `<div class="sc-pad"><div class="sc-search">${ic('search', 17)}<input data-input="sc.q" placeholder="Search name, code, seat…" value="${esc(S.sc.q)}" autocomplete="off"></div>
+    <div class="sc-chips">${[['all', 'All ' + st.total], ['out', 'Not in ' + (st.total - st.inn)], ['in', 'In ' + st.inn]].map(([k, t]) => `<button class="${f === k ? 'on' : ''}" data-action="scFilter" data-v="${k}">${t}</button>`).join('')}</div>
+    ${rows.slice(0, 250).map(t => { const tt = ev.ticketTypes.find(x => x.id === t.ticket_type_id);
+      return `<div class="sc-guest"><div><b>${esc(t.holder)}</b><span>${esc(tt?.name || '')}${t.seat ? ' · ' + esc(t.seat) : ''} · ${esc(t.code)}</span></div>
+        <button class="sc-tick ${t.checked_in_at ? 'on' : ''}" data-action="scToggle" data-v="${esc(t.code)}" data-undo="${t.checked_in_at ? 1 : 0}">${t.checked_in_at ? ic('check', 15) + ' ' + esc(fmtTime(t.checked_in_at)) : 'Check in'}</button></div>`; }).join('') || '<p class="sc-dim" style="padding:20px 0">No guests match.</p>'}</div>`;
+}
+function ScanStats(ev, st) {
+  const pct = st.total ? st.inn / st.total : 0, R = 70, C = 2 * Math.PI * R;
+  const byTT = ev.ticketTypes.map(t => { const a = st.tk.filter(x => x.ticket_type_id === t.id); return { t, n: a.length, i: a.filter(x => x.checked_in_at).length }; }).filter(x => x.n);
+  const now = Date.now(), bins = Array.from({ length: 12 }, (_, i) => ({ from: now - (12 - i) * 15 * 6e4, v: 0 }));
+  st.tk.forEach(t => { if (!t.checked_in_at) return; const ts = D(t.checked_in_at).getTime(), b = bins.find(b => ts >= b.from && ts < b.from + 15 * 6e4); if (b) b.v++; });
+  const mx = Math.max(1, ...bins.map(b => b.v));
+  return `<div class="sc-pad">
+    <div class="sc-ring"><svg viewBox="0 0 180 180"><circle cx="90" cy="90" r="${R}" class="trk"/><circle cx="90" cy="90" r="${R}" class="val" stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${(C * (1 - pct)).toFixed(1)}"/></svg><div><b>${Math.round(pct * 100)}%</b><span>checked in</span></div></div>
+    <div class="sc-kpis"><div><b>${st.inn}</b><span>In</span></div><div><b>${st.total - st.inn}</b><span>To come</span></div><div><b>${st.total}</b><span>Tickets</span></div></div>
+    <div class="sc-card"><div class="sc-eyebrow">Arrivals · last 3 hours</div><div class="sc-arr">${bins.map(b => `<i style="height:${Math.max(4, b.v / mx * 100)}%" title="${b.v} in"></i>`).join('')}</div>
+      <div class="between sc-dim" style="font-size:11px;margin-top:6px"><span>${esc(fmtTime(new Date(bins[0].from).toISOString()))}</span><span>Now</span></div></div>
+    <div class="sc-card"><div class="sc-eyebrow">By ticket type</div>${byTT.map(x => `<div style="margin-top:12px"><div class="between"><span>${esc(x.t.name)}</span><span class="sc-dim">${x.i} / ${x.n}</span></div><div class="sc-bar"><i style="width:${x.i / x.n * 100}%"></i></div></div>`).join('') || '<p class="sc-dim">No tickets sold yet.</p>'}</div></div>`;
+}
+
+// Camera: one persistent <video> that survives re-renders (moved into #camSlot after each render).
+const CAM = { video: null, stream: null, raf: 0, last: '', at: 0, torch: false, canvas: null };
+async function camStart() {
+  if (CAM.stream) return;
+  try {
+    CAM.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 } } });
+    if (!CAM.video) { CAM.video = document.createElement('video'); CAM.video.setAttribute('playsinline', ''); CAM.video.muted = true; }
+    CAM.video.srcObject = CAM.stream; S.sc.err = ''; render(); await CAM.video.play().catch(() => { }); camLoop();
+  } catch (e) { CAM.stream = null; S.sc.err = e.name === 'NotAllowedError' ? 'Camera access was blocked. Allow it in your browser settings, or enter codes by hand.' : 'Camera unavailable: ' + e.message; render(); }
+}
+function camMount() { const slot = $('#camSlot'); if (slot && CAM.video && CAM.video.parentNode !== slot) { slot.append(CAM.video); CAM.video.play().catch(() => { }); } }
+function camStop() { if (CAM.stream) CAM.stream.getTracks().forEach(t => t.stop()); CAM.stream = null; CAM.torch = false; cancelAnimationFrame(CAM.raf); }
+function camLoop() {
+  const v = CAM.video, c = CAM.canvas || (CAM.canvas = document.createElement('canvas')), ctx = c.getContext('2d', { willReadFrequently: true });
+  const tick = () => {
+    if (!CAM.stream) return;
+    if (v.readyState >= 2 && window.jsQR && !S.sc.last && S.sc.tab === 'scan') {
+      const w = Math.min(640, v.videoWidth), h = Math.round(v.videoHeight * w / v.videoWidth); c.width = w; c.height = h; ctx.drawImage(v, 0, 0, w, h);
+      const r = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: 'dontInvert' });
+      if (r?.data && (r.data !== CAM.last || Date.now() - CAM.at > 3000)) { CAM.last = r.data; CAM.at = Date.now(); scanCheck(r.data); }
+    }
+    CAM.raf = requestAnimationFrame(tick);
+  };
+  tick();
+}
+let _resTimer = 0;
+async function scanCheck(code, undo = false, quiet = false) {
+  code = String(code).trim().toUpperCase(); if (!code) return;
+  let r;
+  try { if (DB.live && !navigator.onLine) throw new TypeError('offline'); r = await DB.checkin(code, undo, S.sc.evId || null); }
+  catch (e) { if (!(e instanceof TypeError)) return toast(e.message, true); r = localCheckin(code, undo); }   // network down → validate locally, queue
+  applyTicket(r); r.code = code; r.at = Date.now();
+  S.sc.recent.unshift(r); S.sc.recent.length = Math.min(S.sc.recent.length, 30); feedback(r.result);
+  if (quiet) { toast((r.ticket?.holder || code) + ' — ' + RES_TITLE[r.result], resKind(r.result) === 'bad'); return render(); }
+  S.sc.last = r; render();
+  clearTimeout(_resTimer); _resTimer = setTimeout(() => { if (S.sc.last === r) { S.sc.last = null; render(); } }, r.result === 'ok' ? 1700 : 3800);
+}
+function localCheckin(code, undo) {
+  const t = S.adm.tickets.find(x => x.code === code);
+  if (!t) return { result: 'unknown', offline: true };
+  if (t.status !== 'valid') return { result: 'cancelled', ticket: { ...t }, offline: true };
+  if (S.sc.evId && t.event_id !== S.sc.evId) return { result: 'wrong_event', ticket: { ...t }, offline: true };
+  const was = t.checked_in_at;
+  if (!was || undo) { S.sc.queue.push({ code, undo }); saveQueue(); }
+  return { result: undo ? 'undone' : was ? 'already' : 'ok', ticket: { ...t, checked_in_at: undo ? null : (was || new Date().toISOString()) }, offline: true };
+}
+function loadQueue() { try { return JSON.parse(localStorage.getItem('set_scan_queue')) || []; } catch (e) { return []; } }
+function saveQueue() { try { localStorage.setItem('set_scan_queue', JSON.stringify(S.sc.queue)); } catch (e) { } }
+async function flushQueue() {
+  while (S.sc.queue.length && navigator.onLine) { const q = S.sc.queue[0]; try { await DB.checkin(q.code, q.undo); S.sc.queue.shift(); saveQueue(); } catch (e) { break; } }
+  if (S.route.page === 'scan') render();
+}
+window.addEventListener('online', flushQueue);
+window.addEventListener('offline', () => { if (S.route.page === 'scan') render(); });
+function feedback(kind) {
+  if (navigator.vibrate) navigator.vibrate(kind === 'ok' ? 60 : [80, 60, 80]);
+  if (!S.sc.sound) return;
+  try {
+    const a = feedback.ctx || (feedback.ctx = new (window.AudioContext || window.webkitAudioContext)());
+    const tone = (f, t0, d) => { const o = a.createOscillator(), g = a.createGain(); o.frequency.value = f; g.gain.setValueAtTime(.16, a.currentTime + t0); g.gain.exponentialRampToValueAtTime(.001, a.currentTime + t0 + d); o.connect(g).connect(a.destination); o.start(a.currentTime + t0); o.stop(a.currentTime + t0 + d); };
+    if (kind === 'ok') tone(1320, 0, .12); else if (kind === 'already') { tone(700, 0, .1); tone(700, .15, .1); } else tone(220, 0, .32);
+  } catch (e) { }
+}
+// Bluetooth/USB barcode scanners type the code fast and press Enter ("keyboard wedge").
+const _wedge = { buf: '', t: 0 };
+document.addEventListener('keydown', e => {
+  if (S.route.page !== 'scan' || !S.sc.evId || /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || '')) return;
+  const now = Date.now(); if (now - _wedge.t > 80) _wedge.buf = ''; _wedge.t = now;
+  if (e.key === 'Enter') { if (_wedge.buf.length >= 6) scanCheck(_wedge.buf); _wedge.buf = ''; } else if (e.key.length === 1) _wedge.buf += e.key;
+});
 
 // ── Reports ──────────────────────────────────────────────────────────────────
 function Reports() {
@@ -1002,9 +1161,18 @@ const A = {
   exportReport: () => download('sales-report.csv', csv([['Event', 'Date', 'Tickets sold', 'Ticket revenue'], ...S.adm.events.map(e => { const s = evStats(e); return [e.name, e.start, s.sold, s.rev / 100]; })])),
   exportOptIn: () => download('mailing-list.csv', csv([['Email Address', 'First Name', 'Last Name'], ...[...new Map(S.adm.orders.filter(o => o.data.optIn).map(o => [o.buyer_email, o])).values()].map(o => { const [f, ...l] = o.data.buyer.name.split(' '); return [o.buyer_email, f, l.join(' ')]; })])),
   toggleIn: el => doCheckin(el.dataset.v, el.dataset.undo === '1'),
-  scanOn: () => { S.ui.scan = 'on'; render(); },
-  scanOff: () => { S.ui.scan = null; if (_scan) { _scan.stream.getTracks().forEach(t => t.stop()); _scan = null; } render(); },
-  manualCheck: () => { const v = $('#manualCode').value.trim(); if (v) doCheckin(v); },
+  scPick: el => { S.sc.evId = el.dataset.id; S.sc.tab = 'scan'; S.sc.q = ''; try { localStorage.setItem('set_scan_ev', S.sc.evId); } catch (e) { } render(); },
+  scBack: () => { S.sc.evId = ''; camStop(); render(); },
+  scTab: el => { S.sc.tab = el.dataset.v; render(); },
+  scCam: () => camStart(),
+  scDismiss: (el, e) => { if (e.target.closest('[data-action="scUndo"]')) return; S.sc.last = null; render(); },
+  scUndo: el => scanCheck(el.dataset.v, true),
+  scToggle: el => scanCheck(el.dataset.v, el.dataset.undo === '1', true),
+  scFilter: el => { S.sc.filter = el.dataset.v; render(); },
+  scSound: () => { S.sc.sound = !S.sc.sound; render(); },
+  scTorch: async () => { try { await CAM.stream.getVideoTracks()[0].applyConstraints({ advanced: [{ torch: !CAM.torch }] }); CAM.torch = !CAM.torch; render(); } catch (e) { toast('Torch isn\'t supported on this device', true); } },
+  scManual: () => modal('Enter ticket code', `<input class="inp" id="scCode" placeholder="e.g. 7KQ2M9XHPA" autocomplete="off" style="text-transform:uppercase;font-size:20px;letter-spacing:.12em;text-align:center">`, `<button class="btn btn-ghost" data-action="closeModal">Cancel</button><button class="btn btn-accent" data-action="scManualGo">Check in</button>`) || setTimeout(() => $('#scCode')?.focus(), 50),
+  scManualGo: () => { const v = $('#scCode')?.value; closeModal(); if (v) scanCheck(v); },
   addMember: async () => { const t = S.ui.inv; if (!EMAIL_RE.test(t.email)) return toast('Enter a valid email', true);
     try { const m = { email: t.email.trim().toLowerCase(), role: t.role, name: t.name.trim() }; await DB.saveTeam(m); upsertLocal(S.adm.team, m, 'email'); S.ui.inv = null; toast('Added — they can sign in now'); render(); } catch (e) { toast(e.message, true); } },
   rmMember: async el => { if (!confirmIn('Remove ' + el.dataset.v + '?')) return; try { await DB.saveTeam({ email: el.dataset.v }, true); S.adm.team = S.adm.team.filter(m => m.email !== el.dataset.v); render(); } catch (e) { toast(e.message, true); } },
@@ -1048,15 +1216,16 @@ document.addEventListener('input', e => {
     else if (k === 'wlName' || k === 'wlEmail') (S.ui.wl ||= {})[k === 'wlName' ? 'name' : 'email'] = v;
     else if (k === 'findRef' || k === 'findEmail') (S.ui.find ||= {})[k === 'findRef' ? 'ref' : 'email'] = v;
     else if (k === 'loginEmail') S.ui.login.email = v; else if (k === 'loginCode') S.ui.login.code = v;
+    else if (k === 'sc.q') { S.sc.q = v; return render(); }
     else if (k.includes('.')) { const [a, b] = k.split('.'); (S.ui[a] ||= {})[b] = v; if (a === 'mo' && el.dataset.rerender) ManualOrderModal(); return; }
     else S.ui[k] = v;
-    if (['homeq', 'q', 'ev', 'status', 'attEv', 'scanEv', 'repEv'].includes(k)) render();
+    if (['homeq', 'q', 'ev', 'status', 'attEv', 'repEv'].includes(k)) render();
   }
 });
 document.addEventListener('change', e => { const el = e.target; const fn = CHANGE[el.dataset.actionChange]; if (fn) fn(el); });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closeModal();
-  if (e.key === 'Enter' && e.target.id === 'manualCode') A.manualCheck();
+  if (e.key === 'Enter' && e.target.id === 'scCode') A.scManualGo();
   if (e.key === 'Enter' && ['loginEmail', 'loginCode'].includes(e.target.dataset.input)) A.login();
 });
 
@@ -1106,7 +1275,8 @@ async function boot() {
     S.user = await DB.session();
     if (S.user) await reloadAdmin().catch(e => { S.user = null; toast(e.message, true); });
   } catch (e) { console.error(e); toast('Could not load events: ' + e.message, true); }
-  S.loading = false; loadPixels(); onRoute();
+  S.sc.queue = loadQueue(); try { S.sc.evId = localStorage.getItem('set_scan_ev') || ''; } catch (e) { }
+  S.loading = false; loadPixels(); onRoute(); flushQueue();
 }
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
 boot();
