@@ -21,6 +21,12 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
 ## Run locally
 `cd frontend && python3 -m http.server 8765` → http://localhost:8765 (organizer side: /#/admin).
 
+## Deploy
+Live at https://moishsonn-tech.github.io/set-tickets/ (public repo moishsonn-tech/set-tickets).
+`bash deploy/publish.sh` pushes main and force-pushes `frontend/` as the `gh-pages` branch, which Pages serves.
+No GitHub Actions: the saved gh token for moishsonn-tech lacks the `workflow` scope, so a workflow file in the
+repo makes every push fail. Scanner app = `#/scan` (phone cameras require the https site).
+
 ---
 
 # App Starter Kit — Engineering Guide (CLAUDE.md)
