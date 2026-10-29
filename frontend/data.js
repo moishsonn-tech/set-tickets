@@ -64,8 +64,57 @@ function availabilityFrom(tickets, eventId) {
   return a;
 }
 
+/* ── Seat maps ───────────────────────────────────────────────────────────────────
+   seating = {enabled, stage:{x,y,w,h,label}, sections:[...], prices:{seatId:ttId}, blocked:[seatId], index:{seatId:ttId}}
+   section = {id, code, name, kind:'rows'|'table', x, y, rot, ticketTypeId,
+              rows, seatsPerRow, rowSeats:[n per row], rowStart:'A', reverse, curve(0-100)  |  seats (table)}
+   Seat ids are "<code>-<row><num>" (rows) or "<code>-<num>" (tables). `index` is DERIVED on save from the
+   layout (the server checks each seat is sold as its own ticket type) — sections/prices stay the source. */
+const SEAT = 26, ROWH = 30, ROW_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+function rowLabel(start, i) {
+  if (/^\d+$/.test(String(start))) return String(+start + i);
+  let k = Math.max(0, ROW_LETTERS.indexOf(String(start || 'A').toUpperCase())) + i, out = '';
+  do { out = ROW_LETTERS[k % 24] + out; k = Math.floor(k / 24) - 1; } while (k >= 0);
+  return out;
+}
+function seatLayout(st) {
+  const seats = [], secs = [];
+  for (const sec of st?.sections || []) {
+    const local = []; let R = 0;
+    if (sec.kind === 'table') {
+      const n = Math.max(1, Math.min(40, +sec.seats || 8)); R = Math.max(26, n * SEAT / (2 * Math.PI) - 4);
+      for (let i = 0; i < n; i++) { const a = -Math.PI / 2 + i * 2 * Math.PI / n; local.push({ id: `${sec.code}-${i + 1}`, x: Math.cos(a) * (R + 15), y: Math.sin(a) * (R + 15), row: '', num: i + 1 }); }
+    } else {
+      const rows = Math.max(1, Math.min(60, +sec.rows || 1)), per = Math.max(1, Math.min(80, +sec.seatsPerRow || 10));
+      const counts = Array.from({ length: rows }, (_, r) => Math.max(1, Math.min(80, +(sec.rowSeats || [])[r] || per)));
+      const M = Math.max(...counts), W = (M - 1) * SEAT, bend = (+sec.curve || 0) / 100 * W * .22;
+      counts.forEach((n, r) => {
+        const label = rowLabel(sec.rowStart || 'A', r), off = (M - n) * SEAT / 2;
+        for (let i = 0; i < n; i++) { const x = off + i * SEAT, t = W ? (x - W / 2) / (W / 2) : 0, num = sec.reverse ? n - i : i + 1;
+          local.push({ id: `${sec.code}-${label}${num}`, x, y: r * ROWH - bend * t * t, row: label, num }); }
+      });
+    }
+    const xs = local.map(p => p.x), ys = local.map(p => p.y);
+    const g = { sec, local, R, minx: Math.min(...xs), maxx: Math.max(...xs), miny: Math.min(...ys), maxy: Math.max(...ys) };
+    g.cx = (g.minx + g.maxx) / 2; g.cy = (g.miny + g.maxy) / 2;
+    const a = (+sec.rot || 0) * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a);
+    for (const p of local) {
+      const dx = p.x - g.cx, dy = p.y - g.cy;
+      p.gx = (+sec.x || 0) + g.cx + dx * c - dy * sn; p.gy = (+sec.y || 0) + g.cy + dx * sn + dy * c;
+      p.sec = sec; p.tt = (st.prices || {})[p.id] || sec.ticketTypeId || '';
+      seats.push(p);
+    }
+    secs.push(g);
+  }
+  const st0 = st?.stage, xs = seats.map(p => p.gx), ys = seats.map(p => p.gy);
+  if (st0) { xs.push(+st0.x, +st0.x + +st0.w); ys.push(+st0.y, +st0.y + +st0.h); }
+  const bounds = xs.length ? { x0: Math.min(...xs) - 20, x1: Math.max(...xs) + 20, y0: Math.min(...ys) - 40, y1: Math.max(...ys) + 20 } : { x0: -200, x1: 200, y0: -150, y1: 150 };
+  return { seats, secs, bounds };
+}
+const seatIndex = st => { const b = new Set(st.blocked || []); return Object.fromEntries(seatLayout(st).seats.filter(p => p.tt && !b.has(p.id)).map(p => [p.id, p.tt])); };
+
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v2';
+const DEMO_KEY = 'set_demo_v4';
 const Demo = {
   st: null,
   load() {
@@ -121,7 +170,8 @@ function demoPlaceOrder(p, asTeam) {
       if ((it.seats || []).length !== it.qty) throw new Error(`Pick ${it.qty} seat(s)`);
       for (const s of it.seats) {
         const key = (it.slotId || '') + '|' + s;
-        if ((ev.seating.blocked || []).includes(s)) throw new Error(`Seat ${s} is unavailable`);
+        if ((ev.seating.blocked || []).includes(s) || !ev.seating.index?.[s]) throw new Error(`Seat ${s} is unavailable`);
+        if (ev.seating.index[s] !== tt.id) throw new Error(`Seat ${s} isn't a ${tt.name} seat`);
         if (av.seats.includes(key) || pending.seats.includes(ev.id + key)) throw new Error(`Seat ${s} was just taken`);
         pending.seats.push(ev.id + key);
       }
@@ -281,18 +331,27 @@ function seedDemo() {
     timeSlots: [], seating: { enabled: false }, addons: [], questions: [], waitlist: true, emails: { confirmation: '', reminders: [] } };
   const mk = (o) => ({ ...base, id: uid(), status: 'published', created_at: day(-30), secrets: { password: '', ticketPasswords: {}, discounts: [] }, ...o });
 
-  const vipTT = tt('Premium — front rows', 12000, 0, { desc: 'Rows A–C, best sightlines', max: 8 });
-  const stallsTT = tt('Stalls', 6500, 0, { desc: 'Rows D–H' });
-  const circleTT = tt('Circle', 4500, 0, { desc: 'Rows J–L' });
+  const vipTT = tt('Premium', 12000, 0, { desc: 'Front centre, rows A–C', max: 8 });
+  const stallsTT = tt('Stalls', 6500, 0, { desc: 'Ground floor' });
+  const circleTT = tt('Circle', 4500, 0, { desc: 'Raised rows J–L' });
   const ev1 = mk({ slug: 'winter-orchestra-gala', name: 'Winter Orchestra Gala', category: 'Concert',
     summary: 'A full symphony orchestra with guest soloists.', start: day(41, 19, 30), end: day(41, 22, 0), doors: '6:45 PM',
     venue: 'Grand Lyric Theatre', address: '1500 Broadway, New York, NY 10036',
     description: 'An evening of seasonal favourites performed by a 60-piece orchestra and guest soloists.\n\nDoors open 6:45 PM. The performance begins promptly at 7:30 PM. Seats are reserved — pick yours on the seat map.',
     ticketTypes: [vipTT, stallsTT, circleTT],
-    seating: { enabled: true, rows: 'ABCDEFGHJKL', cols: 16, aisleAfter: [4, 12], tiers: { A: vipTT.id, B: vipTT.id, C: vipTT.id, D: stallsTT.id, E: stallsTT.id, F: stallsTT.id, G: stallsTT.id, H: stallsTT.id, J: circleTT.id, K: circleTT.id, L: circleTT.id }, blocked: ['A1', 'A16', 'L1', 'L16'] },
+    seating: { enabled: true, stage: { x: -170, y: -120, w: 340, h: 46, label: 'STAGE' }, blocked: ['CEN-A1', 'CEN-A14', 'CIR-K1', 'CIR-K24'], prices: {},
+      sections: [
+        { id: shortId('sec_'), code: 'LFT', name: 'Stalls left', kind: 'rows', x: -365, y: 18, rot: 9, rows: 8, seatsPerRow: 6, rowStart: 'A', ticketTypeId: stallsTT.id },
+        { id: shortId('sec_'), code: 'CEN', name: 'Stalls centre', kind: 'rows', x: -169, y: 0, rot: 0, rows: 8, seatsPerRow: 14, rowSeats: [12, 13, 14], rowStart: 'A', curve: 25, ticketTypeId: stallsTT.id },
+        { id: shortId('sec_'), code: 'RGT', name: 'Stalls right', kind: 'rows', x: 235, y: 18, rot: -9, rows: 8, seatsPerRow: 6, rowStart: 'A', ticketTypeId: stallsTT.id },
+        { id: shortId('sec_'), code: 'CIR', name: 'Circle', kind: 'rows', x: -299, y: 320, rot: 0, rows: 3, seatsPerRow: 24, rowStart: 'J', curve: 40, ticketTypeId: circleTT.id },
+      ] },
     addons: [{ id: shortId('ad_'), name: 'Printed programme', price: 800, qty: 0 }, { id: shortId('ad_'), name: 'Parking pass', price: 2500, qty: 150 }],
     questions: [{ id: shortId('q_'), label: 'How did you hear about us?', type: 'select', options: 'Instagram, Email, Friend, Poster, Other', required: false }],
     secrets: { password: '', ticketPasswords: {}, discounts: [{ id: shortId('dc_'), code: 'EARLYBIRD', type: 'pct', amount: 15, limit: 100, expires: day(20), ticketTypeIds: [] }] } });
+  // Premium = front three rows of the centre block (per-seat price overrides).
+  const L1 = seatLayout(ev1.seating); L1.seats.filter(p => p.sec.code === 'CEN' && ['A', 'B', 'C'].includes(p.row)).forEach(p => { ev1.seating.prices[p.id] = vipTT.id; });
+  ev1.seating.index = seatIndex(ev1.seating);
   const ev2 = mk({ slug: 'neon-nights-live', name: 'Neon Nights Live', category: 'Live music', start: day(0, 20, 0), end: day(0, 23, 30), doors: '7:00 PM',
     summary: 'Tonight — three bands, one stage.', venue: 'The Warehouse', address: '210 Kent Ave, Brooklyn, NY 11249', audience: '18+ · ID required',
     description: 'Three of the city\'s best live acts on one stage. Standing room, full bar.\n\nPhoto ID required at the door.',
@@ -332,11 +391,8 @@ function seedDemo() {
       const t = rnd(ev.ticketTypes.filter(x => !x.hidden)), qty = t.admits > 1 ? 1 : 1 + Math.floor(Math.random() * 3);
       const item = { eventId: ev.id, ticketTypeId: t.id, qty, slotId: ev.timeSlots.length ? rnd(ev.timeSlots).id : null };
       if (ev.seating.enabled) {
-        const av = availabilityFrom(Demo.st.tickets, ev.id), rows = Object.keys(ev.seating.tiers).filter(r => ev.seating.tiers[r] === t.id), seats = [];
-        outer: for (const r of rows.sort(() => Math.random() - .5)) for (let c = 1 + Math.floor(Math.random() * 10); c <= ev.seating.cols; c++) {
-          const s = r + c; if (!av.seats.includes('|' + s) && !ev.seating.blocked.includes(s)) seats.push(s); else seats.length = 0;
-          if (seats.length === qty) break outer;
-        }
+        const av = availabilityFrom(Demo.st.tickets, ev.id), free = Object.keys(ev.seating.index).filter(id => ev.seating.index[id] === t.id && !av.seats.includes('|' + id));
+        const at = Math.floor(Math.random() * Math.max(1, free.length - qty)), seats = free.slice(at, at + qty);
         if (seats.length !== qty) continue; item.seats = seats;
       }
       try {

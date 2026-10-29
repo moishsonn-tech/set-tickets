@@ -169,7 +169,8 @@ begin
     if coalesce((ev.data->'seating'->>'enabled')::boolean, false) then
       if jsonb_array_length(coalesce(it->'seats','[]')) <> qty then raise exception 'Pick % seat(s)', qty; end if;
       for seat in select jsonb_array_elements_text(it->'seats') loop
-        if (ev.data->'seating'->'blocked') ? seat then raise exception 'Seat % is unavailable', seat; end if;
+        if (ev.data->'seating'->'blocked') ? seat or not (coalesce(ev.data->'seating'->'index','{}') ? seat) then raise exception 'Seat % is unavailable', seat; end if;
+        if ev.data->'seating'->'index'->>seat <> tt->>'id' then raise exception 'Seat % is not a % seat', seat, tt->>'name'; end if;
         if av->'seats' ? (coalesce(it->>'slotId','') || '|' || seat) then raise exception 'Seat % was just taken', seat; end if;
       end loop;
     end if;
