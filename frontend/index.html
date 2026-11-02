@@ -566,6 +566,28 @@ details.rules>summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--
   .admin{display:block} .main{padding:0}
   .e-ticket{box-shadow:none}
 }
+/* ── Stage 5: box office site, event page sections, checkout, payment, customer account ── */
+.ev-filters{margin-bottom:10px}.ev-filters select.pill-inp{width:auto}
+.banner.bad{background:var(--bad-bg);color:var(--bad)}
+.ev-video{position:relative;aspect-ratio:16/9;border-radius:14px;overflow:hidden;margin-top:14px;background:#000}.ev-video iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+.ev-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-top:14px}.ev-gallery img{width:100%;aspect-ratio:4/3;object-fit:cover;border-radius:10px}
+.sponsors{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}.sponsors>*{display:flex;align-items:center;justify-content:center;min-width:120px;height:56px;padding:8px 16px;border:1px solid var(--line);border-radius:12px;background:#fff;color:var(--ink);text-decoration:none}.sponsors img{max-height:40px;max-width:140px}
+.co-steps{display:flex;flex-wrap:wrap;gap:6px 18px;list-style:none;padding:0;margin:0 0 20px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+.co-steps li{display:flex;align-items:center;gap:6px}.co-steps li::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--line)}
+.co-steps li.done::before{background:var(--ok)}.co-steps li.on{color:var(--ink);font-weight:700}.co-steps li.on::before{background:var(--accent);box-shadow:0 0 0 3px rgba(0,0,0,.08)}
+.tq{border-top:1px dashed var(--line);padding-top:12px;display:grid;gap:10px}
+.q-text{font-size:13px;line-height:1.5;background:var(--bg-2,#f6f5f1);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;white-space:pre-line}.q-text.waiver{max-height:140px;overflow:auto}
+.sig{display:grid;gap:6px}.sig-pad{width:100%;height:120px;border:1.5px dashed var(--line);border-radius:12px;background:#fff;touch-action:none;cursor:crosshair}
+.sig-img{height:46px;vertical-align:middle;background:#fff;border:1px solid var(--line);border-radius:6px}
+.breakdown .sum-line{font-size:14px}
+.pay-wrap{max-width:520px;margin:0 auto;padding:36px 0 60px}.pay-card h2{font-family:var(--display);font-size:38px;line-height:1}
+.wallets{display:grid;grid-template-columns:1fr 1fr;gap:10px}.wallet{height:48px;font-size:16px;font-weight:700}
+.or{display:flex;align-items:center;gap:10px;margin:16px 0;color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.or::before,.or::after{content:'';flex:1;height:1px;background:var(--line)}
+.pay-el{min-height:120px}
+.wallet-card{display:flex;gap:14px;align-items:center;padding:12px;border:1px solid var(--line);border-radius:14px;background:#fff;margin-bottom:10px;color:inherit;text-decoration:none;transition:transform .15s}
+.wallet-card:hover{transform:translateY(-1px)}.ev-img.sm{width:76px;height:56px;flex:none;border-radius:10px;background-size:cover;background-position:center}
+.sec-toggles{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;margin-bottom:14px}
+@media (max-width:640px){.sec-toggles{grid-template-columns:1fr}.wallet-card .btn{display:none}.pay-wrap{padding:20px 0 40px}}
 </style>
 </head>
 <body>

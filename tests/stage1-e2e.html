@@ -66,7 +66,7 @@ async function throwsP(code){ try{ await E(code); return false }catch(e){ return
   await E(`DB.setBoxOfficeStatus('${harbor}','suspended')`); await E('refreshPublic()');
   ok(E('S.events.length')===2,'suspending Harbor takes its events offline: '+E('S.events.length'));
   const harborEv=E("Demo.st.events.find(e=>e.slug==='founders-summit')");
-  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${harborEv.id}',ticketTypeId:'${harborEv.ticketTypes[0].id}',qty:1}],payment:'card'})`)).includes('not selling'),'suspended box office checkout refused');
+  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${harborEv.id}',ticketTypeId:'${harborEv.ticketTypes[0].id}',qty:1}],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'}})`)).includes('not selling'),'suspended box office checkout refused');
   ok(String(await throwsP(`DB.deleteBoxOffice('${harbor}')`)).includes('Deactivate'),'delete requires deactivation first');
   await E(`DB.setBoxOfficeStatus('${harbor}','deactivated')`);
   ok(String(await throwsP(`DB.deleteBoxOffice('${harbor}')`)).includes('history'),'box office with orders can never be deleted');
@@ -85,7 +85,7 @@ async function throwsP(code){ try{ await E(code); return false }catch(e){ return
   W().location.hash='#/e/founders-summit'; await until(()=>W().document.querySelector('[data-action="qty"]'));
   click('[data-action="qty"][data-d="1"]'); click('[data-action="addToCart"]'); await sleep(80);
   ok(E("S.cart.items.every(i=>evById(i.eventId).box_office_id===S.events.find(e=>e.slug==='founders-summit').box_office_id)"),'cart holds one organizer at a time');
-  const r=await E(`DB.placeOrder({buyer:{name:'Pat Buyer',email:'pat@example.com'},items:S.cart.items,addons:[],payment:'card'})`);
+  const r=await E(`DB.placeOrder({buyer:{name:'Pat Buyer',email:'pat@example.com'},items:S.cart.items,addons:[],payment:'card',answers:Object.fromEntries(evById(S.cart.items[0].eventId).questions.filter(q=>q.scope!=='ticket').map(q=>[q.id,q.type==='terms'?true:'Acme'])),ticketAnswers:Object.fromEntries(evById(S.cart.items[0].eventId).questions.filter(q=>q.scope==='ticket').map(q=>[q.id,S.cart.items.flatMap(i=>Array(i.qty).fill(q.type==='select'?'None':'Pat Buyer'))])),card:{number:'4242424242424242',exp:'12/34',cvc:'123'}})`);
   const o=E(`Demo.st.orders.find(x=>x.id==='${r.id}')`);
   ok(o.box_office_id===harbor && o.data.platformFee>0 && o.data.tax>0,'order tagged to Harbor, Harbor tax applied, platform fee recorded: '+o.data.platformFee);
 

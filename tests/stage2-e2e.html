@@ -23,7 +23,7 @@ async function edit(slug, fn){ const id=ev(slug).id; W().location.hash='#/admin/
   ok(W().document.querySelectorAll('.slot').length===2,'hidden showtime not offered');
   ok(has("Join the waitlist"),'“always” waitlist offered while on sale');
   const k=ev('city-food-festival'), hid=k.timeSlots.find(s=>s.hidden);
-  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${k.id}',ticketTypeId:'${k.ticketTypes[0].id}',qty:1,slotId:'${hid.id}'}],payment:'card'})`)).includes('not available'),'checkout refuses a hidden showtime');
+  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${k.id}',ticketTypeId:'${k.ticketTypes[0].id}',qty:1,slotId:'${hid.id}'}],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'}})`)).includes('not available'),'checkout refuses a hidden showtime');
   await E(`DB.joinWaitlist('${k.id}','Wait Person','wait@example.com','917-555-0100')`);
   ok(E(`Demo.st.waitlist.some(w=>w.email==='wait@example.com'&&w.phone==='917-555-0100')`),'waitlist collects name, email, phone');
   ok(E("Object.keys(Demo.st.views).length")>0,'page views recorded');
@@ -35,7 +35,7 @@ async function edit(slug, fn){ const id=ev(slug).id; W().location.hash='#/admin/
   await edit('neon-nights-live', "d=>d.visibility='hidden'");
   ok(!(await E(`DB.eventBySlug('neon-nights-live')`)),'hidden: not reachable publicly');
   const nn=ev('neon-nights-live');
-  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${nn.id}',ticketTypeId:'${nn.ticketTypes[0].id}',qty:1}],payment:'card'})`)).includes('not on sale'),'hidden event refuses public checkout');
+  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${nn.id}',ticketTypeId:'${nn.ticketTypes[0].id}',qty:1}],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'}})`)).includes('not on sale'),'hidden event refuses public checkout');
   await edit('neon-nights-live', "d=>d.visibility='public'");
   // scheduled publish + sales open
   await edit('spring-jazz-brunch', "d=>{d.publishAt=new Date(Date.now()-6e4).toISOString()}");
@@ -43,7 +43,7 @@ async function edit(slug, fn){ const id=ev(slug).id; W().location.hash='#/admin/
   W().location.hash='#/e/spring-jazz-brunch'; await until(()=>has('Tickets go on sale'));
   ok(has('Get notified'),'before sales open: shows opening time + pre-sale waitlist');
   const sj=ev('spring-jazz-brunch');
-  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${sj.id}',ticketTypeId:'${sj.ticketTypes[0].id}',qty:1}],payment:'card'})`)).includes('go on sale'),'checkout refused before sales open');
+  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${sj.id}',ticketTypeId:'${sj.ticketTypes[0].id}',qty:1}],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'}})`)).includes('go on sale'),'checkout refused before sales open');
   // notify waitlist
   await E(`(async()=>{await reloadAdmin(); DB._bo=S.adm.bo.id})()`);
   const harbor=E("Demo.st.boxOffices.find(b=>b.slug==='harbor-arts').id");

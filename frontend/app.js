@@ -66,8 +66,9 @@ const artTitle = (ev, cls = 'art-t') => safeUrl(ev.image) ? '' : `<div class="${
 // ── State (single source of truth) ────────────────────────────────────────────
 const S = {
   route: { page: 'home', params: [] }, settings: { ...DEFAULT_SETTINGS }, events: [], loading: true,
-  home: { view: 'list', cat: 'All', q: '', month: null },
-  avail: {}, sel: null, cart: loadCart(), co: { name: '', email: '', phone: '', answers: {}, optIn: false, terms: false, payment: '', code: '', disc: null, busy: false, err: '' },
+  home: { view: 'list', cat: 'All', q: '', when: '', month: null },
+  avail: {}, sel: null, cart: loadCart(), co: { name: '', email: '', phone: '', address: '', answers: {}, tanswers: {}, optIn: false, terms: false, payment: '', code: '', disc: null, busy: false, err: '', pay: null, attempt: null },
+  cust: null,  // signed-in customer account (optional — guest checkout always works)
   bos: [], bo: null, platform: { ...DEFAULT_PLATFORM }, plat: null,  // public box offices · box office in context · platform (public part) · super-admin data
   user: null, adm: null, draft: null, dirty: false,
   ui: { q: '', ev: '', status: '', picked: {}, attEv: '', repEv: '', login: { email: '', code: '', sent: false, totp: '' } },
@@ -87,7 +88,8 @@ function setContext() {
     : r.page === 'cart' ? cartBo() : r.page === 'order' ? S.bos.find(b => b.id === S.order?.order?.box_office_id) : null;
   S.bo = bo || null;
   S.settings = bo ? { ...DEFAULT_SETTINGS, ...bo.settings, name: bo.name } : { ...DEFAULT_SETTINGS, name: S.platform.name + ' Tickets' };
-  applyTheme(['admin', 'scan', 'platform'].includes(r.page) ? null : bo?.branding);
+  const ev = evSlug && (S.events.find(e => e.slug === evSlug) || S.adm?.events.find(e => e.slug === evSlug)), pg = ev?.page || {};
+  applyTheme(['admin', 'scan', 'platform'].includes(r.page) ? null : { ...(bo?.branding || {}), ...(HEX.test(pg.accent || '') ? { accent: pg.accent } : {}), ...(HEX.test(pg.ink || '') ? { ink: pg.ink } : {}) });
 }
 const HEX = /^#[0-9a-f]{6}$/i;
 const shade = (hex, t) => '#' + [1, 3, 5].map(i => { const c = parseInt(hex.substr(i, 2), 16); return Math.round(c + (255 - c) * t).toString(16).padStart(2, '0'); }).join('');
@@ -130,6 +132,7 @@ async function onRoute() {
     if (ev) refreshAvail(ev.id);
   }
   if (r.page === 'order') loadOrder(r.params[0], r.params[1]);
+  if (r.page === 'account') { S.wallet = null; if (r.params[0] === 'password') S.ui.wtab = 'profile'; }
   if (r.page === 'cart') cartEventIds().forEach(id => { if (!S.avail[id]) refreshAvail(id); });  // price phases + product stock
   if (r.page === 'platform' && r.params[0] !== S._platSub) { S._platSub = r.params[0]; S.plat = null; }  // fresh numbers on each platform page
   setContext();
@@ -163,6 +166,7 @@ function render() {
 function hydrate() {
   document.querySelectorAll('[data-qr]').forEach(el => { if (!el.childElementCount && window.QRCode) new QRCode(el, { text: el.dataset.qr, width: 300, height: 300, colorDark: '#020a16', correctLevel: QRCode.CorrectLevel.M }); });
   if (S.route.page === 'home') startHeroCanvas();
+  if (S.route.page === 'cart') { sigMount(); if (S.co.pay?.clientSecret && !$('#payEl')?.childElementCount) mountStripe(S.co.pay).catch(e => { S.co.err = e.message; render(); }); }
   if (S.route.page === 'scan') camMount();
 }
 
@@ -171,14 +175,14 @@ function hydrate() {
 // ══════════════════════════════════════════════════════════════════════════════
 function PubShell() {
   const r = S.route, solid = !['home', 'e', 'b'].includes(r.page);
-  const body = { home: Home, e: EventPage, embed: EventPage, cart: Checkout, order: OrderPage, tickets: FindTickets, b: BoxOfficePage, register: Register }[r.page] || NotFound;
+  const body = { home: Home, e: EventPage, embed: EventPage, cart: Checkout, order: OrderPage, tickets: FindTickets, b: BoxOfficePage, register: Register, account: Account }[r.page] || NotFound;
   const bo = S.bo, brandLogo = bo && safeUrl(bo.branding.logo);
   return `
   <nav class="pub-nav ${solid ? 'solid' : ''}">
     ${bo ? `<a href="#/b/${esc(bo.slug)}" class="logo bo-brand" aria-label="${esc(bo.name)}">${brandLogo ? `<img src="${esc(brandLogo)}" alt="">` : `<span class="bo-word">${esc(bo.name)}</span>`}<small>Tickets by SET</small></a>`
       : `<a href="#/" class="logo" aria-label="SET home">${logo()}<small>SING Entertainment Tickets</small></a>`}
     <div class="links">
-      <a class="btn glass btn-sm hide-sm" href="#/tickets">${ic('ticket', 15)} My tickets</a>
+      <a class="btn glass btn-sm hide-sm" href="#/account">${ic('ticket', 15)} ${S.cust ? 'My account' : 'My tickets'}</a>
       <a class="btn glass btn-sm hide-sm" href="${S.platform.publicRegistration ? '#/register' : '#/admin'}">Sell tickets</a>
       <a class="btn btn-accent btn-sm" href="#/cart">${ic('cart', 15)} Cart ${cartCount() ? `<span class="cart-dot">${cartCount()}</span>` : ''}</a>
     </div>
@@ -196,22 +200,25 @@ function priceFrom(ev) {
   if (!p.length) return ''; const lo = Math.min(...p);
   return lo === 0 ? 'Free' : 'From ' + money(lo, ev.currency);
 }
-function soldOut(ev, av) {
-  if (!av) return false;
-  if (+ev.capacity > 0 && av.total >= +ev.capacity) return true;
-  const vis = (ev.ticketTypes || []).filter(t => !t.hidden);
-  return vis.length > 0 && vis.every(t => +t.qty > 0 && (av.tt[t.id] || 0) >= +t.qty);
+const soldOut = (ev, av) => saleState(ev, av) === 'soldout';
+const SALE_CHIP = { soldout: '<span class="chip bad">Sold out</span>', low: '<span class="chip warn">Few left</span>', soon: '<span class="chip info">Coming soon</span>', closed: '<span class="chip">Sales closed</span>' };
+// search + category + date filters, shared by the platform home page and each box office's own page
+const WHEN = [['', 'Any date'], ['week', 'Next 7 days'], ['month', 'Next 30 days'], ['later', 'Later']];
+function filterEvents(all) {
+  const h = S.home, q = h.q.trim().toLowerCase(), now = Date.now(), d = e => D(e.start) - now;
+  return all.filter(e => (h.cat === 'All' || e.category === h.cat) && (!q || [e.name, e.venue, e.address, e.category, e.summary].join(' ').toLowerCase().includes(q))
+    && (!h.when || (h.when === 'week' ? d(e) <= 7 * 864e5 : h.when === 'month' ? d(e) <= 30 * 864e5 : d(e) > 30 * 864e5)));
 }
+const EventFilters = all => `<div class="row wrap ev-filters"><input class="inp pill-inp" data-input="homeq" placeholder="Search events or venues…" value="${esc(S.home.q)}">
+  <select class="inp pill-inp" data-input="homeWhen" aria-label="When">${WHEN.map(([v, t]) => `<option value="${v}" ${S.home.when === v ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+  <div class="cat-row">${['All', ...new Set(all.map(e => e.category).filter(Boolean))].map(c => `<button class="${S.home.cat === c ? 'on' : ''}" data-action="homeCat" data-v="${esc(c)}">${esc(c)}</button>`).join('')}</div>`;
 function listedEvents() {
   const now = Date.now() - 6 * 3600e3;
   return S.events.filter(e => eventListed(e) && D(e.end || e.start) >= now).sort((a, b) => D(a.start) - D(b.start));
 }
 
 function Home() {
-  const h = S.home, all = listedEvents();
-  const cats = ['All', ...new Set(all.map(e => e.category).filter(Boolean))];
-  const q = h.q.trim().toLowerCase();
-  const evs = all.filter(e => (h.cat === 'All' || e.category === h.cat) && (!q || [e.name, e.venue, e.address, e.category, e.summary].join(' ').toLowerCase().includes(q)));
+  const h = S.home, all = listedEvents(), evs = filterEvents(all);
   const marq = ['Reserved seating', 'Timed entry', 'Discount codes', 'QR e-tickets', 'Door scanner app', 'Waitlists', 'Embeddable checkout', 'Team permissions', 'Sales reports'];
   const feats = [['cal', 'Every kind of event', 'One-off shows, multi-day festivals, timed entry slots and recurring sessions.'],
     ['ticket', 'Reserved seating', 'Draw your room, price it by section, and let buyers pick their own seats.'],
@@ -234,10 +241,9 @@ function Home() {
     <div class="container section" id="events">
       <div class="section-head">
         <div><div class="eyebrow dash">On sale now</div><h2 style="margin-top:8px">Upcoming events</h2></div>
-        <div class="row wrap"><input class="inp pill-inp" data-input="homeq" placeholder="Search events or venues…" value="${esc(h.q)}">
-        <div class="tabs"><button class="${h.view === 'list' ? 'on' : ''}" data-action="homeView" data-v="list">Grid</button><button class="${h.view === 'cal' ? 'on' : ''}" data-action="homeView" data-v="cal">Calendar</button></div></div>
+        <div class="tabs"><button class="${h.view === 'list' ? 'on' : ''}" data-action="homeView" data-v="list">Grid</button><button class="${h.view === 'cal' ? 'on' : ''}" data-action="homeView" data-v="cal">Calendar</button></div>
       </div>
-      <div class="cat-row">${cats.map(c => `<button class="${h.cat === c ? 'on' : ''}" data-action="homeCat" data-v="${esc(c)}">${esc(c)}</button>`).join('')}</div>
+      ${EventFilters(all)}
       ${h.view === 'cal' ? Calendar(evs) : evs.length ? `<div class="ev-grid">${evs.map(EvCard).join('')}</div>` : `<div class="empty"><div class="display">No events found</div><p>Try a different search or category.</p></div>`}
     </div>
     <div class="container section">
@@ -261,16 +267,16 @@ function Home() {
 }
 function EvCard(ev) {
   const d = D(ev.start), av = S.avail[ev.id]; if (!av) refreshAvailOnce(ev.id);
-  const out = soldOut(ev, av);
+  const st = saleState(ev, av), out = st === 'soldout';
   return `<a class="ev-card" href="#/e/${esc(ev.slug)}">
     <div class="ev-img" style="${artBg(ev)}">${artTitle(ev)}
-      <div class="chips">${out ? '<span class="chip bad">Sold out</span>' : ''}${ev.category ? `<span class="chip gold">${esc(ev.category)}</span>` : ''}</div>
+      <div class="chips">${SALE_CHIP[st] || ''}${ev.category ? `<span class="chip gold">${esc(ev.category)}</span>` : ''}</div>
       <div class="datebadge"><div class="m">${esc(fmtDate(ev.start, { month: 'short' }))}</div><div class="d">${d.getDate()}</div></div>
     </div>
     <div class="ev-body"><h3>${esc(ev.name)}</h3>
       <div class="meta">${esc(fmtDate(ev.start, { weekday: 'long' }))} · ${esc(fmtTime(ev.start))}</div>
       <div class="meta">${esc(ev.venue || (ev.online ? 'Online event' : ''))}</div>
-      <div class="foot"><span class="price">${esc(priceFrom(ev))}</span><span class="btn btn-dark btn-sm">${out ? 'Join waitlist' : 'Tickets'} →</span></div>
+      <div class="foot"><span class="price">${esc(priceFrom(ev))}</span><span class="btn btn-dark btn-sm">${out ? 'Join waitlist' : st === 'soon' ? 'Details' : 'Tickets'} →</span></div>
     </div></a>`;
 }
 const _availReq = new Set();
@@ -321,17 +327,34 @@ function EventPage() {
   <div class="container"><div class="ev-layout">
     <div>
       ${ev.seating?.enabled && sel && (!ev.timeSlots?.length || sel.slotId) && !(ev.hasPassword && !sel.unlocked.event) ? BuyerSeatMap(ev, av, sel) : ''}
-      <div class="eyebrow dash" ${ev.seating?.enabled ? 'style="margin-top:28px"' : ''}>About this event</div>
-      <p class="ev-desc" style="margin-top:14px">${esc(ev.description || ev.summary || '')}</p>
-      ${ev.instructions ? `<div class="sep" style="margin:28px 0"></div><div class="eyebrow dash">Good to know</div><p class="ev-desc" style="margin-top:12px">${esc(ev.instructions)}</p>` : ''}
-      ${ev.policies ? `<div class="sep" style="margin:28px 0"></div><div class="eyebrow dash">Event policies</div><p class="ev-desc small" style="margin-top:12px">${esc(ev.policies)}</p>` : ''}
-      ${contact?.email || contact?.phone ? `<div class="sep" style="margin:28px 0"></div><div class="eyebrow dash">Questions?</div><p style="margin-top:10px">${contact.name ? esc(contact.name) + '<br>' : ''}${contact.email ? `<a href="mailto:${esc(contact.email)}">${esc(contact.email)}</a>` : ''}${contact.phone ? (contact.email ? ' · ' : '') + esc(contact.phone) : ''}</p>` : ''}
-      ${!ev.online && ev.address ? `<div class="sep" style="margin:28px 0"></div><div class="eyebrow dash">Venue</div>
-        <p style="margin-top:10px"><b>${esc(ev.venue)}</b><br><span class="muted">${esc(ev.address)}</span></p>
-        <div class="map"><iframe loading="lazy" title="Map" src="https://maps.google.com/maps?q=${encodeURIComponent(ev.address)}&output=embed"></iframe></div>` : ''}
+      ${EventSections(ev, contact)}
     </div>
     <aside class="ticket-panel"><div class="card">${TicketPanel(ev, sel, av)}</div></aside>
   </div></div>`;
+}
+// ── Event page sections (Stage 5): each one shows when it has content and the organizer hasn't switched it off (ev.page.hide) ──
+const PAGE_SECTIONS = [['about', 'About this event'], ['video', 'Video'], ['gallery', 'Photo gallery'], ['blocks', 'Custom text blocks'], ['instructions', 'Good to know'],
+  ['policies', 'Event policies'], ['sponsors', 'Sponsors'], ['contact', 'Questions / contact'], ['venue', 'Venue & map']];
+// only YouTube / Vimeo, rebuilt from the video id — never an arbitrary URL in an iframe
+function videoEmbed(u) {
+  const s = String(u || ''), yt = s.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([\w-]{11})/), vm = s.match(/vimeo\.com\/(?:video\/)?(\d{6,12})/);
+  return yt ? 'https://www.youtube-nocookie.com/embed/' + yt[1] : vm ? 'https://player.vimeo.com/video/' + vm[1] : '';
+}
+function EventSections(ev, contact) {
+  const pg = ev.page || {}, on = k => !pg.hide?.[k], sec = (title, body, first) => `${first ? '' : '<div class="sep" style="margin:28px 0"></div>'}<div class="eyebrow dash">${esc(title)}</div>${body}`;
+  const out = [], vid = videoEmbed(pg.video), gal = (pg.gallery || []).map(safeUrl).filter(Boolean), spons = (pg.sponsors || []).filter(x => x.name || safeUrl(x.logo));
+  if (on('about') && (ev.description || ev.summary)) out.push(['About this event', `<p class="ev-desc" style="margin-top:14px">${esc(ev.description || ev.summary)}</p>`]);
+  if (on('video') && vid) out.push(['Video', `<div class="ev-video"><iframe loading="lazy" title="Event video" src="${esc(vid)}" allow="encrypted-media; picture-in-picture" allowfullscreen></iframe></div>`]);
+  if (on('gallery') && gal.length) out.push(['Photos', `<div class="ev-gallery">${gal.map(u => `<img loading="lazy" src="${esc(u)}" alt="">`).join('')}</div>`]);
+  if (on('blocks')) for (const b of pg.blocks || []) if (b.title || b.text) out.push([b.title || 'More', `<p class="ev-desc" style="margin-top:12px">${esc(b.text || '')}</p>`]);
+  if (on('instructions') && ev.instructions) out.push(['Good to know', `<p class="ev-desc" style="margin-top:12px">${esc(ev.instructions)}</p>`]);
+  if (on('policies') && ev.policies) out.push(['Event policies', `<p class="ev-desc small" style="margin-top:12px">${esc(ev.policies)}</p>`]);
+  if (on('sponsors') && spons.length) out.push(['Sponsors', `<div class="sponsors">${spons.map(x => { const u = safeUrl(x.url), inner = safeUrl(x.logo) ? `<img src="${esc(safeUrl(x.logo))}" alt="${esc(x.name || '')}">` : `<b>${esc(x.name)}</b>`;
+    return u ? `<a href="${esc(u)}" target="_blank" rel="noopener sponsored">${inner}</a>` : `<span>${inner}</span>`; }).join('')}</div>`]);
+  if (on('contact') && (contact?.email || contact?.phone)) out.push(['Questions?', `<p style="margin-top:10px">${contact.name ? esc(contact.name) + '<br>' : ''}${contact.email ? `<a href="mailto:${esc(contact.email)}">${esc(contact.email)}</a>` : ''}${contact.phone ? (contact.email ? ' · ' : '') + esc(contact.phone) : ''}</p>`]);
+  if (on('venue') && !ev.online && ev.address) out.push(['Venue', `<p style="margin-top:10px"><b>${esc(ev.venue)}</b><br><span class="muted">${esc(ev.address)}</span></p>
+    <div class="map"><iframe loading="lazy" title="Map" src="https://maps.google.com/maps?q=${encodeURIComponent(ev.address)}&output=embed"></iframe></div>`]);
+  return out.map(([t, b], i) => sec(t, b, i === 0 && !ev.seating?.enabled)).join('');
 }
 // The buyer's selection as cart lines. Bundles take their seats first (each bundle ticket needs a seat of an allowed price level).
 function selCart(ev, sel) {
@@ -527,7 +550,7 @@ function Waitlist(ev, why) {
 }
 
 // ── Cart & checkout ───────────────────────────────────────────────────────────
-function cartQuote() { const bo = cartBo(); return quote(S.cart, S.events.concat(S.adm?.events || []), bo ? { ...DEFAULT_SETTINGS, ...bo.settings } : S.settings, S.co.disc, { avail: S.avail }); }
+function cartQuote() { const bo = cartBo(); return quote(S.cart, S.events.concat(S.adm?.events || []), bo ? pricingSettings(bo, S.platform) : S.settings, S.co.disc, { avail: S.avail, method: S.co.payment }); }
 const cartEventIds = () => [...new Set([...S.cart.items, ...S.cart.addons].map(i => i.eventId))];
 // smart add-ons: an offer shows when the cart matches its trigger (ticket type, seating area, price level, quantity) and the product isn't in it yet
 function upsellsFor(q) {
@@ -548,37 +571,45 @@ function upsellsFor(q) {
   return out;
 }
 function Checkout() {
-  const q = cartQuote(), co = S.co, set = S.settings, ups = upsellsFor(q), ref = co.tracking || sessionStorage.getItem('set_ref') || '';
+  const co = S.co, set = S.settings, bo = cartBo(), ck = { ...DEFAULT_SETTINGS.checkout, ...(set.checkout || {}) };
+  if (co.pay) return PaymentStep();
+  const q = cartQuote(), ups = upsellsFor(q), ref = co.tracking || sessionStorage.getItem('set_ref') || '';
   const evIds = cartEventIds(), evs = evIds.map(evById).filter(Boolean);
   if (!q.lines.length) return `<div class="container section"><div class="empty"><div class="display">Your cart is empty</div><p style="margin-bottom:18px">Find something great to go to.</p><a class="btn btn-accent" href="#/">Browse events <span class="arr">→</span></a></div></div>`;
-  const questions = evs.flatMap(e => (e.questions || []).map(qq => ({ ...qq, ev: e })));
+  const card = cardReady(bo) && set.payments?.card !== false, gw = GATEWAYS[bo?.gateway?.provider];
   const payOpts = [
-    set.payments?.card !== false && { v: 'card', t: 'Credit / debit card', d: DB.live ? 'Card payments are not connected yet' : 'Demo mode — no charge, order is marked paid', off: DB.live },
-    set.payments?.offline !== false && { v: 'offline', t: 'Pay later / at the door', d: 'Reserve now; your order stays pending until paid' },
+    set.payments?.card !== false && { v: 'card', t: 'Card, Apple Pay or Google Pay', d: card ? `Secure payment by ${gw.name}${bo.gateway.test ? ' · test mode, no real charge' : ''}` : 'Card payments aren\'t set up for this box office yet', off: !card },
+    set.payments?.offline !== false && { v: 'offline', t: 'Pay later / at the door', d: 'Reserve now. Your tickets are issued once the box office has your payment.' },
   ].filter(Boolean);
-  if (!co.payment) co.payment = (payOpts.find(p => !p.off) || {}).v || '';
+  if (!co.payment || payOpts.find(p => p.v === co.payment)?.off) co.payment = (payOpts.find(p => !p.off) || {}).v || '';
+  const perEv = ticketsPerEvent(q), orderQs = set.questions || [];
+  const field = (k, label, o = {}) => `<div><label class="fl">${label}${o.req ? ' *' : ''}</label><input class="inp" ${o.type ? `type="${o.type}"` : ''} data-bind="co.${k}" ${o.ac ? `autocomplete="${o.ac}"` : ''} value="${esc(getPath(co, k) || '')}"></div>`;
   return `<div class="container"><div class="checkout">
     <div>
       <a href="javascript:history.back()" class="small muted" style="text-decoration:none">← Keep shopping</a>
-      <h1 class="display" style="font-size:44px;margin:10px 0 22px">Checkout</h1>
+      <h1 class="display" style="font-size:44px;margin:10px 0 6px">Checkout</h1>
+      <ol class="co-steps"><li class="done">Tickets</li><li class="done">Add-ons</li><li class="on">Your details</li><li>Pay</li><li>Tickets</li></ol>
       ${Object.values(S.cart.holds || {}).some(Boolean) ? `<div class="banner info hold-banner">${ic('lock', 14)} <span data-hold="${esc(Object.values(S.cart.holds).filter(Boolean).sort()[0])}">${holdText(Object.values(S.cart.holds).filter(Boolean).sort()[0])}</span></div>` : ''}
+      ${ck.note ? `<div class="banner info">${esc(ck.note)}</div>` : ''}${evs.filter(e => e.page?.checkoutNote).map(e => `<div class="banner info"><b>${esc(e.name)}:</b> ${esc(e.page.checkoutNote)}</div>`).join('')}
+      ${S.cust ? `<p class="small muted" style="margin-bottom:10px">Signed in as <b>${esc(S.cust.email)}</b> — these tickets will be in <a href="#/account">your account</a>.</p>`
+        : `<p class="small muted" style="margin-bottom:10px">No account needed. <a href="#/account">Sign in</a> if you have one.</p>`}
       <div class="card stack">
         <div class="eyebrow dash">Your details</div>
-        <div class="grid2"><div><label class="fl">Full name *</label><input class="inp" data-bind="co.name" autocomplete="name" value="${esc(co.name)}"></div>
-          <div><label class="fl">Email *</label><input class="inp" type="email" data-bind="co.email" autocomplete="email" value="${esc(co.email)}"></div></div>
-        <div class="grid2"><div><label class="fl">Mobile (for text reminders)</label><input class="inp" type="tel" data-bind="co.phone" autocomplete="tel" value="${esc(co.phone)}"></div><div></div></div>
-        ${questions.map(qq => `<div><label class="fl">${esc(qq.label)}${qq.required ? ' *' : ''} <span class="muted">· ${esc(qq.ev.name)}</span></label>${qq.type === 'select'
-          ? `<select class="inp" data-bind="co.answers.${qq.id}"><option value="">Choose…</option>${String(qq.options || '').split(',').map(o => o.trim()).filter(Boolean).map(o => `<option ${co.answers[qq.id] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`
-          : qq.type === 'checkbox' ? `<label class="check"><input type="checkbox" data-bind="co.answers.${qq.id}" ${co.answers[qq.id] ? 'checked' : ''}> Yes</label>`
-          : `<input class="inp" data-bind="co.answers.${qq.id}" value="${esc(co.answers[qq.id] || '')}">`}</div>`).join('')}
+        <div class="grid2">${field('name', 'Full name', { req: 1, ac: 'name' })}${field('email', 'Email', { req: 1, type: 'email', ac: 'email' })}</div>
+        ${ck.phone !== 'off' || ck.address !== 'off' ? `<div class="grid2">${ck.phone !== 'off' ? field('phone', 'Mobile', { req: ck.phone === 'required', type: 'tel', ac: 'tel' }) : ''}${ck.address !== 'off' ? field('address', 'Address', { req: ck.address === 'required', ac: 'street-address' }) : ''}</div>` : ''}
+        ${orderQs.map(qq => QField(qq, `answers.${qq.id}`)).join('')}
       </div>
+      ${evs.filter(e => (e.questions || []).length).map(e => `<div class="card stack" style="margin-top:16px"><div class="eyebrow dash">${esc(e.name)}</div>
+        ${e.questions.filter(qq => qq.scope !== 'ticket').map(qq => QField(qq, `answers.${qq.id}`)).join('')}
+        ${Array.from({ length: e.questions.some(qq => qq.scope === 'ticket') ? perEv[e.id] || 0 : 0 }, (_, i) => `<div class="tq"><div class="small"><b>Ticket ${i + 1}</b></div>
+          ${e.questions.filter(qq => qq.scope === 'ticket').map(qq => QField(qq, `tanswers.${qq.id}.${i}`)).join('')}</div>`).join('')}</div>`).join('')}
       ${set.donations ? `<div class="card" style="margin-top:16px"><div class="eyebrow dash">Add a donation</div><p class="small muted" style="margin:6px 0 12px">Support ${esc(set.name)}'s community programs. No fees are charged on donations.</p>
         <div class="row wrap">${[0, 1800, 3600, 10000].map(v => `<button class="btn ${+S.cart.donation === v ? 'btn-dark' : 'btn-ghost'} btn-sm" data-action="donate" data-v="${v}">${v ? money(v) : 'None'}</button>`).join('')}</div></div>` : ''}
       <div class="card" style="margin-top:16px"><div class="eyebrow dash" style="margin-bottom:12px">Payment</div>
-        ${payOpts.map(p => `<label class="pay-opt ${co.payment === p.v ? 'on' : ''} ${p.off ? 'off' : ''}"><input type="radio" name="pay" ${p.off ? 'disabled' : ''} ${co.payment === p.v ? 'checked' : ''} data-action="pay" data-v="${p.v}"><div><b>${esc(p.t)}</b><div class="small muted">${esc(p.d)}</div></div></label>`).join('')}
+        ${payOpts.map(p => `<label class="pay-opt ${co.payment === p.v ? 'on' : ''} ${p.off ? 'off' : ''}"><input type="radio" name="pay" ${p.off ? 'disabled' : ''} ${co.payment === p.v ? 'checked' : ''} data-action="pay" data-v="${p.v}"><div><b>${esc(p.t)}</b><div class="small muted">${esc(p.d)}</div></div></label>`).join('') || '<p class="small muted">This box office isn\'t taking payments online right now.</p>'}
         <div class="sep"></div>
         <label class="check"><input type="checkbox" data-bind="co.terms" ${co.terms ? 'checked' : ''}> <span>I agree to the <a href="#" data-action="showTerms">terms & conditions</a>.</span></label>
-        <label class="check" style="margin-top:8px"><input type="checkbox" data-bind="co.optIn" ${co.optIn ? 'checked' : ''}> <span>Email me about future ${esc(set.name)} events.</span></label>
+        ${ck.optIn !== false ? `<label class="check" style="margin-top:8px"><input type="checkbox" data-bind="co.optIn" ${co.optIn ? 'checked' : ''}> <span>Email me about future ${esc(set.name)} events.</span></label>` : ''}
       </div>
     </div>
     <aside class="ticket-panel"><div class="card">
@@ -590,23 +621,73 @@ function Checkout() {
         <button class="btn btn-dark btn-sm" data-action="addUpsell" data-id="${x.ev.id}" data-v="${x.ad.id}" data-q="${x.n}">Add</button></div>`).join('')}</div>` : ''}
       <div class="sep"></div>
       ${co.disc ? `<div class="between small"><span class="chip ok">${esc(co.disc.code)}</span><a href="#" data-action="removeCode" class="small">Remove</a></div>${q.promoErr ? `<p class="small" style="color:var(--warn);margin-top:6px">${esc(q.promoErr)}</p>` : ''}`
-        : `<div class="row"><input class="inp" data-bind="co.code" placeholder="Promo or referral code" value="${esc(co.code)}"><button class="btn btn-ghost" data-action="applyCode">Apply</button></div>`}
+        : ck.promo !== false ? `<div class="row"><input class="inp" data-bind="co.code" placeholder="Promo or referral code" value="${esc(co.code)}"><button class="btn btn-ghost" data-action="applyCode">Apply</button></div>` : ''}
       ${ref ? `<div class="between small" style="margin-top:8px"><span class="muted">Referral code <b class="tnum">${esc(ref)}</b></span><a href="#" data-action="removeRef" class="small">Remove</a></div>` : ''}
-      <div style="margin-top:12px">
-        <div class="sum-line"><span class="muted">Subtotal</span><span class="tnum">${money(q.subtotal, q.currency)}</span></div>
-        ${q.discount + q.feeDiscount ? `<div class="sum-line" style="color:var(--ok)"><span>Discount${co.disc ? ' · ' + esc(co.disc.code) : ''}</span><span class="tnum">−${money(q.discount + q.feeDiscount, q.currency)}</span></div>` : ''}
-        ${q.fee + q.feeDiscount ? `<div class="sum-line"><span class="muted">Booking fee</span><span class="tnum">${money(q.fee + q.feeDiscount, q.currency)}</span></div>` : ''}
-        ${q.tax ? `<div class="sum-line"><span class="muted">Tax</span><span class="tnum">${money(q.tax, q.currency)}</span></div>` : ''}
-        ${q.donation ? `<div class="sum-line"><span class="muted">Donation</span><span class="tnum">${money(q.donation, q.currency)}</span></div>` : ''}
-        <div class="sum-line total"><span>Total</span><span class="tnum">${money(q.total, q.currency)}</span></div>
-      </div>
+      ${Breakdown(q, co.disc?.code)}
       ${co.err ? `<div class="banner" style="background:var(--bad-bg);color:var(--bad);margin:12px 0 0">${esc(co.err)}</div>` : ''}
-      <button class="btn btn-accent btn-lg btn-block" style="margin-top:16px" data-action="placeOrder" ${co.busy ? 'disabled' : ''}>${co.busy ? 'Placing order…' : q.total ? (co.payment === 'offline' ? 'Reserve tickets' : 'Pay ' + money(q.total, q.currency)) : 'Get free tickets'} <span class="arr">→</span></button>
-      <p class="small muted" style="text-align:center;margin-top:10px">${ic('lock', 12)} Secure checkout · Tickets emailed instantly</p>
+      <button class="btn btn-accent btn-lg btn-block" style="margin-top:16px" data-action="placeOrder" ${co.busy || (q.total && !co.payment) ? 'disabled' : ''}>${co.busy ? 'One moment…' : q.total ? (co.payment === 'offline' ? 'Reserve tickets' : 'Continue to payment') : 'Get free tickets'} <span class="arr">→</span></button>
+      <p class="small muted" style="text-align:center;margin-top:10px">${ic('lock', 12)} ${q.total && co.payment === 'card' ? 'You\'ll see the exact total before you pay' : 'Secure checkout'} · tickets only after payment</p>
     </div></aside>
   </div></div>`;
 }
-
+const ticketsPerEvent = q => q.lines.reduce((m, l) => (m[l.eventId] = (m[l.eventId] || 0) + lineUnits(l).length, m), {});
+// The money, every part on its own line (Eli's example: Tickets $300 · Booking fee $12 · Sales tax $8.50 · Discount −$30 · Total $290.50)
+function Breakdown(q, code) {
+  const row = (t, v, cls = '') => v ? `<div class="sum-line ${cls}"><span${cls ? '' : ' class="muted"'}>${t}</span><span class="tnum">${v < 0 ? '−' + money(-v, q.currency) : money(v, q.currency)}</span></div>` : '';
+  return `<div class="breakdown" style="margin-top:12px">
+    ${row('Tickets', q.ticketsTotal)}${row('Products & add-ons', q.addonsTotal)}
+    ${row('Booking fee', (q.fee || 0) + (q.feeDiscount || 0))}${row('Service fee', q.serviceFee)}${row('Sales tax', q.tax)}
+    ${q.discount + q.feeDiscount ? `<div class="sum-line" style="color:var(--ok)"><span>Discount${code ? ' · ' + esc(code) : ''}</span><span class="tnum">−${money(q.discount + q.feeDiscount, q.currency)}</span></div>` : ''}
+    ${row('Card processing', q.processing)}${row('Donation', q.donation)}${q.refunded ? row('Refunded', -q.refunded) : ''}
+    <div class="sum-line total"><span>Total</span><span class="tnum">${money(q.total, q.currency)}</span></div></div>`;
+}
+// one checkout question. path is under S.co ("answers.<id>" or "tanswers.<id>.<ticket>")
+function QField(q, path) {
+  const v = getPath(S.co, path), bind = `data-bind="co.${path}"`, t = q.type || 'text', req = q.required ? ' *' : '';
+  if (t === 'checkbox') return `<label class="check"><input type="checkbox" ${bind} data-t="bool" ${v ? 'checked' : ''}> <span>${esc(q.label)}${req}</span></label>`;
+  if (t === 'terms' || t === 'waiver') return `<div class="q-terms">${q.text ? `<div class="q-text ${t === 'waiver' ? 'waiver' : ''}">${esc(q.text)}</div>` : ''}<label class="check"><input type="checkbox" ${bind} data-t="bool" ${v ? 'checked' : ''}> <span>${t === 'waiver' ? 'I have read and accept: ' : ''}${esc(q.label)}${req}</span></label></div>`;
+  const lab = `<label class="fl">${esc(q.label)}${req}</label>`;
+  if (t === 'select') return `<div>${lab}<select class="inp" ${bind}><option value="">Choose…</option>${String(q.options || '').split(',').map(o => o.trim()).filter(Boolean).map(o => `<option ${v === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+  if (t === 'date') return `<div>${lab}<input class="inp" type="date" ${bind} value="${esc(v || '')}"></div>`;
+  if (t === 'signature') return `<div>${lab}<div class="sig"><canvas class="sig-pad" width="560" height="140" data-sig="${esc(path)}" aria-label="Sign here"></canvas>
+    <div class="between small"><span class="muted">Sign with your finger or mouse — or type your full name:</span><a href="#" data-action="sigClear" data-v="${esc(path)}">Clear</a></div>
+    <input class="inp" placeholder="Type your full name to sign" ${bind} value="${esc(String(v || '').startsWith('data:') ? '' : v || '')}"></div></div>`;
+  return `<div>${lab}<input class="inp" ${bind} value="${esc(v || '')}"></div>`;
+}
+// ── Payment (Stage 5): the order is placed (seats / stock reserved, NO tickets yet), then paid through the box office's processor ──
+function PaymentStep() {
+  const co = S.co, p = co.pay, cur = p.currency || S.settings.currency, demo = p.provider === 'demo', expired = D(p.expires_at) <= Date.now();
+  return `<div class="container"><div class="pay-wrap">
+    <ol class="co-steps"><li class="done">Tickets</li><li class="done">Add-ons</li><li class="done">Your details</li><li class="on">Pay</li><li>Tickets</li></ol>
+    <div class="card pay-card">
+      <div class="between"><div><div class="eyebrow">Order ${esc(p.ref)}</div><h2 style="margin-top:4px">Pay ${money(p.total, cur)}</h2></div>${p.test ? '<span class="chip info">Test mode</span>' : ''}</div>
+      <div class="banner ${expired ? 'bad' : 'info'}" style="margin:14px 0">${ic('lock', 14)} <span data-pay="${esc(p.expires_at)}">${payText(p.expires_at)}</span></div>
+      ${expired ? `<p class="small">Nothing was charged. Your selection is still in your cart.</p><button class="btn btn-accent btn-block" data-action="payRestart">Start again</button>` : demo ? `
+        <div class="wallets"><button class="btn btn-dark wallet" data-action="payWallet" data-v="apple_pay" ${co.busy ? 'disabled' : ''}>Apple Pay</button><button class="btn btn-ghost wallet" data-action="payWallet" data-v="google_pay" ${co.busy ? 'disabled' : ''}>Google Pay</button></div>
+        <div class="or"><span>or pay by card</span></div>
+        <div class="field"><label class="fl">Card number</label><input class="inp tnum" inputmode="numeric" autocomplete="cc-number" placeholder="1234 1234 1234 1234" data-bind="co.card.number" value="${esc(co.card?.number || '')}"></div>
+        <div class="grid2"><div class="field"><label class="fl">Expiry</label><input class="inp tnum" autocomplete="cc-exp" placeholder="MM/YY" data-bind="co.card.exp" value="${esc(co.card?.exp || '')}"></div>
+          <div class="field"><label class="fl">Security code</label><input class="inp tnum" inputmode="numeric" autocomplete="cc-csc" placeholder="CVC" data-bind="co.card.cvc" value="${esc(co.card?.cvc || '')}"></div></div>
+        <p class="small muted">Demo processor: use <b class="tnum">4242 4242 4242 4242</b> (any future date, any CVC). <b class="tnum">4000 0000 0000 0002</b> is declined, <b class="tnum">4000 0000 0000 9995</b> has insufficient funds.</p>`
+        : `<div id="payEl" class="pay-el"></div>`}
+      ${co.err ? `<div class="banner" style="background:var(--bad-bg);color:var(--bad);margin:12px 0 0">${esc(co.err)}</div>` : ''}
+      ${expired ? '' : `<button class="btn btn-accent btn-lg btn-block" style="margin-top:16px" data-action="payCard" ${co.busy ? 'disabled' : ''}>${co.busy ? 'Processing…' : 'Pay ' + money(p.total, cur)} <span class="arr">→</span></button>
+        <div class="between small" style="margin-top:12px"><span class="muted">${ic('lock', 12)} Card details go straight to the processor — we never see or store them.</span><a href="#" data-action="payCancel">Cancel</a></div>`}
+    </div>
+    <p class="small muted" style="text-align:center;margin-top:14px">Your tickets are issued the moment the payment is confirmed — never before, and you're never charged twice for one order.</p>
+  </div></div>`;
+}
+function payText(exp) { const ms = D(exp) - Date.now(); if (ms <= 0) return 'Time ran out — your seats were released.';
+  return `Your seats and tickets are reserved for ${Math.floor(ms / 6e4)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')} while you pay`; }
+setInterval(() => document.querySelectorAll('[data-pay]').forEach(el => { const was = el.textContent.startsWith('Time'); el.textContent = payText(el.dataset.pay); if (!was && el.textContent.startsWith('Time')) render(); }), 1000);
+// Stripe (LIVE): the Payment Element shows card + Apple Pay + Google Pay + Link from the box office's own Stripe account
+const STRIPE = { js: null, el: null, els: null, secret: '' };
+async function mountStripe(p) {
+  if (!window.Stripe) await new Promise((ok, no) => { const sc = document.createElement('script'); sc.src = 'https://js.stripe.com/v3/'; sc.onload = ok; sc.onerror = () => no(new Error('Couldn\'t load the payment form')); document.head.append(sc); });
+  const host = $('#payEl'); if (!host) return;
+  if (STRIPE.secret !== p.clientSecret) { STRIPE.js = window.Stripe(p.publishableKey, { stripeAccount: p.account }); STRIPE.els = STRIPE.js.elements({ clientSecret: p.clientSecret }); STRIPE.el = STRIPE.els.create('payment'); STRIPE.secret = p.clientSecret; }
+  if (!host.childElementCount) { try { STRIPE.el.unmount(); } catch (e) { } STRIPE.el.mount(host); }
+}
 // one order-summary line: tickets (with their price phase, seats and discount), packages (with what's inside) and add-ons
 function SumLine(ev, l, cur) {
   const inside = l.kind === 'bundle' ? [...Object.entries(l.tts.reduce((m, id) => (m[id] = (m[id] || 0) + 1, m), {})).map(([id, n]) => `${n} × ${ev?.ticketTypes?.find(t => t.id === id)?.name || 'ticket'}`), ...l.addons.map(a => `${a.qty * l.qty} × ${a.name}`)].join(', ') : '';
@@ -619,6 +700,53 @@ function SumLine(ev, l, cur) {
 function holdText(exp) { const ms = D(exp) - Date.now(); if (ms <= 0) return 'Your seat hold has ended — the seats are yours if nobody else has taken them. Complete your order now.';
   const m = Math.floor(ms / 6e4), sec = Math.floor(ms / 1000) % 60; return `Your seats are held for you for ${m}:${String(sec).padStart(2, '0')}`; }
 setInterval(() => document.querySelectorAll('[data-hold]').forEach(el => { el.textContent = holdText(el.dataset.hold); }), 1000);
+
+// per-ticket answers as arrays {questionId: [ticket 1, ticket 2, …]}
+const tAnswers = () => Object.fromEntries(Object.entries(S.co.tanswers || {}).map(([k, v]) => [k, Object.keys(v).reduce((a, i) => (a[+i] = v[i], a), [])]));
+async function startPay(r) {
+  const co = S.co; co.busy = false;
+  try {
+    const pay = await DB.startPayment(r.id, r.key);
+    if (pay.paid) return checkoutDone(r);
+    co.pay = { ...r, ...pay, provider: pay.provider, expires_at: pay.expires_at || r.expires_at, total: pay.total ?? r.total };
+    try { localStorage.setItem('set_pay', JSON.stringify({ id: r.id, key: r.key, ref: r.ref })); } catch (e) { }
+  } catch (e) { co.err = e.message; }
+  render();
+}
+async function payWith(card) {
+  const co = S.co, p = co.pay; if (!p || co.busy) return;
+  co.busy = true; co.err = ''; render();
+  try {
+    if (p.provider === 'demo') await DB.payOrder(p.id, p.key, card);
+    else {   // processor's own form; then wait for its webhook to confirm (that is what issues the tickets)
+      const { error } = await STRIPE.js.confirmPayment({ elements: STRIPE.els, redirect: 'if_required', confirmParams: { return_url: location.origin + location.pathname + '#/order/' + p.id + '/' + p.key } });
+      if (error) throw new Error(error.message);
+      for (let i = 0; i < 30; i++) { const o = await DB.getOrder(p.id, p.key); if (o?.order?.status === 'paid') break; await new Promise(r => setTimeout(r, 1000)); }
+    }
+    co.card = null; checkoutDone(p);
+  } catch (e) { co.busy = false; co.err = e.message; S.avail = {}; render(); }
+}
+function endPay() { S.co = { ...S.co, pay: null, busy: false, err: '', attempt: null, card: null }; try { localStorage.removeItem('set_pay'); } catch (e) { } render(); }
+async function checkoutDone(r) {
+  S.cart = { items: [], addons: [], donation: 0, unlock: {} }; saveCart();
+  S.co = { ...S.co, busy: false, disc: null, code: '', tracking: '', answers: {}, tanswers: {}, terms: false, pay: null, attempt: null, card: null, err: '' };
+  try { localStorage.removeItem('set_pay'); } catch (e) { }
+  S.avail = {}; _availReq.clear(); S.order = null;
+  if (S.adm) await reloadAdmin();
+  location.hash = '#/order/' + r.id + '/' + r.key;
+}
+// signature pads: draw with a finger / mouse; the PNG is the answer
+function sigMount() {
+  document.querySelectorAll('canvas[data-sig]').forEach(c => {
+    if (c._on) return; c._on = true;
+    const ctx = c.getContext('2d'), v = getPath(S.co, c.dataset.sig); ctx.lineWidth = 2.4; ctx.lineCap = 'round'; ctx.strokeStyle = '#020a16';
+    if (String(v || '').startsWith('data:image/png')) { const im = new Image(); im.onload = () => ctx.drawImage(im, 0, 0); im.src = v; }
+    let down = false; const pt = e => { const r = c.getBoundingClientRect(); return [(e.clientX - r.left) * c.width / r.width, (e.clientY - r.top) * c.height / r.height]; };
+    c.addEventListener('pointerdown', e => { down = true; c.setPointerCapture(e.pointerId); ctx.beginPath(); ctx.moveTo(...pt(e)); });
+    c.addEventListener('pointermove', e => { if (down) { ctx.lineTo(...pt(e)); ctx.stroke(); } });
+    c.addEventListener('pointerup', () => { if (!down) return; down = false; setPath(S.co, c.dataset.sig, c.toDataURL('image/png')); const t = c.parentNode.querySelector('input'); if (t) t.value = ''; });
+  });
+}
 
 // ── Order confirmation + e-tickets ───────────────────────────────────────────
 async function loadOrder(id, key) {
@@ -634,13 +762,17 @@ function OrderPage() {
   const ord = o.order, d = ord.data, cur = d.currency;
   return `<div class="container" style="padding:36px 28px 60px;max-width:900px">
     <div class="no-print">
-      <span class="chip ${ord.status === 'paid' ? 'ok' : ord.status === 'pending' ? 'warn' : 'bad'}">${ord.status === 'pending' ? 'Reserved — payment due' : esc(ord.status)}</span>
-      <h1 class="display" style="font-size:48px;margin:12px 0 6px">${ord.status === 'cancelled' || ord.status === 'refunded' ? 'Order ' + esc(ord.status) : 'You\'re going!'}</h1>
-      <p class="muted">Order <b>${esc(ord.ref)}</b> · confirmation sent to <b>${esc(ord.buyer_email)}</b></p>
+      <span class="chip ${ord.status === 'paid' ? 'ok' : ['pending', 'awaiting_payment'].includes(ord.status) ? 'warn' : 'bad'}">${esc(ORDER_STATUS[ord.status] || ord.status)}</span>
+      <h1 class="display" style="font-size:48px;margin:12px 0 6px">${{ paid: 'You\'re going!', pending: 'Reserved', awaiting_payment: 'Payment not finished', expired: 'Checkout expired', cancelled: 'Order cancelled', refunded: 'Order refunded' }[ord.status] || esc(ord.status)}</h1>
+      <p class="muted">Order <b>${esc(ord.ref)}</b>${ord.status === 'paid' ? ` · confirmation sent to <b>${esc(ord.buyer_email)}</b>` : ''}${ord.paidWith ? ` · paid with ${esc(ord.paidWith)}` : ''}</p>
+      ${ord.status === 'pending' ? `<div class="banner info" style="margin-top:14px">Your tickets are held for you. They're issued here and emailed as soon as ${esc(S.settings.name)} receives your payment.</div>` : ''}
+      ${ord.status === 'awaiting_payment' ? `<div class="banner info" style="margin-top:14px">This order isn't paid yet, so no tickets were issued. <a href="#/cart" data-action="resumePay">Finish paying</a> before the time runs out.</div>` : ''}
+      ${ord.status === 'expired' ? `<div class="banner" style="margin-top:14px">The payment wasn't completed in time, so nothing was charged and the seats were released.</div>` : ''}
+      ${S.settings.checkout?.thanks && ord.status === 'paid' ? `<p style="margin-top:12px">${esc(S.settings.checkout.thanks)}</p>` : ''}
       <div class="row wrap" style="margin:18px 0 26px">
-        <button class="btn btn-dark" data-action="print">Download PDF / print tickets</button>
+        ${o.tickets.some(t => t.status === 'valid') ? '<button class="btn btn-dark" data-action="print">Download PDF / print tickets</button>' : ''}
         ${[...new Set(d.lines.map(l => l.eventId))].map(id => evById(id) ? `<button class="btn btn-ghost" data-action="ics" data-id="${id}">${ic('cal', 14)} Add ${esc(evById(id).name)} to calendar</button>` : '').join('')}
-        <button class="btn btn-ghost" data-action="resendMine">Email my tickets again</button>
+        ${ord.status === 'paid' ? '<button class="btn btn-ghost" data-action="resendMine">Email my tickets again</button>' : ''}
       </div>
     </div>
     ${o.tickets.filter(t => t.status === 'valid').map(t => {
@@ -662,12 +794,61 @@ function OrderPage() {
     }).join('')}
     <div class="card no-print" style="margin-top:20px"><h3>Receipt</h3>
       ${d.lines.map(l => SumLine(evById(l.eventId), l, cur)).join('')}
-      ${d.discount || d.feeDiscount ? `<div class="sum-line"><span>Discount (${esc(d.code)})</span><span>−${money((d.discount || 0) + (d.feeDiscount || 0), cur)}</span></div>` : ''}
-      ${d.fee || d.feeDiscount ? `<div class="sum-line"><span>Booking fee</span><span>${money((d.fee || 0) + (d.feeDiscount || 0), cur)}</span></div>` : ''}${d.tax ? `<div class="sum-line"><span>Tax</span><span>${money(d.tax, cur)}</span></div>` : ''}
-      ${d.donation ? `<div class="sum-line"><span>Donation</span><span>${money(d.donation, cur)}</span></div>` : ''}
-      <div class="sum-line total"><span>Total</span><span>${money(d.total, cur)}</span></div>
+      ${Breakdown({ ...d, ticketsTotal: d.ticketsTotal ?? d.subtotal, currency: cur }, d.code)}
       <p class="small muted" style="margin-top:12px">Bookmark this page — it's your ticket wallet. Need help? ${esc(S.settings.contactEmail)}</p></div>
+    ${!S.cust && ['paid', 'pending'].includes(ord.status) ? `<div class="card no-print save-acct" style="margin-top:16px"><h3>Save your tickets</h3>
+      <p class="small muted" style="margin:6px 0 12px">Create a free account with <b>${esc(ord.buyer_email)}</b> to find these and future tickets in one place. Optional — your tickets already work.</p>
+      <div class="row"><input class="inp" type="password" autocomplete="new-password" placeholder="Choose a password (8+ characters)" data-input="saveAcct.pw"><button class="btn btn-dark" data-action="saveTickets">Create account</button></div></div>` : ''}
   </div>`;
+}
+// ── Customer account (Stage 5): optional. A secure ticket wallet + purchase history, a profile and a password.
+//    Refunds, cancellations, seat changes, upgrades and transfers stay with the box office.
+function Account() {
+  if (!S.cust) return AccountAuth();
+  const w = S.wallet;
+  if (!w) { S.wallet = { loading: true }; DB.myOrders().then(r => { S.wallet = r; render(); }).catch(e => { S.wallet = { err: e.message }; render(); }); }
+  if (!w || w.loading) return '<div class="container section"><p class="muted">Loading your tickets…</p></div>';
+  const tab = S.ui.wtab || 'upcoming', now = Date.now() - 6 * 3600e3, evOf = id => evById(id) || { name: (w.orders.flatMap(o => o.data.lines).find(l => l.eventId === id) || {}).eventName || 'Event' };
+  // one card per order + event, with its valid tickets
+  const groups = (w.orders || []).flatMap(o => [...new Set(o.data.lines.map(l => l.eventId))].map(id => ({ o, ev: evOf(id), id, tks: (w.tickets || []).filter(t => t.order_id === o.id && t.event_id === id && t.status === 'valid') })))
+    .filter(g => g.tks.length || ['pending', 'awaiting_payment'].includes(g.o.status));
+  const when = g => D(g.tks[0]?.slot_id ? (g.ev.timeSlots || []).find(x => x.id === g.tks[0].slot_id)?.start || g.ev.start : g.ev.start);
+  const up = groups.filter(g => !g.ev.start || when(g) >= now).sort((a, b) => when(a) - when(b)), past = groups.filter(g => g.ev.start && when(g) < now).sort((a, b) => when(b) - when(a));
+  const card = g => `<a class="wallet-card" href="#/order/${esc(g.o.id)}/${esc(g.o.key)}"><div class="ev-img sm" style="${artBg(g.ev)}"></div><div style="flex:1;min-width:0"><b>${esc(g.ev.name)}</b>
+    <div class="small muted">${g.ev.start ? esc(fmtDT(when(g).toISOString())) : ''}${g.ev.venue ? ' · ' + esc(g.ev.venue) : ''}</div>
+    <div class="small">${g.tks.length ? `${g.tks.length} ticket${g.tks.length === 1 ? '' : 's'}${g.tks.some(t => t.seat) ? ' · ' + esc(g.tks.filter(t => t.seat).map(t => seatName(g.ev, t.seat, true, t)).join(', ')) : ''}` : `<span class="chip warn">${esc(ORDER_STATUS[g.o.status])}</span>`} · ${esc(g.o.ref)}</div></div><span class="btn btn-dark btn-sm">Open</span></a>`;
+  const tabs = [['upcoming', `Upcoming (${up.length})`], ['past', 'Past'], ['orders', 'Orders'], ['profile', 'Profile']];
+  const p = { name: S.ui.prof?.name ?? S.cust.name, phone: S.ui.prof?.phone ?? S.cust.phone };
+  return `<div class="container" style="max-width:860px;padding:40px 20px 60px">
+    <div class="between wrap"><div><h1 class="display" style="font-size:44px">My account</h1><p class="muted">${esc(S.cust.name || '')} · ${esc(S.cust.email)}</p></div><button class="btn btn-ghost btn-sm" data-action="custOut">Sign out</button></div>
+    <div class="tabs" style="margin:20px 0">${tabs.map(([k, t]) => `<button class="${tab === k ? 'on' : ''}" data-action="custTab" data-v="${k}">${t}</button>`).join('')}</div>
+    ${w.err ? `<div class="banner bad">${esc(w.err)}</div>` : ''}
+    ${tab === 'upcoming' ? (up.map(card).join('') || '<div class="empty">No upcoming tickets. <a href="#/">Find an event</a>.</div>')
+      : tab === 'past' ? (past.map(card).join('') || '<div class="empty">No past events yet.</div>')
+      : tab === 'orders' ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Order</th><th>Placed</th><th>Events</th><th>Total</th><th>Status</th></tr></thead><tbody>
+          ${(w.orders || []).map(o => `<tr class="click" data-action="go" data-v="#/order/${esc(o.id)}/${esc(o.key)}"><td class="tnum"><b>${esc(o.ref)}</b></td><td class="small">${esc(fmtDT(o.created_at))}</td>
+            <td>${esc([...new Set(o.data.lines.map(l => l.eventName))].join(', '))}</td><td class="tnum">${money(o.data.total, o.data.currency)}</td><td>${esc(ORDER_STATUS[o.status] || o.status)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">No orders yet.</td></tr>'}</tbody></table></div>`
+      : `<div class="cols"><div class="card"><h3>Profile</h3><div class="field"><label class="fl">Name</label><input class="inp" data-input="prof.name" value="${esc(p.name)}"></div>
+          <div class="field"><label class="fl">Mobile</label><input class="inp" type="tel" data-input="prof.phone" value="${esc(p.phone)}"></div>
+          <div class="field"><label class="fl">Email</label><input class="inp" readonly value="${esc(S.cust.email)}"><div class="small muted" style="margin-top:4px">Your tickets are matched to this email.</div></div>
+          <button class="btn btn-accent" data-action="saveProfile">Save</button></div>
+        <div class="card"><h3>Change password</h3><div class="field"><label class="fl">Current password</label><input class="inp" type="password" autocomplete="current-password" data-input="pw.cur"></div>
+          <div class="field"><label class="fl">New password</label><input class="inp" type="password" autocomplete="new-password" data-input="pw.next"></div><button class="btn btn-dark" data-action="changePw">Change password</button></div></div>`}
+    <p class="small muted" style="margin-top:24px">Need to change, move or refund an order? Contact the box office — those changes are handled by the organizer.</p>
+  </div>`;
+}
+function AccountAuth() {
+  const f = S.ui.ca || (S.ui.ca = { mode: 'in' }), m = f.mode;
+  return `<div class="container" style="max-width:480px;padding:60px 20px"><h1 class="display" style="font-size:44px">${m === 'up' ? 'Create account' : m === 'forgot' ? 'Reset password' : 'Sign in'}</h1>
+    <p class="muted" style="margin:6px 0 20px">${m === 'up' ? 'Optional — keep all your tickets in one place. You never need an account to buy.' : 'See your upcoming tickets, past orders and receipts.'}</p>
+    <div class="card">${f.sent ? `<p>${m === 'forgot' ? 'If there\'s an account for that email, a reset link is on its way.' : 'Check your email to confirm your account, then sign in.'}</p>` : `
+      ${m === 'up' ? `<div class="field"><label class="fl">Name</label><input class="inp" autocomplete="name" data-input="ca.name" value="${esc(f.name || '')}"></div>` : ''}
+      <div class="field"><label class="fl">Email</label><input class="inp" type="email" autocomplete="email" data-input="ca.email" value="${esc(f.email || '')}"></div>
+      ${m !== 'forgot' ? `<div class="field"><label class="fl">Password</label><input class="inp" type="password" autocomplete="${m === 'up' ? 'new-password' : 'current-password'}" data-input="ca.pw"></div>` : ''}
+      ${f.err ? `<p class="small" style="color:var(--bad);margin-bottom:10px">${esc(f.err)}</p>` : ''}
+      <button class="btn btn-accent btn-block" data-action="custAuth">${m === 'up' ? 'Create account' : m === 'forgot' ? (DB.live ? 'Email me a reset link' : 'Reset (demo: nothing is sent)') : 'Sign in'}</button>`}
+      <div class="small" style="margin-top:14px;display:flex;gap:14px;flex-wrap:wrap">${m !== 'in' ? '<a href="#" data-action="custMode" data-v="in">Sign in</a>' : ''}${m !== 'up' ? '<a href="#" data-action="custMode" data-v="up">Create an account</a>' : ''}${m === 'in' ? '<a href="#" data-action="custMode" data-v="forgot">Forgot password?</a>' : ''}<a href="#/tickets">Find tickets with an order number</a></div></div>
+    ${DB.live ? '' : '<p class="small muted" style="margin-top:14px">Demo account: <b>maya@example.com</b> / <b>tickets123</b></p>'}</div>`;
 }
 function FindTickets() {
   const f = S.ui.find || {};
@@ -777,7 +958,7 @@ function Dashboard() {
       <td><div class="between small"><span>${s.sold}${s.cap ? ' / ' + s.cap : ''}</span><span class="muted">${s.cap ? Math.round(s.sold / s.cap * 100) + '%' : ''}</span></div><div class="bar"><i style="width:${s.cap ? Math.min(100, s.sold / s.cap * 100) : 0}%"></i></div></td><td class="tnum">${money(s.rev)}</td></tr>`; }).join('') || '<tr><td colspan="5" class="muted">No upcoming events.</td></tr>'}
     </tbody></table></div></div>`;
 }
-const statusChip = s => `<span class="chip ${{ paid: 'ok', pending: 'warn', cancelled: 'bad', refunded: 'bad' }[s] || ''}">${esc(s)}</span>`;
+const statusChip = s => `<span class="chip ${{ paid: 'ok', pending: 'warn', awaiting_payment: 'info', cancelled: 'bad', refunded: 'bad' }[s] || ''}">${esc(ORDER_STATUS[s] || s)}</span>`;
 
 // ── Events (Stage 2): list, templates, overview, showtimes, waitlist, team, history ─────────────
 const evChip = e => e.archived ? '<span class="chip">Archived</span>' : e.status === 'cancelled' ? '<span class="chip bad">Cancelled</span>' : e.status === 'draft' ? '<span class="chip">Draft</span>'
@@ -813,7 +994,7 @@ function NewEventModal() {
   modal('New event', `<div class="new-ev"><button class="item-card" data-action="blankEvent"><b>Blank event</b><span class="small muted">Start from scratch</span></button>
     ${list.map(t => `<button class="item-card" data-action="fromTemplate" data-v="${t.id}"><b>${esc(t.name)}</b><span class="small muted">${esc(t.event.ticketTypes.length)} ticket types${t.event.seating?.enabled ? ' · seating map' : ''}</span></button>`).join('')}</div>`);
 }
-const ETABS = [['overview', 'Overview'], ['details', 'Details'], ['tickets', 'Tickets & pricing'], ['products', 'Products & packages'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['inventory', 'Seat inventory'], ['checkout', 'Checkout'], ['discounts', 'Promo codes'],
+const ETABS = [['overview', 'Overview'], ['details', 'Details'], ['tickets', 'Tickets & pricing'], ['products', 'Products & packages'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['inventory', 'Seat inventory'], ['checkout', 'Page & checkout'], ['discounts', 'Promo codes'],
   ['emails', 'Emails'], ['waitlist', 'Waitlist'], ['team', 'Team'], ['history', 'History'], ['share', 'Share & embed']];
 function EventEditor() {
   const ev = S.draft; if (!ev) return '<p class="muted">Event not found.</p>';
@@ -1261,11 +1442,39 @@ document.addEventListener('pointerup', () => {
   else if (m.changed) { dirty(); render(); }
 });
 function EdCheckout(ev) {
-  return `<div class="cols"><div class="card"><div class="between" style="margin-bottom:10px"><h3>Checkout questions</h3><button type="button" class="btn btn-ghost btn-sm" data-action="addQ">${ic('plus', 14)} Add question</button></div>
-    <p class="small muted" style="margin-bottom:12px">Collected once per order. Answers appear on orders and exports.</p>
-    ${(ev.questions || []).map((q, i) => `<div class="item-card"><div class="grid2">${inp(`questions.${i}.label`, 'Question')}${sel(`questions.${i}.type`, 'Type', [['text', 'Text'], ['select', 'Dropdown'], ['checkbox', 'Checkbox']])}</div>
-      ${q.type === 'select' ? inp(`questions.${i}.options`, 'Options (comma-separated)') : ''}<div class="between">${chk(`questions.${i}.required`, 'Required')}<button type="button" class="btn btn-ghost btn-sm" data-action="delQ" data-i="${i}">Remove</button></div></div>`).join('') || '<p class="muted">No questions.</p>'}
-  </div><div class="card"><h3>Products & packages</h3><p class="small muted" style="margin-top:6px">Add-ons, packages and checkout offers now have their own tab.</p><a class="btn btn-ghost btn-sm" style="margin-top:12px" href="#/admin/event/${ev.id}/products">Open Products & packages</a>  </div></div>`;
+  const pg = ev.page || {}, hidden = k => !!pg.hide?.[k];
+  return `<div class="cols"><div class="stack">
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Event page</div>
+      <p class="small muted" style="margin:-4px 0 12px">Flyer / image, description, instructions and policies are on the <a href="#/admin/event/${ev.id}/details">Details</a> tab. Turn any section off here.</p>
+      <div class="sec-toggles">${PAGE_SECTIONS.map(([k, t]) => `<label class="check"><input type="checkbox" data-action="pgSection" data-v="${k}" ${hidden(k) ? '' : 'checked'}> <span>${t}</span></label>`).join('')}</div>
+      ${inp('page.video', 'Video (YouTube or Vimeo link)', { ph: 'https://www.youtube.com/watch?v=…', hint: pg.video && !videoEmbed(pg.video) ? '<span style="color:var(--bad)">Only YouTube and Vimeo links can be embedded.</span>' : '' })}
+      <div class="field"><label class="fl">Photo gallery (one https:// image link per line)</label><textarea class="inp" data-input="pgGallery" data-rr="0">${esc((pg.gallery || []).join('\n'))}</textarea></div>
+      <div class="grid2"><div class="field"><label class="fl">Page accent colour</label><input class="inp" type="color" data-bind="draft.page.accent" value="${esc(pg.accent || S.adm.bo.branding.accent || '#f4cd5e')}"></div>
+        <div class="field"><label class="fl">Page main colour</label><input class="inp" type="color" data-bind="draft.page.ink" value="${esc(pg.ink || S.adm.bo.branding.ink || '#020a16')}"></div></div>
+      ${pg.accent || pg.ink ? '<button type="button" class="btn btn-ghost btn-sm" data-action="pgColorsReset">Use the box office colours</button>' : '<p class="small muted">Uses the box office colours until you pick different ones.</p>'}
+    </div>
+    <div class="card"><div class="between" style="margin-bottom:10px"><h3>Custom text blocks</h3><button type="button" class="btn btn-ghost btn-sm" data-action="pgAdd" data-v="blocks">${ic('plus', 14)} Add block</button></div>
+      ${(pg.blocks || []).map((b, i) => `<div class="item-card">${inp(`page.blocks.${i}.title`, 'Heading')}${inp(`page.blocks.${i}.text`, 'Text', { t: 'area' })}<button type="button" class="btn btn-ghost btn-sm" data-action="pgDel" data-v="blocks" data-i="${i}">Remove</button></div>`).join('') || '<p class="small muted">Programme, line-up, FAQs, menus — anything you want on the page.</p>'}</div>
+    <div class="card"><div class="between" style="margin-bottom:10px"><h3>Sponsors</h3><button type="button" class="btn btn-ghost btn-sm" data-action="pgAdd" data-v="sponsors">${ic('plus', 14)} Add sponsor</button></div>
+      ${(pg.sponsors || []).map((x, i) => `<div class="item-card"><div class="grid3">${inp(`page.sponsors.${i}.name`, 'Name')}${inp(`page.sponsors.${i}.logo`, 'Logo URL', { ph: 'https://…' })}${inp(`page.sponsors.${i}.url`, 'Link', { ph: 'https://…' })}</div><button type="button" class="btn btn-ghost btn-sm" data-action="pgDel" data-v="sponsors" data-i="${i}">Remove</button></div>`).join('') || '<p class="small muted">No sponsors.</p>'}</div>
+  </div><div class="stack">
+    <div class="card">${inp('page.checkoutNote', 'Note shown at checkout for this event', { t: 'area', ph: 'e.g. Premium seats include a welcome drink.' })}</div>
+    <div class="card">${QEditor('draft', 'questions', ev.questions || [], Q_SCOPES)}</div>
+    <div class="card"><h3>Products & packages</h3><p class="small muted" style="margin-top:6px">Add-ons, packages and checkout offers have their own tab.</p><a class="btn btn-ghost btn-sm" style="margin-top:12px" href="#/admin/event/${ev.id}/products">Open Products & packages</a></div>
+  </div></div>`;
+}
+// checkout questions editor for an event (draft.questions) or the whole box office (set.questions — asked once per order)
+function QEditor(root, path, list, scopes) {
+  const obj = root === 'draft' ? S.draft : S.ui.set, b = (i, k) => `data-bind="${root}.${path}.${i}.${k}"`;
+  return `<div class="between" style="margin-bottom:10px"><h3>${root === 'draft' ? 'Checkout questions' : 'Questions on every order'}</h3><button type="button" class="btn btn-ghost btn-sm" data-action="addQ" data-v="${root}">${ic('plus', 14)} Add question</button></div>
+    <p class="small muted" style="margin-bottom:12px">${root === 'draft' ? 'Asked once per event, or once for every ticket (e.g. each attendee\'s name). Answers are on orders, tickets and exports.' : 'Asked once per order, whatever is in the cart.'}</p>
+    ${list.map((q, i) => `<div class="item-card"><div class="grid2"><div class="field"><label class="fl">Question</label><input class="inp" ${b(i, 'label')} value="${esc(q.label || '')}"></div>
+      <div class="field"><label class="fl">Type</label><select class="inp" ${b(i, 'type')}>${Q_TYPES.map(([v, t]) => `<option value="${v}" ${(q.type || 'text') === v ? 'selected' : ''}>${t}</option>`).join('')}</select></div></div>
+      ${q.type === 'select' ? `<div class="field"><label class="fl">Options (comma-separated)</label><input class="inp" ${b(i, 'options')} value="${esc(q.options || '')}"></div>` : ''}
+      ${q.type === 'terms' || q.type === 'waiver' ? `<div class="field"><label class="fl">${q.type === 'waiver' ? 'Waiver text' : 'Terms text'}</label><textarea class="inp" ${b(i, 'text')}>${esc(q.text || '')}</textarea></div>` : ''}
+      <div class="between wrap">${scopes.length ? `<select class="inp" style="max-width:240px" ${b(i, 'scope')}>${scopes.map(([v, t]) => `<option value="${v}" ${(q.scope || 'event') === v ? 'selected' : ''}>${t}</option>`).join('')}</select>` : ''}
+        <label class="check"><input type="checkbox" ${b(i, 'required')} data-t="bool" ${q.required ? 'checked' : ''}> <span>Required</span></label>
+        <button type="button" class="btn btn-ghost btn-sm" data-action="delQ" data-v="${root}" data-i="${i}">Remove</button></div></div>`).join('') || '<p class="muted">No questions.</p>'}`;
 }
 // ── Ticket types, pricing rules, products, bundles, upsells (Stage 4) ───────
 // tick boxes that add / remove a value in an array on the draft (targeting lists). [] = "any".
@@ -1506,7 +1715,7 @@ function Orders() {
     `${can('customers.export') ? '<button class="btn btn-ghost" data-action="exportOrders">Export CSV</button>' : ''}${can('orders.edit') ? `<button class="btn btn-accent" data-action="manualOrder">${ic('plus', 15)} Manual order</button>` : ''}`) + `
   <div class="toolbar"><input class="inp" data-input="q" placeholder="Search name, email, order #…" value="${esc(S.ui.q)}">
     <select class="inp" data-input="ev">${evOptions(S.ui.ev)}</select>
-    <select class="inp" data-input="status"><option value="">Any status</option>${['paid', 'pending', 'cancelled', 'refunded'].map(s => `<option ${S.ui.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+    <select class="inp" data-input="status"><option value="">Any status</option>${Object.entries(ORDER_STATUS).map(([k, t]) => `<option value="${k}" ${S.ui.status === k ? 'selected' : ''}>${t}</option>`).join('')}</select>
     ${picked.length && can('orders.refund') ? `<button class="btn btn-danger btn-sm" data-action="bulkCancel">Cancel & refund ${picked.length} selected</button>` : ''}</div>
   <div class="tbl-wrap"><table class="tbl"><thead><tr><th style="width:30px"></th><th>Order</th><th>Buyer</th><th>Event</th><th>Tickets</th><th>Total</th><th>Status</th><th>Placed</th></tr></thead><tbody>
   ${os.slice(0, 300).map(o => `<tr class="click" data-action="openOrder" data-id="${o.id}"><td data-stop="1"><input type="checkbox" data-action="pick" data-id="${o.id}" ${S.ui.picked[o.id] ? 'checked' : ''}></td>
@@ -1517,19 +1726,26 @@ function Orders() {
 }
 function OrderModal(id) {
   const o = S.adm.orders.find(x => x.id === id); if (!o) return;
-  const d = o.data, tks = S.adm.tickets.filter(t => t.order_id === id), qs = o.event_ids.flatMap(e => evById(e)?.questions || []);
+  const d = o.data, tks = S.adm.tickets.filter(t => t.order_id === id), qs = [...(S.adm.bo.settings.questions || []), ...o.event_ids.flatMap(e => (evById(e)?.questions || []).filter(q => q.scope !== 'ticket'))];
+  const tqs = o.event_ids.flatMap(e => (evById(e)?.questions || []).filter(q => q.scope === 'ticket')), pay = o.payment, mail = (S.adm.outbox || []).find(m => m.order_id === o.id);
+  const ans = (q, v) => q.type === 'signature' && String(v || '').startsWith('data:image/png') ? `<img class="sig-img" src="${esc(v)}" alt="signature">` : esc(v === true ? (q.type === 'terms' || q.type === 'waiver' ? 'Accepted' : 'Yes') : v || '—');
   modal(`Order ${esc(o.ref)}`, `<div class="between"><div><b style="font-size:16px">${esc(d.buyer.name)}</b><div class="muted small">${esc(o.buyer_email)}${d.buyer.phone ? ' · ' + esc(d.buyer.phone) : ''}</div></div>${statusChip(o.status)}</div>
     <div class="small muted" style="margin-top:6px">${esc(fmtDT(o.created_at))} · ${esc(d.payment)}${d.source ? ' · source: ' + esc(d.source) : ''}${d.tracking ? ' · referral: ' + esc(d.tracking) : ''}${d.optIn ? ' · opted in to marketing' : ''}</div>
     <div class="sep"></div>${d.lines.map(l => l.unit == null ? `<div class="sum-line"><span>${l.qty} × ${esc(l.name)}</span><span>—</span></div>` : SumLine(evById(l.eventId), l, d.currency)).join('')}
-    ${d.discount || d.feeDiscount ? `<div class="sum-line"><span>Discount ${esc(d.code)}</span><span>−${money((d.discount || 0) + (d.feeDiscount || 0), d.currency)}</span></div>` : ''}${d.fee ? `<div class="sum-line"><span>Fees</span><span>${money(d.fee, d.currency)}</span></div>` : ''}${d.tax ? `<div class="sum-line"><span>Tax</span><span>${money(d.tax, d.currency)}</span></div>` : ''}${d.donation ? `<div class="sum-line"><span>Donation</span><span>${money(d.donation, d.currency)}</span></div>` : ''}
-    <div class="sum-line total"><span>Total</span><span>${money(d.total, d.currency)}</span></div>
-    ${qs.length ? `<div class="sep"></div>${qs.map(q => `<div class="small"><span class="muted">${esc(q.label)}:</span> ${esc(d.answers?.[q.id] === true ? 'Yes' : d.answers?.[q.id] || '—')}</div>`).join('')}` : ''}
+    ${d.total == null ? '' : Breakdown({ ...d, ticketsTotal: d.ticketsTotal ?? d.subtotal }, d.code)}
+    ${d.platformFee != null || d.processingFee != null ? `<div class="small muted" style="margin-top:6px">Kept by others: ${d.platformFee != null ? `platform fee ${money(d.platformFee, d.currency)}` : ''}${d.processingFee != null ? ` · card processing ${money(d.processingFee, d.currency)}` : ''}</div>` : ''}
+    ${pay ? `<div class="sep"></div><div class="small"><b>Payment</b> · ${esc(GATEWAYS[pay.provider]?.name || pay.provider || '')}${pay.test ? ' (test)' : ''}${pay.ref ? ` · <code>${esc(pay.ref)}</code>` : ''}${pay.last4 ? ` · ${esc(pay.brand)} •••• ${esc(pay.last4)}` : pay.brand ? ' · ' + esc(pay.brand) : ''}${pay.markedPaidBy ? ' · marked paid by ' + esc(pay.markedPaidBy) : ''}${o.paid_at ? ' · ' + esc(fmtDT(o.paid_at)) : ''}</div>
+      ${(pay.attempts || []).filter(a => !a.ok).map(a => `<div class="small" style="color:var(--bad)">${esc(fmtDT(a.at))} · ${esc(a.brand || a.method || '')} ${a.last4 ? '•••• ' + esc(a.last4) : ''} — ${esc(a.error || 'failed')}</div>`).join('')}${pay.note ? `<div class="small" style="color:var(--warn)">${esc(pay.note)}</div>` : ''}` : ''}
+    ${o.status === 'awaiting_payment' ? `<div class="small muted" style="margin-top:6px">Card checkout in progress — seats held until ${esc(fmtTime(o.expires_at))}. No tickets until the payment is confirmed.</div>` : ''}
+    ${o.status === 'pending' ? `<div class="small muted" style="margin-top:6px">Pay-later reservation: no tickets yet. “Mark paid” issues them and sends the confirmation.</div>` : ''}
+    ${mail ? `<div class="small muted" style="margin-top:6px">Confirmation email ${esc(mail.status)} for ${esc(mail.to)} · ${esc(fmtDT(mail.at))}</div>` : ''}
+    ${qs.length ? `<div class="sep"></div>${qs.map(q => `<div class="small"><span class="muted">${esc(q.label)}:</span> ${ans(q, d.answers?.[q.id])}</div>`).join('')}` : ''}
     <div class="sep"></div><div class="eyebrow" style="margin-bottom:8px">Tickets</div>
-    ${tks.map(t => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="tnum"><b>${esc(t.code)}</b> ${t.seat ? '· ' + esc(seatName(evById(t.event_id), t.seat, true, t)) : ''}${t.face != null ? `<span class="muted"> · ${esc(evById(t.event_id)?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name || '')} · face ${money(t.face, d.currency)} · paid ${money(t.paid, d.currency)}${t.discount ? ' · −' + money(t.discount, d.currency) + ' ' + esc(t.promo || '') : ''}${t.bundle ? ' · ' + esc(t.bundle.name) : ''}${t.comp ? ' · comp' : ''}${t.price_override ? ' · price override' : ''}</span>` : ''}</span><span>${t.status !== 'valid' ? '<span class="chip bad">void</span>' : t.checked_in_at ? '<span class="chip ok">in ' + esc(fmtTime(t.checked_in_at)) + '</span>' : '<span class="chip">not in</span>'}</span></div>`).join('')}`,
+    ${tks.map(t => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="tnum"><b>${esc(t.code)}</b> ${t.seat ? '· ' + esc(seatName(evById(t.event_id), t.seat, true, t)) : ''}${t.face != null ? `<span class="muted"> · ${esc(evById(t.event_id)?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name || '')} · face ${money(t.face, d.currency)} · paid ${money(t.paid, d.currency)}${t.discount ? ' · −' + money(t.discount, d.currency) + ' ' + esc(t.promo || '') : ''}${t.bundle ? ' · ' + esc(t.bundle.name) : ''}${t.comp ? ' · comp' : ''}${t.price_override ? ' · price override' : ''}</span>` : ''}${tqs.filter(q => t.answers?.[q.id] !== undefined).map(q => `<br><span class="muted">${esc(q.label)}:</span> ${ans(q, t.answers[q.id])}`).join('')}</span><span>${t.status !== 'valid' ? '<span class="chip bad">void</span>' : t.checked_in_at ? '<span class="chip ok">in ' + esc(fmtTime(t.checked_in_at)) + '</span>' : '<span class="chip">not in</span>'}</span></div>`).join('')}`,
     `<a class="btn btn-ghost btn-sm" target="_blank" href="#/order/${o.id}/${o.access_key || ''}">Buyer's page</a>
      <button class="btn btn-ghost btn-sm" data-action="emailPv" data-id="${o.id}">Confirmation email</button>
      <button class="btn btn-ghost btn-sm" data-action="resend" data-id="${o.id}">Resend tickets</button>
-     ${can('orders.edit', o.event_ids[0]) && o.status === 'pending' ? `<button class="btn btn-dark btn-sm" data-action="orderStatus" data-id="${o.id}" data-v="paid">Mark paid</button>` : ''}
+     ${can('orders.edit', o.event_ids[0]) && ['pending', 'awaiting_payment'].includes(o.status) ? `<button class="btn btn-dark btn-sm" data-action="orderStatus" data-id="${o.id}" data-v="paid">Mark paid & issue tickets</button>` : ''}
      ${can(o.status === 'paid' ? 'orders.refund' : 'orders.cancel', o.event_ids[0]) && ['paid', 'pending'].includes(o.status) ? `<button class="btn btn-danger btn-sm" data-action="orderStatus" data-id="${o.id}" data-v="${o.status === 'paid' ? 'refunded' : 'cancelled'}">${o.status === 'paid' ? 'Refund & cancel' : 'Cancel'}</button>` : ''}`);
 }
 // The order confirmation: ONE email per order with every ticket and its Area / Row / Seat, plus one PDF of all tickets.
@@ -1938,6 +2154,21 @@ function Security() {
     <div class="card"><h3>My recent activity</h3>${(S.adm.audit || []).filter(a => a.actor === S.user.email).slice(0, 8).map(a => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span>${esc(a.summary)}</span><span class="muted">${esc(ago(a.at))}</span></div>`).join('') || '<p class="small muted">Nothing yet.</p>'}</div></div></div>`;
 }
 
+const feeText = f => `${+f.pct || 0}% + ${money(+f.fixed || 0)} per paid ticket, paid by ${f.payer === 'buyer' ? 'the buyer (shown as a service fee)' : 'the organizer (from payouts)'}`;
+// Payments: the box office connects its OWN processor account; money goes straight to it. One gateway interface, many processors.
+function PaymentsCard(s, c) {
+  const g = S.adm.bo.gateway, gw = g && GATEWAYS[g.provider], pick = S.ui.gwPick || (DB.live ? 'stripe' : 'demo');
+  return `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Payments</div>
+    ${g ? `<div class="item-card"><div class="between"><b>${esc(gw?.name || g.provider)}</b><span class="chip ${g.status === 'connected' ? 'ok' : 'warn'}">${g.status === 'connected' ? 'Connected' : 'Finish setup'}${g.test ? ' · test mode' : ''}</span></div>
+        <p class="small muted" style="margin-top:6px">${esc((gw?.methods || []).join(' · '))}${g.account ? ` · account <code>${esc(g.account)}</code>` : ''}. Payouts go straight to this account; the platform fee is taken automatically.</p>
+        <div class="row wrap" style="margin-top:10px">${g.status !== 'connected' ? `<button class="btn btn-accent btn-sm" data-action="gwConnect" data-v="${esc(g.provider)}">Continue setup</button>` : ''}<button class="btn btn-ghost btn-sm" data-action="gwDisconnect">Disconnect</button></div></div>`
+      : `<p class="small muted" style="margin-bottom:10px">Connect your own payment account to take cards, Apple Pay and Google Pay. Payouts go straight to you.</p>
+        <div class="field"><label class="fl">Payment processor</label><select class="inp" data-input="gwPick" data-rr="1">${Object.entries(GATEWAYS).filter(([k]) => k !== 'demo' || !DB.live).map(([k, x]) => `<option value="${k}" ${pick === k ? 'selected' : ''}>${esc(x.name)}${x.adapter ? '' : ' — on request'}</option>`).join('')}</select>
+        <div class="small muted" style="margin-top:4px">${esc(GATEWAYS[pick]?.how || '')} · ${esc((GATEWAYS[pick]?.methods || []).join(', '))}</div></div>
+        <button class="btn btn-accent btn-sm" data-action="gwConnect" data-v="${esc(pick)}">Connect ${esc(GATEWAYS[pick]?.name || '')}</button>`}
+    <div style="margin-top:14px">${c('payments.card', 'Accept card payments')}${c('payments.offline', 'Allow “pay later / at the door” reservations (tickets issued when you mark them paid)')}
+      ${c('passProcessing', `Pass the card processing fee to buyers${gw ? ` (${optNum(g.pct, gw.pct)}% + ${money(optNum(g.fixed, gw.fixed))})` : ''}`)}</div></div>`;
+}
 function Settings() {
   const s = S.ui.set || (S.ui.set = JSON.parse(JSON.stringify(S.adm.bo.settings)));
   const f = (path, label, t = 'text', hint = '') => { const v = getPath(s, path); const val = t === 'money' ? (+v / 100 || 0) : v ?? '';
@@ -1950,13 +2181,19 @@ function Settings() {
       <p class="small muted">Name, logo, colours, contact details and policies are on the <a href="#/admin/branding">Branding</a> page.</p></div>
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Fees & tax</div><div class="grid3">${f('feePct', 'Booking fee %', 'num')}${f('feeFixed', 'Booking fee per ticket', 'money')}${f('taxPct', 'Sales tax %', 'num')}</div>
       <div class="field"><label class="fl">Who pays the booking fee?</label><select class="inp" data-bind="set.feeMode"><option value="buyer" ${s.feeMode === 'buyer' ? 'selected' : ''}>Buyer (added at checkout)</option><option value="absorb" ${s.feeMode === 'absorb' ? 'selected' : ''}>We absorb it</option></select></div>
-      ${c('donations', 'Offer a donation at checkout')}</div>
+      ${c('taxOnFees', 'Charge sales tax on booking and service fees too')}
+      ${c('donations', 'Offer a donation at checkout')}
+      <p class="small muted">Platform fee: ${esc(feeText(platformFeeFor(S.platform, S.adm.bo)))} — set by the platform.</p></div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Checkout</div>
+      <div class="grid2"><div class="field"><label class="fl">Mobile number</label><select class="inp" data-bind="set.checkout.phone">${[['off', 'Don\'t ask'], ['optional', 'Optional'], ['required', 'Required']].map(([v, t]) => `<option value="${v}" ${s.checkout?.phone === v ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+        <div class="field"><label class="fl">Address</label><select class="inp" data-bind="set.checkout.address">${[['off', 'Don\'t ask'], ['optional', 'Optional'], ['required', 'Required']].map(([v, t]) => `<option value="${v}" ${s.checkout?.address === v ? 'selected' : ''}>${t}</option>`).join('')}</select></div></div>
+      ${c('checkout.promo', 'Show the promo / referral code box')}${c('checkout.optIn', 'Offer the marketing opt-in')}
+      ${f('checkout.note', 'Message at the top of checkout')}${f('checkout.thanks', 'Message on the confirmation page')}</div>
+    <div class="card">${QEditor('set', 'questions', s.questions || [], [])}</div>
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Staff security</div>${c('require2fa', 'Require two-factor sign-in for everyone on this team')}
       <p class="small muted">People without it are asked to set it up before they can see anything. <a href="#/admin/security">Set up yours</a>.</p></div>
   </div><div class="stack">
-    ${can('admin.payments') ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Payments</div>
-      <div class="item-card"><div class="between"><b>Stripe — cards, Apple Pay, Google Pay</b><span class="chip ${DB.live ? 'warn' : 'info'}">${DB.live ? 'Not connected' : 'Demo'}</span></div><p class="small muted" style="margin-top:6px">Each box office connects its own payment account, so payouts go straight to you. Other processors plug into the same slot (Stage 5).</p></div>
-      <div style="margin-top:12px">${c('payments.card', 'Accept card payments')}${c('payments.offline', 'Allow “pay later / at the door” reservations')}</div></div>` : ''}
+    ${can('admin.payments') ? PaymentsCard(s, c) : ''}
     ${can('admin.integrations') ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Tracking</div>${f('pixels.ga4', 'Google Analytics 4 ID', 'text', 'e.g. G-XXXXXXX')}${f('pixels.meta', 'Meta Pixel ID')}</div>` : ''}
     ${can('admin.api') ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Developers</div><p class="small muted">REST API + RPCs via Supabase: <code>place_order</code>, <code>availability</code>, <code>checkin</code>. Access follows the same box office and permission rules. Webhooks arrive in Stage 8.</p>
       ${!DB.live ? `<div class="sep"></div><button class="btn btn-danger btn-sm" data-action="demoReset">Reset demo data</button>` : ''}</div>` : ''}
@@ -2008,7 +2245,7 @@ function PBoxOffices() {
   return head('Box offices', 'Create, approve, suspend and support organizer accounts', `<button class="btn btn-accent" data-action="newBo">${ic('plus', 15)} New box office</button>`) + `
   <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Box office</th><th>Status</th><th>Owner</th><th>Events</th><th>Sales</th><th>Fees earned</th><th>Staff</th><th></th></tr></thead><tbody>
   ${P.bos.slice().sort((a, b) => (a.status === 'pending' ? -1 : 0) - (b.status === 'pending' ? -1 : 0) || a.name.localeCompare(b.name)).map(b => `<tr><td><b>${esc(b.name)}</b><div class="small muted">/b/${esc(b.slug)} · since ${esc(fmtDate(b.created_at, { month: 'short', year: 'numeric' }))}${b.created_by === 'self-registration' ? ' · self-registered' : ''}</div></td>
-    <td>${boChip(b.status)}</td><td class="small">${esc(b.owner)}</td><td class="tnum">${b.stats.events}</td><td class="tnum">${money(b.stats.gross)}<div class="small muted">${b.stats.orders} orders</div></td><td class="tnum">${money(b.stats.platformFees)}</td><td class="tnum">${b.stats.staff}</td>
+    <td>${boChip(b.status)}</td><td class="small">${esc(b.owner)}</td><td class="tnum">${b.stats.events}</td><td class="tnum">${money(b.stats.gross)}<div class="small muted">${b.stats.orders} orders</div></td><td class="tnum">${money(b.stats.platformFees)}<div class="small muted">${b.platformFee ? 'custom fee' : 'default fee'} · <a href="#" data-action="boFee" data-id="${b.id}">change</a></div></td><td class="tnum">${b.stats.staff}</td>
     <td style="white-space:nowrap;text-align:right">${b.status === 'pending' ? `<button class="btn btn-accent btn-sm" data-action="boStatus" data-id="${b.id}" data-v="active">Approve</button> <button class="btn btn-ghost btn-sm" data-action="boStatus" data-id="${b.id}" data-v="deactivated">Decline</button>`
       : b.status === 'active' ? `<button class="btn btn-ghost btn-sm" data-action="support" data-id="${b.id}">Open (support)</button> <button class="btn btn-ghost btn-sm" data-action="boStatus" data-id="${b.id}" data-v="suspended">Suspend</button>`
       : b.status === 'suspended' ? `<button class="btn btn-dark btn-sm" data-action="boStatus" data-id="${b.id}" data-v="active">Reactivate</button> <button class="btn btn-ghost btn-sm" data-action="boStatus" data-id="${b.id}" data-v="deactivated">Deactivate</button>`
@@ -2016,6 +2253,15 @@ function PBoxOffices() {
   </tbody></table></div>
   <div class="cols" style="margin-top:18px"><div class="card small"><h3>What each status means</h3><p class="muted" style="margin-top:6px"><b>Suspended</b> — event pages and checkout go offline and staff can't sign in; nothing is deleted. <b>Deactivated</b> — closed for good, all records kept and still exportable. <b>Delete</b> is separate and only possible for a deactivated box office that never sold a ticket, so order and financial history can't be erased by accident.</p></div>
   <div class="card small"><h3>Support access</h3><p class="muted" style="margin-top:6px">“Open (support)” lets you into an organizer's back office with full access to troubleshoot. It's shown to you as a banner and every visit is written to that box office's activity log.</p></div></div>`;
+}
+function PlatformFeeModal(id) {
+  const b = S.plat.bos.find(x => x.id === id), cur = b.platformFee || {}, P = S.plat.platform;
+  S.ui.bf = { useDefault: !b.platformFee, pct: cur.pct ?? '', fixed: cur.fixed === '' || cur.fixed == null ? '' : cur.fixed / 100, payer: cur.payer || '' };
+  modal(`Platform fee — ${esc(b.name)}`, `<p class="small muted" style="margin-bottom:12px">Platform default: ${esc(feeText({ pct: P.feePct, fixed: P.feeFixed, payer: P.feePayer }))}. Leave a box blank to use the default.</p>
+    <div class="grid2"><div class="field"><label class="fl">Percent of sales</label><input class="inp" type="number" step="0.1" data-input="bf.pct" value="${esc(S.ui.bf.pct)}" placeholder="${esc(P.feePct)}"></div>
+      <div class="field"><label class="fl">Per paid ticket ($)</label><input class="inp" type="number" step="0.01" data-input="bf.fixed" value="${esc(S.ui.bf.fixed)}" placeholder="${esc(+P.feeFixed / 100)}"></div></div>
+    <div class="field"><label class="fl">Who pays</label><select class="inp" data-input="bf.payer"><option value="">Platform default</option><option value="organizer" ${cur.payer === 'organizer' ? 'selected' : ''}>The organizer</option><option value="buyer" ${cur.payer === 'buyer' ? 'selected' : ''}>The buyer (service fee)</option></select></div>`,
+    `<button class="btn btn-ghost" data-action="closeModal">Cancel</button><button class="btn btn-accent" data-action="saveBoFee" data-id="${b.id}">Save</button>`);
 }
 function NewBoModal() {
   const f = S.ui.nb || (S.ui.nb = { name: '', slug: '', ownerEmail: '', ownerName: '' });
@@ -2037,7 +2283,8 @@ function PSettings() {
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Platform fees</div><div class="grid2">
       <div class="field"><label class="fl">Percent of ticket sales</label><input class="inp" type="number" step="0.1" data-bind="ui.ps.feePct" data-t="num" value="${esc(f.feePct)}"></div>
       <div class="field"><label class="fl">Per paid ticket</label><input class="inp" type="number" step="0.01" data-bind="ui.ps.feeFixed" data-t="money" value="${esc(+f.feeFixed / 100)}"></div></div>
-      <p class="small muted">Recorded on each new order and deducted from the organizer's payout — buyers don't see it. Box offices set their own booking fees separately.</p>
+      <div class="field"><label class="fl">Who pays it</label><select class="inp" data-bind="ui.ps.feePayer"><option value="organizer" ${f.feePayer !== 'buyer' ? 'selected' : ''}>The organizer — deducted from payouts, buyers don't see it</option><option value="buyer" ${f.feePayer === 'buyer' ? 'selected' : ''}>The buyer — added at checkout as a “service fee”</option></select></div>
+      <p class="small muted">Recorded on each order and taken automatically as the processor's application fee. Override it for one box office from Box offices → Fee. Box offices set their own booking fees separately.</p>
       <div class="field"><label class="fl">Subscription / service pricing</label><textarea class="inp" data-bind="ui.ps.plans">${esc(f.plans || '')}</textarea></div></div></div>
   <div class="stack"><div class="card"><div class="eyebrow dash" style="margin-bottom:12px">General</div><div class="field"><label class="fl">Platform name</label><input class="inp" data-bind="ui.ps.name" value="${esc(f.name)}"></div>
     <div class="field"><label class="fl">Super admins</label><input class="inp" data-bind="ui.ps.adminsText" value="${esc(f.adminsText)}"><div class="small muted" style="margin-top:4px">Comma-separated emails. Super admins can see and manage every box office.</div></div></div></div></div>`;
@@ -2046,13 +2293,14 @@ function PSettings() {
 // ── Public: a box office's own page, and self-registration ──────────────────────
 function BoxOfficePage() {
   const bo = S.bos.find(b => b.slug === S.route.params[0]); if (!bo) return NotFound();
-  const br = bo.branding, evs = listedEvents().filter(e => e.box_office_id === bo.id);
+  const br = bo.branding, all = listedEvents().filter(e => e.box_office_id === bo.id), evs = filterEvents(all);
   const soc = [['website', br.website, br.website], ['instagram', br.instagram, br.instagram && 'https://instagram.com/' + br.instagram.replace(/^@/, '')], ['facebook', br.facebook, br.facebook], ['tiktok', br.tiktok, br.tiktok && 'https://tiktok.com/@' + br.tiktok.replace(/^@/, '')]].filter(x => safeUrl(x[2]));
   return `<header class="bo-hero" style="${safeUrl(br.banner) ? `background-image:linear-gradient(rgba(0,0,0,.35),rgba(0,0,0,.7)),url('${safeUrl(br.banner)}')` : ''}"><div class="container">
       ${safeUrl(br.logo) ? `<img class="bo-logo" src="${esc(safeUrl(br.logo))}" alt="${esc(bo.name)}">` : ''}<h1 class="display">${esc(bo.name)}</h1>${br.tagline ? `<p>${esc(br.tagline)}</p>` : ''}
       ${soc.length ? `<div class="row wrap" style="margin-top:14px">${soc.map(([k, , u]) => `<a class="btn glass btn-sm" href="${esc(u)}" target="_blank" rel="noopener">${k[0].toUpperCase() + k.slice(1)}</a>`).join('')}</div>` : ''}</div></header>
     <section class="container section"><div class="eyebrow dash" style="margin-bottom:16px">Upcoming events</div>
-      ${evs.length ? `<div class="ev-grid">${evs.map(EvCard).join('')}</div>` : '<div class="empty">No events on sale right now — check back soon.</div>'}</section>
+      ${all.length > 1 ? EventFilters(all) : ''}
+      ${evs.length ? `<div class="ev-grid">${evs.map(EvCard).join('')}</div>` : `<div class="empty">${all.length ? 'No events match — try a different search.' : 'No events on sale right now — check back soon.'}</div>`}</section>
     <section class="container section" style="padding-top:0"><div class="cols"><div class="card"><h3>Contact</h3><p class="small" style="margin-top:6px">${bo.settings.contactEmail ? `<a href="mailto:${esc(bo.settings.contactEmail)}">${esc(bo.settings.contactEmail)}</a>` : ''}${br.phone ? '<br>' + esc(br.phone) : ''}</p></div>
       <div class="card"><h3>Policies</h3><p class="small" style="margin-top:6px"><a href="#" data-action="showPolicy" data-v="terms">Terms</a>${br.refundPolicy ? ' · <a href="#" data-action="showPolicy" data-v="refundPolicy">Refunds</a>' : ''}${br.privacyPolicy ? ' · <a href="#" data-action="showPolicy" data-v="privacyPolicy">Privacy</a>' : ''}</p></div></div></section>`;
 }
@@ -2167,25 +2415,48 @@ const A = {
     if (a) a.qty += +el.dataset.q || 1; else S.cart.addons.push({ eventId: el.dataset.id, addonId: el.dataset.v, qty: +el.dataset.q || 1 }); saveCart(); toast('Added to your order'); render(); },
   delAddonLine: el => { S.cart.addons = S.cart.addons.filter(x => !(x.eventId === el.dataset.id && x.addonId === el.dataset.v)); saveCart(); render(); },
   placeOrder: async () => {
-    const co = S.co; co.err = '';
-    if (!co.name.trim() || !EMAIL_RE.test(co.email)) co.err = 'Please enter your name and a valid email.';
-    else if (!co.terms) co.err = 'Please accept the terms & conditions.';
-    const qs = [...new Set(S.cart.items.map(i => i.eventId))].flatMap(id => evById(id)?.questions || []).filter(q => q.required && !co.answers[q.id]);
-    if (!co.err && qs.length) co.err = 'Please answer: ' + qs.map(q => q.label).join(', ');
+    const co = S.co, set = S.settings, ck = { ...DEFAULT_SETTINGS.checkout, ...(set.checkout || {}) }, q = cartQuote(); co.err = '';
+    if (!co.name.trim() || !EMAIL_RE.test(co.email.trim())) co.err = 'Please enter your name and a valid email.';
+    else if (ck.phone === 'required' && !String(co.phone || '').trim()) co.err = 'Please enter your mobile number.';
+    else if (ck.address === 'required' && !String(co.address || '').trim()) co.err = 'Please enter your address.';
+    else co.err = checkAnswers(set.questions, cartEventIds().map(evById).filter(Boolean), co.answers, tAnswers(), ticketsPerEvent(q));
+    if (!co.err && !co.terms) co.err = 'Please accept the terms & conditions.';
     if (co.err) return render();
-    co.busy = true; render();
+    co.busy = true; co.attempt ||= uid(); render();   // one attempt id per checkout: a double click or retry returns the same order
     try {
-      const q = cartQuote();
-      const r = await DB.placeOrder({ buyer: { name: co.name.trim(), email: co.email.trim(), phone: co.phone.trim() }, items: S.cart.items, addons: S.cart.addons, code: co.disc?.code || '',
-        tracking: co.tracking || sessionStorage.getItem('set_ref') || '',
-        donation: S.cart.donation || 0, payment: q.total === 0 ? 'free' : co.payment, answers: co.answers, optIn: co.optIn, source: sessionStorage.getItem('set_src') || null, unlock: S.cart.unlock, holdToken: DB.holdToken() });
-      S.cart = { items: [], addons: [], donation: 0, unlock: {} }; saveCart();
-      S.co = { ...S.co, busy: false, disc: null, code: '', tracking: '', answers: {}, terms: false };
-      S.avail = {}; _availReq.clear(); S.order = null;
-      if (S.adm) await reloadAdmin();
-      location.hash = '#/order/' + r.id + '/' + r.key;
+      const r = await DB.placeOrder({ buyer: { name: co.name.trim(), email: co.email.trim(), phone: String(co.phone || '').trim(), ...(co.address ? { address: co.address.trim() } : {}) },
+        items: S.cart.items, addons: S.cart.addons, code: co.disc?.code || '', tracking: co.tracking || sessionStorage.getItem('set_ref') || '',
+        donation: S.cart.donation || 0, payment: q.total === 0 ? 'free' : co.payment, answers: co.answers, ticketAnswers: tAnswers(), optIn: co.optIn,
+        source: sessionStorage.getItem('set_src') || null, unlock: S.cart.unlock, holdToken: DB.holdToken(), attempt: co.attempt });
+      if (r.status === 'awaiting_payment') return startPay(r);
+      checkoutDone(r);
     } catch (e) { co.busy = false; co.err = e.message; render(); }
   },
+  payCard: async () => payWith(S.co.card || {}),
+  payWallet: el => payWith({ wallet: el.dataset.v }),
+  payCancel: async () => { const p = S.co.pay; if (!p) return; await DB.cancelCheckout(p.id, p.key).catch(() => { }); endPay(); toast('Checkout cancelled — your seats were released'); },
+  payRestart: () => { endPay(); },
+  sigClear: el => { setPath(S.co, el.dataset.v, ''); render(); },
+  resumePay: async e => { await resumePay(); location.hash = '#/cart'; },
+  saveTickets: async () => {
+    const ord = S.order?.order; if (!ord) return;
+    try { const r = await DB.custSignUp({ name: ord.data.buyer.name, email: ord.buyer_email, password: S.ui.saveAcct?.pw || '' }); S.ui.saveAcct = {};
+      if (r.confirm) toast('Check your email to confirm your account'); else { await loadCustomer(); toast('Account created — your tickets are saved'); } render(); } catch (e) { toast(e.message, true); }
+  },
+  custAuth: async () => {
+    const f = S.ui.ca || {}; f.err = '';
+    try {
+      if (f.mode === 'up') { const r = await DB.custSignUp({ name: f.name, email: f.email, password: f.pw }); if (r.confirm) { f.sent = true; return render(); } }
+      else if (f.mode === 'forgot') { await DB.custForgot(f.email); f.sent = true; return render(); }
+      else await DB.custSignIn(f.email, f.pw);
+      S.ui.ca = { mode: 'in' }; S.wallet = null; await loadCustomer(); render();
+    } catch (e) { f.err = e.message; S.ui.ca = f; render(); }
+  },
+  custMode: el => { S.ui.ca = { ...(S.ui.ca || {}), mode: el.dataset.v, err: '', sent: false }; render(); },
+  custOut: async () => { await DB.custSignOut(); S.cust = null; S.wallet = null; S.co = { ...S.co, name: '', email: '', phone: '' }; location.hash = '#/account'; render(); },
+  custTab: el => { S.ui.wtab = el.dataset.v; render(); },
+  saveProfile: async () => { const f = S.ui.prof || {}; try { await DB.saveProfile({ name: f.name ?? S.cust.name, phone: f.phone ?? S.cust.phone }); await loadCustomer(); S.ui.prof = {}; toast('Profile saved'); render(); } catch (e) { toast(e.message, true); } },
+  changePw: async () => { const f = S.ui.pw || {}; try { await DB.changePassword(f.cur || '', f.next || ''); S.ui.pw = {}; toast('Password changed'); render(); } catch (e) { toast(e.message, true); } },
   resendMine: () => toast(DB.live ? 'Email delivery is not connected yet — save this page.' : 'Demo mode: email sending is off. Your tickets are on this page.'),
   findOrder: async () => { const f = S.ui.find || {}; try { const r = await DB.lookupOrder(f.ref || '', f.email || ''); if (r) location.hash = '#/order/' + r.id + '/' + r.key; else { f.err = 'No order matches that number and email.'; S.ui.find = f; render(); } } catch (e) { toast(e.message, true); } },
   joinWaitlist: async el => { const w = S.ui.wl || {}; try { await DB.joinWaitlist(el.dataset.id, w.name || '', w.email || '', w.phone || ''); S.ui.wl = { done: el.dataset.id }; render(); } catch (e) { toast(e.message, true); } },
@@ -2260,7 +2531,7 @@ const A = {
     try { await DB.setBoxOfficeStatus(b.id, v); S.plat = null; await refreshPublic(); toast(`${b.name}: ${BO_STATUS[v]}`); render(); } catch (e) { toast(e.message, true); }
   },
   boDelete: async el => { const b = S.plat.bos.find(x => x.id === el.dataset.id); const typed = window.prompt(`Permanently delete ${b.name}? This can't be undone. Type the box office name to confirm.`); if (typed?.trim() !== b.name) return toast('Not deleted'); try { await DB.deleteBoxOffice(b.id); S.plat = null; toast('Deleted'); render(); } catch (e) { toast(e.message, true); } },
-  savePlatform: async () => { const f = S.ui.ps; try { await DB.savePlatform({ name: f.name, publicRegistration: !!f.publicRegistration, feePct: +f.feePct || 0, feeFixed: +f.feeFixed || 0, plans: f.plans, admins: f.adminsText.split(',') }); S.ui.ps = null; S.plat = null; await refreshPublic(); toast('Platform settings saved'); render(); } catch (e) { toast(e.message, true); } },
+  savePlatform: async () => { const f = S.ui.ps; try { await DB.savePlatform({ name: f.name, publicRegistration: !!f.publicRegistration, feePct: +f.feePct || 0, feeFixed: +f.feeFixed || 0, feePayer: f.feePayer === 'buyer' ? 'buyer' : 'organizer', plans: f.plans, admins: f.adminsText.split(',') }); S.ui.ps = null; S.plat = null; await refreshPublic(); toast('Platform settings saved'); render(); } catch (e) { toast(e.message, true); } },
   register: async () => { const f = S.ui.reg; try { await DB.createBoxOffice({ name: f.name, ownerEmail: f.ownerEmail, ownerName: f.ownerName }, true); f.done = true; render(); } catch (e) { toast(e.message, true); } },
   newEvent: () => { if ((S.adm.bo.eventTemplates || []).length) NewEventModal(); else A.blankEvent(); },
   blankEvent: async () => {
@@ -2437,8 +2708,18 @@ const A = {
     const i = list.findIndex(x => x.id === v.id); if (i >= 0) list[i] = v; else list.push(v);
     try { await DB.saveVenues(list); S.adm.bo.venues = list; S.draft.seating.venueId = v.id; S.draft.seating.venueName = v.name; dirty(); toast('Saved to venue library as “' + v.name + '”'); render(); } catch (e) { toast(e.message, true); }
   },
-  addQ: () => { (S.draft.questions ||= []).push({ id: shortId('q_'), label: 'New question', type: 'text', options: '', required: false }); dirty(); render(); },
-  delQ: el => { S.draft.questions.splice(+el.dataset.i, 1); dirty(); render(); },
+  addQ: el => { const o = el.dataset.v === 'set' ? S.ui.set : S.draft; (o.questions ||= []).push({ id: shortId('q_'), label: 'New question', type: 'text', options: '', required: false, scope: el.dataset.v === 'set' ? 'order' : 'event' }); if (o === S.draft) dirty(); render(); },
+  delQ: el => { const o = el.dataset.v === 'set' ? S.ui.set : S.draft; o.questions.splice(+el.dataset.i, 1); if (o === S.draft) dirty(); render(); },
+  pgSection: el => { const pg = S.draft.page ||= {}; (pg.hide ||= {})[el.dataset.v] = !el.checked; dirty(); render(); },
+  pgAdd: el => { const pg = S.draft.page ||= {}; (pg[el.dataset.v] ||= []).push(el.dataset.v === 'blocks' ? { id: shortId('blk_'), title: '', text: '' } : { name: '', logo: '', url: '' }); dirty(); render(); },
+  pgDel: el => { S.draft.page[el.dataset.v].splice(+el.dataset.i, 1); dirty(); render(); },
+  pgColorsReset: () => { delete S.draft.page.accent; delete S.draft.page.ink; dirty(); render(); },
+  gwConnect: async el => {
+    try { const r = await DB.connectGateway(el.dataset.v, true); if (r?.url) { location.href = r.url; return; } await reloadAdmin(); await refreshPublic(); toast('Payment processor connected'); render(); } catch (e) { toast(e.message, true); }
+  },
+  gwDisconnect: async () => { if (!confirm('Disconnect the payment processor? Card checkout stops until you connect one again.')) return; try { await DB.disconnectGateway(); await reloadAdmin(); await refreshPublic(); toast('Disconnected'); render(); } catch (e) { toast(e.message, true); } },
+  boFee: el => PlatformFeeModal(el.dataset.id),
+  saveBoFee: async el => { const f = S.ui.bf; try { await DB.setPlatformFee(el.dataset.id, f.useDefault ? null : { pct: f.pct === '' ? '' : +f.pct, fixed: f.fixed === '' ? '' : Math.round(+f.fixed * 100), payer: f.payer || '' }); closeModal(); S.plat = null; toast('Platform fee saved'); render(); } catch (e) { toast(e.message, true); } },
   addAddon: () => { (S.draft.addons ||= []).push({ id: shortId('ad_'), name: 'New product', price: 1000, qty: 0, max: 0, desc: '', category: 'Other', salesStart: '', salesEnd: '', ticketTypeIds: [], areas: [], standalone: false }); dirty(); render(); },
   delAddon: el => { const a = S.draft.addons[+el.dataset.i]; if (S.adm.orders.some(o => ['paid', 'pending'].includes(o.status) && o.data.lines.some(l => l.addonId === a.id || (l.addons || []).some(x => x.addonId === a.id)))) return toast('This product has been sold — hide it instead', true);
     if ((S.draft.bundles || []).some(b => (b.addons || []).some(x => x.addonId === a.id))) return toast('A package includes this product — remove it from the package first', true);
@@ -2570,14 +2851,15 @@ document.addEventListener('input', e => {
   }
   if (el.dataset.input) {
     const k = el.dataset.input, v = el.value;
-    if (k === 'homeq') S.home.q = v; else if (k === 'pw') S.sel.pw = v;
+    if (k === 'pgGallery') { (S.draft.page ||= {}).gallery = v.split('\n').map(x => x.trim()).filter(Boolean); dirty(); return; }
+    if (k === 'homeq') S.home.q = v; else if (k === 'homeWhen') S.home.when = v; else if (k === 'pw') S.sel.pw = v;
     else if (k === 'wlName' || k === 'wlEmail' || k === 'wlPhone') (S.ui.wl ||= {})[{ wlName: 'name', wlEmail: 'email', wlPhone: 'phone' }[k]] = v;
     else if (k === 'findRef' || k === 'findEmail') (S.ui.find ||= {})[k === 'findRef' ? 'ref' : 'email'] = v;
     else if (k === 'loginEmail') S.ui.login.email = v; else if (k === 'loginCode') S.ui.login.code = v; else if (k === 'loginTotp') S.ui.login.totp = v;
     else if (k === 'sc.q') { S.sc.q = v; return render(); }
     else if (k.includes('.')) { const [a, b] = k.split('.'); (S.ui[a] ||= {})[b] = v; if (a === 'mo' && el.dataset.rerender) ManualOrderModal(); if (el.dataset.rr || (a === 'inv' && b === 'template')) render(); return; }
     else S.ui[k] = v;
-    if (['homeq', 'q', 'ev', 'status', 'attEv', 'repEv'].includes(k)) render();
+    if (['homeq', 'homeWhen', 'q', 'ev', 'status', 'attEv', 'repEv'].includes(k)) render();
   }
 });
 document.addEventListener('change', e => { const el = e.target; const fn = CHANGE[el.dataset.actionChange]; if (fn) fn(el); });
@@ -2644,6 +2926,18 @@ setInterval(async () => {
   const sess = await DB.session().catch(() => null), ok = sess && await DB.stillAllowed();
   if (!ok) { S.user = sess; S.adm = null; toast(sess ? 'Your access to this box office was changed' : 'You were signed out', true); if (sess) await reloadAdmin().catch(() => { }); render(); }
 }, 20000);
+async function loadCustomer() {
+  S.cust = await DB.custSession().catch(() => null);
+  if (S.cust) { const co = S.co; co.name ||= S.cust.name; co.email ||= S.cust.email; co.phone ||= S.cust.phone; }
+}
+// an interrupted card checkout (closed tab, lost signal) picks up where it stopped while its time lasts
+async function resumePay() {
+  let pend = null; try { pend = JSON.parse(localStorage.getItem('set_pay') || 'null'); } catch (e) { }
+  if (!pend) return;
+  const o = await DB.getOrder(pend.id, pend.key).catch(() => null);
+  if (o?.order?.status === 'awaiting_payment' && D(o.order.expires_at) > Date.now()) startPay({ ...pend, status: 'awaiting_payment', total: o.order.data.total, expires_at: o.order.expires_at });
+  else try { localStorage.removeItem('set_pay'); } catch (e) { }
+}
 async function boot() {
   try {
     LOGO = (await (await fetch('set-logo.svg')).text()).replace('<svg ', '<svg class="set-logo" role="img" aria-label="SET" ');
@@ -2652,6 +2946,8 @@ async function boot() {
     await refreshPublic();
     S.user = await DB.session();
     if (S.user && !S.user.mfa) await reloadAdmin().catch(e => { S.user = null; toast(e.message, true); });
+    await loadCustomer();
+    resumePay();
   } catch (e) { console.error(e); toast('Could not load events: ' + e.message, true); }
   S.sc.queue = loadQueue(); try { S.sc.evId = localStorage.getItem('set_scan_ev') || ''; } catch (e) { }
   S.loading = false; loadPixels(); onRoute(); flushQueue();

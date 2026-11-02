@@ -42,13 +42,29 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   box-office wide (`promos`, `tracking_codes`; one code namespace incl. bulk unique `codes`) — `findCode()` / `find_code()`. Promo discounts
   are per unit (`line.discs`), so every ticket stores `face`, `paid`, `discount`, `promo`, `tracking`, `bundle`, `extras`, `comp`,
   `price_override`. Tracking links are `?ref=CODE` (views keep the ref). Promotions page = `#/admin/promos`.
+- **Checkout & payments (Stage 5):** tickets exist ONLY for paid orders (or deliberate staff orders/comps). Order states
+  (`ORDER_STATUS`): `awaiting_payment` (card checkout, holds seats/stock for `PAY_MINUTES` via `expires_at`), `pending` (pay-later
+  reservation, no tickets until staff "Mark paid"), `expired`, `paid`, `cancelled`, `refunded`. Unpaid-but-reserved orders count in
+  availability through `lineUnits()` / SQL `reserved_units()`; `issueOrderTickets()` / `issue_order_tickets()` run once on paid (SQL: the
+  `orders_paid` trigger) and queue ONE `outbox` confirmation. Same checkout submitted twice → same order (`attempt` key). Processors:
+  `GATEWAYS` in data.js + `supabase/functions/payments/` (one adapter per processor in `providers/`; Stripe Connect direct charges with
+  the platform fee as application fee; webhook → `confirm_payment()`, which refunds late payments whose seats are gone). DEMO uses a
+  built-in test processor with Stripe's test card numbers (`demoCharge`). Box office's processor = `bo.gateway` (public part) +
+  `payment_accounts` (account id, service-role only). Money breakdown is in `quote()` / `price_cart()`: ticketsTotal, addonsTotal, fee,
+  serviceFee (platform fee when the buyer pays it), tax (`taxOnFees`), processing (only if `passProcessing`), processingFee, platformFee
+  (`platformFeeFor()`: platform default + super-admin per-box-office override), refunded, total. Buyers get `buyerOrder()` / `buyer_order()`
+  (never platform/processing fees or payment internals). Checkout questions: box office `settings.questions` (per order) + `event.questions`
+  with `scope` event|ticket, types in `Q_TYPES`, checked server-side by `checkAnswers()` / `check_answers()`; per-ticket answers land on
+  `tickets.answers`. Event page sections + `event.page` (video, gallery, sponsors, blocks, hide{}, colours, checkoutNote). Customer accounts
+  (`#/account`, optional): DEMO `st.customers` (PBKDF2), LIVE Supabase Auth email+password + `my_orders()` (confirmed email only).
 - **Money is integer cents everywhere.**
-- **Not yet wired:** Stripe card payments (needs a Supabase Edge Function + webhook), outbound email/SMS
-  (confirmations, reminders, broadcasts are recorded but not sent), Apple Wallet passes.
+- **Not yet wired:** the payments Edge Function is written but not deployed (no Supabase project yet; needs Stripe keys in
+  Supabase secrets + pg_cron for `expire_orders()`); outbound email/SMS (confirmations are queued in `outbox`, not sent); Apple Wallet passes.
 
 ## Run locally
 `cd frontend && python3 -m http.server 8765` → http://localhost:8765 (organizer side: /#/admin).
 Tests: copy `tests/*.html` into `frontend/`, open via the local server (headless Chrome `--dump-dom` works), then delete the copies.
+Stage 5's suite uses PBKDF2 (real CPU time), so run it in real time (poll its `#out`), not with `--virtual-time-budget`.
 
 ## Deploy
 Live at https://moishsonn-tech.github.io/set-tickets/ (public repo moishsonn-tech/set-tickets).

@@ -89,3 +89,21 @@ Add the new public key to the new company's GitHub account.
 6. Open `CLAUDE.md` in Claude Code and describe the use case — it will build in the owner's style.
 7. Adding email, payments, maps, scheduled jobs, browser automation, LLM calls, push, or PDF
    output? Read `INTEGRATIONS.md` for the proven option in each category before picking one.
+
+## SET — taking real card payments (Stage 5)
+1. Create the SET Supabase project (separate from any other app), run `supabase/schema.sql`, fill `frontend/config.js`.
+2. Turn on **pg_cron** (Database → Extensions) and run `select cron.schedule('set-expire-checkouts', '* * * * *', 'select expire_orders()');`
+   — unpaid card checkouts release their seats after 15 minutes.
+3. In Stripe (platform account): enable **Connect** (Express accounts). Then set the secrets — in your own terminal, never in chat:
+   `supabase secrets set STRIPE_SECRET_KEY=sk_test_… STRIPE_PUBLISHABLE_KEY=pk_test_… APP_ORIGINS=https://your-site`
+4. Deploy: `supabase functions deploy payments --no-verify-jwt`.
+5. Stripe → Developers → Webhooks → add `https://<project>.functions.supabase.co/payments?webhook=stripe`, listening to
+   `payment_intent.succeeded`, `payment_intent.payment_failed`, `account.updated` (tick "events on Connected accounts"). Put its signing
+   secret in `STRIPE_WEBHOOK_SECRET`.
+6. Each box office: Settings → Payments → Connect Stripe → finishes Stripe's onboarding → card checkout turns on by itself.
+Test with Stripe's test cards first (4242 4242 4242 4242); switch to live keys only when everything checks out.
+
+## SET — custom domains for a box office
+Each box office already has a branded link (`#/b/<slug>`). A custom domain (tickets.theirvenue.com) needs production hosting that can
+issue certificates per domain (e.g. Cloudflare for SaaS / Vercel domains) pointing at the same site — planned with Stage 10's hosting.
+The box office saves the domain under Branding today; it shows "Not connected yet" until then.

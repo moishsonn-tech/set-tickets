@@ -1,0 +1,216 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Stage 5 — box office website, event pages, checkout, questions, payment gateways, fees & taxes, customer accounts, backend separation,
+// payment failures, confirmation (Eli's Step 5). Run from the local server: /stage5-e2e.html
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow; const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=6000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t);
+const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));
+let lastErr=''; async function throwsP(code){ try{ await E(code); lastErr='(no error)'; return false }catch(e){ lastErr=e.message; return e.message||true } }
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const tt=(slug,name)=>ev(slug).ticketTypes.find(t=>t.name===name);
+const free=(slug,ttName,n)=>E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='${slug}'),t=e.ticketTypes.find(t=>t.name==='${ttName}');return [...seatStates(e,{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt===t.id).map(x=>x.p.id).slice(0,${n})})()`);
+const CARD={number:'4242424242424242',exp:'12/34',cvc:'123'}, DECLINE={number:'4000000000000002',exp:'12/34',cvc:'123'}, NSF={number:'4000000000009995',exp:'12/34',cvc:'123'};
+const place=(p,team)=>`DB.placeOrder(${JSON.stringify({buyer:{name:'Pay Tester',email:'pay5@test.co'},addons:[],payment:'card',...p})}${team?',true':''})`;
+const order=id=>E(`Demo.st.orders.find(o=>o.id==='${id}')`), tickets=id=>E(`Demo.st.tickets.filter(t=>t.order_id==='${id}')`);
+const seatTaken=(slug,seat)=>E(`offSeats(availabilityFrom(Demo.st.tickets,Demo.st.events.find(e=>e.slug==='${slug}').id,Demo.st.seatStatus,'',Demo.st.orders),'').has('${seat}')`);
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.noSingles=false;Demo.save()`);  // the gap rule is Stage 3's
+  const g=ev('winter-orchestra-gala'), neon=ev('neon-nights-live'), food=ev('city-food-festival'), fs=ev('founders-summit'), kids=ev('kids-science-show');
+  const stalls=tt('winter-orchestra-gala','Stalls'), ga=tt('neon-nights-live','General admission');
+
+  // ── §1 customer-facing box office website ──
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='founders-summit');e.salesStart=new Date(Date.now()+3*864e5).toISOString();Demo.save()})()`); await E('refreshPublic()');
+  W().location.hash='#/'; await sleep(60); E('S.avail={};_availReq.clear()'); E('render()'); await until(()=>has('Coming soon'));
+  ok(has('Coming soon'),'listing shows "Coming soon" when sales open later');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='founders-summit');e.salesStart='';Demo.save()})()`); await E('refreshPublic()');
+  const nAv=E(`availabilityFrom(Demo.st.tickets,'${neon.id}',[],'',Demo.st.orders)`);
+  ok(E(`saleState(S.events.find(e=>e.slug==='neon-nights-live'),{...${JSON.stringify(nAv)},total:0,tt:{}})`)==='onsale','plenty left → on sale');
+  ok(E(`saleState({ticketTypes:[{id:'a',qty:100}]},{tt:{a:95},total:95,seats:[],off:[]})`)==='low' && E(`saleState({ticketTypes:[{id:'a',qty:100}]},{tt:{a:100},total:100,seats:[],off:[]})`)==='soldout','few left / sold out states');
+  W().location.hash='#/'; await sleep(60); E(`S.home.q='neon'`); E('render()'); await sleep(40);
+  ok(W().document.querySelectorAll('.ev-card').length===1 && has('Neon Nights Live'),'search filters the listing');
+  E(`S.home.q='';S.home.when='week'`); E('render()'); await sleep(40);
+  const wk=[...W().document.querySelectorAll('.ev-card h3')].map(x=>x.textContent); ok(wk.includes('Neon Nights Live') && !wk.includes('Big Bang Science Show'),'date filter: next 7 days '+wk.join('|'));
+  E(`S.home.when='';S.home.cat='All'`);
+  W().location.hash='#/b/harbor-arts'; await until(()=>has('Harbor Arts Center')); await sleep(60);
+  const hb=[...W().document.querySelectorAll('.ev-card h3')].map(x=>x.textContent); ok(hb.length>=2 && !hb.includes('Winter Orchestra Gala') && W().document.querySelector('[data-input="homeq"]'),'box office homepage lists only its own events, with search: '+hb.join('|'));
+  ok(E(`getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()`)==='#7fd3b4','box office branding applied on its site');
+  W().location.hash='#/e/neon-nights-live'; await until(()=>has('Neon Nights Live')); ok(W().document.querySelector('.ticket-panel'),'direct event link opens the event page');
+  ok(E(`DB.live`)===false && E(`!!document.querySelector('meta[name="viewport"]')`),'mobile viewport set (screenshots cover phone width)');
+
+  // ── §2 customizable event pages ──
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').page.video='https://youtu.be/aqz-KE-bpKQ';Demo.save()`); await E('refreshPublic()');
+  W().location.hash='#/e/winter-orchestra-gala'; await until(()=>has('The programme'));
+  ok(W().document.querySelector('.ev-video iframe')?.src.startsWith('https://www.youtube-nocookie.com/embed/'),'video section embeds YouTube (no-cookie)');
+  ok(has('Lyric Bank') && has('Hudson Foundation') && has('The programme'),'sponsors and a custom text block show');
+  ok(E(`videoEmbed('https://evil.example/x.mp4')`)==='' && E(`videoEmbed('https://vimeo.com/123456789')`)==='https://player.vimeo.com/video/123456789','only YouTube / Vimeo can be embedded');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='winter-orchestra-gala');e.page.hide={video:true,sponsors:true};e.page.accent='#cc3366';Demo.save()})()`); await E('refreshPublic()');
+  W().location.hash='#/'; await sleep(40); W().location.hash='#/e/winter-orchestra-gala'; await until(()=>has('The programme'));
+  ok(!W().document.querySelector('.ev-video') && !has('Lyric Bank'),'sections can be switched off');
+  ok(E(`getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()`)==='#cc3366','per-event colour overrides the box office');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='winter-orchestra-gala');e.page.hide={};delete e.page.accent;Demo.save()})()`); await E('refreshPublic()');
+
+  // ── §6 fees & taxes: Eli's example (Tickets $300 · Booking fee $12 · Sales tax $8.50 · Discount −$30 · Total $290.50) ──
+  const eli={id:'eli',name:'Example',ticketTypes:[{id:'t',name:'Seat',price:10000,qty:0}],timeSlots:[]};
+  const eq=E(`quote({items:[{eventId:'eli',ticketTypeId:'t',qty:3}],addons:[]},[${JSON.stringify(eli)}],{...DEFAULT_SETTINGS,feeMode:'buyer',feePct:4,feeFixed:0,taxPct:850/270,platform:{pct:1,fixed:0,payer:'organizer'},card:{pct:2.9,fixed:30,pass:false}},{id:'p',code:'TEN',type:'pct',amount:10,on:'tickets'},{method:'card'})`);
+  ok(eq.ticketsTotal===30000 && eq.fee===1200 && eq.tax===850 && eq.discount===3000 && eq.total===29050,'Eli\'s example: $300 + $12 fee + $8.50 tax − $30 = $290.50 → '+JSON.stringify({t:eq.ticketsTotal,f:eq.fee,x:eq.tax,d:eq.discount,T:eq.total}));
+  ok(eq.processingFee===Math.round(29050*.029)+30 && eq.processing===0 && eq.platformFee===270,'processing fee and platform fee calculated and kept separate (not charged to the buyer)');
+  const eq2=E(`quote({items:[{eventId:'eli',ticketTypeId:'t',qty:3}],addons:[]},[${JSON.stringify(eli)}],{...DEFAULT_SETTINGS,feeMode:'buyer',feePct:4,feeFixed:0,taxPct:0,taxOnFees:true,platform:{pct:1,fixed:50,payer:'buyer'},card:{pct:2.9,fixed:30,pass:true}},null,{method:'card'})`);
+  ok(eq2.serviceFee===450 && eq2.processing===Math.round((30000+1200+450)*.029)+30 && eq2.total===30000+1200+450+eq2.processing,'buyer-pays platform fee (service fee) and passed-on card processing add to the total');
+  ok(E(`quote({items:[{eventId:'eli',ticketTypeId:'t',qty:3}],addons:[]},[${JSON.stringify(eli)}],{...DEFAULT_SETTINGS,taxPct:10,taxOnFees:true,feeMode:'buyer',feePct:4,platform:{pct:0,fixed:0}},null,{}).tax`)===3120,'tax on fees when the box office chooses');
+
+  // ── §9 payment failures + tickets only after payment ──
+  const s1=free('winter-orchestra-gala','Stalls',2);
+  const r1=await E(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:2,seats:s1}],attempt:'att-1'}));
+  ok(r1.status==='awaiting_payment' && tickets(r1.id).length===0,'card order is awaiting payment with NO tickets issued');
+  ok(seatTaken('winter-orchestra-gala',s1[0]) && /just taken|being held/.test(String(await throwsP(place({buyer:{name:'Other',email:'other@test.co'},items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:[s1[0]]}]})))),'its seats are reserved — nobody else can buy them (no double-selling)');
+  const r1b=await E(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:2,seats:s1}],attempt:'att-1'}));
+  ok(r1b.id===r1.id && r1b.again && E(`Demo.st.orders.filter(o=>o.attempt_key==='att-1').length`)===1,'duplicate submit of the same checkout returns the same order');
+  ok(/declined/.test(String(await throwsP(`DB.payOrder('${r1.id}','${order(r1.id).access_key}',${JSON.stringify(DECLINE)})`))) && order(r1.id).status==='awaiting_payment' && tickets(r1.id).length===0,'declined card: order stays unpaid, no tickets');
+  ok(/insufficient/.test(String(await throwsP(`DB.payOrder('${r1.id}','${order(r1.id).access_key}',${JSON.stringify(NSF)})`))),'insufficient funds reported');
+  ok(/invalid/.test(String(await throwsP(`DB.payOrder('${r1.id}','${order(r1.id).access_key}',{number:'4242424242424241',exp:'12/34',cvc:'123'})`))),'bad card number rejected');
+  await E(`DB.payOrder('${r1.id}','${order(r1.id).access_key}',${JSON.stringify(CARD)})`);
+  const o1=order(r1.id);
+  ok(o1.status==='paid' && tickets(r1.id).length===2 && o1.payment.attempts.length===4 && o1.payment.attempts.filter(a=>!a.ok).length===3,'retry succeeds → paid, tickets issued, every attempt recorded');
+  await E(`DB.payOrder('${r1.id}','${o1.access_key}',${JSON.stringify(CARD)})`);
+  ok(tickets(r1.id).length===2 && order(r1.id).payment.attempts.length===4,'paying again after success never charges twice or issues extra tickets');
+  ok(E(`confirmPayment(Demo.st,Demo.st.orders.find(o=>o.id==='${r1.id}'),{provider:'demo',ref:'dup'})`)==='already','a duplicate processor confirmation is ignored');
+  ok(E(`Demo.st.outbox.filter(m=>m.order_id==='${r1.id}').length`)===1,'exactly ONE confirmation email queued for the order');
+  // interrupted / expired checkout → seats released
+  const s2=free('winter-orchestra-gala','Stalls',1);
+  const r2=await E(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:s2}],attempt:'att-2'}));
+  ok(seatTaken('winter-orchestra-gala',s2[0]),'abandoned checkout still holds its seat while the timer runs');
+  E(`Demo.st.orders.find(o=>o.id==='${r2.id}').expires_at=new Date(Date.now()-1000).toISOString();Demo.save()`);
+  await E(`DB.availability('${g.id}')`);
+  ok(order(r2.id).status==='expired' && !seatTaken('winter-orchestra-gala',s2[0]) && E(`Demo.st.seatLog.some(l=>l.seat==='${s2[0]}'&&l.action==='released')`),'checkout expired → order expired, seat released and logged');
+  ok(/expired/.test(String(await throwsP(`DB.payOrder('${r2.id}','${order(r2.id).access_key}',${JSON.stringify(CARD)})`))) && tickets(r2.id).length===0,'paying an expired checkout is refused');
+  // a payment that lands late, after someone else bought the seat → automatic refund, never two buyers for one seat
+  const r3=await E(place({buyer:{name:'Late Payer',email:'late@test.co'},items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:s2}]}));
+  E(`Demo.st.orders.find(o=>o.id==='${r3.id}').expires_at=new Date(Date.now()-1000).toISOString();expireOrders(Demo.st)`);
+  await E(place({buyer:{name:'Next Buyer',email:'next@test.co'},items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:s2}],card:CARD}));
+  ok(E(`confirmPayment(Demo.st,Demo.st.orders.find(o=>o.id==='${r3.id}'),{provider:'demo',ref:'late'})`)==='refunded' && order(r3.id).status==='refunded' && order(r3.id).data.refunded===order(r3.id).data.total && tickets(r3.id).length===0,'late payment for a seat that was resold is refunded automatically');
+  const r4=await E(place({buyer:{name:'Late OK',email:'lateok@test.co'},items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1}]}));
+  E(`Demo.st.orders.find(o=>o.id==='${r4.id}').expires_at=new Date(Date.now()-1000).toISOString();expireOrders(Demo.st)`);
+  ok(E(`confirmPayment(Demo.st,Demo.st.orders.find(o=>o.id==='${r4.id}'),{provider:'demo',ref:'late2'})`)==='issued' && tickets(r4.id).length===1,'late payment while tickets are still free → tickets issued');
+  // pay later: reserved, no tickets until staff mark it paid
+  const r5=await E(place({buyer:{name:'Door Payer',email:'door@test.co'},items:[{eventId:neon.id,ticketTypeId:ga.id,qty:2}],payment:'offline'}));
+  ok(r5.status==='pending' && tickets(r5.id).length===0,'pay-later reservation: no tickets yet');
+
+  // ── §5 payment gateways ──
+  ok(E(`Object.keys(GATEWAYS).join()`)==='stripe,square,paypal,authorizenet,custom,demo' && E(`GATEWAYS.stripe.adapter&&GATEWAYS.stripe.methods.includes('Apple Pay')&&GATEWAYS.stripe.methods.includes('Google Pay')`),'processors listed; Stripe (cards, Apple Pay, Google Pay) is the built adapter');
+  await as('moishsonn@gmail.com');
+  ok(E(`S.adm.bo.gateway.account`)!==E(`Demo.st.boxOffices.find(b=>b.slug==='harbor-arts').gateway.account`),'each box office has its own processor account');
+  W().location.hash='#/admin/settings'; await until(()=>has('Payment processor')||has('Disconnect'));
+  ok(has('Connected') && has('test mode') && has('Pass the card processing fee'),'Settings → Payments shows the connected processor');
+  await E('A.gwDisconnect()'); await sleep(80);
+  ok(!E(`Demo.st.boxOffices.find(b=>b.slug==='skyline-live').gateway`) && /not set up/.test(String(await throwsP(place({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1}]})))),'no processor → card checkout refused by the server');
+  ok(/isn't wired/.test(String(await throwsP(`DB.connectGateway('square')`))),'processors without an adapter can\'t be faked as connected');
+  E(`S.ui.gwPick='demo'`); E('render()'); await E(`A.gwConnect({dataset:{v:'demo'}})`); await sleep(80);
+  ok(E(`Demo.st.boxOffices.find(b=>b.slug==='skyline-live').gateway.status`)==='connected' && E(`Demo.st.audit.filter(a=>a.kind==='settings.payments').length`)>=2,'reconnect works; both changes in the activity log');
+  ok(/permission/.test(String(await (async()=>{await as('support@skyline.example');return throwsP(`DB.connectGateway('demo')`)})())),'staff without admin.payments cannot change the processor');
+  await as('moishsonn@gmail.com');
+  // §5/§6 stored separately on the order
+  const r6=await E(place({buyer:{name:'Fee Check',email:'fees@test.co'},items:[{eventId:neon.id,ticketTypeId:ga.id,qty:2}],addons:[{eventId:neon.id,addonId:neon.addons.find(a=>a.standalone).id,qty:1}],card:CARD}));
+  const d6=order(r6.id).data;
+  ok(['ticketsTotal','addonsTotal','fee','processingFee','tax','discount','refunded','total','platformFee'].every(k=>typeof d6[k]==='number') && d6.addonsTotal>0 && d6.ticketsTotal+d6.addonsTotal===d6.subtotal && d6.total===d6.subtotal-d6.discount+d6.fee+d6.serviceFee+d6.tax+d6.donation+d6.processing,'order stores tickets, add-ons, booking fee, processing fee, tax, discount, refund and total separately');
+  await E(`DB.setOrderStatus('${r6.id}','refunded')`); ok(order(r6.id).data.refunded===d6.total,'refund amount recorded');
+  // staff: mark the pay-later reservation paid → tickets
+  await E(`DB.setOrderStatus('${r5.id}','paid')`); ok(order(r5.id).status==='paid' && tickets(r5.id).length===2,'staff "Mark paid" issues the reservation\'s tickets');
+  const rc=await E(`DB.placeOrder({buyer:{name:'Guest Comp',email:'gc@test.co'},items:[{eventId:'${neon.id}',ticketTypeId:'${ga.id}',qty:1}],addons:[],payment:'manual',comp:true},true)`);
+  ok(order(rc.id).status==='paid' && tickets(rc.id).length===1,'authorized staff comps are issued immediately (no payment)');
+  W().location.hash='#/admin/orders'; await until(()=>W().document.querySelector('[data-action="openOrder"]'));
+  E(`OrderModal('${r1.id}')`); await sleep(40);
+  ok(has('Visa •••• 4242') && has('declined') && has('Confirmation email queued'),'order view shows the payment, failed attempts and the queued confirmation');
+  E('closeModal()');
+
+  // ── §4 checkout information + custom questions ──
+  const fsStd=fs.ticketTypes[0], fq=fs.questions, ans={[fq[0].id]:'Acme',[fq[3].id]:true};
+  let e4=String(await throwsP(place({items:[{eventId:fs.id,ticketTypeId:fsStd.id,qty:2}],answers:ans,ticketAnswers:{[fq[1].id]:['Ann']}})));
+  ok(/Attendee name.*ticket 2/.test(e4),'per-ticket question required for every ticket (server check): '+e4);
+  e4=String(await throwsP(place({items:[{eventId:fs.id,ticketTypeId:fsStd.id,qty:1}],answers:{[fq[0].id]:'Acme'},ticketAnswers:{[fq[1].id]:['Ann']}})));
+  ok(/accept.*code of conduct/i.test(e4),'terms question must be accepted');
+  e4=String(await throwsP(place({items:[{eventId:fs.id,ticketTypeId:fsStd.id,qty:1}],answers:ans,ticketAnswers:{[fq[1].id]:['Ann'],[fq[2].id]:['Pizza']}})));
+  ok(/Choose an option/.test(e4),'dropdown answers must be one of the options');
+  const r7=await E(place({items:[{eventId:fs.id,ticketTypeId:fsStd.id,qty:2}],answers:ans,ticketAnswers:{[fq[1].id]:['Ann Lee','Bo Diaz'],[fq[2].id]:['Vegan','None']},card:CARD}));
+  const t7=tickets(r7.id);
+  ok(t7.map(t=>t.answers[fq[1].id]).sort().join()==='Ann Lee,Bo Diaz' && t7.some(t=>t.answers[fq[2].id]==='Vegan') && order(r7.id).data.answers[fq[0].id]==='Acme','each ticket keeps its own answers; event answers on the order');
+  const kq=kids.questions, kt=kids.ticketTypes[0];
+  ok(/sign/i.test(String(await throwsP(place({items:[{eventId:kids.id,ticketTypeId:kt.id,qty:1,slotId:kids.timeSlots[2].id}],answers:{[kq[0].id]:true,[kq[1].id]:'data:image/png;base64,<script>'}})))),'waiver + signature: a forged signature value is rejected');
+  const r8=await E(place({items:[{eventId:kids.id,ticketTypeId:kt.id,qty:1,slotId:kids.timeSlots[2].id}],answers:{[kq[0].id]:true,[kq[1].id]:'data:image/png;base64,iVBORw0KGgo='},card:CARD}));
+  ok(order(r8.id).status==='paid' && order(r8.id).data.answers[kq[1].id].startsWith('data:image/png'),'signed waiver accepted and stored');
+  E(`Demo.st.boxOffices.find(b=>b.slug==='skyline-live').settings.questions=[{id:'q_need',label:'Seat request',type:'text',required:true,scope:'order'}];Demo.save()`);
+  ok(/Seat request/.test(String(await throwsP(place({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1}]})))),'box office "every order" question enforced');
+  E(`Demo.st.boxOffices.find(b=>b.slug==='skyline-live').settings.questions=[]`); E(`Object.assign(Demo.st.boxOffices.find(b=>b.slug==='skyline-live').settings.checkout,{phone:'required',address:'required'});Demo.save()`); await E('refreshPublic()');
+
+  // ── §3 checkout flow in the browser: multi-event cart → details (phone + address + per-ticket questions) → pay (decline, then success) → tickets ──
+  await E('A.signOut()'); W().location.hash='#/'; await sleep(60);
+  E(`S.cart={items:[{eventId:'${neon.id}',ticketTypeId:'${ga.id}',qty:1}],addons:[],donation:0,unlock:{}};saveCart()`);
+  const s9=free('winter-orchestra-gala','Stalls',2);
+  W().location.hash='#/e/winter-orchestra-gala'; await until(()=>W().document.querySelector('.sm-buy .st[data-action]'));
+  for (const id of s9) W().document.querySelector(`.sm-buy [data-seat="${id}"]`).dispatchEvent(new MouseEvent('click',{bubbles:true}));
+  await sleep(40); await E('A.addToCart()'); await until(()=>W().location.hash.startsWith('#/cart') && W().document.querySelector('[data-action="placeOrder"]'));
+  ok(E('cartEventIds().length')===2 && has('Neon Nights Live') && has('Winter Orchestra Gala'),'one cart, two events');
+  ok(W().document.querySelector('[data-hold]') && has('Tickets') && has('Booking fee') && has('Total') && W().document.querySelector('.co-steps'),'seat timer, step indicator and the fee breakdown before paying');
+  E(`S.co.name='Flow Five';S.co.email='flow5@test.co';S.co.terms=true`); await E('A.placeOrder()');
+  ok(/mobile/i.test(E('S.co.err')),'required mobile number enforced at checkout: '+E('S.co.err'));
+  E(`S.co.phone='(212) 555-0100';S.co.address='1 Main St'`); await E('A.placeOrder()'); await until(()=>W().document.querySelector('[data-action="payCard"]'));
+  ok(has('Pay $') && W().document.querySelector('[data-pay]') && /reserved for (14|15):/.test(W().document.querySelector('[data-pay]').textContent),'payment step: total + 15-minute timer');
+  E(`S.co.card=${JSON.stringify(DECLINE)}`); await E('A.payCard()'); await sleep(60);
+  ok(has('Your card was declined.') && W().document.querySelector('[data-action="payCard"]'),'declined card shown; buyer can retry');
+  E(`S.co.card=${JSON.stringify(CARD)}`); await E('A.payCard()'); await until(()=>W().location.hash.startsWith('#/order/')); await until(()=>W().document.querySelectorAll('.e-ticket').length===3);
+  ok(has('You\'re going!') && has('Download PDF') && has('Visa •••• 4242'),'confirmation page with tickets, PDF download and payment');
+  const oo=E('S.order.order'); ok(oo.data.buyer.address==='1 Main St' && oo.data.buyer.phone && !('platformFee' in oo.data) && !('processingFee' in oo.data) && !('payment' in oo) && !('access_key' in oo),'buyer view never includes the platform or processor fees, payment internals or keys');
+  ok(E(`Demo.st.outbox.filter(m=>m.order_id==='${oo.id}').length`)===1,'one confirmation email for the whole multi-event order');
+  ok(has('Save your tickets'),'guest checkout → offered an account to save the tickets');
+  E(`Object.assign(Demo.st.boxOffices.find(b=>b.slug==='skyline-live').settings.checkout,{phone:'optional',address:'off'});Demo.save()`); await E('refreshPublic()');
+
+  // ── §7 customer accounts ──
+  E(`S.ui.saveAcct={pw:'short'}`); await E('A.saveTickets()'); ok(!E('S.cust'),'account needs an 8+ character password');
+  E(`S.ui.saveAcct={pw:'flowfive123'}`); await E('A.saveTickets()'); await sleep(40);
+  ok(E('S.cust&&S.cust.email')==='flow5@test.co','"Save your tickets" creates the account for the order email');
+  W().location.hash='#/account'; await until(()=>has('My account')&&has('Upcoming')); await until(()=>W().document.querySelector('.wallet-card'));
+  ok(W().document.querySelectorAll('.wallet-card').length===2 && has('Neon Nights Live') && has('Winter Orchestra Gala'),'wallet: upcoming tickets from the guest order are there');
+  ok(!has('Refund') && !has('Transfer') && !has('Cancel order') && has('Contact the box office'),'no self-service refunds, cancellations or transfers');
+  await E('A.custOut()'); E(`S.ui.ca={mode:'in',email:'maya@example.com',pw:'wrongpass'}`); await E('A.custAuth()'); ok(!E('S.cust') && /Wrong email or password/.test(E('S.ui.ca.err')),'wrong password refused');
+  E(`S.ui.ca={mode:'in',email:'maya@example.com',pw:'tickets123'}`); await E('A.custAuth()'); await until(()=>E('S.cust'));
+  W().location.hash='#/account'; await until(()=>W().document.querySelector('.wallet-card'));
+  const mine=await E('DB.myOrders()'); ok(mine.orders.length>=2 && mine.orders.every(o=>o.buyer_email==='maya@example.com') && mine.tickets.every(t=>mine.orders.some(o=>o.id===t.order_id)),'wallet holds only this customer\'s own orders + tickets');
+  ok(mine.orders.some(o=>o.status==='pending') && has('Reserved'),'pay-later reservation shows in the wallet as reserved');
+  E(`S.ui.wtab='orders'`); E('render()'); ok(has('SET-') && W().document.querySelectorAll('.tbl tbody tr').length===mine.orders.length,'past orders list');
+  E(`S.ui.wtab='past'`); E('render()'); ok(has('No past events') || W().document.querySelector('.wallet-card'),'past tickets tab');
+  E(`S.ui.prof={name:'Maya P.',phone:'(917) 555-0000'}`); await E('A.saveProfile()'); ok(E('S.cust.name')==='Maya P.','profile updated');
+  E(`S.ui.pw={cur:'nope12345',next:'newpass123'}`); await E('A.changePw()'); E(`S.ui.pw={cur:'tickets123',next:'newpass123'}`); await E('A.changePw()');
+  await E('A.custOut()'); E(`S.ui.ca={mode:'in',email:'maya@example.com',pw:'newpass123'}`); await E('A.custAuth()'); ok(E('S.cust&&S.cust.email')==='maya@example.com','password changed (old one needed)');
+  // signed in at checkout → the new order is in the wallet automatically
+  W().location.hash='#/'; await sleep(40); E(`S.cart={items:[{eventId:'${neon.id}',ticketTypeId:'${ga.id}',qty:1}],addons:[],donation:0,unlock:{}};saveCart()`);
+  W().location.hash='#/cart'; await until(()=>W().document.querySelector('[data-action="placeOrder"]'));
+  ok(E('S.co.email')==='maya@example.com' && has('Signed in as'),'signed-in checkout pre-fills the details');
+  E('S.co.terms=true'); await E('A.placeOrder()'); await until(()=>W().document.querySelector('[data-action="payWallet"]'));
+  await E(`A.payWallet({dataset:{v:'apple_pay'}})`); await until(()=>W().location.hash.startsWith('#/order/'));
+  const mine2=await E('DB.myOrders()'); ok(mine2.orders.length===mine.orders.length+1 && !has('Save your tickets'),'Apple Pay (demo) → paid; order lands in the account automatically');
+  await until(()=>E('S.order&&S.order.order')); ok(E('S.order.order.paidWith')==='Apple Pay','wallet payment recorded');
+  E(`S.ui.ca={mode:'up',name:'X',email:'maya@example.com',pw:'whatever12'}`); await E('A.custOut()'); E(`S.ui.ca={mode:'up',name:'X',email:'maya@example.com',pw:'whatever12'}`); await E('A.custAuth()');
+  ok(/already an account/.test(E('S.ui.ca.err')),'one account per email');
+
+  // ── §8 backend separation: a customer can't reach admin data ──
+  E(`S.ui.ca={mode:'in',email:'maya@example.com',pw:'newpass123'}`); await E('A.custAuth()');
+  ok(E('DB._actor')===null || E('DB._actor')===undefined || E('DB._actor')==='','customer sign-in is not a staff session');
+  ok(!!(await throwsP(`DB.setOrderStatus('${r1.id}','refunded')`)) && order(r1.id).status==='paid','customer cannot change orders: '+lastErr);
+  ok(!!(await throwsP(`DB.saveBoxOffice({settings:{}})`)),'customer cannot change box office settings: '+lastErr);
+  ok(!!(await throwsP(`DB.connectGateway('demo')`)) && E(`Demo.st.boxOffices.find(b=>b.slug==='skyline-live').gateway.status`)==='connected','customer cannot touch payment settings: '+lastErr);
+  const go=await E(`DB.getOrder('${r1.id}','${order(r1.id).access_key}')`); ok(!('platformFee' in go.order.data) && !go.order.payment && !go.order.access_key && !go.order.attempt_key,'order link (id + secret key) shows the buyer view only');
+  ok(await E(`DB.getOrder('${r1.id}','wrong-key')`)===null,'an order can\'t be opened without its secret key');
+  W().location.hash='#/admin'; await until(()=>has('Organizer sign in')||W().document.querySelector('[data-action="demoAs"]')); ok(!E('S.adm'),'customer session does not open the back office');
+  await E('A.custOut()');
+
+  // ── §10 confirmation ──
+  ok(E(`Demo.st.orders.filter(o=>o.status==='paid').every(o=>Demo.st.outbox.filter(m=>m.order_id===o.id&&m.kind==='confirmation').length===1)`),'every paid order has exactly one confirmation queued');
+  ok(E(`Demo.st.orders.filter(o=>['pending','awaiting_payment','expired'].includes(o.status)).every(o=>!Demo.st.tickets.some(t=>t.order_id===o.id))`),'no unpaid order anywhere has tickets');
+  log('DONE');
+}catch(e){log('ERROR '+e.message+'\n'+e.stack)}})();
+</script></body></html>

@@ -24,7 +24,8 @@ W && (async()=>{try{
   const q=W().cartQuote(); ok(q.subtotal===7000&&q.discount===1000,'discount applied: '+JSON.stringify({s:q.subtotal,d:q.discount,f:q.fee,t:q.total}));
   click('[data-action="placeOrder"]'); await sleep(100); ok(W().eval('S').co.err,'validation blocks empty form: '+W().eval('S').co.err);
   type('[data-bind="co.name"]','Test Buyer'); type('[data-bind="co.email"]','test@example.com'); check('[data-bind="co.terms"]');
-  click('[data-action="placeOrder"]'); await until(()=>W().location.hash.startsWith('#/order/'),4000);
+  click('[data-action="placeOrder"]'); await until(()=>W().document.querySelector('[data-action="payCard"]'),4000);  // Stage 5: pay step, tickets only after payment
+  W().eval(`S.co.card={number:'4242424242424242',exp:'12/34',cvc:'123'}`); click('[data-action="payCard"]'); await until(()=>W().location.hash.startsWith('#/order/'),4000);
   await until(()=>W().document.querySelectorAll('.e-ticket').length);
   await sleep(300);
   ok(W().document.querySelectorAll('.e-ticket').length===2,'2 e-tickets rendered');
@@ -38,17 +39,18 @@ W && (async()=>{try{
   const picked=[...W().eval('S').sel.seats];
   click('[data-action="addToCart"]'); await until(()=>W().document.querySelector('[data-action="placeOrder"]'));
   type('[data-bind="co.name"]','Seat Buyer'); type('[data-bind="co.email"]','seat@example.com'); check('[data-bind="co.terms"]');
-  click('[data-action="placeOrder"]'); await until(()=>W().location.hash.startsWith('#/order/'),4000); await until(()=>W().eval('S').order?.tickets);
+  click('[data-action="placeOrder"]'); await until(()=>W().document.querySelector('[data-action="payCard"]'),4000);
+  W().eval(`S.co.card={number:'4242424242424242',exp:'12/34',cvc:'123'}`); click('[data-action="payCard"]'); await until(()=>W().location.hash.startsWith('#/order/'),4000); await until(()=>W().eval('S').order?.tickets);
   ok(W().eval('S').order.tickets.map(t=>t.seat).sort().join()===picked.sort().join(),'seats assigned '+W().eval('S').order.tickets.map(t=>t.seat));
   // double-booking the same seat must fail
-  let err=''; try{ await W().eval('DB').placeOrder({buyer:{name:'X',email:'x@x.com'},items:[{eventId:W().eval('S').order.order.event_ids[0],ticketTypeId:W().eval('S').order.tickets[0].ticket_type_id,qty:1,seats:[picked[0]]}],addons:[],payment:'card'});}catch(e){err=e.message}
+  let err=''; try{ await W().eval('DB').placeOrder({buyer:{name:'X',email:'x@x.com'},items:[{eventId:W().eval('S').order.order.event_ids[0],ticketTypeId:W().eval('S').order.tickets[0].ticket_type_id,qty:1,seats:[picked[0]]}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'}});}catch(e){err=e.message}
   ok(/taken/.test(err),'double-book blocked: '+err);
   // a cheap ticket type cannot buy a premium seat
   const g=W().eval('Demo').st.events.find(e=>e.slug==='winter-orchestra-gala'); const prem=Object.keys(g.seating.index).find(id=>g.seating.index[id]===g.ticketTypes[0].id);
-  err=''; try{ await W().eval('DB').placeOrder({buyer:{name:'X',email:'x@x.com'},items:[{eventId:g.id,ticketTypeId:g.ticketTypes[2].id,qty:1,seats:[prem]}],addons:[],payment:'card'});}catch(e){err=e.message}
+  err=''; try{ await W().eval('DB').placeOrder({buyer:{name:'X',email:'x@x.com'},items:[{eventId:g.id,ticketTypeId:g.ticketTypes[2].id,qty:1,seats:[prem]}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'}});}catch(e){err=e.message}
   ok(/isn't a/.test(err),'seat-price mismatch rejected: '+err);
   // time slot event requires slot
-  err=''; const k=W().eval('Demo').st.events.find(e=>e.slug==='city-food-festival'); try{ await W().eval('DB').placeOrder({buyer:{name:'X',email:'x@x.com'},items:[{eventId:k.id,ticketTypeId:k.ticketTypes[0].id,qty:1}],payment:'card'});}catch(e){err=e.message}
+  err=''; const k=W().eval('Demo').st.events.find(e=>e.slug==='city-food-festival'); try{ await W().eval('DB').placeOrder({buyer:{name:'X',email:'x@x.com'},items:[{eventId:k.id,ticketTypeId:k.ticketTypes[0].id,qty:1}],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'}});}catch(e){err=e.message}
   ok(/time slot/.test(err),'slot required: '+err);
   // find tickets
   W().location.hash='#/tickets'; await until(()=>W().document.querySelector('[data-input="findRef"]'));

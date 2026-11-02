@@ -13,7 +13,7 @@ const states=(slug,slot='')=>E(`seatStates(Demo.st.events.find(e=>e.slug==='${sl
 const count=(m,st)=>[...m.values()].filter(x=>x.state===st).length;
 const freeRun=(slug,n)=>{ // n+1 available seats at the start of a row, plus one more free after them (so taking any n leaves no stranded single)
   const e=ev(slug), m=states(slug); for (const ids of Object.values(e.seating.rows)) { if(ids.slice(0,n+2).every(id=>id&&m.get(id)?.state==='available')) return ids.slice(0,n+1); } return null; };
-const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({buyer:{name:'Seat Test',email:'seat@test.co'},items:[{eventId:'${e.id}',ticketTypeId:'${e.seating.index[seats[0]]}',qty:${seats.length},seats:${JSON.stringify(seats)}}],addons:[],payment:'card'${extra}})`; };
+const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({buyer:{name:'Seat Test',email:'seat@test.co'},items:[{eventId:'${e.id}',ticketTypeId:'${e.seating.index[seats[0]]}',qty:${seats.length},seats:${JSON.stringify(seats)}}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'}${extra}})`; };
 (async()=>{try{
   f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
   await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
@@ -64,7 +64,7 @@ const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({bu
   for (const id of run3) W().document.querySelector(`.sm-buy [data-seat="${id}"]`).dispatchEvent(new MouseEvent('click',{bubbles:true}));
   await sleep(50); await E('A.addToCart()'); await until(()=>W().location.hash.startsWith('#/cart'));
   await until(()=>W().document.querySelector('[data-hold]')); ok(/held for you for 9:5\d|10:00/.test(W().document.querySelector('[data-hold]').textContent),'checkout shows the hold countdown: '+W().document.querySelector('[data-hold]').textContent);
-  E(`S.co.name='Flow Buyer';S.co.email='flow@example.com';S.co.terms=true`); await E('A.placeOrder()'); await until(()=>W().document.querySelector('.e-ticket'));
+  E(`S.co.name='Flow Buyer';S.co.email='flow@example.com';S.co.terms=true`); await E('A.placeOrder()'); E(`S.co.card={number:'4242424242424242',exp:'12/34',cvc:'123'}`); await E('A.payCard()'); await until(()=>W().document.querySelector('.e-ticket'));
   const et=W().document.querySelector('.e-ticket').textContent;
   ok(/Ticket type \/ Area/.test(et) && /Row/.test(et) && /Seat/.test(et),'e-ticket shows Ticket type / Area, Row and Seat as separate fields');
   ok(W().document.querySelectorAll('.e-ticket').length===2,'two e-tickets on the order page');
@@ -189,7 +189,7 @@ const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({bu
   W().document.querySelector('.sm-ga.buy').dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(30); W().document.querySelector('.sm-ga.buy').dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(30);
   ok(E('S.sel.seats.length')===2 && E('S.sel.seats').every(x=>x.startsWith('GA-')),'standing area: tap to add spots');
   await E('A.addToCart()'); await until(()=>W().location.hash.startsWith('#/cart'));
-  E(`S.co.name='Standing Fan';S.co.email='floor@example.com';S.co.terms=true`); await E('A.placeOrder()'); await until(()=>W().document.querySelector('.e-ticket'));
+  E(`S.co.name='Standing Fan';S.co.email='floor@example.com';S.co.terms=true`); await E('A.placeOrder()'); E(`S.co.card={number:'4242424242424242',exp:'12/34',cvc:'123'}`); await E('A.payCard()'); await until(()=>W().document.querySelector('.e-ticket'));
   const gt=E(`S.order.tickets`); ok(gt.length===2 && gt.every(t=>t.area==='Standing floor' && t.row===''),'standing tickets carry their area, no row/seat');
 
   // ── venue library ──
