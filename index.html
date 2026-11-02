@@ -588,6 +588,21 @@ details.rules>summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--
 .wallet-card:hover{transform:translateY(-1px)}.ev-img.sm{width:76px;height:56px;flex:none;border-radius:10px;background-size:cover;background-position:center}
 .sec-toggles{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;margin-bottom:14px}
 @media (max-width:640px){.sec-toggles{grid-template-columns:1fr}.wallet-card .btn{display:none}.pay-wrap{padding:20px 0 40px}}
+/* ── Stage 6: order page, change / refund panel, history, customers, live activity ── */
+.ord-grid{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:18px;align-items:start}
+.tl{display:grid;gap:2px}.tl-row{display:grid;grid-template-columns:26px 1fr;gap:8px;padding:7px 0;border-bottom:1px solid var(--line)}.tl-row:last-child{border-bottom:0}
+.tl-i{width:22px;height:22px;border-radius:50%;background:var(--bg-2,#f3f1ec);display:grid;place-items:center;font-size:11px;color:var(--ink)}
+.note-row{padding:8px 10px;border-radius:10px;background:#fbf7ea;border:1px solid #efe4bf;margin-bottom:8px}
+.op-card{border:1.5px solid var(--ink);margin-bottom:18px}.op-card .field{margin:0}
+.op-sum{padding:10px 12px;border-radius:10px;background:var(--bg-2,#f6f5f1);font-size:14px}
+.op-map{border-top:1px solid var(--line);padding-top:12px}.op-map .sm-scroll{max-height:440px}
+tr.op-cur td{background:#fff8e1}tr.dimrow td{opacity:.55}
+.stackbar{display:flex;height:14px;border-radius:999px;overflow:hidden;background:var(--bg-2,#efede7)}.stackbar i{display:block;height:100%}.stackbar .s-sold{background:var(--ink)}.stackbar .s-tied{background:#e8a33d}
+.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#2fb36b;margin-right:4px;box-shadow:0 0 0 3px rgba(47,179,107,.18);vertical-align:0}
+.line.click{cursor:pointer}.line.click:hover{background:var(--bg-2,#f8f7f3)}
+@media (max-width:1100px){.ord-grid{grid-template-columns:minmax(0,1fr)}}
+.ord-grid>*,.op-card{min-width:0}
+@media (max-width:640px){.op-card .row{justify-content:stretch!important}.op-card .row .btn{flex:1}.toolbar .inp{min-width:0;width:100%}}
 </style>
 </head>
 <body>
