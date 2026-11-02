@@ -1,0 +1,122 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow; const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=6000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const click=sel=>{const el=W().document.querySelector(sel); if(!el) throw new Error('no '+sel); el.click()};
+const has=t=>W().document.body.textContent.includes(t);
+const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] '+W().document.body.textContent.slice(0,200).replace(/\s+/g,' ')));
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+async function throwsP(code){ try{ await E(code); return false }catch(e){ return e.message||true } }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+async function edit(slug, fn){ const id=ev(slug).id; W().location.hash='#/admin/event/'+id+'/details'; await until(()=>E('S.draft&&S.draft.id')===id); E(`(${fn})(S.draft)`); E('S.dirty=true'); await E('A.saveEvent()'); await sleep(60); await E('refreshPublic()'); return id; }
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  ok(E('S.events.length')===5 && !E("S.events.some(e=>e.slug==='spring-jazz-brunch')"),'scheduled event not public before its publish time');
+  W().location.hash='#/e/spring-jazz-brunch'; await sleep(250); ok(has('Page not found'),'scheduled event link not reachable yet');
+  W().location.hash='#/e/kids-science-show'; await until(()=>W().document.querySelector('.slot'));
+  const slotsTxt=[...W().document.querySelectorAll('.slot')].map(b=>(b.disabled?'X':'')+b.textContent);
+  ok(slotsTxt.some(t=>t.startsWith('X')&&t.includes('Sold out')) && slotsTxt.some(t=>t.startsWith('X')&&t.includes('Unavailable')),'showtime marked sold out / unavailable is disabled for buyers');
+  W().location.hash='#/e/city-food-festival'; await until(()=>has('City Food')&&W().document.querySelector('.slot'));
+  ok(W().document.querySelectorAll('.slot').length===2,'hidden showtime not offered');
+  ok(has("Join the waitlist"),'“always” waitlist offered while on sale');
+  const k=ev('city-food-festival'), hid=k.timeSlots.find(s=>s.hidden);
+  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${k.id}',ticketTypeId:'${k.ticketTypes[0].id}',qty:1,slotId:'${hid.id}'}],payment:'card'})`)).includes('not available'),'checkout refuses a hidden showtime');
+  await E(`DB.joinWaitlist('${k.id}','Wait Person','wait@example.com','917-555-0100')`);
+  ok(E(`Demo.st.waitlist.some(w=>w.email==='wait@example.com'&&w.phone==='917-555-0100')`),'waitlist collects name, email, phone');
+  ok(E("Object.keys(Demo.st.views).length")>0,'page views recorded');
+
+  await as('moishsonn@gmail.com');
+  // visibility
+  let id=await edit('neon-nights-live', "d=>d.visibility='link'");
+  ok(!E(`listedEvents().some(e=>e.id==='${id}')`) && !!(await E(`DB.eventBySlug('neon-nights-live')`)),'direct-link-only: not listed, link works');
+  await edit('neon-nights-live', "d=>d.visibility='hidden'");
+  ok(!(await E(`DB.eventBySlug('neon-nights-live')`)),'hidden: not reachable publicly');
+  const nn=ev('neon-nights-live');
+  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${nn.id}',ticketTypeId:'${nn.ticketTypes[0].id}',qty:1}],payment:'card'})`)).includes('not on sale'),'hidden event refuses public checkout');
+  await edit('neon-nights-live', "d=>d.visibility='public'");
+  // scheduled publish + sales open
+  await edit('spring-jazz-brunch', "d=>{d.publishAt=new Date(Date.now()-6e4).toISOString()}");
+  ok(E("S.events.some(e=>e.slug==='spring-jazz-brunch')"),'event goes public once publish time passes');
+  W().location.hash='#/e/spring-jazz-brunch'; await until(()=>has('Tickets go on sale'));
+  ok(has('Get notified'),'before sales open: shows opening time + pre-sale waitlist');
+  const sj=ev('spring-jazz-brunch');
+  ok(String(await throwsP(`DB.placeOrder({buyer:{name:'A',email:'a@b.co'},items:[{eventId:'${sj.id}',ticketTypeId:'${sj.ticketTypes[0].id}',qty:1}],payment:'card'})`)).includes('go on sale'),'checkout refused before sales open');
+  // notify waitlist
+  await E(`(async()=>{await reloadAdmin(); DB._bo=S.adm.bo.id})()`);
+  const harbor=E("Demo.st.boxOffices.find(b=>b.slug==='harbor-arts').id");
+  E(`S.ui.support='${harbor}'`); await E(`reloadAdmin('${harbor}')`);
+  const n=await E(`DB.notifyWaitlist('${k.id}','Tickets are back!')`);
+  ok(n>=2 && E(`Demo.st.waitlist.filter(w=>w.event_id==='${k.id}').every(w=>w.notified_at)`) && (await E(`DB.notifyWaitlist('${k.id}','again')`))===0,'notify waitlist marks each person once');
+  E('S.ui.support=null'); await E(`reloadAdmin('${E("Demo.st.boxOffices.find(b=>b.slug==='skyline-live').id")}')`);
+  // templates
+  ok(E('S.adm.bo.eventTemplates.length')===5,'5 event templates (Concert, Reserved, GA, Women\'s Show, Dinner)');
+  const before=E('S.adm.events.length');
+  await E(`A.fromTemplate({dataset:{v:S.adm.bo.eventTemplates.find(t=>t.name==='Dinner Concert').id}})`); await sleep(120);
+  const dc=E('S.adm.events[S.adm.events.length-1]');
+  ok(E('S.adm.events.length')===before+1 && dc.status==='draft' && Object.keys(dc.seating.index).length===120,'event from Dinner Concert template: draft with 120-seat table map');
+  ok(!E(`Demo.st.orders.some(o=>o.event_ids.includes('${dc.id}'))`) && dc.ticketTypes[0].id!==E("S.adm.bo.eventTemplates.find(t=>t.name==='Dinner Concert').event.ticketTypes[0].id"),'template copies structure with fresh ids, no orders');
+  const g=ev('winter-orchestra-gala');
+  W().location.hash='#/admin/event/'+g.id+'/overview'; await until(()=>E('S.draft&&S.draft.id')===g.id);
+  W().prompt=()=>'Gala layout'; await E('A.saveTemplate()');
+  const tp=E("S.adm.bo.eventTemplates.find(t=>t.name==='Gala layout')");
+  ok(tp && tp.event.secrets.discounts.length===0 && tp.event.seating.sections.length===4 && !tp.event.start,'save as template: keeps seating, drops dates & codes');
+  // sellout
+  const so=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets)`);
+  const manual=E(`(()=>{const e=S.adm.events.find(e=>e.id==='${g.id}');const b=new Set(e.seating.blocked);return seatLayout(e.seating).seats.filter(p=>p.tt&&!b.has(p.id)).reduce((t,p)=>t+e.ticketTypes.find(x=>x.id===p.tt).price,0)})()`);
+  ok(so.total===manual && so.total>0,'potential sellout = every unblocked seat at its price: '+so.total);
+  ok(Math.abs(so.byTT.reduce((t,r)=>t+r.potential,0)-so.total)<1 && Math.abs(so.bySec.reduce((t,r)=>t+r.potential,0)-so.total)<1,'by ticket type and by section add up');
+  const seat=Object.keys(g.seating.index).find(s=>!E('S.adm.tickets').some(t=>t.seat===s));
+  const price=g.ticketTypes.find(t=>t.id===g.seating.index[seat]).price;
+  await edit('winter-orchestra-gala', `d=>d.seating.blocked.push('${seat}')`);
+  const so2=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets)`);
+  ok(so.total-so2.total===price,'blocking a seat lowers potential by its price');
+  await edit('winter-orchestra-gala', `d=>{d.ticketTypes[2].price+=1000; d.venue='Grand Lyric Hall'}`);
+  const so3=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets)`);
+  ok(so3.total>so2.total,'price change updates potential');
+  ok(so3.soldValue>0 && so3.remaining===so3.total-so3.soldValue,'sold vs remaining potential');
+  // history
+  const hist=E(`S.adm.audit.filter(a=>a.target==='${g.id}')`);
+  ok(hist.some(a=>a.after&&a.after['Venue']==='Grand Lyric Hall'&&a.before['Venue']==='Grand Lyric Theatre') && hist.some(a=>Object.keys(a.after||{}).some(k=>k.startsWith('Price'))) && hist.some(a=>a.after&&a.after['Blocked seats']!==undefined),'history: venue, price and seat-block changes with before/after');
+  // showtimes generator
+  const ksid=E("Demo.st.events.find(e=>e.slug==='comedy-night').id");
+  W().location.hash='#/admin/event/'+ksid+'/schedule'; await until(()=>E('S.draft&&S.draft.id')===ksid && E('S.ui.gen'));
+  E("Object.assign(S.ui.gen,{mode:'weekly',from:'2027-01-04',until:'',count:6,days:[1,3],times:'14:00, 19:30',cap:80})"); E('A.genSlots()');
+  ok(E('S.draft.timeSlots.length')===12,'weekly Mon+Wed ×6 days × 2 times = 12 showtimes');
+  E('A.genSlots()'); ok(E('S.draft.timeSlots.length')===12,'re-running skips duplicates');
+  E("Object.assign(S.ui.gen,{mode:'interval',from:'2027-02-01',times:'10:00',to:'12:00',every:30,cap:40})"); E('A.genSlots()');
+  ok(E('S.draft.timeSlots.length')===17,'timed entry every 30 min adds 5');
+  E("S.draft.timeSlots[0].capacity=25"); await E('A.saveEvent()'); await sleep(60);
+  const saved=E(`Demo.st.events.find(e=>e.id==='${ksid}')`);
+  ok(saved.timeSlots[0].capacity===25 && saved.timeSlots.slice(1,12).every(s=>s.capacity===80),'editing one showtime leaves the others');
+  // occurrence report + all tabs render
+  const kid=ev('kids-science-show');
+  E(`S.ui.support='${harbor}'`); await E(`reloadAdmin('${harbor}')`);
+  for (const t of ['overview','details','tickets','schedule','seating','checkout','discounts','emails','waitlist','team','history','share']) { W().location.hash='#/admin/event/'+kid.id+'/'+t; await sleep(90); ok(W().document.querySelector('.etabs a.on'),'tab renders: '+t); }
+  W().location.hash='#/admin/event/'+kid.id+'/overview'; await sleep(100);
+  ok(has('By showtime')&&has('All showtimes')&&has('Potential sellout revenue')&&has('Page views'),'overview: sellout, performance, per-showtime report');
+  // comp
+  E('S.ui.support=null'); await E(`reloadAdmin('${E("Demo.st.boxOffices.find(b=>b.slug==='skyline-live').id")}')`);
+  const nv=ev('neon-nights-live');
+  const r=await E(`DB.placeOrder({buyer:{name:'Guest Artist',email:'artist@example.com'},items:[{eventId:'${nv.id}',ticketTypeId:'${nv.ticketTypes[0].id}',qty:2}],payment:'manual',comp:true},true)`);
+  const o=E(`Demo.st.orders.find(x=>x.id==='${r.id}')`);
+  ok(o.data.total===0 && o.data.comp && o.data.faceValue===2*nv.ticketTypes[0].price && o.data.lines[0].face===nv.ticketTypes[0].price && o.data.lines[0].name===nv.ticketTypes[0].name,'comp order: real ticket type, face value kept, $0 collected');
+  await E('reloadAdmin()'); W().location.hash='#/admin/event/'+nv.id+'/overview'; await sleep(120); ok(/2 comp/.test(W().document.body.textContent),'overview counts comp tickets');
+  // archive & permissions
+  await edit('comedy-night', "d=>{d.archived=true}");
+  ok(E(`S.adm.events.find(e=>e.slug==='comedy-night').archived`),'archive');
+  W().location.hash='#/admin/events'; await sleep(80); E("S.ui.evf='archived'"); E('render()'); ok(has('Late Night Comedy Club'),'archived tab lists it');
+  // event-level team
+  W().location.hash='#/admin/event/'+g.id+'/team'; await sleep(100);
+  await E(`A.evAccess({dataset:{v:'support@skyline.example',on:'0'}})`);
+  const sup=E("Demo.st.members.find(m=>m.email==='support@skyline.example'&&m.status==='active')");
+  ok(Array.isArray(sup.events)&&!sup.events.includes(g.id)&&sup.events.length===E('S.adm.events.length')-1,'remove one member from one event');
+  await E(`A.evAccess({dataset:{v:'manager@skyline.example',on:'1'}})`);
+  ok(E("Demo.st.members.find(m=>m.email==='manager@skyline.example').events").includes(g.id),'add member to an event');
+  await as('finance@skyline.example');
+  ok(String(await throwsP(`DB.saveEvent({...Demo.st.events.find(e=>e.slug==='winter-orchestra-gala'),archived:true})`)).includes('permission'),'finance cannot archive/edit events');
+  log('DONE');
+}catch(e){log('ERROR '+e.message+'\n'+e.stack)}})();
+</script></body></html>

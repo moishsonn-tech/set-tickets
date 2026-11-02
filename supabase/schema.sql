@@ -24,6 +24,7 @@ create table if not exists box_offices (
   branding jsonb not null default '{}',     -- public: logo, colours, font, socials, policies, domain
   settings jsonb not null default '{}',     -- public: currency, fees, tax, terms, require2fa, pixels
   templates jsonb not null default '[]',    -- permission templates [{id,name,perms[]}]
+  event_templates jsonb not null default '[]',  -- reusable event set-ups [{id,name,at,minutes,event}]
   created_by text, created_at timestamptz default now());
 
 create table if not exists members (
@@ -73,12 +74,18 @@ create index if not exists tickets_event on tickets(event_id);
 create unique index if not exists tickets_seat on tickets(event_id, coalesce(slot_id,''), seat) where seat is not null and status = 'valid';
 
 create table if not exists waitlist (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id),
-  event_id uuid references events(id) on delete cascade, name text, email text not null, created_at timestamptz default now());
+  event_id uuid references events(id) on delete cascade, name text, email text not null, phone text, notified_at timestamptz, created_at timestamptz default now(),
+  unique (event_id, email));
 create table if not exists broadcasts (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id),
   event_id uuid references events(id) on delete cascade, subject text, body text, recipients int, created_by text, created_at timestamptz default now());
 create table if not exists audit_log (id uuid primary key default gen_random_uuid(), at timestamptz not null default now(),
-  actor text not null, box_office_id uuid, kind text not null, summary text not null, before jsonb, after jsonb);
+  actor text not null, box_office_id uuid, target uuid, kind text not null, summary text not null, before jsonb, after jsonb);
 create index if not exists audit_bo on audit_log(box_office_id, at desc);
+create index if not exists audit_target on audit_log(target, at desc);
+-- Event page views (Stage 2 performance + conversion). Written only through track_view().
+create table if not exists event_views (id bigint generated always as identity primary key, event_id uuid not null references events(id) on delete cascade,
+  at timestamptz not null default now(), visitor text not null, src text);
+create index if not exists event_views_ev on event_views(event_id, at);
 
 -- ── Who is asking ──────────────────────────────────────────────────────────────
 create or replace function me_email() returns text language sql stable as $$ select lower(coalesce(auth.jwt() ->> 'email', '')) $$;
@@ -95,9 +102,14 @@ create or replace function has_perm(p_bo uuid, p_perm text, p_event uuid default
 $$;
 create or replace function is_member(p_bo uuid) returns boolean language sql stable security definer set search_path = public as
 $$ select is_super() or exists(select 1 from members where box_office_id = p_bo and email = me_email() and status = 'active') $$;
-create or replace function log_action(p_bo uuid, p_kind text, p_summary text, p_before jsonb default null, p_after jsonb default null) returns void
+create or replace function log_action(p_bo uuid, p_kind text, p_summary text, p_before jsonb default null, p_after jsonb default null, p_target uuid default null) returns void
   language sql security definer set search_path = public as
-$$ insert into audit_log(actor, box_office_id, kind, summary, before, after) values (coalesce(nullif(me_email(),''), 'system'), p_bo, p_kind, p_summary, p_before, p_after) $$;
+$$ insert into audit_log(actor, box_office_id, target, kind, summary, before, after) values (coalesce(nullif(me_email(),''), 'system'), p_bo, p_target, p_kind, p_summary, p_before, p_after) $$;
+-- Public = published, not archived, not hidden, past its scheduled publish time, box office active. (Mirrors eventLive() in data.js.)
+create or replace function event_live(e events) returns boolean language sql stable as $$
+  select e.status = 'published' and not coalesce((e.data->>'archived')::boolean, false) and coalesce(e.data->>'visibility','public') <> 'hidden'
+    and (nullif(e.data->>'publishAt','') is null or (e.data->>'publishAt')::timestamptz <= now())
+    and exists(select 1 from box_offices b where b.id = e.box_office_id and b.status = 'active') $$;
 
 -- ── Row-level security ─────────────────────────────────────────────────────────
 alter table platform_settings enable row level security; alter table platform_admins enable row level security;
@@ -119,8 +131,9 @@ create policy members_read on members for select using (email = me_email() or ha
 create policy members_insert on members for insert with check (has_perm(box_office_id, 'admin.invite'));
 create policy members_update on members for update using (has_perm(box_office_id, 'admin.perms') or has_perm(box_office_id, 'admin.remove'));
 
+-- Anyone can list public events; direct-link-only events are fetched one at a time through event_by_slug().
 create policy events_public on events for select using (
-  (status = 'published' and exists(select 1 from box_offices b where b.id = box_office_id and b.status = 'active'))
+  (event_live(events.*) and coalesce(data->>'visibility','public') = 'public')
   or has_perm(box_office_id, 'events.view', id) or has_perm(box_office_id, 'door.scan', id));
 create policy events_insert on events for insert with check (has_perm(box_office_id, 'events.create'));
 create policy events_update on events for update using (has_perm(box_office_id, 'events.edit', id)) with check (has_perm(box_office_id, 'events.edit', id));
@@ -131,9 +144,11 @@ create policy orders_update on orders for update using (has_perm(box_office_id, 
 create policy tickets_read on tickets for select using (has_perm(box_office_id, 'door.attendees', event_id) or has_perm(box_office_id, 'orders.view', event_id));
 create policy tickets_update on tickets for update using (has_perm(box_office_id, 'orders.cancelTicket', event_id) or has_perm(box_office_id, 'orders.cancel', event_id));
 create policy waitlist_team on waitlist for select using (has_perm(box_office_id, 'orders.view', event_id) or has_perm(box_office_id, 'comms.lists', event_id));
+alter table event_views enable row level security;
+create policy views_team on event_views for select using (exists(select 1 from events e where e.id = event_id and has_perm(e.box_office_id, 'events.view', e.id)));
 create policy broadcasts_read on broadcasts for select using (has_perm(box_office_id, 'comms.email', event_id) or has_perm(box_office_id, 'comms.notify', event_id));
 create policy broadcasts_insert on broadcasts for insert with check (has_perm(box_office_id, 'comms.email', event_id));
-create policy audit_read on audit_log for select using (is_super() or has_perm(box_office_id, 'admin.perms') or actor = me_email());
+create policy audit_read on audit_log for select using (is_super() or has_perm(box_office_id, 'admin.perms') or actor = me_email() or (target is not null and has_perm(box_office_id, 'events.edit', target)));
 create policy audit_insert on audit_log for insert with check (actor = me_email() and (box_office_id is null or is_member(box_office_id)));
 -- no update/delete policies: the activity log is append-only
 
@@ -195,15 +210,19 @@ create trigger box_offices_guard before update on box_offices for each row execu
 create or replace function events_guard() returns trigger language plpgsql security definer set search_path = public as $$
 declare b jsonb := '{}'; a jsonb := '{}'; k text;
 begin
-  if tg_op = 'INSERT' then perform log_action(new.box_office_id, 'event.created', 'Created event “' || (new.data->>'name') || '”'); return new; end if;
+  if tg_op = 'INSERT' then perform log_action(new.box_office_id, 'event.created', 'Created event “' || (new.data->>'name') || '”', null, null, new.id); return new; end if;
   if new.box_office_id <> old.box_office_id then raise exception 'Events cannot move between box offices'; end if;
-  if new.status <> old.status and not has_perm(new.box_office_id, 'events.publish', new.id) then raise exception 'You don''t have permission to publish or cancel events'; end if;
+  if (new.status <> old.status or (new.data->'archived') is distinct from (old.data->'archived')) and not has_perm(new.box_office_id, 'events.publish', new.id) then
+    raise exception 'You don''t have permission to publish, cancel or archive events'; end if;
   if new.status <> old.status then b := b || jsonb_build_object('Status', old.status); a := a || jsonb_build_object('Status', new.status); end if;
-  foreach k in array array['name','start','end','venue','capacity','visibility'] loop
+  foreach k in array array['name','start','end','allDay','venue','address','online','capacity','visibility','publishAt','salesStart','salesEnd','archived','waitlistMode','currency','contact','policies','timeSlots'] loop
     if (new.data->k) is distinct from (old.data->k) then b := b || jsonb_build_object(k, old.data->k); a := a || jsonb_build_object(k, new.data->k); end if;
   end loop;
   if (new.data->'ticketTypes') is distinct from (old.data->'ticketTypes') then b := b || jsonb_build_object('ticketTypes', old.data->'ticketTypes'); a := a || jsonb_build_object('ticketTypes', new.data->'ticketTypes'); end if;
-  if a <> '{}' then perform log_action(new.box_office_id, 'event.updated', 'Updated “' || (new.data->>'name') || '”: ' || (select string_agg(x, ', ') from jsonb_object_keys(a) x), b, a); end if;
+  if (new.data->'seating'->'blocked') is distinct from (old.data->'seating'->'blocked') then b := b || jsonb_build_object('Blocked seats', jsonb_array_length(coalesce(old.data->'seating'->'blocked','[]'))); a := a || jsonb_build_object('Blocked seats', jsonb_array_length(coalesce(new.data->'seating'->'blocked','[]'))); end if;
+  if (new.data->'seating'->'sections') is distinct from (old.data->'seating'->'sections') then b := b || '{"Seating map":"previous layout"}'; a := a || '{"Seating map":"new layout"}'; end if;
+  if (new.secrets->>'password' <> '') is distinct from (old.secrets->>'password' <> '') then b := b || jsonb_build_object('Password', old.secrets->>'password' <> ''); a := a || jsonb_build_object('Password', new.secrets->>'password' <> ''); end if;
+  if a <> '{}' then perform log_action(new.box_office_id, 'event.updated', 'Updated “' || (new.data->>'name') || '”: ' || (select string_agg(x, ', ') from jsonb_object_keys(a) x), b, a, new.id); end if;
   new.updated_at := now(); return new;
 end $$;
 drop trigger if exists events_guard on events;
@@ -215,7 +234,7 @@ begin
      case new.status when 'refunded' then 'orders.refund' when 'cancelled' then 'orders.cancel' else 'orders.edit' end, new.event_ids[1]) then
     raise exception 'You don''t have permission to mark this order %', new.status; end if;
   if new.status is distinct from old.status then
-    perform log_action(new.box_office_id, 'order.' || new.status, format('Order %s: %s → %s', new.ref, old.status, new.status), jsonb_build_object('status', old.status), jsonb_build_object('status', new.status)); end if;
+    perform log_action(new.box_office_id, 'order.' || new.status, format('Order %s: %s → %s', new.ref, old.status, new.status), jsonb_build_object('status', old.status), jsonb_build_object('status', new.status), new.event_ids[1]); end if;
   return new;
 end $$;
 drop trigger if exists orders_audit on orders;
@@ -237,8 +256,7 @@ create or replace function check_discount(p_event uuid, p_code text) returns jso
 declare d jsonb; used int;
 begin
   select x into d from events e, jsonb_array_elements(e.secrets->'discounts') x
-   where e.id = p_event and e.status='published' and upper(x->>'code') = upper(trim(p_code))
-     and exists(select 1 from box_offices b where b.id = e.box_office_id and b.status = 'active') limit 1;
+   where e.id = p_event and event_live(e) and upper(x->>'code') = upper(trim(p_code)) limit 1;
   if d is null then return null; end if;
   if nullif(d->>'expires','') is not null and (d->>'expires')::timestamptz < now() then return null; end if;
   select count(*) into used from orders where status in ('paid','pending') and p_event = any(event_ids) and upper(data->>'code') = upper(d->>'code');
@@ -250,13 +268,43 @@ create or replace function unlock(p_event uuid, p_password text) returns jsonb l
   select jsonb_build_object(
     'event', coalesce(secrets->>'password','') <> '' and secrets->>'password' = p_password,
     'ticketTypes', coalesce((select jsonb_agg(k) from jsonb_each_text(coalesce(secrets->'ticketPasswords','{}')) where value = p_password), '[]'))
-  from events e where id = p_event and status = 'published' and exists(select 1 from box_offices b where b.id = e.box_office_id and b.status = 'active');
+  from events e where id = p_event and event_live(e);
 $$;
 
-create or replace function join_waitlist(p_event uuid, p_name text, p_email text) returns void language sql security definer set search_path = public as $$
-  insert into waitlist(box_office_id, event_id, name, email) select e.box_office_id, p_event, left(p_name,120), left(lower(trim(p_email)),200)
-  from events e where e.id = p_event and e.status='published' and p_email ~* '^[^@\s]+@[^@\s]+\.[^@\s]+$';
+create or replace function join_waitlist(p_event uuid, p_name text, p_email text, p_phone text default '') returns void language plpgsql security definer set search_path = public as $$
+declare e events%rowtype;
+begin
+  select * into e from events where id = p_event;
+  if not found or not event_live(e) or coalesce(e.data->>'waitlistMode','soldout') = 'off' then raise exception 'This event has no waitlist'; end if;
+  if coalesce(trim(p_name),'') = '' then raise exception 'Enter your name'; end if;
+  if p_email !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'Enter a valid email'; end if;
+  insert into waitlist(box_office_id, event_id, name, email, phone) values (e.box_office_id, p_event, left(trim(p_name),120), left(lower(trim(p_email)),200), left(trim(coalesce(p_phone,'')),40))
+    on conflict (event_id, email) do nothing;
+end $$;
+-- One direct-link-only (or public) event by its URL. Hidden / scheduled / archived events return nothing.
+create or replace function event_by_slug(p_slug text) returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('id', e.id, 'box_office_id', e.box_office_id, 'slug', e.slug, 'status', e.status, 'data', e.data, 'created_at', e.created_at)
+  from events e where e.slug = p_slug and event_live(e);
 $$;
+create or replace function track_view(p_event uuid, p_visitor text, p_src text default null) returns void language sql security definer set search_path = public as $$
+  insert into event_views(event_id, visitor, src) select p_event, left(p_visitor, 40), left(p_src, 60) from events e where e.id = p_event and event_live(e);
+$$;
+create or replace function save_event_templates(p_bo uuid, p jsonb) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not has_perm(p_bo, 'events.create') then raise exception 'You don''t have permission to do that'; end if;
+  update box_offices set event_templates = p where id = p_bo;
+  perform log_action(p_bo, 'event.templates', 'Edited event templates');
+end $$;
+create or replace function notify_waitlist(p_event uuid, p_message text) returns int language plpgsql security definer set search_path = public as $$
+declare e events%rowtype; n int;
+begin
+  select * into e from events where id = p_event;
+  if not has_perm(e.box_office_id, 'comms.notify', p_event) then raise exception 'You don''t have permission to do that'; end if;
+  update waitlist set notified_at = now() where event_id = p_event and notified_at is null; get diagnostics n = row_count;
+  insert into broadcasts(box_office_id, event_id, subject, body, recipients, created_by) values (e.box_office_id, p_event, 'Tickets available', p_message, n, me_email());
+  perform log_action(e.box_office_id, 'comms.waitlist', format('Notified %s people on the waitlist', n), null, null, p_event);
+  return n;  -- emails go out with Stage 8 (outbound email); until then this records the notice
+end $$;
 
 create or replace function get_order(p_id uuid, p_key uuid) returns jsonb language sql stable security definer set search_path = public as $$
   select jsonb_build_object('order', to_jsonb(o) - 'access_key', 'tickets', coalesce((select jsonb_agg(to_jsonb(t)) from tickets t where t.order_id = o.id), '[]'))
@@ -282,8 +330,8 @@ begin
   if coalesce(p->'buyer'->>'email','') !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'A valid email is required'; end if;
 
   for it in select * from jsonb_array_elements(coalesce(p->'items','[]')) loop
-    select * into ev from events where id = (it->>'eventId')::uuid and (status = 'published' or manual);
-    if not found then raise exception 'Event is not on sale'; end if;
+    select * into ev from events where id = (it->>'eventId')::uuid;
+    if not found or not (event_live(ev) or (manual and ev.status <> 'cancelled')) then raise exception 'Event is not on sale'; end if;
     if bo.id is null then select * into bo from box_offices where id = ev.box_office_id; st := bo.settings;
     elsif bo.id <> ev.box_office_id then raise exception 'One order can only hold one organizer''s events'; end if;
     if bo.status <> 'active' and not manual then raise exception 'This box office is not selling tickets right now'; end if;
@@ -302,6 +350,7 @@ begin
       if nullif(tt->>'salesStart','') is not null and (tt->>'salesStart')::timestamptz > now() then raise exception '% is not on sale yet', tt->>'name'; end if;
       if nullif(tt->>'salesEnd','') is not null and (tt->>'salesEnd')::timestamptz < now() then raise exception '% sales have ended', tt->>'name'; end if;
       if nullif(ev.data->>'salesEnd','') is not null and (ev.data->>'salesEnd')::timestamptz < now() then raise exception 'Sales have ended'; end if;
+      if nullif(ev.data->>'salesStart','') is not null and (ev.data->>'salesStart')::timestamptz > now() then raise exception 'Tickets go on sale %', ev.data->>'salesStart'; end if;
       if qty < coalesce((tt->>'min')::int, 1) then raise exception 'Minimum % for %', tt->>'min', tt->>'name'; end if;
       if coalesce((tt->>'max')::int, 0) > 0 and qty > (tt->>'max')::int then raise exception 'Maximum % for %', tt->>'max', tt->>'name'; end if;
     end if;
@@ -312,6 +361,7 @@ begin
     if nullif(it->>'slotId','') is not null then
       select x into slot from jsonb_array_elements(ev.data->'timeSlots') x where x->>'id' = it->>'slotId';
       if slot is null then raise exception 'Unknown time slot'; end if;
+      if not manual and (coalesce((slot->>'hidden')::boolean,false) or coalesce((slot->>'unavailable')::boolean,false) or coalesce((slot->>'soldOut')::boolean,false)) then raise exception 'That showtime is not available'; end if;
       if coalesce((slot->>'capacity')::int,0) > 0 and coalesce((av->'slots'->>(slot->>'id'))::int,0) + qty > (slot->>'capacity')::int then raise exception 'That time slot is full'; end if;
     elsif jsonb_array_length(coalesce(ev.data->'timeSlots','[]')) > 0 then raise exception 'Pick a time slot';
     end if;
@@ -353,6 +403,13 @@ begin
   tax := round((subtotal - discount) * coalesce((st->>'taxPct')::numeric, 0) / 100);
   donation := greatest(coalesce((p->>'donation')::bigint, 0), 0);
   total := subtotal - discount + fee + tax + donation;
+  if coalesce((p->>'comp')::boolean, false) then  -- complimentary: real ticket type + face value kept, $0 collected
+    if not manual then raise exception 'not allowed'; end if;
+    for it in select * from jsonb_array_elements(lines) where value->>'kind' = 'ticket' loop
+      if not has_perm(bo.id, 'tickets.comps', (it->>'eventId')::uuid) then raise exception 'You don''t have permission to issue complimentary tickets'; end if; end loop;
+    select coalesce(jsonb_agg(l || jsonb_build_object('face', l->'unit', 'unit', 0, 'comp', true)), '[]') into lines from jsonb_array_elements(lines) l;
+    p := p || jsonb_build_object('faceValue', subtotal); subtotal := 0; discount := 0; fee := 0; tax := 0; donation := 0; total := 0;
+  end if;
   status := case when total = 0 or manual then 'paid' else 'pending' end;
   if total > 0 and not manual and coalesce(p->>'payment','') <> 'offline' then raise exception 'Card payments are not connected yet'; end if;
 
@@ -362,7 +419,8 @@ begin
   insert into orders(box_office_id, ref, status, buyer_email, event_ids, data) values (bo.id, oref, status, lower(trim(p->'buyer'->>'email')), ev_ids,
     jsonb_build_object('buyer', p->'buyer', 'lines', lines, 'subtotal', subtotal, 'discount', discount, 'fee', fee, 'tax', tax, 'donation', donation,
       'total', total, 'code', case when disc is null then null else disc->>'code' end, 'payment', coalesce(p->>'payment','free'),
-      'answers', coalesce(p->'answers','{}'), 'optIn', coalesce((p->>'optIn')::boolean,false), 'source', p->>'source', 'currency', cur, 'platformFee', pfee))
+      'answers', coalesce(p->'answers','{}'), 'optIn', coalesce((p->>'optIn')::boolean,false), 'source', p->>'source', 'currency', cur, 'platformFee', pfee)
+      || case when coalesce((p->>'comp')::boolean,false) then jsonb_build_object('comp', true, 'faceValue', (p->>'faceValue')::bigint) else '{}'::jsonb end)
     returning id, access_key into oid, okey;
 
   for it in select * from jsonb_array_elements(lines) where value->>'kind' = 'ticket' loop
@@ -386,7 +444,7 @@ begin
   if p_event is not null and t.event_id <> p_event then return jsonb_build_object('result','wrong_event','ticket',to_jsonb(t)); end if;
   was := t.checked_in_at;
   update tickets set checked_in_at = case when p_undo then null else coalesce(checked_in_at, now()) end where id = t.id returning * into t;
-  if p_undo then perform log_action(t.box_office_id, 'door.undo', 'Undid check-in for ticket ' || t.code); end if;
+  if p_undo then perform log_action(t.box_office_id, 'door.undo', 'Undid check-in for ticket ' || t.code, null, null, t.event_id); end if;
   return jsonb_build_object('result', case when p_undo then 'undone' when was is not null then 'already' else 'ok' end, 'ticket', to_jsonb(t));
 end $$;
 
@@ -434,7 +492,13 @@ begin
       then coalesce((select jsonb_agg(to_jsonb(x) - 'all_events' - 'event_ids' || jsonb_build_object('owner', x.email = b.owner, 'events', case when x.all_events then to_jsonb('all'::text) else to_jsonb(x.event_ids) end))
         from members x where x.box_office_id = b.id and x.status = 'active'), '[]') else jsonb_build_array(me) end,
     'broadcasts', coalesce((select jsonb_agg(to_jsonb(x)) from broadcasts x where x.event_id = any(evs) and (has_perm(b.id, 'comms.email') or has_perm(b.id, 'comms.notify'))), '[]'),
-    'audit', coalesce((select jsonb_agg(to_jsonb(a) order by a.at desc) from (select * from audit_log a where a.box_office_id = b.id and (has_perm(b.id, 'admin.perms') or a.actor = em) order by a.at desc limit 800) a), '[]'));
+    'audit', coalesce((select jsonb_agg(to_jsonb(a) order by a.at desc) from (select * from audit_log a where a.box_office_id = b.id
+        and (has_perm(b.id, 'admin.perms') or a.actor = em or (a.target is not null and has_perm(b.id, 'events.edit', a.target))) order by a.at desc limit 1500) a), '[]'),
+    'views', coalesce((select jsonb_object_agg(v.event_id, jsonb_build_object('total', v.total, 'unique', v.uniq, 'today', v.today, 'last10m', v.now10, 'bySrc', v.bysrc)) from (
+        select event_id, count(*) total, count(distinct visitor) uniq, count(*) filter (where at >= date_trunc('day', now())) today,
+          count(distinct visitor) filter (where at >= now() - interval '10 minutes') now10,
+          (select jsonb_object_agg(k, c) from (select coalesce(src,'direct') k, count(*) c from event_views x where x.event_id = ev.event_id group by 1) q) bysrc
+        from event_views ev where event_id = any(evs) group by event_id) v), '{}'));
 end $$;
 
 create or replace function transfer_ownership(p_bo uuid, p_email text) returns void language plpgsql security definer set search_path = public as $$
@@ -520,8 +584,10 @@ begin
   perform log_action(null, 'platform.deleted', 'Permanently deleted box office ' || b.name);
 end $$;
 
-grant execute on function availability(uuid), check_discount(uuid,text), unlock(uuid,text), join_waitlist(uuid,text,text),
-  get_order(uuid,uuid), lookup_order(text,text), place_order(jsonb), register_box_office(text,text,text,text) to anon, authenticated;
+grant execute on function availability(uuid), check_discount(uuid,text), unlock(uuid,text), join_waitlist(uuid,text,text,text),
+  get_order(uuid,uuid), lookup_order(text,text), place_order(jsonb), register_box_office(text,text,text,text),
+  event_by_slug(text), track_view(uuid,text,text) to anon, authenticated;
+grant execute on function save_event_templates(uuid,jsonb), notify_waitlist(uuid,text) to authenticated;
 grant execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), transfer_ownership(uuid,text), platform_overview(), platform_save(jsonb),
   create_box_office(text,text,text,text), set_box_office_status(uuid,text), delete_box_office(uuid) to authenticated;
 revoke execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), new_box_office(text,text,text,text,text,text), log_action(uuid,text,text,jsonb,jsonb) from anon, public;

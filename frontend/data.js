@@ -109,6 +109,86 @@ function availabilityFrom(tickets, eventId) {
   return a;
 }
 
+
+/* ── Events: lifecycle, visibility, showtimes, sellout value (Stage 2). Shared by buyer pages, back office and DEMO checks. ──
+   status: draft | published | cancelled, plus archived:true (hidden everywhere, records kept).
+   visibility: public (listed) | link (direct link only) | hidden (off the public site, team/manual sales only).
+   publishAt / salesStart / salesEnd: scheduled go-live, sales opening and closing.
+   timeSlots = showtimes: {id, start, end?, capacity, label?, hidden?, unavailable?, soldOut?} */
+const VISIBILITY = { public: 'Public — listed on the box office', link: 'Direct link only — not listed', hidden: 'Hidden — off the public site' };
+const WAITLIST_MODES = { off: 'Off', soldout: 'Only when sold out', presale: 'Before tickets go on sale, and when sold out', always: 'Always shown' };
+function normEvent(ev) {
+  if (!ev) return ev;
+  if (ev.visibility === 'private' || !ev.visibility) ev.visibility = ev.visibility === 'private' ? 'link' : 'public';
+  if (!ev.waitlistMode) ev.waitlistMode = ev.waitlist === false ? 'off' : 'soldout';
+  ev.contact ||= { name: '', email: '', phone: '' };
+  return ev;
+}
+// On sale to the public right now? (published, not archived, past its scheduled publish time, not hidden)
+const eventLive = (ev, now = Date.now()) => ev.status === 'published' && !ev.archived && ev.visibility !== 'hidden' && (!ev.publishAt || new Date(ev.publishAt) <= now);
+const eventListed = (ev, now) => eventLive(ev, now) && ev.visibility === 'public';
+const salesOpen = (ev, now = Date.now()) => (!ev.salesStart || new Date(ev.salesStart) <= now) && (!ev.salesEnd || new Date(ev.salesEnd) > now) && !ev.salesPaused;
+function slotState(s, av) {
+  if (s.hidden) return 'hidden'; if (s.unavailable) return 'unavailable'; if (s.soldOut) return 'soldout';
+  return +s.capacity > 0 && (av?.slots?.[s.id] || 0) >= +s.capacity ? 'soldout' : 'open';
+}
+// Maximum revenue if everything sellable sells, at face value — and what's already sold/comped against it.
+// tickets: this event's tickets (any status); lines from orders give the face value actually sold.
+function sellout(ev, tickets = []) {
+  const shows = Math.max(1, (ev.timeSlots || []).filter(s => !s.hidden && !s.unavailable).length);
+  const tts = ev.ticketTypes || [], price = t => +t.price || 0, valid = tickets.filter(t => t.event_id === ev.id && t.status === 'valid');
+  const soldBy = id => valid.filter(t => t.ticket_type_id === id), unitOf = t => price(t) / Math.max(1, +t.admits || 1);
+  const byTT = [], bySec = []; let total = 0, estimate = false, unknown = false;
+  if (ev.seating?.enabled) {
+    const L = seatLayout(ev.seating), blocked = new Set(ev.seating.blocked || []);
+    for (const g of L.secs) {
+      const seats = g.local.filter(p => p.tt && !blocked.has(p.id)), pot = sum2(seats, p => price(tts.find(t => t.id === p.tt) || {})) * shows;
+      const ids = new Set(g.local.map(p => p.id)), sold = valid.filter(t => ids.has(t.seat));
+      bySec.push({ name: g.sec.name || g.sec.code, seats: seats.length * shows, blocked: g.local.filter(p => blocked.has(p.id)).length * shows, sold: sold.length,
+        potential: pot, soldValue: sum2(sold, t => price(tts.find(x => x.id === t.ticket_type_id) || {})) });
+    }
+    for (const t of tts) { const n = Object.values(ev.seating.index || {}).filter(x => x === t.id).length * shows; byTT.push({ tt: t, capacity: n, potential: n * price(t) }); }
+  } else {
+    const cap = (ev.timeSlots || []).length ? sum2(ev.timeSlots.filter(s => !s.hidden && !s.unavailable), s => +s.capacity) : +ev.capacity || 0;
+    let left = cap;
+    for (const t of tts.filter(t => +t.qty > 0)) { const n = cap ? Math.min(+t.qty, left) : +t.qty; left = Math.max(0, left - n); byTT.push({ tt: t, capacity: n, potential: n * unitOf(t) }); }
+    const open = tts.filter(t => !(+t.qty > 0)), main = open.find(t => !t.hidden) || open[0];
+    for (const t of open) { if (t === main && cap) { estimate = true; byTT.push({ tt: t, capacity: left, potential: left * unitOf(t) }); } else { if (!cap) unknown = true; byTT.push({ tt: t, capacity: null, potential: 0 }); } }
+  }
+  byTT.forEach(r => { const s = soldBy(r.tt.id); r.sold = s.length; r.soldValue = s.length * unitOf(r.tt); });
+  total = sum2(byTT, r => r.potential);
+  const soldValue = sum2(byTT, r => r.soldValue);
+  return { total, byTT, bySec, soldValue, remaining: Math.max(0, total - soldValue), pct: total ? soldValue / total : 0, estimate, unknown, shows };
+}
+const sum2 = (a, f) => a.reduce((t, x) => t + (+f(x) || 0), 0);
+// A copy of an event's set-up with fresh ids — no orders, tickets, codes or schedule state carry over.
+function cloneEventStructure(src) {
+  const ev = clone(src), ttMap = {};
+  ev.ticketTypes = (ev.ticketTypes || []).map(t => { const n = shortId('tt_'); ttMap[t.id] = n; return { ...t, id: n }; });
+  (ev.seating?.sections || []).forEach(x => { x.id = shortId('sec_'); x.ticketTypeId = ttMap[x.ticketTypeId] || ''; });
+  if (ev.seating?.prices) ev.seating.prices = Object.fromEntries(Object.entries(ev.seating.prices).map(([k, v]) => [k, ttMap[v] || '']));
+  if (ev.seating?.index) ev.seating.index = Object.fromEntries(Object.entries(ev.seating.index).map(([k, v]) => [k, ttMap[v] || '']));
+  const sec = ev.secrets || {};
+  ev.secrets = { password: sec.password || '', ticketPasswords: Object.fromEntries(Object.entries(sec.ticketPasswords || {}).map(([k, v]) => [ttMap[k], v])),
+    discounts: (sec.discounts || []).map(d => ({ ...d, id: shortId('dc_'), ticketTypeIds: (d.ticketTypeIds || []).map(i => ttMap[i]) })) };
+  ev.timeSlots = (ev.timeSlots || []).map(x => ({ ...x, id: shortId('ts_') }));
+  ev.addons = (ev.addons || []).map(a => ({ ...a, id: shortId('ad_') })); ev.questions = (ev.questions || []).map(q => ({ ...q, id: shortId('q_') }));
+  delete ev.archived; delete ev.publishAt; delete ev.salesStart; delete ev.salesEnd; delete ev.salesPaused; delete ev.hasPassword;
+  return Object.assign(ev, { id: uid(), status: 'draft', created_at: nowIso() });
+}
+// Templates keep the set-up plus time of day and length; dates, showtimes and discount codes are chosen per event.
+function eventToTemplate(ev, name) {
+  const e = cloneEventStructure(ev), st = new Date(ev.start), mins = ev.end ? Math.round((new Date(ev.end) - st) / 6e4) : 180;
+  for (const k of ['id', 'slug', 'status', 'created_at', 'start', 'end', 'box_office_id', 'image']) delete e[k];
+  e.timeSlots = []; e.secrets.discounts = []; e.secrets.password = '';
+  return { id: shortId('etpl_'), name: name || ev.name, created_at: nowIso(), at: [st.getHours(), st.getMinutes()], minutes: mins, event: e };
+}
+function eventFromTemplate(tpl, dayIso) {
+  const e = cloneEventStructure(tpl.event), d = dayIso ? new Date(dayIso) : new Date(Date.now() + 30 * 864e5);
+  d.setHours(tpl.at?.[0] ?? 20, tpl.at?.[1] ?? 0, 0, 0);
+  return Object.assign(e, { name: e.name || tpl.name, slug: 'new-event-' + randCode(4).toLowerCase(), start: d.toISOString(), end: new Date(d.getTime() + (tpl.minutes || 180) * 6e4).toISOString(), timeSlots: [] });
+}
+
 /* ── Seat maps ───────────────────────────────────────────────────────────────────
    seating = {enabled, stage:{x,y,w,h,label}, sections:[...], prices:{seatId:ttId}, blocked:[seatId], index:{seatId:ttId}}
    section = {id, code, name, kind:'rows'|'table', x, y, rot, ticketTypeId,
@@ -159,7 +239,7 @@ function seatLayout(st) {
 const seatIndex = st => { const b = new Set(st.blocked || []); return Object.fromEntries(seatLayout(st).seats.filter(p => p.tt && !b.has(p.id)).map(p => [p.id, p.tt])); };
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v5';
+const DEMO_KEY = 'set_demo_v6';
 const Demo = {
   st: null,
   load() {
@@ -201,6 +281,9 @@ function demoPlaceOrder(p, asTeam) {
     const pw = p.unlock?.[ev.id] || '', sec = ev.secrets || {}, now = new Date();
     if (!(it.qty >= 1)) throw new Error('Bad quantity');
     if (!manual) {
+      normEvent(ev);
+      if (!eventLive(ev)) throw new Error('Event is not on sale');
+      if (ev.salesStart && new Date(ev.salesStart) > now) throw new Error('Tickets go on sale ' + new Date(ev.salesStart).toLocaleString());
       if (sec.password && pw !== sec.password) throw new Error('This event needs a password');
       if (sec.ticketPasswords?.[tt.id] && pw !== sec.ticketPasswords[tt.id]) throw new Error(tt.name + ' is locked');
       if (tt.salesStart && new Date(tt.salesStart) > now) throw new Error(tt.name + ' is not on sale yet');
@@ -215,6 +298,7 @@ function demoPlaceOrder(p, asTeam) {
     if (+ev.capacity > 0 && av.total + pending.total[ev.id] > +ev.capacity) throw new Error('Event is sold out');
     if (ev.timeSlots?.length) {
       const slot = ev.timeSlots.find(s => s.id === it.slotId); if (!slot) throw new Error('Pick a time slot');
+      if (!manual && (slot.hidden || slot.unavailable || slot.soldOut)) throw new Error('That showtime is not available');
       const sk = ev.id + slot.id; pending.slots[sk] = (pending.slots[sk] || 0) + it.qty;
       if (+slot.capacity > 0 && (av.slots[slot.id] || 0) + pending.slots[sk] > +slot.capacity) throw new Error('That time slot is full');
     }
@@ -237,13 +321,19 @@ function demoPlaceOrder(p, asTeam) {
   const plat = st.platform, nTk = q.lines.filter(l => l.kind === 'ticket' && l.unit > 0).reduce((t, l) => t + l.qty, 0);
   const platformFee = q.subtotal - q.discount > 0 ? Math.round((q.subtotal - q.discount) * (+plat.feePct || 0) / 100) + nTk * (+plat.feeFixed || 0) : 0;
   if (q.total > 0 && !manual && !['offline', 'card'].includes(p.payment)) throw new Error('Choose a payment method');
+  if (p.comp) {  // complimentary: keeps the real ticket type and face value, collects $0
+    if (!manual) throw new Error('not allowed');
+    for (const it of p.items) if (!hasPerm(asTeam, 'tickets.comps', it.eventId)) throw new Error('You don\'t have permission to issue complimentary tickets');
+    q.lines.forEach(l => { l.face = l.unit; l.unit = 0; l.comp = true; }); q.faceValue = q.subtotal;
+    Object.assign(q, { subtotal: 0, discount: 0, fee: 0, tax: 0, donation: 0, total: 0 });
+  }
   const status = (q.total === 0 || manual || p.payment === 'card') ? 'paid' : 'pending';
   let ref; do { ref = 'SET-' + randCode(6); } while (st.orders.some(o => o.ref === ref));
   const order = { id: uid(), box_office_id: bo.id, ref, access_key: uid(), status, buyer_email: p.buyer.email.trim().toLowerCase(),
     event_ids: [...new Set(p.items.map(i => i.eventId))], created_at: new Date().toISOString(),
     data: { buyer: p.buyer, lines: q.lines, subtotal: q.subtotal, discount: q.discount, fee: q.fee, tax: q.tax, donation: q.donation,
       total: q.total, code: disc?.code || null, payment: q.total === 0 ? 'free' : p.payment, answers: p.answers || {}, optIn: !!p.optIn,
-      source: p.source || null, currency: q.currency, platformFee } };
+      source: p.source || null, currency: q.currency, platformFee: p.comp ? 0 : platformFee, ...(p.comp ? { comp: true, faceValue: q.faceValue } : {}) } };
   st.orders.push(order);
   for (const l of q.lines.filter(l => l.kind === 'ticket'))
     for (let i = 0; i < l.qty * l.admits; i++)
@@ -260,12 +350,18 @@ const publicEvent = ev => { const { secrets, ...rest } = clone(ev); return rest;
 const publicBo = b => ({ id: b.id, slug: b.slug, name: b.name, status: b.status, branding: { ...DEFAULT_BRANDING, ...b.branding }, settings: { ...DEFAULT_SETTINGS, ...b.settings, name: b.name } });
 async function must(p) { const { data, error } = await p; if (error) throw new Error(error.message); return data; }
 const nowIso = () => new Date().toISOString();
+// page views → {total, unique, today, last10m, bySrc}; hits = [[ms, visitor, src]]
+function viewStats(v) {
+  const hits = v?.hits || [], day0 = new Date().setHours(0, 0, 0, 0), bySrc = {};
+  hits.forEach(h => { const k = h[2] || 'direct'; bySrc[k] = (bySrc[k] || 0) + 1; });
+  return { total: hits.length, unique: new Set(hits.map(h => h[1])).size, today: hits.filter(h => h[0] >= day0).length, last10m: new Set(hits.filter(h => h[0] >= Date.now() - 6e5).map(h => h[1])).size, bySrc };
+}
 const maskEmail = e => String(e || '').replace(/^(.)[^@]*@(.)[^.]*(\..+)$/, '$1•••@$2•••$3');
 
 /* ── DEMO "server": every organizer write passes need(), the same checks the SQL policies make in LIVE. ── */
 function audit(kind, summary, o = {}) {
   const st = Demo.st; (st.audit ||= []).unshift({ id: uid(), at: nowIso(), actor: DB._actor || 'system', box_office_id: o.bo !== undefined ? o.bo : DB._bo || null,
-    kind, summary, before: o.before ?? null, after: o.after ?? null });
+    kind, summary, target: o.target || null, before: o.before ?? null, after: o.after ?? null });
   if (st.audit.length > 5000) st.audit.length = 5000;
 }
 function memberFor(st, email, boId) {
@@ -288,12 +384,28 @@ function startDemoSession(email) {
   st.sessions = (st.sessions || []).filter(x => !x.revoked).concat(s); sessionStorage.setItem('set_demo_sid', s.id);
   DB._actor = email; audit('auth.login', 'Signed in', { bo: null }); Demo.save(); return { email, sid: s.id };
 }
-const EVENT_TRACKED = [['name', 'Name'], ['status', 'Status'], ['start', 'Start'], ['end', 'End'], ['venue', 'Venue'], ['capacity', 'Capacity'], ['visibility', 'Visibility']];
+const EVENT_TRACKED = [['name', 'Name'], ['status', 'Status'], ['archived', 'Archived'], ['start', 'Start'], ['end', 'End'], ['allDay', 'All day'], ['venue', 'Venue'], ['address', 'Address'],
+  ['online', 'Online'], ['capacity', 'Capacity'], ['visibility', 'Visibility'], ['publishAt', 'Scheduled publish'], ['salesStart', 'Sales open'], ['salesEnd', 'Sales close'],
+  ['waitlistMode', 'Waitlist'], ['currency', 'Currency'], ['contact', 'Event contact'], ['policies', 'Policies']];
+const showtimeSig = s => [s.start, s.capacity, s.hidden ? 'hidden' : '', s.unavailable ? 'unavailable' : '', s.soldOut ? 'sold out' : ''].filter(x => x !== '').join(' · ');
 function eventDiff(a, b) {
-  const out = []; for (const [k, l] of EVENT_TRACKED) if (JSON.stringify(a?.[k] ?? '') !== JSON.stringify(b?.[k] ?? '')) out.push([l, a?.[k] ?? '', b?.[k] ?? '']);
-  const price = e => Object.fromEntries((e?.ticketTypes || []).map(t => [t.name, t.price]));
-  const pa = price(a), pb = price(b); for (const n of new Set([...Object.keys(pa), ...Object.keys(pb)])) if (pa[n] !== pb[n]) out.push(['Price · ' + n, pa[n] ?? '', pb[n] ?? '']);
-  return out;
+  const out = [], j = v => JSON.stringify(v ?? '');
+  for (const [k, l] of EVENT_TRACKED) if (j(a?.[k]) !== j(b?.[k])) out.push([l, a?.[k] ?? '', b?.[k] ?? '']);
+  const tt = e => Object.fromEntries((e?.ticketTypes || []).map(t => [t.id, t]));
+  const ta = tt(a), tb = tt(b);
+  for (const id of new Set([...Object.keys(ta), ...Object.keys(tb)])) {
+    const x = ta[id], y = tb[id], n = (y || x).name;
+    if (!x || !y) { out.push(['Ticket type · ' + n, x ? 'existed' : '', y ? 'added' : 'removed']); continue; }
+    if (x.price !== y.price) out.push(['Price · ' + n, x.price, y.price]);
+    if (+x.qty !== +y.qty) out.push(['Quantity · ' + n, x.qty, y.qty]);
+    for (const k of ['name', 'hidden', 'salesStart', 'salesEnd', 'min', 'max']) if (j(x[k]) !== j(y[k])) out.push([`Ticket setting · ${n} · ${k}`, x[k] ?? '', y[k] ?? '']);
+  }
+  const sa = Object.fromEntries((a?.timeSlots || []).map(s => [s.id, showtimeSig(s)])), sb = Object.fromEntries((b?.timeSlots || []).map(s => [s.id, showtimeSig(s)]));
+  for (const id of new Set([...Object.keys(sa), ...Object.keys(sb)])) if (sa[id] !== sb[id]) out.push(['Showtime', sa[id] || '(new)', sb[id] || '(removed)']);
+  if (j(a?.seating?.blocked) !== j(b?.seating?.blocked)) out.push(['Blocked seats', (a?.seating?.blocked || []).length, (b?.seating?.blocked || []).length]);
+  if (j(a?.seating?.sections) !== j(b?.seating?.sections) || j(a?.seating?.prices) !== j(b?.seating?.prices)) out.push(['Seating map', 'changed', '']);
+  if (!!a?.secrets?.password !== !!b?.secrets?.password) out.push(['Password', a?.secrets?.password ? 'on' : 'off', b?.secrets?.password ? 'on' : 'off']);
+  return out.map(d => d[0] === 'Seating map' ? [d[0], 'previous layout', 'new layout'] : d);
 }
 
 const DB = {
@@ -301,13 +413,13 @@ const DB = {
   async init() {
     if (!LIVE) {
       const st = Demo.load(), act = new Set(st.boxOffices.filter(b => b.status === 'active').map(b => b.id));
-      return { settings: { ...DEFAULT_SETTINGS }, events: st.events.filter(e => e.status === 'published' && act.has(e.box_office_id)).map(publicEvent),
+      return { settings: { ...DEFAULT_SETTINGS }, events: st.events.map(normEvent).filter(e => eventListed(e) && act.has(e.box_office_id)).map(publicEvent),
         bos: st.boxOffices.filter(b => act.has(b.id)).map(publicBo), platform: { name: st.platform.name, publicRegistration: st.platform.publicRegistration } };
     }
     const [plat, bos, evs] = await Promise.all([must(sb.from('platform_public').select('*').maybeSingle()),
       must(sb.from('box_offices').select('id,slug,name,status,branding,settings').eq('status', 'active')),
       must(sb.from('events').select('id,box_office_id,slug,status,data,created_at').eq('status', 'published'))]);
-    return { settings: { ...DEFAULT_SETTINGS }, events: evs.map(rowToEvent), bos: bos.map(publicBo), platform: { ...DEFAULT_PLATFORM, ...(plat || {}) } };
+    return { settings: { ...DEFAULT_SETTINGS }, events: evs.map(rowToEvent).map(normEvent), bos: bos.map(publicBo), platform: { ...DEFAULT_PLATFORM, ...(plat || {}) } };
   },
   // ── auth: email one-time code, then an authenticator-app code when 2FA is on ──
   async session() {
@@ -401,6 +513,7 @@ const DB = {
     const events = st.events.filter(e => e.box_office_id === bo.id && (m.owner || m.support || m.events === 'all' || (m.events || []).includes(e.id)));
     const evIds = new Set(events.map(e => e.id));
     const seeOrders = P('orders.view') || P('finance.totals') || P('finance.reports') || P('comms.lists') || P('customers.profiles');
+    events.forEach(normEvent);
     const orders = seeOrders ? clone(st.orders.filter(o => o.box_office_id === bo.id && o.event_ids.some(id => evIds.has(id)))) : [];
     const tickets = clone(st.tickets.filter(t => evIds.has(t.event_id)));
     // Customer-data and money permissions are applied here, before data leaves the "server".
@@ -414,7 +527,8 @@ const DB = {
       waitlist: P('orders.view') || P('comms.lists') ? clone(st.waitlist.filter(w => evIds.has(w.event_id))) : [],
       team: P('admin.invite') || P('admin.perms') || P('admin.remove') ? clone(st.members.filter(x => x.box_office_id === bo.id && x.status === 'active')).map(x => ({ ...x, owner: x.email === bo.owner })) : [{ ...m }],
       broadcasts: P('comms.email') || P('comms.notify') ? clone(st.broadcasts.filter(b => evIds.has(b.event_id))) : [],
-      audit: P('admin.perms') ? clone(st.audit.filter(a => a.box_office_id === bo.id).slice(0, 800)) : clone(st.audit.filter(a => a.box_office_id === bo.id && a.actor === email).slice(0, 200)) };
+      audit: clone(st.audit.filter(a => a.box_office_id === bo.id && (P('admin.perms') || a.actor === email || (a.target && hasPerm(m, 'events.edit', a.target)))).slice(0, 1500)),
+      views: Object.fromEntries([...evIds].map(id => [id, viewStats(st.views?.[id])])) };
   },
   async stillAllowed() { if (LIVE) return true; try { need(); return true; } catch (e) { return !e.revoked; } },
   async saveEvent(ev) {
@@ -425,8 +539,9 @@ const DB = {
       if (prev && prev.box_office_id !== DB._bo) throw new Error('not allowed');
       const row = clone({ ...ev, box_office_id: DB._bo }), diff = eventDiff(prev, row);
       if (i >= 0) st.events[i] = row; else st.events.push(row);
-      if (!prev) audit('event.created', 'Created event “' + row.name + '”');
-      else if (diff.length) audit('event.updated', 'Updated “' + row.name + '”: ' + diff.map(d => d[0]).join(', '), { before: Object.fromEntries(diff.map(d => [d[0], d[1]])), after: Object.fromEntries(diff.map(d => [d[0], d[2]])) });
+      if (prev && !!prev.archived !== !!row.archived) need('events.publish', ev.id);
+      if (!prev) audit('event.created', 'Created event “' + row.name + '”', { target: row.id });
+      else if (diff.length) audit('event.updated', 'Updated “' + row.name + '”: ' + [...new Set(diff.map(d => d[0].split(' · ')[0]))].join(', '), { target: row.id, before: Object.fromEntries(diff.map(d => [d[0], d[1]])), after: Object.fromEntries(diff.map(d => [d[0], d[2]])) });
       Demo.save(); return row;
     }
     const row = eventToRow({ ...ev, box_office_id: ev.box_office_id || DB._bo }); if (!row.id) delete row.id;
@@ -460,7 +575,7 @@ const DB = {
       need({ refunded: 'orders.refund', cancelled: 'orders.cancel' }[status] || 'orders.edit', o.event_ids[0]);
       const was = o.status; o.status = status;
       if (cancel) Demo.st.tickets.forEach(t => { if (t.order_id === id) t.status = 'cancelled'; });
-      audit('order.' + status, `Order ${o.ref}: ${was} → ${status}`, { before: { status: was }, after: { status } }); Demo.save(); return;
+      audit('order.' + status, `Order ${o.ref}: ${was} → ${status}`, { target: o.event_ids[0], before: { status: was }, after: { status } }); Demo.save(); return;
     }
     await must(sb.from('orders').update({ status }).eq('id', id));
     if (cancel) await must(sb.from('tickets').update({ status: 'cancelled' }).eq('order_id', id));
@@ -474,7 +589,7 @@ const DB = {
       if (t.status !== 'valid') return { result: 'cancelled', ticket: clone(t) };
       if (eventId && t.event_id !== eventId) return { result: 'wrong_event', ticket: clone(t) };
       const was = t.checked_in_at; t.checked_in_at = undo ? null : (t.checked_in_at || nowIso());
-      if (undo) audit('door.undo', 'Undid check-in for ticket ' + t.code); Demo.save();
+      if (undo) audit('door.undo', 'Undid check-in for ticket ' + t.code, { target: t.event_id }); Demo.save();
       return { result: undo ? 'undone' : was ? 'already' : 'ok', ticket: clone(t) };
     }
     return must(sb.rpc('checkin', { p_code: code, p_undo: undo, p_event: eventId }));
@@ -523,6 +638,29 @@ const DB = {
       audit('team.owner', `Ownership transferred from ${was} to ${email}`, { before: { owner: was }, after: { owner: email } }); Demo.save(); return;
     }
     await must(sb.rpc('transfer_ownership', { p_bo: DB._bo, p_email: email }));
+  },
+  // ── events (Stage 2) ──
+  async eventBySlug(slug) {   // direct-link-only events aren't in the public list; fetch one by its link
+    if (!LIVE) { const st = Demo.fresh(), act = new Set(st.boxOffices.filter(b => b.status === 'active').map(b => b.id)); const e = st.events.find(x => x.slug === slug); return e && act.has(e.box_office_id) && eventLive(normEvent(e)) ? publicEvent(e) : null; }
+    const r = await must(sb.rpc('event_by_slug', { p_slug: slug })); return r ? normEvent(rowToEvent(r)) : null;
+  },
+  async trackView(eventId, src) {
+    let vid = ''; try { vid = localStorage.getItem('set_vid') || uid(); localStorage.setItem('set_vid', vid); } catch (e) { vid = uid(); }
+    if (!LIVE) { const st = Demo.st, v = ((st.views ||= {})[eventId] ||= { hits: [] }); v.hits.push([Date.now(), vid.slice(0, 8), src || '']); if (v.hits.length > 20000) v.hits.splice(0, 5000); Demo.save(); return; }
+    sb.rpc('track_view', { p_event: eventId, p_visitor: vid, p_src: src || null }).then(() => { }, () => { });
+  },
+  async saveEventTemplates(list) {
+    if (!LIVE) { need('events.create'); const bo = Demo.st.boxOffices.find(b => b.id === DB._bo); bo.eventTemplates = clone(list); audit('event.templates', 'Edited event templates'); Demo.save(); return; }
+    await must(sb.rpc('save_event_templates', { p_bo: DB._bo, p: list }));
+  },
+  async notifyWaitlist(eventId, message) {
+    if (!LIVE) {
+      need('comms.notify', eventId); const st = Demo.st, list = st.waitlist.filter(w => w.event_id === eventId && !w.notified_at), at = nowIso();
+      list.forEach(w => w.notified_at = at);
+      st.broadcasts.push({ id: uid(), box_office_id: DB._bo, event_id: eventId, subject: 'Tickets available', body: message, recipients: list.length, created_by: DB._actor, created_at: at, kind: 'waitlist' });
+      audit('comms.waitlist', `Notified ${list.length} people on the waitlist`, { target: eventId }); Demo.save(); return list.length;
+    }
+    return must(sb.rpc('notify_waitlist', { p_event: eventId, p_message: message }));
   },
   async log(kind, summary) { if (!LIVE) { audit(kind, summary); Demo.save(); return; } await sb.from('audit_log').insert({ actor: DB._actor, box_office_id: DB._bo, kind, summary }); },
   async addBroadcast(b) {
@@ -587,10 +725,16 @@ const DB = {
     }
     return must(sb.rpc('unlock', { p_event: eventId, p_password: password }));
   },
-  async joinWaitlist(eventId, name, email) {
+  async joinWaitlist(eventId, name, email, phone = '') {
+    if (!String(name).trim()) throw new Error('Enter your name');
     if (!EMAIL_RE.test(email)) throw new Error('Enter a valid email');
-    if (!LIVE) { Demo.st.waitlist.push({ id: uid(), box_office_id: Demo.st.events.find(e => e.id === eventId)?.box_office_id, event_id: eventId, name, email: email.toLowerCase(), created_at: new Date().toISOString() }); Demo.save(); return; }
-    await must(sb.rpc('join_waitlist', { p_event: eventId, p_name: name, p_email: email }));
+    if (!LIVE) {
+      const st = Demo.st, ev = st.events.find(e => e.id === eventId);
+      if (!ev || normEvent(ev).waitlistMode === 'off') throw new Error('This event has no waitlist');
+      if (st.waitlist.some(w => w.event_id === eventId && w.email === email.toLowerCase())) return;
+      st.waitlist.push({ id: uid(), box_office_id: ev.box_office_id, event_id: eventId, name: name.trim(), email: email.toLowerCase(), phone: String(phone).trim().slice(0, 40), created_at: nowIso() }); Demo.save(); return;
+    }
+    await must(sb.rpc('join_waitlist', { p_event: eventId, p_name: name, p_email: email, p_phone: phone }));
   },
   async placeOrder(payload, asTeam = false) {
     if (!LIVE) return demoPlaceOrder(clone(payload), asTeam ? need('orders.edit') : null);
@@ -614,8 +758,9 @@ const DB = {
 function seedDemo() {
   const day = (d, h = 20, m = 0) => { const x = new Date(); x.setDate(x.getDate() + d); x.setHours(h, m, 0, 0); return x.toISOString(); };
   const tt = (name, price, qty, extra = {}) => ({ id: shortId('tt_'), name, price, qty, min: 1, max: 10, admits: 1, desc: '', hidden: false, ...extra });
-  const base = { capacity: 0, timezone: 'America/New_York', currency: 'USD', visibility: 'public', online: false, onlineUrl: '', image: '',
-    timeSlots: [], seating: { enabled: false }, addons: [], questions: [], waitlist: true, emails: { confirmation: '', reminders: [] } };
+  const base = { capacity: 0, timezone: 'America/New_York', currency: 'USD', visibility: 'public', online: false, onlineUrl: '', image: '', allDay: false,
+    timeSlots: [], seating: { enabled: false }, addons: [], questions: [], waitlistMode: 'soldout', emails: { confirmation: '', reminders: [] },
+    contact: { name: '', email: '', phone: '' }, policies: '', instructions: '' };
   const mk = (o) => ({ ...base, id: uid(), status: 'published', created_at: day(-30), secrets: { password: '', ticketPasswords: {}, discounts: [] }, ...o });
 
   const vipTT = tt('Premium', 12000, 0, { desc: 'Front centre, rows A–C', max: 8 });
@@ -674,7 +819,23 @@ function seedDemo() {
   const bo3 = { id: uid(), slug: 'northside-comedy', name: 'Northside Comedy Collective', status: 'pending', owner: 'hello@northside.example', created_at: day(-1), created_by: 'self-registration',
     branding: { ...DEFAULT_BRANDING }, settings: boSet('Northside Comedy Collective'), templates: clone(DEFAULT_TEMPLATES) };
   [ev1, ev2, ev6].forEach(e => e.box_office_id = bo1.id); [ev3, ev4, ev5].forEach(e => e.box_office_id = bo2.id);
-  const events = [ev1, ev2, ev3, ev4, ev5, ev6];
+  ev1.contact = { name: 'Front of house', email: 'gala@skyline.example', phone: '(212) 555-0142' };
+  ev1.policies = 'No refunds within 7 days of the performance. Latecomers are seated at a suitable break.';
+  ev1.instructions = 'Bring your ticket QR on your phone. Coat check is on the lower level.';
+  ev3.timeSlots.push({ id: shortId('ts_'), start: day(18, 19, 30), capacity: 120, label: 'Late tasting (private)', hidden: true });
+  ev5.timeSlots[5].unavailable = true; ev5.timeSlots[0].soldOut = true; ev5.allDay = false; ev3.waitlistMode = 'always';
+  const ev7 = mk({ slug: 'spring-jazz-brunch', name: 'Spring Jazz Brunch', category: 'Live music', start: day(64, 11, 30), end: day(64, 14, 0), venue: 'Skyline Roof',
+    address: '22 W 32nd St, New York, NY 10001', summary: 'Live trio, brunch buffet, city views.', description: 'A relaxed late-morning set from the Skyline house trio with a brunch buffet.',
+    publishAt: day(5, 10, 0), salesStart: day(7, 10, 0), waitlistMode: 'presale', capacity: 140,
+    ticketTypes: [tt('Brunch + music', 8500, 120), tt('Music only (bar)', 3500, 20)] });
+  const events = [ev1, ev2, ev3, ev4, ev5, ev6, ev7]; ev7.box_office_id = bo1.id;
+  bo1.eventTemplates = [
+    eventToTemplate(ev2, 'Standard Concert'), eventToTemplate(ev1, 'Reserved Seating Event'),
+    eventToTemplate({ ...ev2, name: 'General Admission Event', ticketTypes: [tt('General admission', 3000, 0)], capacity: 300 }, 'General Admission Event'),
+    eventToTemplate({ ...ev1, name: "Women's Show", audience: 'Women & girls only' }, "Women's Show"),
+    eventToTemplate({ ...ev2, name: 'Dinner Concert', ticketTypes: [tt('Dinner + show', 12500, 0)], capacity: 160,
+      seating: { enabled: true, stage: { x: -150, y: -140, w: 300, h: 40, label: 'STAGE' }, blocked: [], prices: {}, sections: Array.from({ length: 12 }, (_, i) => ({ id: shortId('sec_'), code: 'T' + (i + 1), name: 'Table ' + (i + 1), kind: 'table', seats: 10, x: -260 + (i % 4) * 170, y: -20 + Math.floor(i / 4) * 150, rot: 0, ticketTypeId: '' })) } }, 'Dinner Concert')];
+  { const dc = bo1.eventTemplates[4].event; dc.seating.sections.forEach(x => x.ticketTypeId = dc.ticketTypes[0].id); }
   const tpl = id => DEFAULT_TEMPLATES.find(t => t.id === id).perms;
   const mem = (bo, email, name, template, evs = 'all') => ({ id: uid(), box_office_id: bo.id, email, name, perms: [...tpl(template)], template, events: evs, status: 'active', created_at: day(-40), added_by: bo.owner });
   const members = [
@@ -713,6 +874,14 @@ function seedDemo() {
   Demo.st.tickets.filter(t => t.event_id === ev2.id && t.status === 'valid').forEach(t => { if (Math.random() < .4) t.checked_in_at = new Date(Date.now() - Math.pow(Math.random(), .6) * 110 * 6e4).toISOString(); });
   Demo.st.audit.push({ id: uid(), at: day(-1, 9, 12), actor: 'hello@northside.example', box_office_id: bo3.id, kind: 'platform.registered', summary: 'Registration request: ' + bo3.name, before: null, after: null },
     ...members.filter(m => m.box_office_id !== bo3.id && m.email !== m.added_by).map(m => ({ id: uid(), at: m.created_at, actor: m.added_by, box_office_id: m.box_office_id, kind: 'team.invited', summary: `Invited ${m.email} (${m.perms.length} permissions)`, before: null, after: null })));
+  // Page views so conversion rates mean something: ~8–15 visits per order, from the same channels.
+  Demo.st.views = {};
+  for (const ev of events.filter(e => e.status === 'published')) {
+    const n = Demo.st.orders.filter(o => o.event_ids.includes(ev.id)).length * (8 + Math.floor(Math.random() * 7)) + 40, hits = [], pool = Array.from({ length: Math.ceil(n * .7) }, () => randCode(6).toLowerCase());
+    for (let i = 0; i < n; i++) hits.push([Date.now() - Math.pow(Math.random(), 1.6) * 28 * 864e5, rnd(pool), rnd(['', '', '', 'instagram', 'facebook', 'newsletter', 'whatsapp'])]);
+    hits.push(...Array.from({ length: 4 + Math.floor(Math.random() * 6) }, () => [Date.now() - Math.random() * 5e5, randCode(6).toLowerCase(), '']));
+    Demo.st.views[ev.id] = { hits: hits.sort((a, b) => a[0] - b[0]) };
+  }
   Demo.st.waitlist.push({ id: uid(), box_office_id: bo2.id, event_id: ev3.id, name: 'Jamie Fox', email: 'jamie@example.com', created_at: day(-1) });
   return Demo.st;
 }

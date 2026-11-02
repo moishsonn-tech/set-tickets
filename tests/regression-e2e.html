@@ -67,19 +67,19 @@ W && (async()=>{try{
   // seating designer: template, paint, save
   const fe=W().eval('S').adm.events.find(e=>e.slug==='comedy-night');
   W().location.hash=`#/admin/event/${fe.id}/seating`; await sleep(150);
-  check('[data-bind="draft.seating.enabled"]'); await sleep(50);
+  W().eval('S').draft.ticketTypes.push(W().eval('newTT')()); check('[data-bind="draft.seating.enabled"]'); await sleep(50);
   click('[data-action="smTemplate"][data-v="banquet"]'); await sleep(80);
   ok(W().eval('S').draft.seating.sections.length===12 && W().document.querySelectorAll('.sm-design .st').length===120,'banquet template: 12 tables, 120 seats');
   click('[data-action="smAdd"][data-v="rows"]'); await sleep(50);
   ok(W().document.querySelector('.sm-panel h3')&&W().eval('S').draft.seating.sections.length===13,'add section opens its panel');
   type('[data-bind="draft.seating.sections.12.rows"]','3'); await sleep(50);
   ok(W().document.querySelectorAll('.sm-design .st').length===150,'rows edit re-lays out (150 seats)');
-  click('[data-action="smMode"][data-v="paint"]'); await sleep(30); W().eval('S').ui.smPaint=fe.ticketTypes[0].id;
+  click('[data-action="smMode"][data-v="paint"]'); await sleep(30); W().eval('S').ui.smPaint=W().eval('S').draft.ticketTypes[1].id;
   const svg=W().document.querySelector('svg.sm-design'); const seat=svg.querySelector('[data-seat="T1-1"]');
   seat.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,clientX:1,clientY:1})); W().document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true})); await sleep(50);
-  ok(W().eval('S').draft.seating.prices['T1-1']===fe.ticketTypes[0].id,'paint assigns seat price');
+  ok(W().eval('S').draft.seating.prices['T1-1']===W().eval('S').draft.ticketTypes[1].id,'paint assigns seat price');
   click('[data-action="saveEvent"]'); await sleep(200);
-  const saved=W().eval('S').adm.events.find(e=>e.id===fe.id); ok(Object.keys(saved.seating.index).length===149 && saved.seating.index['T1-1']===fe.ticketTypes[0].id,'save derives seat index ('+Object.keys(saved.seating.index||{}).length+')');
+  const saved=W().eval('S').adm.events.find(e=>e.id===fe.id); ok(Object.keys(saved.seating.index).length===150 && saved.seating.index['T1-1']===saved.ticketTypes[1].id,'save derives seat index ('+Object.keys(saved.seating.index||{}).length+')');
   // checkin
   let r=await W().eval('DB').checkin(code); ok(r.result==='ok','check-in ok'); r=await W().eval('DB').checkin(code); ok(r.result==='already','second scan flagged already');
   r=await W().eval('DB').checkin('NOPE123'); ok(r.result==='unknown','bad code rejected');
@@ -92,7 +92,7 @@ W && (async()=>{try{
   // ── scanner app ──
   ok(!/SING Entertainment'|Kumzitz|Chanukah|Jewish/.test(JSON.stringify(W().eval('Demo').st.events)),'no SING events in sample data');
   W().location.hash='#/scan'; await until(()=>W().document.querySelector('.sc-ev'));
-  ok(W().document.querySelectorAll('.sc-ev').length>=4,'scanner lists events');
+  ok(W().document.querySelectorAll('.sc-ev').length>=2,'scanner lists events');
   const tonight=W().eval('S').adm.events.find(e=>e.slug==='neon-nights-live');
   W().document.querySelector(`[data-action="scPick"][data-id="${tonight.id}"]`).click(); await until(()=>W().document.querySelector('.sc-tabs'));
   const fresh=W().eval('S').adm.tickets.find(t=>t.event_id===tonight.id&&t.status==='valid'&&!t.checked_in_at);

@@ -21,6 +21,11 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   masked server-side (`admin_load()` / `DB.loadAdmin`) by permission. `audit_log` is append-only. Super Admin
   dashboard = `#/platform`; a box office's public page = `#/b/<slug>`; self-registration `#/register` (off).
   DEMO enforces the same rules in `need()` before every write. 2FA = TOTP (Supabase MFA live, `totp()` demo).
+- **Events (Stage 2):** lifecycle helpers in data.js — `eventLive()` (published, not archived/hidden, past `publishAt`) /
+  `eventListed()` (+ visibility `public`; `link` events load via `event_by_slug`), `salesOpen()`, `slotState()` for
+  showtimes (`timeSlots` with hidden/unavailable/soldOut), `sellout()` = potential revenue at face value. Event
+  templates live on the box office (`eventToTemplate` / `eventFromTemplate` / `cloneEventStructure`). Comps keep the
+  real ticket type with `face` value and `unit: 0`. Audit rows carry `target` (event id) → per-event History tab.
 - **Money is integer cents everywhere.** `quote()` in data.js is the one pricing function on the client.
 - **Not yet wired:** Stripe card payments (needs a Supabase Edge Function + webhook), outbound email/SMS
   (confirmations, reminders, broadcasts are recorded but not sent), Apple Wallet passes.
