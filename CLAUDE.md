@@ -14,12 +14,20 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   `events.secrets`, which anon cannot select. Organizers = rows in `team` (role-gated RLS).
 - **Two modes, one interface (`DB.*`):** blank `config.js` → DEMO (sample data in localStorage, same rules
   run in JS in `demoPlaceOrder`); filled `config.js` → LIVE Supabase. Keep the JS and SQL rules in sync.
+- **Multi-tenant (Stage 1):** every event/order/ticket belongs to one **box office** (`box_offices`). Staff are
+  `members` rows (box office + email) with an explicit permission list (`PERMS` in data.js, "group.key") and
+  optional event scoping; templates are just named starting lists. `hasPerm()` (JS) / `has_perm()` (SQL) is the
+  single gate; owner + platform super admins (`platform_admins`) pass everything. Customer details and money are
+  masked server-side (`admin_load()` / `DB.loadAdmin`) by permission. `audit_log` is append-only. Super Admin
+  dashboard = `#/platform`; a box office's public page = `#/b/<slug>`; self-registration `#/register` (off).
+  DEMO enforces the same rules in `need()` before every write. 2FA = TOTP (Supabase MFA live, `totp()` demo).
 - **Money is integer cents everywhere.** `quote()` in data.js is the one pricing function on the client.
 - **Not yet wired:** Stripe card payments (needs a Supabase Edge Function + webhook), outbound email/SMS
   (confirmations, reminders, broadcasts are recorded but not sent), Apple Wallet passes.
 
 ## Run locally
 `cd frontend && python3 -m http.server 8765` → http://localhost:8765 (organizer side: /#/admin).
+Tests: copy `tests/*.html` into `frontend/`, open via the local server (headless Chrome `--dump-dom` works), then delete the copies.
 
 ## Deploy
 Live at https://moishsonn-tech.github.io/set-tickets/ (public repo moishsonn-tech/set-tickets).
