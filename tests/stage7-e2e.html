@@ -1,0 +1,232 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><iframe id="g" style="width:420px;height:800px"></iframe><script>
+// Stage 7 — tickets, QR codes, scanning & event-day operations (Eli's Step 7). Run from the local server: /stage7-e2e.html (real time).
+// Two iframes = two scanner devices sharing the same "server" (demo data in localStorage). The database side of the same rules is
+// checked for real on Postgres by tests/db-e2e.sh (incl. three phones scanning one ticket at the same instant).
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'), g=document.getElementById('g'); const W=()=>f.contentWindow, W2=()=>g.contentWindow;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x), E2=x=>W2().eval(x);
+const until=async(fn,ms=6000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t), txt=sel=>(W().document.querySelector(sel)||{}).textContent||'';
+const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));
+let lastErr=''; async function throwsP(code,w=W){ try{ await w().eval(code); lastErr='(no error)'; return false }catch(e){ lastErr=e.message; return e.message||true } }
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const order=id=>E(`Demo.st.orders.find(o=>o.id==='${id}')`), tickets=id=>E(`Demo.st.tickets.filter(t=>t.order_id==='${id}')`), live=id=>tickets(id).filter(t=>t.status==='valid');
+const tk=code=>E(`Demo.st.tickets.find(t=>t.code==='${code}')`);
+const scan=(code,evId,o,undo)=>E(`DB.checkin(${JSON.stringify(code)},${!!undo},${evId?JSON.stringify(evId):'null'},${JSON.stringify(o||{})})`);
+const act=(id,a,p)=>E(`DB.orderAction('${id}','${a}',${JSON.stringify(p||{})})`);
+const freeSeats=(slug,pred,n)=>E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='${slug}');return [...seatStates(e,{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).entries()].filter(([id,s])=>s.state==='available').map(([id])=>id).filter(id=>(${pred})(id)).slice(0,${n})})()`);
+const buy=(p)=>E(`DB.placeOrder(${JSON.stringify({buyer:{name:'Dana Door',email:'dana7@test.co',phone:'(646) 555-0177'},addons:[],payment:'manual',payMethod:'cash',...p})},true)`);
+const view=async hash=>{ W().location.hash=hash; await sleep(80); E('render()'); await sleep(40); };
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.noSingles=false;Demo.save()`);
+  const gala=ev('winter-orchestra-gala'), neon=ev('neon-nights-live');
+  ok(E(`Demo.st.scanLog.length`)>20 && E(`Demo.st.devices.length`)===3 && neon.entrances.length===2 && gala.entrances.length===3,'sample data: tonight has two doors, three scanning devices and an event-day log');
+  ok(E(`Demo.st.tickets.filter(t=>t.event_id==='${neon.id}'&&t.checked_in_at).every(t=>t.checkin&&t.checkin.device_name)`),'sample check-ins record entrance, device and employee');
+  await as('moishsonn@gmail.com');
+
+  // ── §2 any seating layout: rows, boxes, couches, tables, pods, standing — only what applies ──
+  E(`(()=>{const e=Demo.st.events.find(x=>x.slug==='comedy-night'), T=e.ticketTypes[0].id; e.status='published'; e.start=new Date(Date.now()+3600e3).toISOString(); e.end=new Date(Date.now()+3*3600e3).toISOString();
+    e.seating={enabled:true,prices:{},stage:{x:0,y:-80,w:300,h:40,label:'STAGE'},sections:[
+      {id:'s1',code:'OL',name:'Orchestra Left',kind:'rows',rows:2,seatsPerRow:12,rowStart:'A',ticketTypeId:T,x:0,y:0},
+      {id:'s2',code:'BX4',name:'Box 4',area:'Boxes',kind:'rows',rows:1,seatsPerRow:4,hideRow:true,showName:true,ticketTypeId:T,x:420,y:0},
+      {id:'s3',code:'CO3',name:'Couch 3',area:'Lounge',kind:'booth',seats:4,ticketTypeId:T,x:0,y:200},
+      {id:'s4',code:'T5',name:'Table 5',area:'Cocktail tables',kind:'table',seats:6,ticketTypeId:T,x:300,y:220},
+      {id:'s5',code:'POD2',name:'Pod 2',kind:'table',seats:4,ticketTypeId:T,x:520,y:220},
+      {id:'s6',code:'STD',name:'Standing',kind:'ga',capacity:50,x:0,y:400}]};
+    Object.assign(e.seating, seatDerive(e.seating)); Demo.save(); })()`);
+  const cm=ev('comedy-night'), M=cm.seating.meta;
+  ok(JSON.stringify(seatLinesOf('OL-A12'))==='["Orchestra Left","Row A — Seat 12"]','rows: ORCHESTRA LEFT / ROW A — SEAT 12');
+  ok(JSON.stringify(seatLinesOf('BX4-A2'))==='["Boxes","Box 4 — Seat 2"]','box: BOX 4 — SEAT 2 (no row)');
+  ok(JSON.stringify(seatLinesOf('CO3-1'))==='["Lounge","Couch 3 — Seat 1"]','couch: COUCH 3 — SEAT 1');
+  ok(JSON.stringify(seatLinesOf('T5-3'))==='["Cocktail tables","Table 5 — Seat 3"]','cocktail table: TABLE 5 — SEAT 3');
+  ok(JSON.stringify(seatLinesOf('POD2-1'))==='["Pod 2","Seat 1"]' && JSON.stringify(seatLinesOf('STD-1'))==='["Standing"]','pod and standing area: only what applies');
+  function seatLinesOf(id){ const m=M[id]||[]; return E(`seatLines(${JSON.stringify({area:m[0]||'',row:m[1]||'',seat:m[2]||'',unit:m[3]||''})})`); }
+  await E('reloadAdmin()');
+  const rm=await buy({items:[{eventId:cm.id,ticketTypeId:cm.ticketTypes[0].id,qty:5,seats:['OL-A12','BX4-A2','CO3-1','T5-3','POD2-1']}]});
+  const mt=live(rm.id), bySeat=s=>mt.find(t=>t.seat===s);
+  ok(bySeat('BX4-A2').unit==='Box 4' && bySeat('BX4-A2').row==='' && bySeat('BX4-A2').area==='Boxes' && bySeat('CO3-1').unit==='Couch 3' && !bySeat('OL-A12').unit,'tickets keep area, table/box/couch, row and seat as separate fields');
+
+  // ── §1 ticket generation: unique id + QR per ticket, event, date, venue, type/area, row, seat, box, holder, order ──
+  ok(new Set(mt.map(t=>t.code)).size===5 && mt.every(t=>/^[A-Z0-9]{10}$/.test(t.code)),'every ticket in the order has its own unique random code');
+  const ro=order(rm.id); W().location.hash=`#/order/${rm.id}/${ro.access_key}`; await until(()=>W().document.querySelectorAll('.e-ticket').length===5);
+  const card=code=>[...W().document.querySelectorAll('.e-ticket')].find(x=>x.textContent.includes(code));
+  const bx=card(bySeat('BX4-A2').code), ol=card(bySeat('OL-A12').code);
+  ok(bx.querySelector('[data-qr]').dataset.qr===bySeat('BX4-A2').code,'the QR code holds the ticket code only (no name, email or payment data)');
+  ok(bx.textContent.includes('Box') && bx.textContent.includes('Boxes') && !/\bRow\b/.test(bx.querySelector('.seat3').textContent) && bx.textContent.includes(cm.name) && bx.textContent.includes('Dana Door') && bx.textContent.includes(ro.ref),'box ticket: event, area, Box 4, seat, holder, order — and no empty Row');
+  ok(/Row/.test(ol.querySelector('.seat3').textContent) && ol.textContent.includes('Orchestra Left') && ol.textContent.includes('ticket 1 of 5') && ol.textContent.includes(cm.venue),'theatre ticket: area / row / seat, venue, “ticket 1 of 5”');
+
+  // ── §4 scanner app: sign in to a specific event, choose the entrance, scan ──
+  W().location.hash='#/scan'; await until(()=>W().document.querySelector('.sc-ev'));
+  W().document.querySelector(`[data-action="scPick"][data-id="${cm.id}"]`).click(); await until(()=>W().document.querySelector('.sc-tabs'));
+  ok(E('S.sc.evId')===cm.id && has('checked in'),'scanner: logged into one event (no entrances → straight to scanning)');
+  E(`S.sc._dev={id:'dev_t1',name:'Test phone 1'}`);
+  await E(`scanCheck('${bySeat('BX4-A2').code}')`);
+  ok(W().document.querySelector('.sc-result.ok') && txt('.sc-res-t')==='Valid','valid ticket: clear VALID');
+  ok(txt('.sc-seat')==='BoxesBox 4 — Seat 2' && [...W().document.querySelectorAll('.sc-seat div')].map(d=>d.textContent).join('|')==='Boxes|Box 4 — Seat 2','big seat display: BOXES / BOX 4 — SEAT 2');
+  ok(!!tk(bySeat('BX4-A2').code).checked_in_at && tk(bySeat('BX4-A2').code).checkin.device_name==='Test phone 1','valid tickets are checked in automatically, with the device');
+  E('S.sc.last=null;render()');
+  await E(`scanCheck('${bySeat('OL-A12').code}')`); ok([...W().document.querySelectorAll('.sc-seat div')].map(d=>d.textContent).join('|')==='Orchestra Left|Row A — Seat 12' && txt('.sc-res-type').includes('General'),'ORCHESTRA LEFT / ROW A — SEAT 12, with the ticket type');
+  E('S.sc.last=null;render()');
+  await E(`scanCheck('${bySeat('CO3-1').code}')`); ok([...W().document.querySelectorAll('.sc-seat div')].map(d=>d.textContent).join('|')==='Lounge|Couch 3 — Seat 1','COUCH 3 — SEAT 1');
+  E('S.sc.last=null;render()');
+
+  // ── §5 results: already scanned (original time), invalid QR, wrong event, cancelled, refunded, replaced, wrong showtime, inactive ──
+  await E(`scanCheck('${bySeat('BX4-A2').code}')`);
+  ok(W().document.querySelector('.sc-result.warn') && txt('.sc-res-t')==='Already scanned' && txt('.sc-res-note').includes('First scanned at') && txt('.sc-res-note').includes('Test phone 1'),'ALREADY SCANNED with the original time and device');
+  E('S.sc.last=null;render()');
+  await E(`scanCheck('NOTATICKET1')`); ok(txt('.sc-res-t')==='Invalid QR code' && W().document.querySelector('.sc-result.bad'),'invalid QR code');
+  E('S.sc.last=null;render()');
+  const gs=freeSeats('winter-orchestra-gala',"id=>id.startsWith('CEN-')",3), rg=await buy({items:[{eventId:gala.id,ticketTypeId:gala.seating.index[gs[0]],qty:1,seats:[gs[0]]},{eventId:gala.id,ticketTypeId:gala.seating.index[gs[1]],qty:1,seats:[gs[1]]},{eventId:gala.id,ticketTypeId:gala.seating.index[gs[2]],qty:1,seats:[gs[2]]}]});
+  const [g1,g2,g3]=live(rg.id);
+  await E(`scanCheck('${g1.code}')`); ok(txt('.sc-res-t')==='Wrong event' && txt('.sc-res-note').includes(gala.name) && !tk(g1.code).checked_in_at && !W().document.querySelector('.sc-seat'),'wrong event: says which event, not checked in, no seat shown');
+  E('S.sc.last=null;render()');
+  await act(rg.id,'cancel',{tickets:[g1.id],seat:'release'});
+  ok((await scan(g1.code,gala.id)).result==='cancelled','cancelled ticket → TICKET CANCELLED');
+  await act(rg.id,'refund',{mode:'tickets',tickets:[g2.id],to:'cash',cancel:true,seat:'release'});
+  ok((await scan(g2.code,gala.id)).result==='refunded','refunded ticket → TICKET REFUNDED');
+  const ri=await act(rg.id,'reissue',{tickets:[g3.id]});
+  const r3=await scan(g3.code,gala.id), r3b=await scan(ri.codes[0],gala.id);
+  ok(r3.result==='replaced' && r3b.result==='ok' && r3b.ticket.seat===g3.seat,'reissued: the old QR → REPLACED, the new one is valid for the same seat');
+  E(`(()=>{const e=Demo.st.events.find(x=>x.slug==='spring-jazz-brunch'); e.timeSlots=[{id:'js1',start:new Date(Date.now()+3600e3).toISOString(),capacity:50},{id:'js2',start:new Date(Date.now()+5*3600e3).toISOString(),capacity:50}]; e.salesStart=null; Demo.save();})()`);
+  const jz=ev('spring-jazz-brunch'), rj=await buy({items:[{eventId:jz.id,ticketTypeId:jz.ticketTypes[0].id,qty:1,slotId:'js2'}]}), jt=live(rj.id)[0];
+  const ws=await scan(jt.code,jz.id,{slot:'js1'}); ok(ws.result==='wrong_slot' && ws.ticket.slot_start===jz.timeSlots[1].start,'wrong showtime: says which showtime the ticket is for');
+  ok((await scan(jt.code,jz.id,{slot:''})).result==='ok','“All showtimes” accepts it');
+  E(`Demo.st.events.find(x=>x.slug==='spring-jazz-brunch').archived=true;Demo.save()`); E(`Demo.st.tickets.find(t=>t.code==='${jt.code}').checked_in_at=null;Demo.save()`);
+  ok((await scan(jt.code,jz.id)).result==='inactive','a ticket for an archived event → TICKET NOT ACTIVE');
+  E(`Demo.st.events.find(x=>x.slug==='spring-jazz-brunch').archived=false;Demo.save()`);
+
+  // ── §3 QR security ──
+  const blob=JSON.stringify(E(`Demo.st.tickets.map(t=>t.code)`));
+  ok(!/@|\d{3}-\d{4}|4242/.test(blob),'no QR code contains an email, phone or card number');
+
+  // ── §10 multiple entrances + §11 override ──
+  W().document.querySelector('[data-action="scBack"]').click(); await sleep(60);
+  W().document.querySelector(`[data-action="scPick"][data-id="${neon.id}"]`).click(); await until(()=>W().document.querySelector('[data-action="scSetupDone"]'));
+  ok(has('Main entrance') && has('VIP entrance') && has('Not at a specific entrance') && W().document.querySelector('[data-input="sc.devName"]'),'setup: choose the entrance and name the device');
+  W().document.querySelector('[data-action="scSet"][data-k="entrance"][data-v="en_vip"]').click(); await sleep(40);
+  E(`S.sc.pick.name='VIP door phone'`); W().document.querySelector('[data-action="scSetupDone"]').click(); await until(()=>W().document.querySelector('.sc-tabs'));
+  ok(E('S.sc.entrance')==='en_vip' && has('VIP entrance'),'scanning at the VIP entrance');
+  const ga=E(`Demo.st.tickets.find(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&!t.checked_in_at&&t.ticket_type_id==='${neon.ticketTypes[0].id}')`);
+  await E(`scanCheck('${ga.code}')`);
+  ok(txt('.sc-res-t')==='Wrong entrance' && txt('.sc-res-note').includes('Main entrance') && !tk(ga.code).checked_in_at,'general admission at the VIP door → WRONG ENTRANCE, send to Main entrance');
+  ok(W().document.querySelector('[data-action="scOverride"]'),'owner gets “Let in anyway”');
+  W().document.querySelector('[data-action="scOverride"]').click(); await until(()=>W().document.querySelector('.sc-result.ok'));
+  ok(tk(ga.code).checked_in_at && tk(ga.code).checkin.entrance==='VIP entrance' && E(`Demo.st.scanLog[0].override`)===true,'override: let in, logged as an override at the VIP entrance');
+  E('S.sc.last=null;render()');
+  const early=E(`Demo.st.tickets.find(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&!t.checked_in_at&&t.ticket_type_id==='${neon.ticketTypes[1].id}')`);
+  if(early){ await E(`scanCheck('${early.code}')`); ok(txt('.sc-res-t')==='Valid','early entry at the VIP door is valid'); E('S.sc.last=null;render()'); }
+  W().document.querySelector('[data-action="scTab"][data-v="stats"]').click(); await sleep(60);
+  ok(has('By entrance') && has('VIP entrance') && has('Scanned in') && has('Remaining') && has('Tickets'),'totals: tickets / scanned in / remaining / % and by entrance');
+
+  // ── §8 live count ──
+  const ds=await E(`DB.doorSync('${neon.id}')`), loc=E(`checkStats('${neon.id}')`);
+  ok(ds.stats.total===loc.total && ds.stats.inn===loc.inn && ds.stats.left===loc.total-loc.inn && ds.stats.pct===Math.round(loc.inn/loc.total*100),`live count matches: ${ds.stats.total} tickets, ${ds.stats.inn} in, ${ds.stats.left} remaining, ${ds.stats.pct}%`);
+  ok(ds.stats.byEntrance['VIP entrance']>=1 && ds.stats.byEntrance['Main entrance']>=1,'live count by entrance');
+
+  // ── §9 multiple devices, kept in sync ──
+  g.src='/index.html#/scan'; await until(()=>E2('S.adm && S.adm.events && S.adm.events.length'),10000);
+  E2(`S.sc._dev={id:'dev_t2',name:'Test phone 2'}; S.sc.evId='${neon.id}'; S.sc.entrance=''; S.sc.slot=''; render()`); await until(()=>W2().document.querySelector('.sc-tabs'));
+  const nx=E(`Demo.st.tickets.find(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&!t.checked_in_at)`);
+  await E2(`scanCheck('${nx.code}')`); ok(W2().document.querySelector('.sc-result.ok'),'phone 2 lets a guest in');
+  await E('doorTick()'); await sleep(50);
+  ok(!!E(`S.adm.tickets.find(t=>t.code==='${nx.code}').checked_in_at`),'phone 1 picks it up on its next sync (every 4 s)');
+  W().document.querySelector('[data-action="scTab"][data-v="scan"]').click(); await sleep(40);
+  await E(`scanCheck('${nx.code}')`); ok(txt('.sc-res-t')==='Already scanned' && txt('.sc-res-note').includes('Test phone 2'),'phone 1 scanning the same ticket: ALREADY SCANNED (by Test phone 2)');
+  E('S.sc.last=null;render()');
+  const devs=await E('DB.devices()'); ok(['dev_t1','dev_t2','dev_door1'].every(id=>devs.some(d=>d.id===id)) && devs.find(d=>d.id==='dev_t2').name==='Test phone 2','every scanning device is listed');
+  await E(`DB.deviceAction('dev_t2','disable')`);
+  const nx2=E(`Demo.st.tickets.find(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&!t.checked_in_at)`);
+  ok((await E2(`DB.checkin('${nx2.code}',false,'${neon.id}',scanOpts())`)).result==='device_off' && !tk(nx2.code).checked_in_at,'a device switched off by an admin can’t check anyone in');
+  await E(`DB.deviceAction('dev_t2','enable')`); await E(`DB.deviceAction('dev_t2','rename','Lobby tablet')`);
+  ok((await E('DB.devices()')).find(d=>d.id==='dev_t2').name==='Lobby tablet','admins can rename a device');
+  await view('#/admin/checkin'); await until(()=>has('Scanner devices') && has('Lobby tablet'));
+  ok(has('Switch off') && has('Door phone 1') && has('VIP tablet'),'Scanner app page lists the devices with switch-off');
+
+  // ── §13 real-time sync: back-office changes reach the door at once ──
+  const stalls=gala.ticketTypes.find(t=>t.name==='Stalls'), isStalls=`id=>Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.index[id]==='${stalls.id}'`;
+  const rn=await buy({items:[{eventId:gala.id,ticketTypeId:stalls.id,qty:2,seats:freeSeats('winter-orchestra-gala',isStalls,2)}]});
+  const [n1,n2]=live(rn.id);
+  E2(`S.sc.evId='${gala.id}'; S.sc.entrance=''; S.sc.slot=''; S.sc.syncEv=null; render()`); await E2('doorTick()'); await sleep(50);
+  await act(rn.id,'cancel',{tickets:[n1.id],seat:'release'});
+  await E2('doorTick()'); await sleep(50);
+  ok(E2(`S.adm.tickets.find(t=>t.id==='${n1.id}').status`)==='cancelled' && (await E2(`DB.checkin('${n1.code}',false,'${gala.id}',scanOpts())`)).result==='cancelled','cancel in the back office → the scanner rejects it');
+  const to=freeSeats('winter-orchestra-gala',isStalls,1)[0];
+  const mv=await act(rn.id,'change',{changes:[{ticket:n2.id,seat:to}],settle:'waive',downgrade:'none'}), nn=mv.tickets[0].to.ticket;
+  await E2('doorTick()'); await sleep(50);
+  const rmv=await E2(`DB.checkin('${nn}',false,'${gala.id}',scanOpts())`);
+  const rold=await E2(`DB.checkin('${n2.code}',false,'${gala.id}',scanOpts())`);
+  ok(rold.result==='replaced' && rmv.result==='ok' && rmv.ticket.seat===to,'move seat → the old QR is replaced, the new ticket shows the new seat'+(rold.result==='replaced'&&rmv.result==='ok'&&rmv.ticket.seat===to?'':` [${rold.result} ${rmv.result} ${rmv.ticket&&rmv.ticket.seat} vs ${to} nn=${nn} main:${E(`Demo.st.tickets.find(t=>t.id==='${n2.id}').status`)} g:${E2(`Demo.st.tickets.find(t=>t.id==='${n2.id}').status`)} mv=${JSON.stringify(mv).slice(0,300)}]`));
+  const prem=gala.ticketTypes.find(t=>t.name==='Premium'), up=freeSeats('winter-orchestra-gala',`id=>Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.index[id]==='${prem.id}'`,1)[0];
+  const ru=await buy({items:[{eventId:gala.id,ticketTypeId:stalls.id,qty:1,seats:freeSeats('winter-orchestra-gala',isStalls,1)}]}), u1=live(ru.id)[0];
+  const upg=await act(ru.id,'change',{changes:[{ticket:u1.id,seat:up}],settle:'waive',downgrade:'none'});
+  const rup=await E2(`DB.checkin('${upg.tickets[0].to.ticket}',false,'${gala.id}',scanOpts())`);
+  ok(rup.result==='ok' && rup.ticket.type==='Premium','upgrade → the scanner shows the new ticket type');
+  await E2('doorTick()'); await sleep(50); E2(`S.sc.last=${JSON.stringify(rup)};render()`); await sleep(40);
+  ok(W2().document.querySelector('.sc-res-type').textContent.includes('Premium') && W2().document.querySelector('.sc-seat').textContent.includes('Premium centre'),'scanner screen: Premium, Premium centre');
+  E2('S.sc.last=null;render()');
+
+  // ── §12 reissue / resend from the order page ──
+  await E('reloadAdmin()'); await view(`#/admin/orders/${rn.id}`); await until(()=>has('Reissue tickets'));
+  W().document.querySelector('[data-action="opOpen"][data-v="reissue"]').click(); await until(()=>has('Reissue with new codes'));
+  ok(has('The old codes stop working at the door immediately'),'reissue panel explains the old code dies at once');
+  W().document.querySelector('[data-action="opGo"][data-v="reissue"]').click(); await until(()=>E(`Demo.st.orderLog.some(x=>x.order_id==='${rn.id}'&&x.kind==='reissue')`));
+  const newest=live(rn.id)[0];
+  ok(newest.code!==nn && newest.seat===to && (await scan(nn,gala.id)).result==='replaced','reissue from the order page: new QR, same seat, old QR rejected');
+  ok(E(`Demo.st.outbox.filter(m=>m.order_id==='${rn.id}'&&m.kind==='tickets').length`)>=1 && has('Resend tickets'),'reissued tickets are queued to the customer; resend is there too');
+
+  // ── §7 manual search (door staff) ──
+  await as('door@example.com');
+  const dn=E(`Demo.st.tickets.find(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&!t.checked_in_at)`), dno=E(`Demo.st.orders.find(o=>o.id==='${dn.order_id}')`);
+  const by=async q=>(await E(`DB.doorSearch('${neon.id}',${JSON.stringify(q)})`)).map(x=>x.id);
+  ok((await by(dno.data.buyer.name)).includes(dn.id) && (await by(dno.buyer_email)).includes(dn.id) && (await by(dno.ref)).includes(dn.id) && (await by(dn.code)).includes(dn.id),'door staff find a guest by name, email, order number or ticket number');
+  E(`Demo.st.orders.find(o=>o.id==='${dn.order_id}').data.buyer.phone='(718) 555-0123';Demo.save()`);
+  ok((await by('7185550123')).includes(dn.id) && (await by('555-0123')).includes(dn.id),'… or by phone');
+  const one=(await E(`DB.doorSearch('${neon.id}',${JSON.stringify(dno.buyer_email)})`))[0];
+  ok(!('buyer_email' in one) && !JSON.stringify(one).includes(dno.buyer_email) && !JSON.stringify(one).includes('555-0123') && !('paid' in one),'search results never carry the email, phone or money');
+  W().location.hash='#/scan'; await until(()=>W().document.querySelector('.sc-ev,.sc-tabs,[data-action="scSetupDone"]'));
+  E(`S.sc.evId='${neon.id}';S.sc.entrance='en_main';S.sc.slot='';S.sc.tab='guests';S.sc.q=${JSON.stringify(dno.buyer_email)};render()`);
+  await until(()=>W().document.querySelector(`[data-action="scToggle"][data-v="${dn.code}"]`));
+  W().document.querySelector(`[data-action="scToggle"][data-v="${dn.code}"]`).click(); await until(()=>tk(dn.code).checked_in_at);
+  ok(tk(dn.code).checkin.manual===true && E(`Demo.st.scanLog[0].manual`)===true,'manual check-in from the search, marked manual in the log');
+
+  // ── §11 scanner permissions ──
+  await as('scanner@example.com');
+  ok(JSON.stringify(E('S.adm.me.perms').slice().sort())==='["door.checkin","door.scan"]','Scanner staff template: scan + check in only');
+  await view('#/admin'); ok(has('Your access is the scanner') && !W().document.querySelector('.side a[href="#/admin/orders"]') && !W().document.querySelector('.side a[href="#/admin/reports"]'),'scanner staff: no dashboard, orders or reports — just a way into the scanner');
+  ok(E('S.adm.orders.length')===0 && E(`S.adm.tickets.every(t=>t.paid==null&&t.face==null&&t.refunded==null&&!Object.keys(t.answers||{}).length&&!t.promo&&t.holder==='Guest')`),'scanner staff get no orders, money, answers, codes or names');
+  const sx=E(`Demo.st.tickets.find(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&!t.checked_in_at)`);
+  const rs=await scan(sx.code,neon.id,{entrance:'en_main'}); ok(rs.result==='ok' && rs.ticket.holder==='Guest' && !('paid' in rs.ticket) && rs.ticket.type,'scanner staff: scan, valid, basic seating / type info');
+  ok(/permission/.test(String(await throwsP(`DB.checkin('${sx.code}',true,'${neon.id}')`))),'… cannot undo a check-in');
+  ok(/permission/.test(String(await throwsP(`DB.doorSearch('${neon.id}','smith')`))) && /permission/.test(String(await throwsP(`DB.doorLog('${neon.id}')`))) && /permission/.test(String(await throwsP(`DB.devices()`))),'… cannot search guests, read the scan history or manage devices');
+  const vip=E(`Demo.st.tickets.find(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&!t.checked_in_at&&t.ticket_type_id==='${neon.ticketTypes[0].id}')`);
+  ok(/permission/.test(String(await throwsP(`DB.checkin('${vip.code}',false,'${neon.id}',{entrance:'en_vip',override:true})`))),'… cannot override the entrance warning');
+  ok(/permission/.test(String(await throwsP(`DB.orderAction('${rn.id}','reissue',{})`))),'… cannot reissue tickets');
+
+  // ── §14 scan history ──
+  await as('moishsonn@gmail.com');
+  const lg=await E(`DB.doorLog('${neon.id}')`);
+  ok(['ok','already','unknown','wrong_entrance'].every(r=>lg.some(x=>x.result===r)) && lg.every(x=>x.at && 'device_name' in x && 'entrance' in x && x.by),'scan history: check-ins, duplicates and invalid attempts with time, device, entrance and employee');
+  await view(`#/admin/event/${neon.id}/door`); await until(()=>has('Scan history') && W().document.querySelector('[data-action="dlogF"]') && !has('Loading…'));
+  ok(has('Duplicates') && has('Invalid') && has('VIP tablet') && has('By entrance') && has('Entrances'),'Door & check-in tab: totals, by entrance, entrances, scan history');
+  W().document.querySelector('[data-action="dlogF"][data-v="bad"]').click(); await sleep(60);
+  ok([...W().document.querySelectorAll('.tbl .chip.mini.bad,.tbl .chip.mini.warn')].length>0 && ![...W().document.querySelectorAll('.tbl tbody tr')].some(r=>r.textContent.includes('Valid')),'filter: invalid attempts only');
+  // entrances are edited on the event (Save changes) and kept in its history
+  W().document.querySelector('[data-action="enAdd"]').click(); await sleep(40);
+  ok(E('S.draft.entrances.length')===3 && E('S.dirty'),'add an entrance');
+  E(`S.draft.entrances[2].name='Balcony entrance'`); await E('A.saveEvent()'); await sleep(80);
+  ok(E(`Demo.st.events.find(e=>e.id==='${neon.id}').entrances.length`)===3 && E(`Demo.st.audit.some(a=>a.target==='${neon.id}'&&/Entrances/.test(a.summary))`),'saved entrances are in the event history');
+
+  // ── offline: validate locally, queue, sync when back ──
+  W().location.hash='#/scan'; await sleep(80); E(`S.sc.evId='${neon.id}';S.sc.entrance='en_main';S.sc.slot='';render()`);
+  const off=E(`S.adm.tickets.find(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&!t.checked_in_at)`);
+  const lr=E(`localCheckin('${off.code}',false,scanOpts())`); ok(lr.result==='ok' && lr.offline && E('S.sc.queue.length')===1,'offline: validated on the phone and queued');
+  await E('flushQueue()'); ok(E('S.sc.queue.length')===0 && !!tk(off.code).checked_in_at,'back online: the queued check-in reaches the server');
+  ok(E(`Demo.st.orders.filter(o=>o.status==='paid').every(o=>Demo.st.outbox.filter(m=>m.order_id===o.id&&m.kind==='confirmation').length<=1)`),'still exactly one order confirmation per order');
+  log('DONE');
+}catch(e){log('ERROR '+e.message+'\n'+e.stack)}})();
+</script></body></html>

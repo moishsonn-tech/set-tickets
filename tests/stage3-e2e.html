@@ -24,7 +24,7 @@ const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({bu
   const m0=states('winter-orchestra-gala');
   ok(count(m0,'blocked')===4 && count(m0,'held')===2 && count(m0,'unavailable')===1 && count(m0,'comp')===2 && count(m0,'sold')>20,`seat statuses: ${['sold','comp','held','blocked','unavailable','available'].map(k=>k+' '+count(m0,k)).join(', ')}`);
   const tk=E(`Demo.st.tickets.filter(t=>t.event_id==='${g.id}'&&t.seat)`);
-  ok(tk.length>20 && tk.every(t=>t.area&&t.row&&t.seat_label&&!t.seat_label.includes(t.row)),'every seated ticket stores Area, Row and Seat separately');
+  ok(tk.length>20 && tk.every(t=>t.area&&(t.row||t.unit)&&t.seat_label&&!(t.row&&t.seat_label.includes(t.row))),'every seated ticket stores Area, Row (or Box, since Stage 7) and Seat separately');
   ok(E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.meta['CEN-B5'].join('|')`)==='Premium centre|B|5','seat meta: Premium centre / B / 5');
 
   // ── buyer map: levels, unavailable seats, holds ──

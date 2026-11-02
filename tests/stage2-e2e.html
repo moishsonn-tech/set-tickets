@@ -62,7 +62,7 @@ async function edit(slug, fn){ const id=ev(slug).id; W().location.hash='#/admin/
   W().location.hash='#/admin/event/'+g.id+'/overview'; await until(()=>E('S.draft&&S.draft.id')===g.id);
   W().prompt=()=>'Gala layout'; await E('A.saveTemplate()');
   const tp=E("S.adm.bo.eventTemplates.find(t=>t.name==='Gala layout')");
-  ok(tp && !tp.event.secrets.discounts && !tp.event.secrets.password && tp.event.seating.sections.length===4 && !tp.event.start,'save as template: keeps seating, drops dates, password & codes (codes are box-office wide since Stage 4)');
+  ok(tp && !tp.event.secrets.discounts && !tp.event.secrets.password && tp.event.seating.sections.length===6 && !tp.event.start,'save as template: keeps seating, drops dates, password & codes (codes are box-office wide since Stage 4)');
   // sellout
   const so=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets, S.adm.seatStatus, S.adm.orders)`);
   const manual=E(`(()=>{const e=S.adm.events.find(e=>e.id==='${g.id}');return [...seatStates(e,{tickets:S.adm.tickets,statuses:S.adm.seatStatus,orders:S.adm.orders}).values()].filter(x=>x.p.tt&&!['blocked','unavailable'].includes(x.state)).reduce((t,x)=>t+e.ticketTypes.find(y=>y.id===x.p.tt).price,0)})()`);

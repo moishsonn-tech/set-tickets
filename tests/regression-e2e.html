@@ -89,7 +89,7 @@ W && (async()=>{try{
   // manual order + refund
   const before=W().eval('S').adm.orders.length; await W().eval('DB').placeOrder({buyer:{name:'Comp',email:'comp@x.com'},items:[{eventId:ga.id,ticketTypeId:gaTT,qty:2}],addons:[],payment:'manual'},true);
   await W().reloadAdmin(); ok(W().eval('S').adm.orders.length===before+1,'manual order created');
-  const o=W().eval('S').adm.orders.find(x=>x.ref===ref); await W().eval('DB').setOrderStatus(o.id,'refunded'); r=await W().eval('DB').checkin(W().eval('Demo').st.tickets.find(t=>t.order_id===o.id).code); ok(r.result==='cancelled','refunded ticket rejected at door');
+  const o=W().eval('S').adm.orders.find(x=>x.ref===ref); await W().eval('DB').setOrderStatus(o.id,'refunded'); r=await W().eval('DB').checkin(W().eval('Demo').st.tickets.find(t=>t.order_id===o.id).code); ok(r.result==='refunded','refunded ticket rejected at door (as refunded)');
   // embed
   W().location.hash='#/embed/city-food-festival'; await sleep(200); ok(W().document.body.classList.contains('embed'),'embed mode');
   // ── scanner app ──
@@ -97,7 +97,8 @@ W && (async()=>{try{
   W().location.hash='#/scan'; await until(()=>W().document.querySelector('.sc-ev'));
   ok(W().document.querySelectorAll('.sc-ev').length>=2,'scanner lists events');
   const tonight=W().eval('S').adm.events.find(e=>e.slug==='neon-nights-live');
-  W().document.querySelector(`[data-action="scPick"][data-id="${tonight.id}"]`).click(); await until(()=>W().document.querySelector('.sc-tabs'));
+  W().document.querySelector(`[data-action="scPick"][data-id="${tonight.id}"]`).click(); await until(()=>W().document.querySelector('.sc-tabs,[data-action="scSetupDone"]'));
+  if(W().document.querySelector('[data-action="scSetupDone"]')){ W().document.querySelector('[data-action="scSetupDone"]').click(); await until(()=>W().document.querySelector('.sc-tabs')); }   // Stage 7: pick the entrance first
   const fresh=W().eval('S').adm.tickets.find(t=>t.event_id===tonight.id&&t.status==='valid'&&!t.checked_in_at);
   await W().eval('scanCheck')(fresh.code); ok(W().document.querySelector('.sc-result.ok'),'scanner: valid overlay');
   await W().eval('scanCheck')(fresh.code); ok(W().document.querySelector('.sc-result.warn')&&W().document.body.innerHTML.includes('First scanned'),'scanner: duplicate flagged');

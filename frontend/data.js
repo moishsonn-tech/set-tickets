@@ -28,7 +28,7 @@ const PERMS = [
   ['orders', 'Orders', [['view', 'View orders', 'v'], ['edit', 'Edit orders'], ['cancel', 'Cancel orders'], ['cancelTicket', 'Cancel individual tickets'], ['resend', 'Resend tickets'], ['customer', 'Change customer information'], ['seats', 'Change seats'], ['refund', 'Issue refunds'], ['override', 'Override normal order restrictions']]],
   ['customers', 'Customer data', [['names', 'View customer names', 'v'], ['emails', 'View email addresses', 'v'], ['phones', 'View phone numbers', 'v'], ['profiles', 'View full customer profiles', 'v'], ['export', 'Export customer information']]],
   ['finance', 'Sales & finance', [['totals', 'View ticket sales totals', 'v'], ['reports', 'View financial reports', 'v'], ['fees', 'View fees', 'v'], ['processing', 'View payment processing information', 'v'], ['payouts', 'View payouts', 'v'], ['export', 'Export financial reports']]],
-  ['door', 'Event-day access', [['scan', 'Scan tickets'], ['checkin', 'Check customers in'], ['undo', 'Undo check-in'], ['override', 'Override scanner warnings'], ['attendees', 'View attendee lists', 'v'], ['devices', 'Manage scanner devices'], ['staff', 'Manage door staff']]],
+  ['door', 'Event-day access', [['scan', 'Scan tickets'], ['checkin', 'Check customers in'], ['undo', 'Undo check-in'], ['override', 'Override scanner warnings'], ['search', 'Look up guests at the door (name, email, phone, order)'], ['log', 'View scan history', 'v'], ['attendees', 'View attendee lists', 'v'], ['devices', 'Manage scanner devices'], ['staff', 'Manage door staff']]],
   ['comms', 'Communication', [['email', 'Send customer emails'], ['notify', 'Send event notifications'], ['lists', 'Access attendee mailing lists', 'v']]],
   ['admin', 'Administration', [['invite', 'Invite team members'], ['remove', 'Remove team members'], ['perms', 'Edit team permissions'], ['integrations', 'Access integrations'], ['api', 'Access API settings'], ['payments', 'Access payment settings'], ['settings', 'Access box office settings']]],
 ];
@@ -38,8 +38,9 @@ const DEFAULT_TEMPLATES = [
   { id: 'full', name: 'Full administrator', perms: ALL_PERMS },
   { id: 'event_manager', name: 'Event manager', perms: [...groupPerms('events'), ...groupPerms('seating'), ...groupPerms('tickets'), ...groupPerms('door'), 'orders.view', 'customers.names', 'finance.totals', 'comms.notify'] },
   { id: 'customer_service', name: 'Customer service', perms: ['events.view', 'seating.view', 'seating.move', 'seating.assign', 'tickets.view', 'orders.view', 'orders.edit', 'orders.cancel', 'orders.cancelTicket', 'orders.resend', 'orders.customer', 'orders.seats', 'orders.refund', ...groupPerms('customers', true), 'door.attendees', 'comms.email'] },
-  { id: 'door_staff', name: 'Door staff', perms: ['events.view', 'seating.view', 'customers.names', 'door.scan', 'door.checkin', 'door.undo', 'door.override', 'door.attendees'] },
-  { id: 'scanner', name: 'Scanner staff', perms: ['events.view', 'door.scan', 'door.checkin'] },
+  { id: 'door_staff', name: 'Door staff', perms: ['events.view', 'seating.view', 'customers.names', 'door.scan', 'door.checkin', 'door.undo', 'door.override', 'door.search', 'door.log', 'door.attendees'] },
+  // Scanner staff: scan, see valid / seat / basic totals — nothing else (no back office, no customer or money data).
+  { id: 'scanner', name: 'Scanner staff', perms: ['door.scan', 'door.checkin'] },
   { id: 'finance', name: 'Finance', perms: ['events.view', 'tickets.view', 'orders.view', 'customers.names', ...groupPerms('finance')] },
   { id: 'marketing', name: 'Marketing', perms: ['events.view', 'tickets.view', 'tickets.discounts', 'tickets.discountsEdit', 'tickets.tracking', 'customers.names', 'customers.emails', 'customers.export', 'finance.totals', ...groupPerms('comms')] },
 ];
@@ -451,6 +452,9 @@ function seatNum(sec, i, n) {
   const first = (s % 2 === 1) === (sec.numbering === 'odd') ? s : s + 1; return first + 2 * k;
 }
 const secKind = sec => ['table', 'booth', 'ga'].includes(sec.kind) ? sec.kind : 'rows';
+// The section's own name on the ticket ("Table 5", "Box 4", "Couch 3") — on by default for tables and booths, opt-in for rows
+// (boxes, pods, couches drawn as a row). Left out when it would just repeat the area.
+const secUnit = (sec, kind, area) => { const on = sec.showName ?? (kind === 'table' || kind === 'booth'), n = String(sec.name || '').trim(); return on && kind !== 'ga' && n && n !== area ? n : ''; };
 function seatLayout(st) {
   const seats = [], secs = [], removed = new Set(st?.removed || []), areas = st?.areas || {}, labels = st?.labels || {}, lv0 = st?.levels?.[0]?.id || '';
   for (const sec of st?.sections || []) {
@@ -486,6 +490,7 @@ function seatLayout(st) {
       p.gx = (+sec.x || 0) + g.cx + dx * c - dy * sn; p.gy = (+sec.y || 0) + g.cy + dx * sn + dy * c;
       p.sec = sec; p.tt = (kind === 'ga' ? '' : (st.prices || {})[p.id]) || sec.ticketTypeId || '';
       p.area = areas[p.id] || sec.area || sec.name || sec.code; p.label = kind === 'ga' ? '' : labels[p.id] || String(p.num); p.level = g.level;
+      p.unit = secUnit(sec, kind, p.area); p.tRow = sec.hideRow ? '' : p.row;   // tRow = the row printed on the ticket (boxes / couches can leave it off)
       p.removed = removed.has(p.id);
       if (!p.removed) { seats.push(p); g.local.push(p); }
     }
@@ -506,11 +511,11 @@ function boundsOf(L, level, stage) {
   if (stage && (level == null || level === (stage.level || L.lv0 || ''))) { xs.push(+stage.x, +stage.x + +stage.w); ys.push(+stage.y, +stage.y + +stage.h); }
   return xs.length ? { x0: Math.min(...xs) - 30, x1: Math.max(...xs) + 30, y0: Math.min(...ys) - 44, y1: Math.max(...ys) + 24 } : { x0: -200, x1: 200, y0: -150, y1: 150 };
 }
-// What the server checks against: price per seat (index), what goes on the ticket (meta: [area, row, seat]),
+// What the server checks against: price per seat (index), what goes on the ticket (meta: [area, row, seat, unit]),
 // and row order for the single-seat gap rule (rows: "SEC|A" → [seatId | null for a removed seat]).
 function seatDerive(st) {
   const L = seatLayout(st), index = {}, meta = {}, rows = {};
-  for (const p of L.seats) { if (p.tt) index[p.id] = p.tt; meta[p.id] = [p.area, p.row, p.label]; }
+  for (const p of L.seats) { if (p.tt) index[p.id] = p.tt; meta[p.id] = p.unit ? [p.area, p.tRow, p.label, p.unit] : [p.area, p.tRow, p.label]; }
   for (const g of L.secs) for (const [r, ids] of Object.entries(g.rowsOrder)) rows[g.sec.code + '|' + r] = ids;
   return { index, meta, rows };
 }
@@ -535,8 +540,8 @@ function pruneSeatKeys(st) {
 }
 // Ticket Type / Area, Row and Seat — kept separate on every ticket (Eli: never one combined label).
 function seatInfo(ev, id, t) {
-  if (t?.area !== undefined && t.area !== null) return { area: t.area, row: t.row || '', seat: t.seat_label || '' };
-  const m = ev?.seating?.meta?.[id]; return m ? { area: m[0], row: m[1], seat: m[2] } : { area: '', row: '', seat: id || '' };
+  if (t?.area !== undefined && t.area !== null) return { area: t.area, row: t.row || '', seat: t.seat_label || '', unit: t.unit || '' };
+  const m = ev?.seating?.meta?.[id]; return m ? { area: m[0], row: m[1], seat: m[2], unit: m[3] || '' } : { area: '', row: '', seat: id || '', unit: '' };
 }
 
 // Venue chart <-> event. A chart keeps the layout plus named price tiers; attaching it to an event copies it and maps
@@ -603,7 +608,7 @@ function singleGaps(ev, isFree, chosen) {
 }
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v10';
+const DEMO_KEY = 'set_demo_v11';
 const Demo = {
   st: null,
   load() {
@@ -612,7 +617,12 @@ const Demo = {
     return this.st;
   },
   // Pick up changes another tab made (e.g. an admin removed this person) — what a real server would see.
-  fresh() { let raw = null; try { raw = localStorage.getItem(DEMO_KEY); } catch (e) { } if (raw && raw !== this._raw) { this.st = JSON.parse(raw); this._raw = raw; } return this.st || this.load(); },
+  // Updated in place, so an action that already holds Demo.st (and then checks permissions) keeps writing to the live copy.
+  fresh() {
+    let raw = null; try { raw = localStorage.getItem(DEMO_KEY); } catch (e) { }
+    if (raw && raw !== this._raw) { const n = JSON.parse(raw); if (this.st) { for (const k of Object.keys(this.st)) if (!(k in n)) delete this.st[k]; Object.assign(this.st, n); } else this.st = n; this._raw = raw; }
+    return this.st || this.load();
+  },
   save() { try { this._raw = JSON.stringify(this.st); localStorage.setItem(DEMO_KEY, this._raw); } catch (e) { console.warn('demo save failed', e); } },
   reset() { localStorage.removeItem(DEMO_KEY); return this.load(); },
 };
@@ -634,7 +644,7 @@ function codeClash(st, code, extra, selfId) {
 }
 
 // "Stalls centre · Row A · Seat 12" from the saved ticket meta (data layer has no layout renderer)
-const seatText = (ev, id) => { const m = ev?.seating?.meta?.[id]; return m ? [m[0], m[1] && 'Row ' + m[1], m[2] && 'Seat ' + m[2]].filter(Boolean).join(' · ') : id; };
+const seatText = (ev, id) => { const m = ev?.seating?.meta?.[id]; return m ? [m[0], m[3], m[1] && 'Row ' + m[1], m[2] && 'Seat ' + m[2]].filter(Boolean).join(' · ') : id; };
 const money_ = c => '$' + (Math.round(+c || 0) / 100).toFixed(2);
 // Per-seat history (Eli Step 3 §9). action: sold | comp | cancelled | blocked | unblocked | held | released | unavailable | available | moved | price | area
 function seatLog(ev, slotId, seat, action, detail, o = {}) {
@@ -846,7 +856,7 @@ function issueOrderTickets(st, order, o = {}) {
   const issue = (l, ttId, seat, face, paid, discount, more = {}) => {
     const ev = st.events.find(e => e.id === l.eventId), inf = seat ? seatInfo(ev, seat) : null;
     st.tickets.push({ id: uid(), box_office_id: order.box_office_id, order_id: order.id, event_id: l.eventId, ticket_type_id: ttId, slot_id: l.slotId || null,
-      seat, ...(inf ? { area: inf.area, row: inf.row, seat_label: inf.seat } : {}), comp, face, paid, discount, promo: discount > 0 ? code : null, tracking,
+      seat, ...(inf ? { area: inf.area, row: inf.row, seat_label: inf.seat, unit: inf.unit || null } : {}), comp, face, paid, discount, promo: discount > 0 ? code : null, tracking,
       bundle: null, extras: extras(l.eventId), price_override: !!l.override, answers: tAns(l.eventId), ...more, code: randCode(10), holder: d.buyer.name, status: 'valid', checked_in_at: null });
     if (seat) seatLog(ev, l.slotId, seat, comp ? 'comp' : 'sold', `${comp ? 'Complimentary ticket issued' : 'Sold'} to ${d.buyer.name}${discount > 0 ? ` · discount ${code}` : ''}${more.bundle ? ` · ${more.bundle.name}` : ''} · ${money_(comp ? face : paid)}`, { ref: order.ref, by, discount: discount > 0 ? code : null });
   };
@@ -1070,7 +1080,7 @@ function changeOrderTickets(st, o, p, by, inventory = false) {
   const keepPaid = (net > 0 && p.settle === 'waive') || (net < 0 && p.downgrade === 'none'), rows = [];
   for (const x of plan) {
     const t = x.t, inf = x.seat ? seatInfo(x.ev, x.seat) : null, paid = keepPaid ? t.paid : x.newPaid;
-    const nt = { ...clone(t), id: uid(), ticket_type_id: x.tt.id, slot_id: x.slot, seat: x.seat, area: inf?.area ?? null, row: inf?.row ?? null, seat_label: inf?.seat ?? null,
+    const nt = { ...clone(t), id: uid(), ticket_type_id: x.tt.id, slot_id: x.slot, seat: x.seat, area: inf?.area ?? null, row: inf?.row ?? null, seat_label: inf?.seat ?? null, unit: inf?.unit || null,
       face: x.face, paid, discount: t.comp ? 0 : x.ovr ? Math.max(0, x.face - paid) : (t.discount || 0) + (keepPaid && x.diff > 0 ? x.diff : 0), price_override: x.ovr || !!t.price_override,
       refunded: 0, code: randCode(10), status: 'valid', replaces: t.id, issued_at: nowIso() };
     delete nt.replaced_by; delete nt.changed_at;
@@ -1228,6 +1238,16 @@ function demoOrderAction(id, action, p = {}) {
       if (!subject || !body) throw new Error('Add a subject and a message');
       const m = queueMail(st, o, 'message', subject, body, by); log('message', `message queued for ${o.buyer_email}: “${subject.slice(0, 80)}”`, { outbox: m.id }); break;
     }
+    case 'reissue': {  // same seat / type, new QR code: the old code stops working at the door at once (lost phone, forwarded screenshot)
+      need('orders.edit', ev0); paidOnly();
+      const ids = p.tickets?.length ? new Set(p.tickets) : null, list = live().filter(t => !ids || ids.has(t.id));
+      if (!list.length) throw new Error('Choose the tickets to reissue');
+      const pairs = list.map(t => { const nt = { ...clone(t), id: uid(), code: randCode(10), status: 'valid', replaces: t.id, issued_at: nowIso() }; delete nt.replaced_by; delete nt.changed_at;
+        Object.assign(t, { status: 'replaced', replaced_by: nt.id, changed_at: nowIso() }); st.tickets.push(nt); return [t.code, nt.code]; });
+      log('reissue', `reissued ${pairs.length} ticket${pairs.length === 1 ? '' : 's'} with new QR codes (${pairs.map(([a, b]) => a + ' → ' + b).join(', ')}) — the old codes no longer scan`, { pairs });
+      notify('tickets', 'Your updated tickets', 'Your tickets were reissued with new QR codes. Please use these — the old ones no longer work at the door.');
+      res = { codes: pairs.map(x => x[1]) }; break;
+    }
     case 'resend': {
       need('orders.resend', ev0); if (!live().length && p.kind !== 'confirmation') throw new Error('This order has no valid tickets');
       const k = p.kind === 'confirmation' ? 'confirmation_copy' : 'tickets';
@@ -1323,7 +1343,7 @@ function startDemoSession(email) {
 }
 const EVENT_TRACKED = [['name', 'Name'], ['status', 'Status'], ['archived', 'Archived'], ['start', 'Start'], ['end', 'End'], ['allDay', 'All day'], ['venue', 'Venue'], ['address', 'Address'],
   ['online', 'Online'], ['capacity', 'Capacity'], ['visibility', 'Visibility'], ['publishAt', 'Scheduled publish'], ['salesStart', 'Sales open'], ['salesEnd', 'Sales close'],
-  ['waitlistMode', 'Waitlist'], ['currency', 'Currency'], ['contact', 'Event contact'], ['policies', 'Policies']];
+  ['waitlistMode', 'Waitlist'], ['currency', 'Currency'], ['contact', 'Event contact'], ['policies', 'Policies'], ['entrances', 'Entrances']];
 const priceSig = e => JSON.stringify([(e.ticketTypes || []).map(t => [t.id, +t.price || 0, t.phases || [], t.breaks || [], t.slotPrices || {}]), (e.addons || []).map(a => [a.id, +a.price || 0]), (e.bundles || []).map(b => [b.id, +b.price || 0])]);
 const showtimeSig = s => [s.start, s.capacity, s.hidden ? 'hidden' : '', s.unavailable ? 'unavailable' : '', s.soldOut ? 'sold out' : ''].filter(x => x !== '').join(' · ');
 function eventDiff(a, b) {
@@ -1353,6 +1373,71 @@ function eventDiff(a, b) {
   if (!!a?.secrets?.password !== !!b?.secrets?.password) out.push(['Password', a?.secrets?.password ? 'on' : 'off', b?.secrets?.password ? 'on' : 'off']);
   return out.map(d => d[0] === 'Seating map' ? [d[0], 'previous layout', 'new layout'] : d);
 }
+
+// ── Door / scanning (Stage 7) ─────────────────────────────────────────────────
+// A ticket's QR holds only its random code. Every scan is checked by the "server" (DEMO: here; LIVE: checkin()), logged in
+// scanLog / scan_log, and answered with doorTicket(): where the guest belongs — never money, email or phone.
+const SCAN_RESULTS = ['ok', 'already', 'undone', 'unknown', 'cancelled', 'refunded', 'replaced', 'wrong_event', 'wrong_slot', 'wrong_entrance', 'inactive', 'device_off'];
+function doorTicket(st, t, P) {
+  const ev = st.events.find(e => e.id === t.event_id), tt = ev?.ticketTypes.find(x => x.id === t.ticket_type_id), o = st.orders.find(x => x.id === t.order_id);
+  const sibs = st.tickets.filter(x => x.order_id === t.order_id && x.status === 'valid'), sp = t.seat ? seatInfo(ev, t.seat, t) : null, slot = t.slot_id && (ev?.timeSlots || []).find(x => x.id === t.slot_id);
+  return { id: t.id, code: t.code, event_id: t.event_id, event_name: ev?.name || '', event_start: ev?.start || null, slot_id: t.slot_id || null, slot_start: slot?.start || null,
+    ticket_type_id: t.ticket_type_id, type: tt?.name || '', admits: Math.max(1, +tt?.admits || 1), seat: t.seat || null, area: sp?.area ?? null, row: sp?.row ?? null, seat_label: sp?.seat ?? null, unit: sp?.unit || null,
+    holder: P('customers.names') ? t.holder : 'Guest', comp: !!t.comp, status: t.status, checked_in_at: t.checked_in_at || null, checkin: t.checkin || null,
+    order_id: t.order_id, order_ref: o?.ref || '', of: sibs.length, no: sibs.indexOf(t) + 1, due: (o?.data?.due || 0) > 0 };
+}
+// An entrance can be limited to ticket types and/or seating areas (e.g. "Box seat entrance" → area Boxes). No limits = everyone.
+const entranceTakes = (en, t) => !en || ((!en.ticketTypeIds?.length || en.ticketTypeIds.includes(t.ticket_type_id)) && (!en.areas?.length || en.areas.includes(t.area || '')));
+const doorStats = (tks, ev) => {
+  const v = tks.filter(t => t.status === 'valid'), inn = v.filter(t => t.checked_in_at), byEntrance = {};
+  for (const t of inn) { const k = t.checkin?.entrance || ''; byEntrance[k] = (byEntrance[k] || 0) + 1; }
+  return { total: v.length, inn: inn.length, left: v.length - inn.length, pct: v.length ? Math.round(inn.length / v.length * 100) : 0, byEntrance,
+    bySlot: Object.fromEntries((ev?.timeSlots || []).map(s => [s.id, { total: v.filter(t => t.slot_id === s.id).length, inn: inn.filter(t => t.slot_id === s.id).length }])) };
+};
+function demoCheckin(code, undo, eventId, o) {
+  const st = Demo.fresh(), me = need('door.scan'), P = k => hasPerm(me, k, eventId || undefined), c = String(code || '').trim().toUpperCase().slice(0, 64);
+  const dev = scanDevice(st, o), ev = eventId && st.events.find(e => e.id === eventId && e.box_office_id === DB._bo);
+  const en = ev && o.entrance ? (ev.entrances || []).find(x => x.id === o.entrance) : null;
+  const t = c && st.tickets.find(x => x.code === c && x.box_office_id === DB._bo);   // another box office's ticket looks exactly like a fake one
+  const done = (result, extra = {}) => {
+    (st.scanLog ||= []).unshift({ id: uid(), at: nowIso(), box_office_id: DB._bo, event_id: eventId || t?.event_id || null, slot_id: o.slot || null, ticket_id: t?.id || null, code: c,
+      result, entrance: en?.name || '', device: dev?.id || '', device_name: dev?.name || '', by: DB._actor, manual: !!o.manual, override: !!extra.override });
+    if (st.scanLog.length > 20000) st.scanLog.length = 20000;
+    Demo.save();
+    const tk = !t ? null : result === 'wrong_event' ? (x => ({ code: x.code, event_id: x.event_id, event_name: x.event_name, event_start: x.event_start, slot_start: x.slot_start }))(doorTicket(st, t, () => false)) : doorTicket(st, t, P);
+    return { result, ticket: tk, ...extra };
+  };
+  if (dev?.disabled) return done('device_off');
+  if (!t) return done('unknown');
+  if (eventId && t.event_id !== eventId) { need('door.checkin', eventId); return done('wrong_event'); }   // says which event it is for, nothing more
+  need(undo ? 'door.undo' : 'door.checkin', t.event_id);
+  if (t.status === 'replaced') return done('replaced');
+  if (t.status !== 'valid') return done(t.refunded > 0 ? 'refunded' : 'cancelled');
+  if (o.slot && t.slot_id && t.slot_id !== o.slot) return done('wrong_slot');
+  const ord = st.orders.find(x => x.id === t.order_id), tev = st.events.find(e => e.id === t.event_id);
+  if (!ord || !['paid', 'refunded'].includes(ord.status) || tev?.archived) return done('inactive');
+  if (undo) { const was = t.checked_in_at; t.checked_in_at = null; t.checkin = null; if (was) audit('door.undo', 'Undid check-in for ticket ' + t.code, { target: t.event_id }); return done('undone'); }
+  if (t.checked_in_at) return done('already', { first: { at: t.checked_in_at, ...(t.checkin || {}) } });
+  let override = false;
+  if (en && !entranceTakes(en, { ...t, area: t.area ?? seatInfo(tev, t.seat).area })) {
+    if (!o.override) return done('wrong_entrance', { entrances: (tev.entrances || []).filter(x => entranceTakes(x, { ...t, area: t.area ?? seatInfo(tev, t.seat).area })).map(x => x.name) });
+    need('door.override', t.event_id); override = true;
+  }
+  t.checked_in_at = nowIso(); t.checkin = { entrance: en?.name || '', device: dev?.id || '', device_name: dev?.name || '', by: DB._actor, manual: !!o.manual };
+  return done('ok', override ? { override } : {});
+}
+// Each phone / tablet / handheld that scans is a device: named by its user, seen by admins, can be switched off if lost.
+function scanDevice(st, o) {
+  const id = String(o.device || '').slice(0, 40); if (!id) return null;
+  const list = st.devices ||= []; let d = list.find(x => x.id === id && x.box_office_id === DB._bo);
+  if (!d) { d = { id, box_office_id: DB._bo, name: String(o.deviceName || 'Scanner').slice(0, 60), first_seen: nowIso(), scans: 0, disabled: false }; list.push(d); }
+  else if (o.deviceName && !d.renamed) d.name = String(o.deviceName).slice(0, 60);
+  d.last_seen = nowIso(); d.last_by = DB._actor; d.entrance = o.entranceName || d.entrance || ''; d.scans++;
+  return d;
+}
+const guestMatch = (st, t, q, digits) => { const o = st.orders.find(x => x.id === t.order_id);
+  return [t.holder, t.code, o?.ref, o?.buyer_email, o?.data?.buyer?.name].some(v => String(v || '').toLowerCase().includes(q))
+    || (digits.length >= 4 && String(o?.data?.buyer?.phone || '').replace(/\D/g, '').includes(digits)); };
 
 const DB = {
   live: LIVE, _actor: null, _bo: null, _support: false,
@@ -1471,8 +1556,10 @@ const DB = {
     if (!P('finance.fees')) orders.forEach(o => delete o.data.platformFee);
     if (!P('finance.totals')) {
       orders.forEach(o => { for (const k of MONEY_KEYS) o.data[k] = null; o.data.lines.forEach(l => { for (const k of LINE_MONEY) delete l[k]; l.unit = null; }); });
-      tickets.forEach(t => { t.face = t.paid = t.discount = null; });
+      tickets.forEach(t => { t.face = t.paid = t.discount = t.refunded = null; });
     }
+    // door-only staff (scanner): a ticket is just where the guest belongs — no answers, codes used or purchases
+    if (!P('orders.view') && !P('door.attendees')) tickets.forEach(t => { t.answers = {}; t.promo = t.tracking = t.bundle = null; t.extras = []; t.price_override = false; });
     const full = clone({ ...bo, templates: bo.templates?.length ? bo.templates : DEFAULT_TEMPLATES });
     return { super: isSuper, bos, me: m, bo: { ...full, branding: { ...DEFAULT_BRANDING, ...full.branding }, settings: { ...DEFAULT_SETTINGS, ...full.settings, name: bo.name } },
       events: clone(events), orders, tickets,
@@ -1542,7 +1629,8 @@ const DB = {
   // resend | markPaid | cancelUnpaid | status. LIVE: refunds to the card go through the payments Edge Function (it calls order_action as you,
   // then refunds at the processor); everything else is the order_action() RPC. Tables are never written directly.
   async orderAction(id, action, p = {}) {
-    if (!LIVE) { try { return demoOrderAction(id, action, p); } finally { Demo.save(); } }
+    // Demo.fresh() first: another tab (a second scanner) may have written since — acting on a stale copy would overwrite its changes
+    if (!LIVE) { Demo.fresh(); try { return demoOrderAction(id, action, p); } finally { Demo.save(); } }
     const viaProcessor = (action === 'refund' && (p.to || 'original') === 'original') || (action === 'status' && p.status === 'refunded')
       || (action === 'cancel' && p.refund && (p.refund.to || 'original') === 'original') || (action === 'change' && p.downgrade === 'refund' && (p.to || 'original') === 'original')
       || (action === 'removeAddon' && p.refund && (p.to || 'original') === 'original');
@@ -1550,7 +1638,7 @@ const DB = {
     return must(sb.rpc('order_action', { p_order: id, p_action: action, p }));
   },
   async creditAction(action, p = {}) {
-    if (!LIVE) { try { return demoCreditAction(action, p); } finally { Demo.save(); } }
+    if (!LIVE) { Demo.fresh(); try { return demoCreditAction(action, p); } finally { Demo.save(); } }
     return must(sb.rpc('credit_action', { p_bo: DB._bo, p_action: action, p }));
   },
   async customerNote(email, body) {
@@ -1576,19 +1664,51 @@ const DB = {
       x.at = Date.now(); x.cart = Math.max(0, Math.min(99, +cart || 0)); if (x.cart && !x.carted) x.carted = x.at; if (converted) x.conv = x.at; Demo.save(); return; }
     sb.rpc('presence_ping', { p_event: eventId, p_visitor: vid, p_cart: Math.max(0, Math.min(99, +cart || 0)), p_converted: !!converted }).then(() => { }, () => { });
   },
-  // eventId (optional): the event being scanned — a valid ticket for another event is rejected, not checked in.
-  async checkin(code, undo = false, eventId = null) {
+  // Scan / check in one ticket. eventId = the event being scanned (a ticket for another event is rejected, not checked in).
+  // o: {slot, entrance (id), entranceName, device, deviceName, manual, override}. → {result (SCAN_RESULTS), ticket (doorTicket), first?, entrances?}
+  async checkin(code, undo = false, eventId = null, o = {}) {
+    if (!LIVE) return demoCheckin(code, undo, eventId, o);
+    return must(sb.rpc('checkin', { p_code: code, p_undo: undo, p_event: eventId, p: o }));
+  },
+  // What every scanner polls: the event's tickets as the door sees them (cancel / move / upgrade / reissue show up within seconds).
+  async doorSync(eventId, since = null) {
     if (!LIVE) {
-      const t = Demo.st.tickets.find(x => x.code === String(code).trim().toUpperCase() && x.box_office_id === DB._bo);
-      if (!t) { need('door.scan'); return { result: 'unknown' }; }   // another box office's ticket looks exactly like a fake one
-      need(undo ? 'door.undo' : 'door.checkin', t.event_id);
-      if (t.status !== 'valid') return { result: 'cancelled', ticket: clone(t) };
-      if (eventId && t.event_id !== eventId) return { result: 'wrong_event', ticket: clone(t) };
-      const was = t.checked_in_at; t.checked_in_at = undo ? null : (t.checked_in_at || nowIso());
-      if (undo) audit('door.undo', 'Undid check-in for ticket ' + t.code, { target: t.event_id }); Demo.save();
-      return { result: undo ? 'undone' : was ? 'already' : 'ok', ticket: clone(t) };
+      const st = Demo.fresh(), me = need('door.scan', eventId), P = k => hasPerm(me, k, eventId), ev = st.events.find(e => e.id === eventId && e.box_office_id === DB._bo);
+      if (!ev) throw new Error('Event not found');
+      const tks = st.tickets.filter(t => t.event_id === eventId);
+      return { tickets: tks.filter(t => t.status === 'valid' || t.changed_at || t.cancelled_at).map(t => doorTicket(st, t, P)), stats: doorStats(tks, ev), at: nowIso() };
     }
-    return must(sb.rpc('checkin', { p_code: code, p_undo: undo, p_event: eventId }));
+    return must(sb.rpc('door_sync', { p_event: eventId, p_since: since }));   // LIVE: only tickets changed since the last pull
+  },
+  // Manual look-up when a QR won't scan: name, email, phone, order number or ticket number. Returns door info only (no email / phone).
+  async doorSearch(eventId, q) {
+    q = String(q || '').trim().toLowerCase().slice(0, 80); if (q.length < 2) return [];
+    if (!LIVE) {
+      const st = Demo.fresh(), me = need('door.search', eventId), P = k => hasPerm(me, k, eventId), digits = q.replace(/\D/g, '');
+      return st.tickets.filter(t => t.event_id === eventId && t.box_office_id === DB._bo && t.status === 'valid' && guestMatch(st, t, q, digits)).slice(0, 50).map(t => doorTicket(st, t, P));
+    }
+    return must(sb.rpc('door_search', { p_event: eventId, p_q: q }));
+  },
+  // Event-day log: every scan, duplicate and invalid attempt, with device, employee and entrance.
+  async doorLog(eventId) {
+    if (!LIVE) { need('door.log', eventId); return clone((Demo.fresh().scanLog || []).filter(r => r.box_office_id === DB._bo && r.event_id === eventId).slice(0, 3000)); }
+    return must(sb.rpc('door_log', { p_event: eventId }));
+  },
+  async devices() {
+    if (!LIVE) { need('door.devices'); return clone((Demo.fresh().devices || []).filter(d => d.box_office_id === DB._bo)); }
+    return must(sb.rpc('scan_devices_list', { p_bo: DB._bo }));
+  },
+  // rename | disable | enable | forget
+  async deviceAction(id, action, name = '') {
+    if (!LIVE) {
+      const st = Demo.fresh(); need('door.devices'); const d = (st.devices || []).find(x => x.id === id && x.box_office_id === DB._bo); if (!d) throw new Error('Device not found');
+      if (action === 'rename') { const n = String(name).trim().slice(0, 60); if (!n) throw new Error('Enter a name'); d.name = n; d.renamed = true; }
+      else if (action === 'disable' || action === 'enable') d.disabled = action === 'disable';
+      else if (action === 'forget') st.devices = st.devices.filter(x => x !== d);
+      else throw new Error('Unknown device action');
+      audit('door.device', `Scanner device “${d.name}”: ${action === 'rename' ? 'renamed' : action === 'forget' ? 'removed' : action + 'd'}`); Demo.save(); return;
+    }
+    return must(sb.rpc('scan_device_action', { p_bo: DB._bo, p_id: id, p_action: action, p_name: name }));
   },
   // ── team ──
   async saveMember(m) {
@@ -1840,7 +1960,7 @@ const DB = {
     await must(sb.rpc('join_waitlist', { p_event: eventId, p_name: name, p_email: email, p_phone: phone }));
   },
   async placeOrder(payload, asTeam = false) {
-    if (!LIVE) return demoPlaceOrder(clone(payload), asTeam ? need('orders.edit') : null);
+    if (!LIVE) { Demo.fresh(); return demoPlaceOrder(clone(payload), asTeam ? need('orders.edit') : null); }
     return must(sb.rpc('place_order', { p: payload }));
   },
   // ── Payments (Stage 5). DEMO: the built-in test processor. LIVE: the box office's processor through the `payments` Edge Function
@@ -1964,6 +2084,9 @@ function seedDemo() {
         { id: shortId('sec_'), code: 'CEN', name: 'Stalls centre', kind: 'rows', x: -169, y: 0, rot: 0, rows: 8, seatsPerRow: 14, rowSeats: [12, 13, 14], rowStart: 'A', curve: 25, ticketTypeId: stallsTT.id },
         { id: shortId('sec_'), code: 'RGT', name: 'Stalls right', kind: 'rows', x: 235, y: 18, rot: -9, rows: 8, seatsPerRow: 6, rowStart: 'A', ticketTypeId: stallsTT.id },
         { id: shortId('sec_'), code: 'CIR', name: 'Circle', level: 'L2', kind: 'rows', x: -299, y: 40, rot: 0, rows: 3, seatsPerRow: 24, rowStart: 'J', curve: 40, ticketTypeId: circleTT.id },
+        // side boxes upstairs: the box name goes on the ticket, no row ("Boxes · Box 1 · Seat 2")
+        ...[1, 2].map(n => ({ id: shortId('sec_'), code: 'BX' + n, name: 'Box ' + n, area: 'Boxes', level: 'L2', kind: 'rows', x: n === 1 ? -390 : 330, y: -40, rot: n === 1 ? 20 : -20, rows: 1, seatsPerRow: 4,
+          rowStart: 'A', hideRow: true, showName: true, ticketTypeId: circleTT.id })),
       ] },
     addons: [prod('Printed programme', 800, 0, { category: 'Merchandise', standalone: true }), prod('Parking pass', 2500, 150, { category: 'Parking', max: 2, desc: 'Garage on W 47th St, all evening' }),
       prod('Pre-show dinner', 5500, 80, { category: 'Dinner', desc: 'Three courses in the Lyric Room, 5:30 PM' }), prod('Meet the soloists', 4500, 20, { category: 'Meet & greet', max: 2, desc: 'After the show, backstage' })],
@@ -1978,6 +2101,8 @@ function seedDemo() {
   ev1.seating.areas = {}; const L1 = seatLayout(ev1.seating); L1.seats.filter(p => p.sec.code === 'CEN' && ['A', 'B', 'C'].includes(p.row)).forEach(p => { ev1.seating.prices[p.id] = vipTT.id; });
   L1.seats.filter(p => p.sec.code === 'CEN' && ['A', 'B', 'C'].includes(p.row)).forEach(p => { ev1.seating.areas[p.id] = 'Premium centre'; });
   Object.assign(ev1.seating, seatDerive(ev1.seating));
+  ev1.entrances = [{ id: 'en_main', name: 'Main entrance', ticketTypeIds: [], areas: [] }, { id: 'en_circle', name: 'Circle entrance', ticketTypeIds: [], areas: ['Circle'] },
+    { id: 'en_box', name: 'Box seat entrance', ticketTypeIds: [], areas: ['Boxes'] }];
   const ev2 = mk({ slug: 'neon-nights-live', name: 'Neon Nights Live', category: 'Live music', start: day(0, 20, 0), end: day(0, 23, 30), doors: '7:00 PM',
     summary: 'Tonight — three bands, one stage.', venue: 'The Warehouse', address: '210 Kent Ave, Brooklyn, NY 11249', audience: '18+ · ID required',
     description: 'Three of the city\'s best live acts on one stage. Standing room, full bar.\n\nPhoto ID required at the door.',
@@ -1986,6 +2111,8 @@ function seedDemo() {
     addons: [prod('Parking', 1500, 40, { category: 'Parking' }), prod('Tour T-shirt', 2500, 0, { category: 'Merchandise', standalone: true })] });
   ev2.bundles = [{ id: shortId('bd_'), name: 'Ticket + parking', desc: 'General admission and a parking spot', price: 4500, qty: 30, max: 4, parts: [{ ticketTypeIds: [ev2.ticketTypes[0].id], qty: 1 }], addons: [{ addonId: ev2.addons[0].id, qty: 1 }] }];
   ev2.secrets.ticketPasswords[ev2.ticketTypes[3].id] = 'VIPACCESS';
+  // Stage 7: doors. The VIP door only takes VIP tables and early entry; the main door takes everyone.
+  ev2.entrances = [{ id: 'en_main', name: 'Main entrance', ticketTypeIds: [], areas: [] }, { id: 'en_vip', name: 'VIP entrance', ticketTypeIds: [ev2.ticketTypes[1].id, ev2.ticketTypes[3].id, ev2.ticketTypes[4].id], areas: [] }];
   const ev3 = mk({ slug: 'city-food-festival', name: 'City Food & Wine Festival', category: 'Food & drink',
     summary: 'Two tasting sessions, 40 vendors.', start: day(18, 12, 0), end: day(18, 20, 0), venue: 'Pier 36', address: '299 South St, New York, NY 10002',
     description: 'Taste your way through 40 local restaurants, bakeries and wineries. Choose your session at checkout. Unlimited tastings included.',
@@ -2143,7 +2270,20 @@ function seedDemo() {
   bo1.venues = [eventToVenue(ev1, 'Grand Lyric Theatre'), eventToVenue(bo1.eventTemplates[4].event, 'Skyline Roof — dinner layout')];
   bo1.venues[1].address = ev7.address; ev1.seating.venueId = bo1.venues[0].id; ev1.seating.venueName = bo1.venues[0].name;
   // ev2 is tonight: doors are open and some guests are already in (for the scanner app).
-  Demo.st.tickets.filter(t => t.event_id === ev2.id && t.status === 'valid').forEach(t => { if (Math.random() < .4) t.checked_in_at = new Date(Date.now() - Math.pow(Math.random(), .6) * 110 * 6e4).toISOString(); });
+  // Two phones and a venue tablet are scanning at two doors; the scan log has the check-ins plus a few duplicate / invalid attempts.
+  { const devs = [['dev_door1', 'Door phone 1', 'Main entrance', 'door@example.com'], ['dev_door2', 'Door phone 2', 'Main entrance', 'scanner@example.com'], ['dev_vip', 'VIP tablet', 'VIP entrance', 'door@example.com']];
+    Demo.st.devices = devs.map(([id, name, entrance, by]) => ({ id, box_office_id: bo1.id, name, entrance, first_seen: day(0, 18, 40), last_seen: nowIso(), last_by: by, scans: 0, disabled: false, renamed: true }));
+    const log = Demo.st.scanLog = [], vipIds = new Set(ev2.entrances[1].ticketTypeIds);
+    const add = (at, t, result, d, extra = {}) => { const dv = Demo.st.devices.find(x => x.id === d[0]); dv.scans++;
+      log.push({ id: uid(), at, box_office_id: bo1.id, event_id: ev2.id, slot_id: null, ticket_id: t?.id || null, code: t?.code || extra.code, result, entrance: d[2], device: d[0], device_name: d[1], by: d[3], manual: !!extra.manual, override: false }); };
+    Demo.st.tickets.filter(t => t.event_id === ev2.id && t.status === 'valid').forEach(t => { if (Math.random() >= .4) return;
+      const d = vipIds.has(t.ticket_type_id) && Math.random() < .8 ? devs[2] : rnd(devs.slice(0, 2)), manual = Math.random() < .05;
+      t.checked_in_at = new Date(Date.now() - Math.pow(Math.random(), .6) * 110 * 6e4).toISOString();
+      t.checkin = { entrance: d[2], device: d[0], device_name: d[1], by: d[3], manual }; add(t.checked_in_at, t, 'ok', d, { manual });
+      if (Math.random() < .06) add(new Date(Date.parse(t.checked_in_at) + 4 * 6e4).toISOString(), t, 'already', d); });
+    for (const code of ['X7Q2PLM9KA', 'HELLO12345']) add(new Date(Date.now() - Math.random() * 60 * 6e4).toISOString(), null, 'unknown', devs[0], { code });
+    const gone = Demo.st.tickets.find(t => t.event_id === ev2.id && t.status === 'cancelled'); if (gone) add(new Date(Date.now() - 20 * 6e4).toISOString(), gone, gone.refunded > 0 ? 'refunded' : 'cancelled', devs[1]);
+    log.sort((a, b) => b.at < a.at ? -1 : 1); }
   Demo.st.audit.push({ id: uid(), at: day(-1, 9, 12), actor: 'hello@northside.example', box_office_id: bo3.id, kind: 'platform.registered', summary: 'Registration request: ' + bo3.name, before: null, after: null },
     ...members.filter(m => m.box_office_id !== bo3.id && m.email !== m.added_by).map(m => ({ id: uid(), at: m.created_at, actor: m.added_by, box_office_id: m.box_office_id, kind: 'team.invited', summary: `Invited ${m.email} (${m.perms.length} permissions)`, before: null, after: null })));
   // Page views so conversion rates mean something: ~8–15 visits per order, from the same channels.

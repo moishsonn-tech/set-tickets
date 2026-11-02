@@ -157,6 +157,18 @@ create table if not exists event_presence (event_id uuid not null references eve
 alter table outbox add column if not exists subject text, add column if not exists body text, add column if not exists by text;
 alter table outbox drop constraint if exists outbox_order_id_kind_key;
 create unique index if not exists outbox_one_confirmation on outbox(order_id) where kind = 'confirmation';
+-- Stage 7: event-day operations. A ticket's QR is only its random code. unit = the section's own name on the ticket ("Table 5", "Box 4");
+-- checkin = where / how it was let in {entrance, device, device_name, by, manual}. Every scan attempt (good, duplicate or invalid) is a scan_log row;
+-- every phone / tablet / handheld that scans is a scan_devices row (an admin can switch one off). Both are written only by checkin().
+alter table tickets add column if not exists unit text, add column if not exists checkin jsonb, add column if not exists touched_at timestamptz not null default now();
+create index if not exists tickets_touched on tickets(event_id, touched_at);
+create table if not exists scan_log (id bigint generated always as identity primary key, at timestamptz not null default now(), box_office_id uuid not null references box_offices(id),
+  event_id uuid, slot_id text, ticket_id uuid, code text, result text not null, entrance text, device text, device_name text, by text, manual boolean not null default false, override boolean not null default false);
+create index if not exists scan_log_ev on scan_log(event_id, at desc);
+create table if not exists scan_devices (box_office_id uuid not null references box_offices(id) on delete cascade, id text not null, name text not null, renamed boolean not null default false,
+  entrance text, first_seen timestamptz not null default now(), last_seen timestamptz not null default now(), last_by text, scans int not null default 0, disabled boolean not null default false,
+  primary key (box_office_id, id));
+alter table scan_log enable row level security; alter table scan_devices enable row level security;   -- no policies: read through door_log() / scan_devices_list()
 
 -- ── Who is asking ──────────────────────────────────────────────────────────────
 create or replace function me_email() returns text language sql stable as $$ select lower(coalesce(auth.jwt() ->> 'email', '')) $$;
@@ -314,7 +326,7 @@ begin
   if price_sig(new.data) is distinct from price_sig(old.data) and not has_perm(new.box_office_id, 'tickets.pricing', new.id) then
     raise exception 'You don''t have permission to change ticket prices'; end if;
   if new.status <> old.status then b := b || jsonb_build_object('Status', old.status); a := a || jsonb_build_object('Status', new.status); end if;
-  foreach k in array array['name','start','end','allDay','venue','address','online','capacity','visibility','publishAt','salesStart','salesEnd','archived','waitlistMode','currency','contact','policies','timeSlots','addons','bundles','upsells'] loop
+  foreach k in array array['name','start','end','allDay','venue','address','online','capacity','visibility','publishAt','salesStart','salesEnd','archived','waitlistMode','currency','contact','policies','timeSlots','addons','bundles','upsells','entrances'] loop
     if (new.data->k) is distinct from (old.data->k) then b := b || jsonb_build_object(k, old.data->k); a := a || jsonb_build_object(k, new.data->k); end if;
   end loop;
   if (new.data->'ticketTypes') is distinct from (old.data->'ticketTypes') then b := b || jsonb_build_object('ticketTypes', old.data->'ticketTypes'); a := a || jsonb_build_object('ticketTypes', new.data->'ticketTypes'); end if;
@@ -407,7 +419,7 @@ $$;
 -- ── Seats (Stage 3) ────────────────────────────────────────────────────────────
 -- "Stalls centre · Row A · Seat 12" from the event's derived seat meta
 create or replace function seat_text(e events, p_seat text) returns text language sql stable as $$
-  select coalesce(concat_ws(' · ', nullif(e.data->'seating'->'meta'->p_seat->>0, ''), 'Row ' || nullif(e.data->'seating'->'meta'->p_seat->>1, ''),
+  select coalesce(concat_ws(' · ', nullif(e.data->'seating'->'meta'->p_seat->>0, ''), nullif(e.data->'seating'->'meta'->p_seat->>3, ''), 'Row ' || nullif(e.data->'seating'->'meta'->p_seat->>1, ''),
     'Seat ' || nullif(e.data->'seating'->'meta'->p_seat->>2, '')), p_seat) $$;
 -- What stops this seat being sold right now (null = nothing). Staff may sell a seat they're holding; a buyer may buy their own checkout hold.
 create or replace function seat_blocker(p_event uuid, p_slot text, p_seat text, p_token text, p_staff boolean) returns text language sql stable as $$
@@ -542,6 +554,10 @@ begin
   end if;
   return new;
 end $$;
+-- every ticket write bumps touched_at, so scanners only pull what changed (door_sync)
+create or replace function tickets_touch() returns trigger language plpgsql as $$ begin new.touched_at := now(); return new; end $$;
+drop trigger if exists tickets_touch on tickets;
+create trigger tickets_touch before insert or update on tickets for each row execute function tickets_touch();
 drop trigger if exists tickets_seat_log on tickets;
 create trigger tickets_seat_log after update on tickets for each row execute function tickets_seat_log();
 
@@ -809,8 +825,8 @@ create or replace function issue_ticket(p_bo uuid, p_order uuid, p_ref text, l j
 declare e events%rowtype;
 begin
   select * into e from events where id = (l->>'eventId')::uuid;
-  insert into tickets(box_office_id, order_id, event_id, ticket_type_id, slot_id, seat, area, "row", seat_label, comp, face, paid, discount, promo, tracking, bundle, extras, price_override, answers, code, holder)
-  values (p_bo, p_order, e.id, p_tt, nullif(l->>'slotId',''), p_seat, e.data->'seating'->'meta'->p_seat->>0, e.data->'seating'->'meta'->p_seat->>1, e.data->'seating'->'meta'->p_seat->>2,
+  insert into tickets(box_office_id, order_id, event_id, ticket_type_id, slot_id, seat, area, "row", seat_label, unit, comp, face, paid, discount, promo, tracking, bundle, extras, price_override, answers, code, holder)
+  values (p_bo, p_order, e.id, p_tt, nullif(l->>'slotId',''), p_seat, e.data->'seating'->'meta'->p_seat->>0, e.data->'seating'->'meta'->p_seat->>1, e.data->'seating'->'meta'->p_seat->>2, nullif(e.data->'seating'->'meta'->p_seat->>3, ''),
     p_comp, p_face, p_paid, p_disc, case when p_disc > 0 then p_promo end, p_tracking, p_bundle, coalesce(p_extras, '[]'), coalesce((l->>'override')::boolean, false), coalesce(p_answers, '{}'), rand_code(10), p_holder);
   if p_seat is not null then
     insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref, discount)
@@ -1444,8 +1460,8 @@ begin
     select * into t from tickets where id = (x->>'t')::uuid; select * into e from events where id = (x->>'e')::uuid;
     paid := case when keep then t.paid else (x->>'newPaid')::bigint end;
     disc := case when t.comp then 0 when (x->>'ovr')::boolean then greatest(0, (x->>'face')::bigint - paid) else coalesce(t.discount, 0) + case when keep and (x->>'diff')::bigint > 0 then (x->>'diff')::bigint else 0 end end;
-    insert into tickets(box_office_id, order_id, event_id, ticket_type_id, slot_id, seat, area, "row", seat_label, comp, face, paid, discount, promo, tracking, bundle, extras, price_override, answers, code, holder, status, checked_in_at, replaces)
-      values (t.box_office_id, t.order_id, e.id, x->'tt'->>'id', x->>'slot', x->>'seat', e.data->'seating'->'meta'->(x->>'seat')->>0, e.data->'seating'->'meta'->(x->>'seat')->>1, e.data->'seating'->'meta'->(x->>'seat')->>2,
+    insert into tickets(box_office_id, order_id, event_id, ticket_type_id, slot_id, seat, area, "row", seat_label, unit, comp, face, paid, discount, promo, tracking, bundle, extras, price_override, answers, code, holder, status, checked_in_at, replaces)
+      values (t.box_office_id, t.order_id, e.id, x->'tt'->>'id', x->>'slot', x->>'seat', e.data->'seating'->'meta'->(x->>'seat')->>0, e.data->'seating'->'meta'->(x->>'seat')->>1, e.data->'seating'->'meta'->(x->>'seat')->>2, nullif(e.data->'seating'->'meta'->(x->>'seat')->>3, ''),
         t.comp, (x->>'face')::bigint, paid, disc, t.promo, t.tracking, t.bundle, t.extras, (x->>'ovr')::boolean or t.price_override, t.answers, rand_code(10), t.holder, 'valid', t.checked_in_at, t.id) returning id into nt;
     update tickets set status = 'replaced', replaced_by = nt, changed_at = now() where id = t.id;
     frm := coalesce(case when t.seat is not null then seat_text(e, t.seat) end, (select y->>'name' from jsonb_array_elements(e.data->'ticketTypes') y where y->>'id' = t.ticket_type_id));
@@ -1509,7 +1525,7 @@ create or replace function refresh_extras(p_order uuid, p_event text) returns vo
 create or replace function order_action(p_order uuid, p_action text, p jsonb default '{}') returns jsonb language plpgsql security definer set search_path = public as $$
 declare o orders%rowtype; ev uuid; by_ text := me_email(); res jsonb := '{}'; plan jsonb; r jsonb; codes text[]; was text; all_ boolean; n_live int; amt bigint; l jsonb; e events%rowtype;
   ad jsonb; qty int; sold int; unit bigint; txt text := ''; nm text; em text; ph text; bef jsonb; aft jsonb; body text; subj text; t tickets%rowtype; mid uuid; s text;
-  perm_ok boolean;
+  perm_ok boolean; nt uuid; pairs text[] := '{}'; nc text[] := '{}';
 begin
   select * into o from orders where id = p_order for update;
   if not found or not is_member(o.box_office_id) and not is_super() then raise exception 'Order not found'; end if;
@@ -1523,7 +1539,7 @@ begin
     when 'collect' then has_perm(o.box_office_id, 'orders.edit', ev) when 'addAddon' then has_perm(o.box_office_id, 'orders.edit', ev) when 'removeAddon' then has_perm(o.box_office_id, 'orders.edit', ev)
     when 'customer' then has_perm(o.box_office_id, 'orders.customer', ev) when 'holder' then has_perm(o.box_office_id, 'orders.customer', ev)
     when 'note' then has_perm(o.box_office_id, 'orders.edit', ev) when 'message' then has_perm(o.box_office_id, 'comms.email', ev) when 'resend' then has_perm(o.box_office_id, 'orders.resend', ev)
-    when 'cancel' then true else null end;
+    when 'reissue' then has_perm(o.box_office_id, 'orders.edit', ev) when 'cancel' then true else null end;
   if perm_ok is null then raise exception 'Unknown order action'; end if;
   if not perm_ok then raise exception 'You don''t have permission to do that'; end if;
   perform set_config('set.system', '1', true);   -- this function checks and logs the change itself
@@ -1644,6 +1660,24 @@ begin
     subj := trim(coalesce(p->>'subject','')); body := trim(coalesce(p->>'body','')); if subj = '' or body = '' then raise exception 'Add a subject and a message'; end if;
     mid := queue_mail(o, 'message', subj, body, by_);
     perform order_log_add(o, 'message', format('message queued for %s: “%s”', o.buyer_email, left(subj, 80)), by_, '', jsonb_build_object('outbox', mid));
+  elsif p_action = 'reissue' then   -- same seat / type, new QR code; the old code stops working at the door at once (Stage 7)
+    if o.status <> 'paid' then raise exception 'Only paid orders can be changed'; end if;
+    for t in select * from tickets where order_id = o.id and status = 'valid'
+        and (coalesce(jsonb_array_length(p->'tickets'), 0) = 0 or id::text in (select jsonb_array_elements_text(p->'tickets'))) order by issued_at, id loop
+      update tickets set status = 'replaced', changed_at = now() where id = t.id;   -- first, so the seat is free for its replacement
+      insert into tickets(box_office_id, order_id, event_id, ticket_type_id, slot_id, seat, area, "row", seat_label, unit, comp, face, paid, discount, promo, tracking, bundle, extras, price_override, answers,
+          code, holder, status, checked_in_at, checkin, refunded, replaces)
+        values (t.box_office_id, t.order_id, t.event_id, t.ticket_type_id, t.slot_id, t.seat, t.area, t."row", t.seat_label, t.unit, t.comp, t.face, t.paid, t.discount, t.promo, t.tracking, t.bundle, t.extras,
+          t.price_override, t.answers, rand_code(10), t.holder, 'valid', t.checked_in_at, t.checkin, t.refunded, t.id) returning id into nt;
+      update tickets set replaced_by = nt where id = t.id;
+      nc := nc || (select code from tickets where id = nt); pairs := pairs || (t.code || ' → ' || nc[cardinality(nc)]);
+    end loop;
+    if cardinality(nc) = 0 then raise exception 'Choose the tickets to reissue'; end if;
+    perform order_log_add(o, 'reissue', format('reissued %s ticket%s with new QR codes (%s) — the old codes no longer scan', cardinality(nc), case when cardinality(nc) = 1 then '' else 's' end,
+      array_to_string(pairs, ', ')), by_, coalesce(p->>'note', ''), jsonb_build_object('pairs', to_jsonb(pairs)));
+    if coalesce((p->>'notify')::boolean, true) then
+      perform queue_mail(o, 'tickets', 'Your updated tickets', 'Your tickets were reissued with new QR codes. Please use these — the old ones no longer work at the door.', by_); end if;
+    res := jsonb_build_object('codes', to_jsonb(nc));
   elsif p_action = 'resend' then
     if p->>'kind' is distinct from 'confirmation' and not exists(select 1 from tickets where order_id = o.id and status = 'valid') then raise exception 'This order has no valid tickets'; end if;
     mid := queue_mail(o, case when p->>'kind' = 'confirmation' then 'confirmation_copy' else 'tickets' end, case when p->>'kind' = 'confirmation' then 'Your order confirmation' else 'Your tickets' end, '', by_);
@@ -1791,18 +1825,130 @@ begin
 end $$;
 
 -- Door check-in (staff of the ticket's box office only). Another box office's ticket looks exactly like an unknown code.
-create or replace function checkin(p_code text, p_undo boolean default false, p_event uuid default null) returns jsonb language plpgsql security definer set search_path = public as $$
-declare t tickets%rowtype; was timestamptz;
+-- ── Door / scanning (Stage 7). Mirrors demoCheckin() / doorTicket() / DB.door* in data.js. ──
+-- What a scanner may know about a ticket: where the guest belongs — never money, email or phone.
+create or replace function door_ticket(t tickets, p_names boolean) returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('id', t.id, 'code', t.code, 'event_id', t.event_id, 'event_name', e.data->>'name', 'event_start', e.data->>'start', 'slot_id', t.slot_id,
+    'slot_start', (select s->>'start' from jsonb_array_elements(coalesce(e.data->'timeSlots', '[]')) s where s->>'id' = t.slot_id limit 1),
+    'ticket_type_id', t.ticket_type_id, 'type', z.tt->>'name', 'admits', greatest(1, coalesce((z.tt->>'admits')::int, 1)),
+    'seat', t.seat, 'area', t.area, 'row', t."row", 'seat_label', t.seat_label, 'unit', t.unit,
+    'holder', case when p_names then t.holder else 'Guest' end, 'comp', t.comp, 'status', t.status, 'checked_in_at', t.checked_in_at, 'checkin', t.checkin,
+    'order_id', t.order_id, 'order_ref', o.ref,
+    'of', (select count(*) from tickets x where x.order_id = t.order_id and x.status = 'valid'),
+    'no', (select count(*) from tickets x where x.order_id = t.order_id and x.status = 'valid' and (x.issued_at, x.id) <= (t.issued_at, t.id)),
+    'due', coalesce((o.data->>'due')::bigint, 0) > 0)
+  from events e left join lateral (select y from jsonb_array_elements(e.data->'ticketTypes') y where y->>'id' = t.ticket_type_id limit 1) z(tt) on true
+    left join orders o on o.id = t.order_id
+  where e.id = t.event_id $$;
+-- An entrance can be limited to ticket types and/or seating areas. No limits = everyone.
+create or replace function entrance_takes(en jsonb, t tickets) returns boolean language sql immutable as $$
+  select en is null or ((jsonb_array_length(coalesce(en->'ticketTypeIds', '[]')) = 0 or en->'ticketTypeIds' ? t.ticket_type_id)
+    and (jsonb_array_length(coalesce(en->'areas', '[]')) = 0 or en->'areas' ? coalesce(t.area, ''))) $$;
+-- Scan / check in one ticket. p_event = the event being scanned. p {slot, entrance (id), device, deviceName, manual, override}.
+-- → {result: ok | already | undone | unknown | cancelled | refunded | replaced | wrong_event | wrong_slot | wrong_entrance | inactive | device_off, ticket, first?, entrances?}
+-- Every attempt is logged in scan_log. The check-in itself is one conditional UPDATE, so two scanners can never both accept a ticket.
+drop function if exists checkin(text, boolean, uuid);
+create or replace function checkin(p_code text, p_undo boolean default false, p_event uuid default null, p jsonb default '{}') returns jsonb language plpgsql security definer set search_path = public as $$
+declare t tickets%rowtype; c text := upper(left(trim(coalesce(p_code, '')), 64)); bo uuid; ev events%rowtype; te events%rowtype; o orders%rowtype; en jsonb; dv scan_devices%rowtype;
+  res text; extra jsonb := '{}'; names boolean; dev text := left(coalesce(p->>'device', ''), 40); manual boolean := coalesce((p->>'manual')::boolean, false);
 begin
-  select * into t from tickets where code = upper(trim(p_code));
-  if not found or not is_member(t.box_office_id) then return jsonb_build_object('result','unknown'); end if;
-  if not has_perm(t.box_office_id, case when p_undo then 'door.undo' else 'door.checkin' end, t.event_id) then raise exception 'You don''t have permission to do that'; end if;
-  if t.status <> 'valid' then return jsonb_build_object('result','cancelled','ticket',to_jsonb(t)); end if;
-  if p_event is not null and t.event_id <> p_event then return jsonb_build_object('result','wrong_event','ticket',to_jsonb(t)); end if;
-  was := t.checked_in_at;
-  update tickets set checked_in_at = case when p_undo then null else coalesce(checked_in_at, now()) end where id = t.id returning * into t;
-  if p_undo then perform log_action(t.box_office_id, 'door.undo', 'Undid check-in for ticket ' || t.code, null, null, t.event_id); end if;
-  return jsonb_build_object('result', case when p_undo then 'undone' when was is not null then 'already' else 'ok' end, 'ticket', to_jsonb(t));
+  if me_email() = '' then raise exception 'Sign in first'; end if;
+  select * into t from tickets where code = c;
+  if p_event is not null then select * into ev from events where id = p_event; if not found then raise exception 'Event not found'; end if; end if;
+  bo := coalesce(ev.box_office_id, t.box_office_id);
+  if bo is null or not is_member(bo) then return jsonb_build_object('result', 'unknown'); end if;   -- another box office's ticket looks exactly like a fake one
+  if not has_perm(bo, 'door.scan', p_event) then raise exception 'You don''t have permission to do that'; end if;
+  if t.id is not null and t.box_office_id <> bo then t := null; end if;
+  names := has_perm(bo, 'customers.names');
+  if p_event is not null then select x into en from jsonb_array_elements(coalesce(ev.data->'entrances', '[]')) x where x->>'id' = p->>'entrance'; end if;
+  if dev <> '' then
+    insert into scan_devices as d (box_office_id, id, name, entrance, last_by, scans) values (bo, dev, coalesce(nullif(left(p->>'deviceName', 60), ''), 'Scanner'), coalesce(en->>'name', ''), me_email(), 1)
+      on conflict (box_office_id, id) do update set last_seen = now(), last_by = me_email(), scans = d.scans + 1, entrance = coalesce(en->>'name', ''),
+        name = case when d.renamed or coalesce(p->>'deviceName', '') = '' then d.name else left(p->>'deviceName', 60) end
+      returning * into dv;
+  end if;
+  res := case when coalesce(dv.disabled, false) then 'device_off' when t.id is null then 'unknown' when p_event is not null and t.event_id <> p_event then 'wrong_event' end;
+  if res is null then
+    if not has_perm(bo, case when p_undo then 'door.undo' else 'door.checkin' end, t.event_id) then raise exception 'You don''t have permission to do that'; end if;
+    select * into o from orders where id = t.order_id; select * into te from events where id = t.event_id;
+    res := case when t.status = 'replaced' then 'replaced' when t.status <> 'valid' then case when t.refunded > 0 then 'refunded' else 'cancelled' end
+      when nullif(p->>'slot', '') is not null and t.slot_id is not null and t.slot_id <> p->>'slot' then 'wrong_slot'
+      when o.status not in ('paid', 'refunded') or coalesce((te.data->>'archived')::boolean, false) then 'inactive' end;
+  end if;
+  if res is null and p_undo then
+    update tickets set checked_in_at = null, checkin = null where id = t.id returning * into t;
+    perform log_action(bo, 'door.undo', 'Undid check-in for ticket ' || t.code, null, null, t.event_id); res := 'undone';
+  end if;
+  if res is null and en is not null and not entrance_takes(en, t) then
+    if not coalesce((p->>'override')::boolean, false) then
+      res := 'wrong_entrance';
+      extra := jsonb_build_object('entrances', coalesce((select jsonb_agg(x->>'name') from jsonb_array_elements(ev.data->'entrances') x where entrance_takes(x, t)), '[]'));
+    elsif not has_perm(bo, 'door.override', t.event_id) then raise exception 'You don''t have permission to do that';
+    else extra := '{"override":true}'; end if;
+  end if;
+  if res is null then
+    update tickets set checked_in_at = now(), checkin = jsonb_build_object('entrance', coalesce(en->>'name', ''), 'device', dev, 'device_name', coalesce(dv.name, ''), 'by', me_email(), 'manual', manual)
+      where id = t.id and checked_in_at is null returning * into t;
+    if found then res := 'ok';
+    else select * into t from tickets where code = c; res := 'already'; extra := extra || jsonb_build_object('first', coalesce(t.checkin, '{}') || jsonb_build_object('at', t.checked_in_at)); end if;
+  end if;
+  insert into scan_log(box_office_id, event_id, slot_id, ticket_id, code, result, entrance, device, device_name, by, manual, override)
+    values (bo, coalesce(p_event, t.event_id), nullif(p->>'slot', ''), t.id, c, res, coalesce(en->>'name', ''), dev, coalesce(dv.name, ''), me_email(), manual, coalesce((extra->>'override')::boolean, false));
+  return extra || jsonb_build_object('result', res, 'ticket', case when t.id is null then null
+    when res = 'wrong_event' then (select jsonb_build_object('code', t.code, 'event_id', t.event_id, 'event_name', x.data->>'name', 'event_start', x.data->>'start') from events x where x.id = t.event_id)
+    else door_ticket(t, names) end);
+end $$;
+-- What every scanner polls (every few seconds): tickets changed since p_since (all of them the first time) + the totals.
+create or replace function door_sync(p_event uuid, p_since timestamptz default null) returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare e events%rowtype; names boolean;
+begin
+  select * into e from events where id = p_event;
+  if not found or not has_perm(e.box_office_id, 'door.scan', e.id) then raise exception 'You don''t have permission to do that'; end if;
+  names := has_perm(e.box_office_id, 'customers.names');
+  return jsonb_build_object('at', now(),
+    'tickets', coalesce((select jsonb_agg(jsonb_build_object('id', t.id, 'code', t.code, 'event_id', t.event_id, 'order_id', t.order_id, 'ticket_type_id', t.ticket_type_id, 'slot_id', t.slot_id,
+        'seat', t.seat, 'area', t.area, 'row', t."row", 'seat_label', t.seat_label, 'unit', t.unit, 'holder', case when names then t.holder else 'Guest' end, 'comp', t.comp,
+        'status', t.status, 'checked_in_at', t.checked_in_at, 'checkin', t.checkin))
+      from tickets t where t.event_id = e.id and (p_since is null or t.touched_at > p_since - interval '2 seconds') and (p_since is not null or t.status = 'valid' or t.changed_at is not null or t.cancelled_at is not null)), '[]'),
+    'stats', (select jsonb_build_object('total', count(*) filter (where status = 'valid'), 'inn', count(*) filter (where status = 'valid' and checked_in_at is not null)) from tickets where event_id = e.id));
+end $$;
+-- Manual look-up at the door: name, email, phone, order number or ticket number → door info only.
+create or replace function door_search(p_event uuid, p_q text) returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare e events%rowtype; q text := lower(left(trim(coalesce(p_q, '')), 80)); dg text; names boolean;
+begin
+  select * into e from events where id = p_event;
+  if not found or not has_perm(e.box_office_id, 'door.search', e.id) then raise exception 'You don''t have permission to do that'; end if;
+  if length(q) < 2 then return '[]'; end if;
+  dg := regexp_replace(q, '\D', '', 'g'); names := has_perm(e.box_office_id, 'customers.names');
+  return coalesce((select jsonb_agg(door_ticket(t, names)) from tickets t where t.id in (select x.id from tickets x join orders o on o.id = x.order_id
+    where x.event_id = e.id and x.status = 'valid' and (position(q in lower(coalesce(x.holder, ''))) > 0 or position(q in lower(x.code)) > 0 or position(q in lower(o.ref)) > 0
+      or position(q in o.buyer_email) > 0 or position(q in lower(coalesce(o.data->'buyer'->>'name', ''))) > 0
+      or (length(dg) >= 4 and position(dg in regexp_replace(coalesce(o.data->'buyer'->>'phone', ''), '\D', '', 'g')) > 0)) limit 50)), '[]');
+end $$;
+-- Event-day log: every scan, duplicate and invalid attempt.
+create or replace function door_log(p_event uuid) returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare e events%rowtype;
+begin
+  select * into e from events where id = p_event;
+  if not found or not has_perm(e.box_office_id, 'door.log', e.id) then raise exception 'You don''t have permission to do that'; end if;
+  return coalesce((select jsonb_agg(to_jsonb(l) order by l.at desc) from (select * from scan_log where event_id = e.id and box_office_id = e.box_office_id order by at desc limit 3000) l), '[]');
+end $$;
+create or replace function scan_devices_list(p_bo uuid) returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if not has_perm(p_bo, 'door.devices') then raise exception 'You don''t have permission to do that'; end if;
+  return coalesce((select jsonb_agg(to_jsonb(d) order by d.last_seen desc) from scan_devices d where d.box_office_id = p_bo), '[]');
+end $$;
+-- rename | disable | enable | forget. A switched-off device gets 'device_off' for every scan.
+create or replace function scan_device_action(p_bo uuid, p_id text, p_action text, p_name text default '') returns void language plpgsql security definer set search_path = public as $$
+declare d scan_devices%rowtype;
+begin
+  if not has_perm(p_bo, 'door.devices') then raise exception 'You don''t have permission to do that'; end if;
+  select * into d from scan_devices where box_office_id = p_bo and id = p_id; if not found then raise exception 'Device not found'; end if;
+  if p_action = 'rename' then if trim(coalesce(p_name, '')) = '' then raise exception 'Enter a name'; end if; update scan_devices set name = left(trim(p_name), 60), renamed = true where box_office_id = p_bo and id = p_id;
+  elsif p_action in ('disable', 'enable') then update scan_devices set disabled = p_action = 'disable' where box_office_id = p_bo and id = p_id;
+  elsif p_action = 'forget' then delete from scan_devices where box_office_id = p_bo and id = p_id;
+  else raise exception 'Unknown device action'; end if;
+  perform log_action(p_bo, 'door.device', format('Scanner device “%s”: %s', d.name, case p_action when 'rename' then 'renamed' when 'forget' then 'removed' else p_action || 'd' end));
 end $$;
 
 -- Everything the back office needs for ONE box office, already filtered to the member's events and masked
@@ -1849,8 +1995,11 @@ begin
                || case when P_emails then '{}'::jsonb else jsonb_build_object('email', regexp_replace(o.buyer_email, '^(.)[^@]*@(.)[^.]*(\..+)$', '\1•••@\2•••\3')) end
                || case when P_phones or coalesce(o.data->'buyer'->>'phone','') = '' then '{}'::jsonb else '{"phone":"•••"}'::jsonb end)))
       from orders o where o.box_office_id = b.id and o.event_ids && evs), '[]') end,
-    'tickets', coalesce((select jsonb_agg(to_jsonb(t) || case when P_names then '{}'::jsonb else '{"holder":"Guest"}'::jsonb end
-        || case when P_money then '{}'::jsonb else '{"face":null,"paid":null,"discount":null}'::jsonb end) from tickets t where t.event_id = any(evs)), '[]'),
+    'tickets', coalesce((select jsonb_agg(to_jsonb(t) - 'touched_at' || case when P_names then '{}'::jsonb else '{"holder":"Guest"}'::jsonb end
+        || case when P_money then '{}'::jsonb else '{"face":null,"paid":null,"discount":null,"refunded":null}'::jsonb end
+        -- door-only staff (scanner): where the guest belongs, not their answers, codes used or purchases
+        || case when seeorders or has_perm(b.id, 'door.attendees') then '{}'::jsonb else '{"answers":{},"promo":null,"tracking":null,"bundle":null,"extras":[],"price_override":false}'::jsonb end)
+      from tickets t where t.event_id = any(evs)), '[]'),
     'promos', case when has_perm(b.id, 'tickets.discounts') or has_perm(b.id, 'tickets.discountsEdit') or has_perm(b.id, 'finance.reports') then coalesce((select jsonb_agg(x.data
         || jsonb_build_object('id', x.id, 'box_office_id', x.box_office_id, 'code', x.code, 'created_at', x.created_at, 'created_by', x.created_by) order by x.created_at) from promos x where x.box_office_id = b.id), '[]') else '[]' end,
     'tracking', case when has_perm(b.id, 'tickets.tracking') or has_perm(b.id, 'finance.reports') then coalesce((select jsonb_agg(x.data
@@ -1977,10 +2126,10 @@ grant execute on function order_action(uuid,text,jsonb), credit_action(uuid,text
 revoke insert, update, delete on orders, tickets, order_log, credits, customer_notes, event_presence from anon, authenticated;
 grant execute on function save_event_templates(uuid,jsonb), notify_waitlist(uuid,text), seat_action(uuid,text,text,text[],jsonb), save_venues(uuid,jsonb),
   save_promo(uuid,jsonb), delete_promo(uuid,text), save_tracking(uuid,jsonb), delete_tracking(uuid,text), my_orders(), disconnect_gateway(uuid), set_platform_fee(uuid,jsonb) to authenticated;
-grant execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), transfer_ownership(uuid,text), platform_overview(), platform_save(jsonb),
+grant execute on function checkin(text,boolean,uuid,jsonb), door_sync(uuid,timestamptz), door_search(uuid,text), door_log(uuid), scan_devices_list(uuid), scan_device_action(uuid,text,text,text), admin_load(uuid,boolean), transfer_ownership(uuid,text), platform_overview(), platform_save(jsonb),
   create_box_office(text,text,text,text), set_box_office_status(uuid,text), delete_box_office(uuid) to authenticated;
 -- staff-only RPCs: not for anonymous callers (their explicit grant to authenticated above stays)
-revoke execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), order_action(uuid,text,jsonb), credit_action(uuid,text,jsonb), customer_note(uuid,text,text), my_credits() from anon, public;
+revoke execute on function checkin(text,boolean,uuid,jsonb), door_sync(uuid,timestamptz), door_search(uuid,text), door_log(uuid), scan_devices_list(uuid), scan_device_action(uuid,text,text,text), admin_load(uuid,boolean), order_action(uuid,text,jsonb), credit_action(uuid,text,jsonb), customer_note(uuid,text,text), my_credits() from anon, public;
 revoke execute on function new_box_office(text,text,text,text,text,text), log_action(uuid,text,text,jsonb,jsonb,uuid),
   seat_blocker(uuid,text,text,text,boolean), seat_free(events,text,text,text), single_gaps(events,text,text[],text),
   find_code(uuid,text), promo_usable(jsonb,text,text), tracking_usable(jsonb,uuid,uuid[]), apply_promo(jsonb,jsonb,bigint), price_cart(jsonb,boolean,jsonb,jsonb),
@@ -1989,7 +2138,7 @@ revoke execute on function new_box_office(text,text,text,text,text,text), log_ac
   pricing_settings(box_offices), check_answers(jsonb,uuid[],jsonb,jsonb,jsonb), ticket_answers(orders,text,int), reserved_units(uuid), reserved_units_of(orders),
   order_log_add(orders,text,text,text,text,jsonb,jsonb,jsonb), queue_mail(orders,text,text,text,text), issue_credit(uuid,jsonb,orders,text), refund_plan(orders,jsonb), apply_refund(uuid,jsonb,jsonb,text),
   settle_order_status(uuid), change_order_tickets(uuid,jsonb,text,boolean), cancel_order_tickets(orders,jsonb,text), refresh_extras(uuid,text), finish_refund(uuid,text,jsonb),
-  credit_state(credits), credit_problem(credits,uuid[]) from anon, authenticated, public;
+  credit_state(credits), credit_problem(credits,uuid[]), door_ticket(tickets,boolean), entrance_takes(jsonb,tickets) from anon, authenticated, public;
 -- the payments Edge Function (service role) confirms payments, records failed attempts and expires stale checkouts
 grant execute on function confirm_payment(uuid,jsonb), record_payment_attempt(uuid,jsonb), expire_orders(), finish_refund(uuid,text,jsonb) to service_role;
 -- pg_cron (enable it in Supabase → Database → Extensions): release unpaid card checkouts every minute

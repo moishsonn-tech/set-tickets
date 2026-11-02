@@ -71,6 +71,19 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   Customers page `#/admin/customers[/<email>]`, notes `customer_notes`; order page `#/admin/orders/<id>`, manual order `#/admin/orders/new`.
   Live activity: `DB.ping()` / `presence_ping()` → `event_presence`, summarised in `admin_load().live`; event tab "Live activity". Outbox has
   one `confirmation` per order (partial unique index) plus resend / updated / refund / message rows.
+- **Scanning & event day (Stage 7):** a QR holds only the ticket's random `code`. Every scan goes to `DB.checkin(code, undo, eventId, o)` →
+  DEMO `demoCheckin()` / SQL `checkin(p_code, p_undo, p_event, p)` (o: slot, entrance id, device, deviceName, manual, override) and answers
+  with a result in `SCAN_RESULTS` (ok | already | undone | unknown | cancelled | refunded | replaced | wrong_event | wrong_slot | wrong_entrance |
+  inactive | device_off) + `doorTicket()` / `door_ticket()` — where the guest belongs, never money / email / phone. Check-in is one conditional
+  UPDATE (`checked_in_at is null`), so parallel scanners accept a ticket once; `tickets.checkin` = {entrance, device, device_name, by, manual}.
+  Every attempt is a `scanLog` / `scan_log` row; scanning phones are `devices` / `scan_devices` (admin can rename / switch off — `door.devices`).
+  Entrances = `event.entrances` [{id, name, ticketTypeIds, areas}] (`entranceTakes()` / `entrance_takes()`; wrong door → warn, `door.override`
+  lets in). Scanners poll `DB.doorSync()` / `door_sync(p_event, p_since)` every 4 s (`tickets.touched_at` trigger → only changes) and merge via
+  `mergeDoor()`. Manual look-up `doorSearch()` / `door_search()` (`door.search`), history `doorLog()` / `door_log()` (`door.log`). Reissue =
+  order action `reissue` (same seat, new code, old → replaced). Section names on tickets ("Box 4", "Table 5", "Couch 3"): `sec.showName`
+  (default on for table / booth) → 4th `meta` element → `tickets.unit`; `sec.hideRow` leaves the row off. `seatLines()` = the big door display.
+  Scanner staff template = `door.scan` + `door.checkin` only (back office shows `ScannerHome`). Event tab "Door & check-in" (`EdDoor`).
+  DEMO multi-device: `Demo.fresh()` updates `Demo.st` in place, and order / credit / place-order actions refresh first.
 - **Money is integer cents everywhere.**
 - **Not yet wired:** the payments Edge Function is written but not deployed (no Supabase project yet; needs Stripe keys in
   Supabase secrets + pg_cron for `expire_orders()`); outbound email/SMS (confirmations are queued in `outbox`, not sent); Apple Wallet passes.

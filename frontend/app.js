@@ -72,7 +72,7 @@ const S = {
   bos: [], bo: null, platform: { ...DEFAULT_PLATFORM }, plat: null,  // public box offices · box office in context · platform (public part) · super-admin data
   user: null, adm: null, draft: null, dirty: false,
   ui: { q: '', ev: '', status: '', picked: {}, attEv: '', repEv: '', login: { email: '', code: '', sent: false, totp: '' } },
-  sc: { evId: '', tab: 'scan', last: null, q: '', filter: 'all', recent: [], sound: true, queue: [], err: '' },  // door scanner app
+  sc: { evId: '', tab: 'scan', last: null, q: '', filter: 'all', recent: [], sound: true, queue: [], err: '', entrance: null, slot: null, pick: null },  // door scanner app (entrance / slot null = not chosen yet)
 };
 function loadCart() { try { return JSON.parse(localStorage.getItem('set_cart')) || { items: [], addons: [], donation: 0, unlock: {} }; } catch (e) { return { items: [], addons: [], donation: 0, unlock: {} }; } }
 function saveCart() { try { localStorage.setItem('set_cart', JSON.stringify(S.cart)); } catch (e) { } if (!S.loading) setTimeout(presencePing); }
@@ -473,15 +473,22 @@ const layoutOf = st => { const k = JSON.stringify([st.sections, st.prices, st.st
   const L = seatLayout(st); L.byId = new Map(L.seats.map(p => [p.id, p])); _layoutMemo.set(st, { k, L }); return L; };
 // Area / Row / Seat — from the ticket when it has them (what was sold), else from the map.
 function seatParts(ev, id, t) {
-  if (t?.area != null) return { area: t.area, row: t.row || '', seat: t.seat_label || '' };
-  const p = ev?.seating?.sections && layoutOf(ev.seating).byId.get(id); if (p) return { area: p.area, row: p.row, seat: p.label };
+  if (t?.area != null) return { area: t.area, row: t.row || '', seat: t.seat_label || '', unit: t.unit || '' };
+  const p = ev?.seating?.sections && layoutOf(ev.seating).byId.get(id); if (p) return { area: p.area, row: p.tRow ?? p.row, seat: p.label, unit: p.unit || '' };
   return seatInfo(ev, id, t);
 }
 // "Stalls centre · Row A · Seat 12" (long) or "Stalls centre A12" (short)
 function seatName(ev, id, short, t) {
-  const i = seatParts(ev, id, t); if (!i.area && !i.row) return i.seat || id || '';
-  if (short) return [i.area, i.row ? i.row + i.seat : i.seat].filter(Boolean).join(' ');
-  return [i.area, i.row && 'Row ' + i.row, i.seat && 'Seat ' + i.seat].filter(Boolean).join(' · ');
+  const i = seatParts(ev, id, t); if (!i.area && !i.row && !i.unit) return i.seat || id || '';
+  if (short) return i.unit ? [i.unit, i.seat && 'Seat ' + i.seat].filter(Boolean).join(' ') : [i.area, i.row ? i.row + i.seat : i.seat].filter(Boolean).join(' ');   // "Box 2 Seat 1" · "Stalls left E6"
+  return [i.area, i.unit, i.row && 'Row ' + i.row, i.seat && 'Seat ' + i.seat].filter(Boolean).join(' · ');
+}
+// "Table 5" → ['Table', '5'] · "Box 4" → ['Box', '4'] · "The Loft" → ['Section', 'The Loft']
+const unitParts = u => { const m = /^(.*\D)\s+(\S*\d\S*)$/.exec(String(u).trim()); return m ? [m[1], m[2]] : ['Section', u]; };
+// Only the seating details that apply, as the door sees them: ["ORCHESTRA LEFT", "ROW A — SEAT 12"] · ["BOXES", "BOX 4 — SEAT 2"] · ["STANDING"]
+function seatLines(i) {
+  const second = [i.unit, i.row && 'Row ' + i.row, i.seat && 'Seat ' + i.seat].filter(Boolean).join(' — ');
+  return [i.area, second].filter(Boolean);
 }
 const levelsOf = st => st?.levels?.length ? st.levels : [{ id: '', name: 'Main floor' }];
 // One SVG renderer for buyers (mode ''), the builder ('move' | 'paint' | 'seats') and the inventory ('inv').
@@ -805,11 +812,11 @@ function OrderPage() {
         <h3 style="margin-top:6px">${esc(ev.name)}</h3>
         <div class="kv"><div><div class="k">Date</div><div class="v">${esc(fmtDate(t.slot_id ? l.slotStart : ev.start, { month: 'short', day: 'numeric', year: 'numeric' }))}</div></div>
           <div><div class="k">Time</div><div class="v">${esc(fmtTime(t.slot_id ? l.slotStart : ev.start))}</div></div>
-          ${t.seat ? (sp => `<div class="seat3"><div><div class="k">Ticket type / Area</div><div class="v">${esc(sp.area && sp.area !== l.name ? `${l.name || ''} · ${sp.area}` : sp.area || l.name || '')}</div></div>
-            <div><div class="k">Row</div><div class="v">${esc(sp.row || '—')}</div></div><div><div class="k">Seat</div><div class="v">${esc(sp.seat || '—')}</div></div></div>`)(seatParts(ev, t.seat, t))
+          ${t.seat ? (sp => `<div class="seat3">${[['Ticket type / Area', sp.area && sp.area !== l.name ? `${l.name || ''} · ${sp.area}` : sp.area || l.name || ''],
+              ...(sp.unit ? [unitParts(sp.unit)] : []), ...(sp.row ? [['Row', sp.row]] : []), ...(sp.seat ? [['Seat', sp.seat]] : [])].map(([k, v]) => `<div><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join('')}</div>`)(seatParts(ev, t.seat, t))
             : `<div><div class="k">Entry</div><div class="v">General admission</div></div>`}
           <div><div class="k">Name</div><div class="v">${esc(t.holder)}</div></div>
-          <div><div class="k">Order</div><div class="v">${esc(ord.ref)}</div></div>
+          <div><div class="k">Order</div><div class="v">${esc(ord.ref)}${(n => n > 1 ? ` · ticket ${o.tickets.filter(x => x.status === 'valid').indexOf(t) + 1} of ${n}` : '')(o.tickets.filter(x => x.status === 'valid').length)}</div></div>
           <div style="grid-column:span 2"><div class="k">Venue</div><div class="v">${esc([ev.venue, ev.address].filter(Boolean).join(' · '))}</div></div></div>
       </div><div class="r"><div class="qr" data-qr="${esc(t.code)}"></div><div class="code">${esc(t.code)}</div><div class="small muted">${t.checked_in_at ? 'Checked in ' + esc(fmtDT(t.checked_in_at)) : 'Show at the door'}</div></div></div>`;
     }).join('')}
@@ -891,6 +898,9 @@ const NAV = [
   ['team', 'Team', 'team', 'admin.invite|admin.perms|admin.remove'], ['branding', 'Branding', 'brush', 'admin.settings'], ['settings', 'Settings', 'gear', 'admin.settings'], ['security', 'My security', 'lock'],
 ];
 const navOk = n => !n[3] || n[3].split('|').some(k => can(k));
+// door-only staff (the Scanner staff template): the back office is just a way into the scanner — no dashboards, sales or customers
+const scannerOnly = () => can('door.scan') && !NAV.some(n => n[3] && n[0] !== 'checkin' && navOk(n));
+const ScannerHome = () => `<div class="empty" style="padding-top:12vh"><div class="display" style="font-size:30px">Your access is the scanner</div><p class="muted" style="margin:8px auto 18px;max-width:42ch">You can scan tickets, see whether they're valid, where the guest sits and the check-in totals.</p><a class="btn btn-accent btn-lg" href="#/scan">Open the scanner →</a></div>`;
 const meLabel = m => m.support ? 'Platform support' : m.owner ? 'Owner' : (tplName(m.template) && (S.adm.bo.templates.find(t => t.id === m.template).perms.length === m.perms.length) ? tplName(m.template) : 'Custom access');
 function AdminShell() {
   if (!S.user || S.user.mfa) return Login();
@@ -899,7 +909,7 @@ function AdminShell() {
   if (S.adm.blocked) return Gate(S.adm.bo.name + ' is ' + BO_STATUS[S.adm.blocked].toLowerCase(), S.adm.blocked === 'pending' ? 'The platform team is reviewing this box office. You\'ll get an email when it\'s approved.' : 'Event pages and checkout are offline and staff access is paused. Contact the platform team.');
   const sub = S.route.sub, page = { dashboard: Dashboard, events: EventsList, event: EventEditor, venues: Venues, orders: Orders, customers: Customers, promos: Promos, attendees: Attendees, checkin: CheckIn, reports: Reports, marketing: Marketing, team: Team, branding: Branding, settings: Settings, security: Security }[sub] || Dashboard;
   const allowed = NAV.filter(navOk), navKey = sub === 'event' ? 'events' : sub, entry = NAV.find(n => n[0] === navKey);
-  const body = S.adm.needs2fa && sub !== 'security' ? Gate2fa() : entry && !navOk(entry) ? `<div class="empty"><div class="display" style="font-size:28px">No access</div><p class="muted" style="margin-top:8px">You don't have permission to open ${esc(entry[1])}. Ask a box office admin.</p></div>` : page();
+  const body = S.adm.needs2fa && sub !== 'security' ? Gate2fa() : entry && !navOk(entry) ? `<div class="empty"><div class="display" style="font-size:28px">No access</div><p class="muted" style="margin-top:8px">You don't have permission to open ${esc(entry[1])}. Ask a box office admin.</p></div>` : scannerOnly() && (sub || 'dashboard') === 'dashboard' ? ScannerHome() : page();
   return `<div class="admin">
     <aside class="side"><a class="logo" href="#/admin">${logo()}<small>Box office</small></a>
       ${S.adm.bos.length > 1 || S.adm.super ? `<select class="inp bo-pick" data-action-change="switchBo" aria-label="Box office">${(S.adm.me.support && !S.adm.bos.some(b => b.id === S.adm.bo.id) ? [{ id: S.adm.bo.id, name: S.adm.bo.name + ' (support)' }] : []).concat(S.adm.bos).map(b => `<option value="${b.id}" ${b.id === S.adm.bo.id ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}</select>` : `<div class="bo-name">${esc(S.adm.bo.name)}</div>`}
@@ -1017,12 +1027,12 @@ function NewEventModal() {
     ${list.map(t => `<button class="item-card" data-action="fromTemplate" data-v="${t.id}"><b>${esc(t.name)}</b><span class="small muted">${esc(t.event.ticketTypes.length)} ticket types${t.event.seating?.enabled ? ' · seating map' : ''}</span></button>`).join('')}</div>`);
 }
 const ETABS = [['overview', 'Overview'], ['live', 'Live activity'], ['details', 'Details'], ['tickets', 'Tickets & pricing'], ['products', 'Products & packages'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['inventory', 'Seat inventory'], ['checkout', 'Page & checkout'], ['discounts', 'Promo codes'],
-  ['emails', 'Emails'], ['waitlist', 'Waitlist'], ['team', 'Team'], ['history', 'History'], ['share', 'Share & embed']];
+  ['door', 'Door & check-in'], ['emails', 'Emails'], ['waitlist', 'Waitlist'], ['team', 'Team'], ['history', 'History'], ['share', 'Share & embed']];
 function EventEditor() {
   const ev = S.draft; if (!ev) return '<p class="muted">Event not found.</p>';
   const tab = S.route.params[1] || 'overview', ro = !can('events.edit', ev.id), pub = can('events.publish', ev.id);
-  const body = { overview: EdOverview, live: EdLive, details: EdDetails, tickets: EdTickets, products: EdProducts, schedule: EdSchedule, seating: EdSeating, inventory: EdInventory, checkout: EdCheckout, discounts: EdDiscounts, emails: EdEmails, waitlist: EdWaitlist, team: EdTeam, history: EdHistory, share: EdShare }[tab] || EdOverview;
-  const live = ['overview', 'live', 'team', 'history', 'waitlist', 'inventory', 'discounts'].includes(tab);  // these tabs act immediately, not through "Save changes"
+  const body = { overview: EdOverview, live: EdLive, details: EdDetails, tickets: EdTickets, products: EdProducts, schedule: EdSchedule, seating: EdSeating, inventory: EdInventory, checkout: EdCheckout, discounts: EdDiscounts, door: EdDoor, emails: EdEmails, waitlist: EdWaitlist, team: EdTeam, history: EdHistory, share: EdShare }[tab] || EdOverview;
+  const live = ['overview', 'live', 'team', 'history', 'waitlist', 'inventory', 'discounts', 'door'].includes(tab);  // these tabs act immediately, not through "Save changes"
   return `<a href="#/admin/events" class="small muted" style="text-decoration:none">← Events</a>
   ${head(esc(ev.name || 'Untitled event'), `${evChip(ev)} ${S.dirty ? '<span class="chip warn">Unsaved changes</span>' : ''}`,
     `<a class="btn btn-ghost" href="#/e/${esc(ev.slug)}?preview=1" target="_blank">Preview</a>
@@ -1031,6 +1041,35 @@ function EventEditor() {
     ${ro ? '' : `<button class="btn btn-accent" data-action="saveEvent" ${S.dirty ? '' : 'disabled'}>Save changes</button>`}`)}
   <nav class="etabs">${ETABS.map(([k, t]) => `<a class="${tab === k ? 'on' : ''}" href="#/admin/event/${ev.id}/${k}">${t}</a>`).join('')}</nav>
   ${live ? body(ev) : `<fieldset ${ro ? 'disabled' : ''} style="border:0">${body(ev)}</fieldset>`}`;
+}
+// ── Door & check-in (Stage 7): live totals, entrances (optionally limited to ticket types / areas), event-day scan history ──
+const SCAN_FILTERS = { all: ['All scans', () => true], ok: ['Check-ins', r => r.result === 'ok'], dup: ['Duplicates', r => r.result === 'already'], bad: ['Invalid', r => !['ok', 'already', 'undone'].includes(r.result)] };
+function EdDoor(ev) {
+  const ro = !can('events.edit', ev.id), saved = evById(ev.id) || ev, st = checkStats(ev.id), by = byEntrance(saved, st.tk), slots = saved.timeSlots || [];
+  const areas = [...new Set(Object.values(saved.seating?.enabled ? saved.seating.meta || {} : {}).map(m => m[0]).filter(Boolean))];
+  const lg = S.ui.dlog?.ev === ev.id ? S.ui.dlog : null, logOk = can('door.log', ev.id);
+  if (logOk && !lg) { S.ui.dlog = { ev: ev.id, loading: true, f: 'all' }; DB.doorLog(ev.id).then(r => { if (S.ui.dlog?.ev === ev.id) { S.ui.dlog.rows = r; S.ui.dlog.loading = false; render(); } }).catch(e => { S.ui.dlog = { ev: ev.id, err: e.message, f: 'all' }; render(); }); }
+  const rows = (lg?.rows || []).filter(SCAN_FILTERS[lg?.f || 'all'][1]), tk = id => S.adm.tickets.find(t => t.id === id);
+  const kpi = (l, v, d = '') => `<div class="kpi"><div class="eyebrow">${l}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`;
+  const chk = (i, k, v, on, label) => `<label class="chip-check ${on ? 'on' : ''}"><input type="checkbox" data-action="enPick" data-i="${i}" data-k="${k}" data-v="${esc(v)}" ${on ? 'checked' : ''} ${ro ? 'disabled' : ''}> ${esc(label)}</label>`;
+  return `<div class="kpis">${kpi('Tickets', st.total.toLocaleString())}${kpi('Scanned in', st.inn.toLocaleString())}${kpi('Remaining', (st.total - st.inn).toLocaleString())}${kpi('Checked in', (st.total ? Math.round(st.inn / st.total * 100) : 0) + '%')}</div>
+  <div class="cols"><div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>By entrance</h3></div><table class="tbl"><thead><tr><th>Entrance</th><th>Takes</th><th>Checked in</th></tr></thead><tbody>
+    ${by.map(x => `<tr><td><b>${esc(x.name)}</b></td><td class="small muted">${x.en ? esc([...(x.en.ticketTypeIds || []).map(id => saved.ticketTypes.find(t => t.id === id)?.name).filter(Boolean), ...(x.en.areas || [])].join(', ') || 'Everyone') : '—'}</td><td class="tnum">${x.n}</td></tr>`).join('') || '<tr><td colspan="3" class="muted small">No entrances set up — every scanner accepts every ticket.</td></tr>'}</tbody></table></div>
+    ${slots.length ? `<div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>By showtime</h3></div><table class="tbl"><thead><tr><th>Showtime</th><th>Checked in</th></tr></thead><tbody>
+      ${slots.map(sl => { const x = checkStats(ev.id, sl.id); return `<tr><td>${esc(fmtDT(sl.start))}${sl.label ? ' · ' + esc(sl.label) : ''}</td><td class="tnum">${x.inn} / ${x.total}</td></tr>`; }).join('')}</tbody></table></div>` : `<div class="card"><h3>How scanning works</h3><p class="small muted" style="margin-top:6px">Each QR code holds only a random ticket code — no names, emails or payment details. Every scan is checked by the server, so a ticket can only get in once even with many phones scanning. Cancelled, refunded and replaced tickets are rejected at once.</p></div>`}</div>
+  <div class="card" style="margin-top:16px"><div class="between"><h3>Entrances</h3>${ro ? '' : '<button class="btn btn-ghost btn-sm" data-action="enAdd">Add entrance</button>'}</div>
+    <p class="small muted" style="margin:4px 0 12px">Door staff pick their entrance when they open the scanner. Limit an entrance to some ticket types or seating areas and it warns when a guest is at the wrong door (staff with “Override scanner warnings” can let them in anyway). Save with “Save changes”.</p>
+    ${(ev.entrances || []).map((en, i) => `<div class="en-row"><div class="row" style="gap:8px"><input class="inp" data-input="entr:${i}:name" value="${esc(en.name)}" placeholder="e.g. VIP entrance" ${ro ? 'disabled' : ''} style="max-width:260px">${ro ? '' : `<button class="btn btn-ghost btn-sm" data-action="enDel" data-i="${i}">Remove</button>`}</div>
+      <div class="small muted" style="margin:8px 0 4px">Only these ticket types <span class="muted">(none ticked = all)</span></div><div class="row wrap" style="gap:6px">${ev.ticketTypes.map(t => chk(i, 'ticketTypeIds', t.id, (en.ticketTypeIds || []).includes(t.id), t.name)).join('')}</div>
+      ${areas.length ? `<div class="small muted" style="margin:8px 0 4px">Only these seating areas</div><div class="row wrap" style="gap:6px">${areas.map(a => chk(i, 'areas', a, (en.areas || []).includes(a), a)).join('')}</div>` : ''}</div>`).join('') || '<p class="small muted">No entrances yet.</p>'}</div>
+  ${logOk ? `<div class="card" style="padding:0;margin-top:16px"><div class="between wrap" style="padding:16px 20px 8px;gap:8px"><h3>Scan history</h3><div class="row wrap">${Object.entries(SCAN_FILTERS).map(([k, [l, f]]) => `<button class="btn btn-sm ${(lg?.f || 'all') === k ? 'btn-dark' : 'btn-ghost'}" data-action="dlogF" data-v="${k}">${l} ${(lg?.rows || []).filter(f).length}</button>`).join('')}
+      <button class="btn btn-ghost btn-sm" data-action="dlogRefresh">Refresh</button><button class="btn btn-ghost btn-sm" data-action="dlogCsv">Export CSV</button></div></div>
+    <div class="tbl-wrap" style="border:0;box-shadow:none;border-radius:0;max-height:560px;overflow:auto"><table class="tbl"><thead><tr><th>Time</th><th>Result</th><th>Ticket</th><th>Guest / seat</th><th>Entrance</th><th>Device</th><th>Staff</th></tr></thead><tbody>
+    ${lg?.loading ? '<tr><td colspan="7" class="muted small">Loading…</td></tr>' : lg?.err ? `<tr><td colspan="7" class="small" style="color:var(--bad)">${esc(lg.err)}</td></tr>` : rows.slice(0, 500).map(r => { const t = tk(r.ticket_id);
+      return `<tr><td class="small tnum">${esc(fmtTime(r.at))}</td><td><span class="chip mini ${resKind(r.result)}">${esc(RES_TITLE[r.result] || r.result)}</span>${r.manual ? ' <span class="chip mini">manual</span>' : ''}${r.override ? ' <span class="chip warn mini">override</span>' : ''}</td>
+        <td class="tnum small">${esc(r.code || '')}</td><td class="small">${t ? esc(t.holder || '') + (t.seat ? '<div class="muted">' + esc(seatName(saved, t.seat, false, t)) + '</div>' : '') : '<span class="muted">—</span>'}</td>
+        <td class="small">${esc(r.entrance || '—')}</td><td class="small">${esc(r.device_name || '—')}</td><td class="small">${esc(r.by || '')}</td></tr>`; }).join('') || '<tr><td colspan="7" class="muted small">No scans yet.</td></tr>'}
+    </tbody></table></div></div>` : ''}`;
 }
 function EdOverview(ev) {
   const saved = S.adm.events.find(e => e.id === ev.id) || ev, tks = S.adm.tickets.filter(t => t.event_id === ev.id), valid = tks.filter(t => t.status === 'valid');
@@ -1320,6 +1359,8 @@ function SectionPanel(ev, sec, i, sold) {
     <h3 style="margin:12px 0 12px">${esc(sec.name)} <span class="chip">${{ rows: 'Seated rows', table: 'Table', booth: 'Booth', ga: 'Standing area' }[kind]}</span></h3>
     <div class="grid2">${inp(`${P}.name`, 'Section name')}${inp(`${P}.code`, 'Code', { ro: hasSold, hint: hasSold ? 'Locked — seats sold' : 'Prefix on seat IDs' })}</div>
     <div class="grid2">${inp(`${P}.area`, 'Seating area', { ph: sec.name, hint: 'Printed on tickets. Blank = section name.' })}${lvs.length > 1 ? sel(`${P}.level`, 'Level', lvs.map(l => [l.id, l.name])) : '<div></div>'}</div>
+    ${kind !== 'ga' ? `<div class="row wrap" style="gap:16px;margin:-4px 0 10px"><label class="check"><input type="checkbox" data-bind="draft.${P}.showName" data-t="bool" ${(sec.showName ?? (kind === 'table' || kind === 'booth')) ? 'checked' : ''}> <span>Print “${esc(sec.name || 'section name')}” on tickets <span class="muted">(table, box, couch, pod…)</span></span></label>
+      ${kind === 'rows' ? chk(`${P}.hideRow`, 'No row on tickets <span class="muted">(boxes, couches)</span>') : ''}</div>` : ''}
     ${sel(`${P}.ticketTypeId`, 'Price for this section', [['', '— not for sale —'], ...ev.ticketTypes.map(t => [t.id, `${t.name} · ${money(t.price, ev.currency)}`])])}
     ${overrides ? `<div class="banner info" style="display:flex;justify-content:space-between;align-items:center">${overrides} seats have their own price<button type="button" class="btn btn-ghost btn-sm" data-action="smClearPrices">Reset</button></div>` : ''}
     ${kind === 'ga' ? `<div class="grid3">${inp(`${P}.capacity`, 'Capacity', { t: 'int', hint: 'Max ' + GA_MAX })}${inp(`${P}.w`, 'Width', { t: 'int' })}${inp(`${P}.h`, 'Depth', { t: 'int' })}</div>`
@@ -1769,7 +1810,7 @@ const OrderModal = id => { location.hash = '#/admin/orders/' + id; };   // the o
 const TK_CHIP = { valid: '', cancelled: '<span class="chip bad mini">cancelled</span>', replaced: '<span class="chip mini">replaced</span>' };
 const tkType = t => evById(t.event_id)?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name || 'Ticket';
 const tkWhere = t => { const ev = evById(t.event_id), slot = t.slot_id && ev?.timeSlots?.find(s => s.id === t.slot_id); return [t.seat ? seatName(ev, t.seat, true, t) : '', slot ? fmtDT(slot.start) : ''].filter(Boolean).join(' · ') || 'General admission'; };
-const LOG_ICON = { change: '⇄', cancel: '✕', refund: '↩', payment: '＋', addon: '＋', customer: '✎', holder: '✎', note: '✎', message: '✉', resend: '✉', paid: '✓', cancelled: '✕', credit: '★', placed: '•' };
+const LOG_ICON = { reissue: '⟲', change: '⇄', cancel: '✕', refund: '↩', payment: '＋', addon: '＋', customer: '✎', holder: '✎', note: '✎', message: '✉', resend: '✉', paid: '✓', cancelled: '✕', credit: '★', placed: '•' };
 function orderTimeline(o) {
   const rows = (S.adm.orderLog || []).filter(x => x.order_id === o.id).map(x => ({ at: x.at, kind: x.kind, text: x.summary, by: x.by, note: x.kind === 'note' ? '' : x.note }));
   rows.push({ at: o.created_at, kind: 'placed', text: `order placed — ${o.data.payment === 'manual' ? 'staff order' : o.data.payment}${o.data.comp ? ' · complimentary' : ''}`, by: o.data.payment === 'manual' ? '' : o.buyer_email });
@@ -1799,7 +1840,7 @@ function OrderView(id) {
   <div class="ord-grid"><div class="stack">
     <div class="card" style="padding:0"><div class="between wrap" style="padding:16px 20px 8px;gap:8px"><h3>Tickets <span class="muted small">${live.length} valid${all.length > live.length ? ` · ${all.length - live.length} cancelled / replaced` : ''}</span></h3>
       <div class="row wrap">${all.some(t => t.status === 'replaced') ? `<label class="check small"><input type="checkbox" data-action="oAll" ${S.ui.oAll ? 'checked' : ''}> <span>Show replaced tickets</span></label>` : ''}
-        ${paid && live.length ? `${btn('change', sel.length ? `Change ${sel.length} selected` : 'Change seats / tickets', 'orders.seats', 'btn-dark', sel.length ? '' : 'data-all="1"')}${btn('cancel', sel.length ? `Cancel ${sel.length} selected` : 'Cancel tickets', sel.length && sel.length < live.length ? 'orders.cancelTicket' : 'orders.cancel', 'btn-ghost', sel.length ? '' : 'data-all="1"')}` : ''}</div></div>
+        ${paid && live.length ? `${btn('change', sel.length ? `Change ${sel.length} selected` : 'Change seats / tickets', 'orders.seats', 'btn-dark', sel.length ? '' : 'data-all="1"')}${btn('cancel', sel.length ? `Cancel ${sel.length} selected` : 'Cancel tickets', sel.length && sel.length < live.length ? 'orders.cancelTicket' : 'orders.cancel', 'btn-ghost', sel.length ? '' : 'data-all="1"')}${btn('reissue', sel.length ? `Reissue ${sel.length} selected` : 'Reissue tickets', 'orders.edit', 'btn-ghost', sel.length ? '' : 'data-all="1"')}` : ''}</div></div>
       <div class="tbl-wrap" style="border:0;box-shadow:none;border-radius:0"><table class="tbl"><thead><tr><th style="width:30px">${paid && live.length ? `<input type="checkbox" data-action="oSelAll" ${sel.length === live.length && live.length ? 'checked' : ''} aria-label="Select all">` : ''}</th><th>Ticket</th><th>Type / area</th><th>Seat / showtime</th><th>Holder</th>${fin ? '<th>Face</th><th>Paid</th>' : ''}<th>Status</th></tr></thead><tbody>
       ${shown.map(t => `<tr class="${t.status !== 'valid' ? 'dimrow' : ''}"><td>${t.status === 'valid' && paid ? `<input type="checkbox" data-action="oSel" data-id="${t.id}" ${S.ui.osel[t.id] ? 'checked' : ''}>` : ''}</td>
         <td class="tnum"><b>${esc(t.code)}</b>${t.replaces ? `<div class="small muted">replaces ${esc(all.find(x => x.id === t.replaces)?.code || '')}</div>` : ''}${t.status === 'replaced' ? `<div class="small muted">→ ${esc(all.find(x => x.id === t.replaced_by)?.code || '')}</div>` : ''}</td>
@@ -1965,6 +2006,11 @@ function OpPanel(o, sel, live) {
     title = 'Mark paid & issue tickets';
     body = `${opRow('Paid by', opSel('method', PAY_METHODS, op.method))}<p class="small muted">The tickets are issued now and the confirmation email is queued.</p>${note}`;
     foot = go('Mark paid', 'btn-dark');
+  } else if (op.kind === 'reissue') {
+    const tks = live.filter(t => op.tickets.includes(t.id));
+    title = `Reissue ${tks.length} ticket${tks.length === 1 ? '' : 's'}`;
+    body = `<p class="small">${tks.map(t => `<b>${esc(t.code)}</b>`).join(', ')} get new QR codes. Same seat, type and price. <b>The old codes stop working at the door immediately</b> — use this for a lost phone or a forwarded screenshot.</p>${tell}${note}`;
+    foot = go('Reissue with new codes', 'btn-dark');
   } else if (op.kind === 'cancelUnpaid') {
     title = 'Cancel this reservation'; body = `<p class="small">Nothing was paid, so there's nothing to refund. The seats and stock go back on sale.</p>${note}`; foot = go('Cancel reservation', 'btn-danger');
   }
@@ -1985,11 +2031,12 @@ function opPayload(o) {
     case 'holder': return { ticket: op.ticket, name: op.name, note };
     case 'message': return { subject: op.subject || 'About your order ' + o.ref, body: op.body };
     case 'markPaid': return { method: op.method, note };
+    case 'reissue': return { tickets: op.tickets, note, notify };
     default: return { note };
   }
 }
 const OP_DONE = { change: 'Tickets changed — new tickets issued', cancel: 'Cancelled', refund: 'Refund issued', collect: 'Payment recorded', addAddon: 'Product added', removeAddon: 'Product removed', customer: 'Customer details saved',
-  holder: 'Holder changed', message: 'Message queued', markPaid: 'Marked paid — tickets issued', cancelUnpaid: 'Reservation cancelled', note: 'Note added', resend: 'Tickets re-sent' };
+  holder: 'Holder changed', reissue: 'Reissued — the old codes no longer scan', message: 'Message queued', markPaid: 'Marked paid — tickets issued', cancelUnpaid: 'Reservation cancelled', note: 'Note added', resend: 'Tickets re-sent' };
 
 // ── Customers (Stage 6 §7): one record per email across all of this box office's orders ──
 function customerIndex() {
@@ -2166,54 +2213,104 @@ function Attendees() {
 function CheckIn() {
   const url = location.origin + location.pathname + '#/scan';
   const evs = S.adm.events.filter(e => e.status === 'published' && D(e.end || e.start) >= Date.now() - 12 * 3600e3).sort((a, b) => D(a.start) - D(b.start));
+  if (can('door.devices') && !S.ui.devs) { S.ui.devs = { loading: true }; DB.devices().then(r => { S.ui.devs = { list: r }; render(); }).catch(e => { S.ui.devs = { err: e.message }; render(); }); }
+  const dv = S.ui.devs;
   return head('Scanner app', 'Check guests in at the door from any phone — no app store needed.', `<a class="btn btn-accent" href="#/scan" target="_blank">Open scanner ${ic('ext', 14)}</a>`) + `
   <div class="cols"><div class="stack">
     <div class="card"><div class="row" style="gap:22px;align-items:flex-start;flex-wrap:wrap"><div class="qr qr-sm" data-qr="${esc(url)}"></div>
-      <div style="flex:1;min-width:220px"><h3>Put it on your door staff's phones</h3><ol class="steps"><li>Scan this code with the phone's camera.</li><li>Sign in with an email on the <a href="#/admin/team">Team</a> page.</li><li>Tap <b>Share → Add to Home Screen</b> — it opens full-screen like a native app.</li></ol>
-      <p class="small muted">Scans with the phone camera, Bluetooth/USB barcode scanners, or typed codes. Keeps working when the venue Wi-Fi drops and syncs when it's back.</p></div></div></div>
+      <div style="flex:1;min-width:220px"><h3>Put it on your door staff's phones</h3><ol class="steps"><li>Scan this code with the phone's camera.</li><li>Sign in with an email on the <a href="#/admin/team">Team</a> page (the <b>Scanner staff</b> template can only scan).</li><li>Pick the event, the entrance and a name for the device.</li><li>Tap <b>Share → Add to Home Screen</b> — it opens full-screen like a native app.</li></ol>
+      <p class="small muted">Any number of phones, tablets or handheld scanners can scan the same event at once — they stay in sync, so a ticket is only let in once. Bluetooth/USB barcode scanners and typed codes work too, and it keeps working when the venue Wi-Fi drops.</p></div></div></div>
     <div class="card" style="padding:0"><div style="padding:18px 22px 8px"><h3>Live door status</h3></div><div style="overflow:auto"><table class="tbl"><thead><tr><th>Event</th><th>Starts</th><th style="width:40%">Checked in</th></tr></thead><tbody>
-      ${evs.map(e => { const st = checkStats(e.id); return `<tr><td><b>${esc(e.name)}</b></td><td class="small">${esc(fmtDT(e.start))}</td><td><div class="between small"><span>${st.inn} / ${st.total}</span><span class="muted">${st.total ? Math.round(st.inn / st.total * 100) : 0}%</span></div><div class="bar"><i style="width:${st.total ? st.inn / st.total * 100 : 0}%;background:var(--accent)"></i></div></td></tr>`; }).join('') || '<tr><td colspan="3" class="muted">No upcoming events.</td></tr>'}
+      ${evs.map(e => { const st = checkStats(e.id), by = byEntrance(e, st.tk); return `<tr><td><b>${esc(e.name)}</b>${can('door.log', e.id) ? `<div class="small"><a href="#/admin/event/${e.id}/door">Door & scan history →</a></div>` : ''}</td><td class="small">${esc(fmtDT(e.start))}</td><td><div class="between small"><span>${st.inn} / ${st.total}</span><span class="muted">${st.total ? Math.round(st.inn / st.total * 100) : 0}%</span></div><div class="bar"><i style="width:${st.total ? st.inn / st.total * 100 : 0}%;background:var(--accent)"></i></div>
+        ${by.length > 1 ? `<div class="small muted" style="margin-top:4px">${by.map(x => `${esc(x.name)} ${x.n}`).join(' · ')}</div>` : ''}</td></tr>`; }).join('') || '<tr><td colspan="3" class="muted">No upcoming events.</td></tr>'}
     </tbody></table></div></div>
+    ${can('door.devices') ? `<div class="card" style="padding:0"><div style="padding:18px 22px 4px"><h3>Scanner devices</h3><p class="small muted" style="margin-top:4px">Every phone, tablet or handheld that has scanned for this box office. Switch one off if it's lost — it stops accepting tickets at once.</p></div>
+      <div class="tbl-wrap" style="border:0;box-shadow:none;border-radius:0"><table class="tbl"><thead><tr><th>Device</th><th>Entrance</th><th>Last used</th><th>Scans</th><th>Status</th><th></th></tr></thead><tbody>
+      ${dv?.loading ? '<tr><td colspan="6" class="muted small">Loading…</td></tr>' : dv?.err ? `<tr><td colspan="6" class="small" style="color:var(--bad)">${esc(dv.err)}</td></tr>`
+        : (dv?.list || []).sort((a, b) => D(b.last_seen) - D(a.last_seen)).map(d => `<tr class="${d.disabled ? 'dimrow' : ''}"><td style="white-space:nowrap">${S.ui.devEdit === d.id ? `<div class="row"><input class="inp" data-input="devName" value="${esc(S.ui.devName ?? d.name)}" style="max-width:180px"><button class="btn btn-dark btn-sm" data-action="devSave" data-id="${esc(d.id)}">Save</button></div>` : `<b>${esc(d.name)}</b>`}</td>
+          <td class="small">${esc(d.entrance || '—')}</td><td class="small">${esc(fmtDT(d.last_seen))}<div class="muted">${esc(d.last_by || '')}</div></td><td class="tnum">${d.scans || 0}</td>
+          <td>${d.disabled ? '<span class="chip bad mini">switched off</span>' : '<span class="chip ok mini">active</span>'}</td>
+          <td><div class="row" style="justify-content:flex-end;gap:6px;flex-wrap:nowrap">${S.ui.devEdit === d.id ? '' : `<button class="btn btn-ghost btn-sm" data-action="devEdit" data-id="${esc(d.id)}">Rename</button>`}<button class="btn btn-ghost btn-sm" data-action="devToggle" data-id="${esc(d.id)}" data-v="${d.disabled ? 'enable' : 'disable'}">${d.disabled ? 'Switch on' : 'Switch off'}</button><button class="btn btn-ghost btn-sm" data-action="devForget" data-id="${esc(d.id)}">Remove</button></div></td></tr>`).join('') || '<tr><td colspan="6" class="muted small">No devices yet — they appear here after their first scan.</td></tr>'}
+      </tbody></table></div></div>` : ''}
   </div><div><div class="phone"><iframe src="${esc(location.pathname)}#/scan" title="Scanner app preview" allow="camera"></iframe></div><p class="small muted" style="text-align:center;margin-top:10px">Live preview — this is the real app.</p></div></div>`;
 }
 async function doCheckin(code, undo) {
-  try { const r = await DB.checkin(code, undo); applyTicket(r); render(); } catch (e) { toast(e.message, true); }
+  try { const r = await DB.checkin(code, undo, null, { manual: true, device: 'backoffice', deviceName: 'Back office' }); applyTicket(r); render(); } catch (e) { toast(e.message, true); }
 }
-function applyTicket(r) { if (!r?.ticket) return; const t = S.adm.tickets.find(x => x.id === r.ticket.id); if (t) t.checked_in_at = r.ticket.checked_in_at; }
-const checkStats = evId => { const tk = S.adm.tickets.filter(t => t.event_id === evId && t.status === 'valid'); return { tk, total: tk.length, inn: tk.filter(t => t.checked_in_at).length }; };
+function applyTicket(r) { if (!r?.ticket?.id) return; const t = S.adm.tickets.find(x => x.id === r.ticket.id); if (t) { t.checked_in_at = r.ticket.checked_in_at; t.checkin = r.ticket.checkin; } }
+const checkStats = (evId, slot) => { const tk = S.adm.tickets.filter(t => t.event_id === evId && t.status === 'valid' && (!slot || t.slot_id === slot)); return { tk, total: tk.length, inn: tk.filter(t => t.checked_in_at).length }; };
+// checked-in counts per entrance (+ scans made before entrances were set up / by the back office)
+const byEntrance = (ev, tk) => { const c = {}; tk.filter(t => t.checked_in_at).forEach(t => { const k = t.checkin?.entrance || ''; c[k] = (c[k] || 0) + 1; });
+  return [...(ev.entrances || []).map(e => ({ name: e.name, n: c[e.name] || 0, en: e })), ...Object.keys(c).filter(k => !(ev.entrances || []).some(e => e.name === k)).map(k => ({ name: k || 'No entrance', n: c[k] }))]; };
+// What the scanner shows for a ticket — the server's door view, or (offline / back office) the same fields from local data.
+function doorView(t) {
+  if (!t) return null; const ev = evById(t.event_id), tt = ev?.ticketTypes.find(x => x.id === t.ticket_type_id), o = S.adm.orders.find(x => x.id === t.order_id);
+  const sibs = S.adm.tickets.filter(x => x.order_id === t.order_id && x.status === 'valid'), sp = t.seat && t.area == null ? seatParts(ev, t.seat, t) : null;
+  return { ...t, type: t.type || tt?.name || '', admits: t.admits || Math.max(1, +tt?.admits || 1), event_name: t.event_name || ev?.name || '', event_start: t.event_start || ev?.start,
+    slot_start: t.slot_start || (t.slot_id && ev?.timeSlots?.find(x => x.id === t.slot_id)?.start) || null, order_ref: t.order_ref || o?.ref || '',
+    of: t.of ?? sibs.length, no: t.no ?? sibs.indexOf(t) + 1, ...(sp ? { area: sp.area, row: sp.row, seat_label: sp.seat, unit: sp.unit } : {}) };
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  DOOR SCANNER APP  (#/scan — phone-first, installable, works offline)
 // ══════════════════════════════════════════════════════════════════════════════
+// This device: a random id + a name staff choose ("Door phone 1"). Admins see it on the Scanner app page and can switch it off.
+function scanDev() {
+  let d = null; try { d = JSON.parse(localStorage.getItem('set_scan_device')); } catch (e) { }
+  if (!d?.id) { const ua = navigator.userAgent, kind = /iPad|Tablet/i.test(ua) ? 'Tablet' : /iPhone|Android|Mobile/i.test(ua) ? 'Phone' : 'Scanner';
+    d = { id: 'dev_' + randCode(12).toLowerCase(), name: kind + ' ' + randCode(3) }; try { localStorage.setItem('set_scan_device', JSON.stringify(d)); } catch (e) { S.sc._dev = d; } }
+  return S.sc._dev || d;
+}
+const scanEntrance = ev => (ev?.entrances || []).find(e => e.id === S.sc.entrance) || null;
+const scanOpts = (extra = {}) => { const d = scanDev(), en = scanEntrance(evById(S.sc.evId)); return { slot: S.sc.slot || null, entrance: en?.id || null, entranceName: en?.name || '', device: d.id, deviceName: d.name, ...extra }; };
+function saveScanCtx() { try { localStorage.setItem('set_scan_ctx', JSON.stringify({ evId: S.sc.evId, entrance: S.sc.entrance, slot: S.sc.slot })); } catch (e) { } }
+// the showtime on now / next (timed-entry events)
+const nearSlot = ev => { const sl = (ev.timeSlots || []).filter(s => !s.hidden); if (!sl.length) return ''; const now = Date.now();
+  return (sl.filter(s => D(s.start) - now < 45 * 6e4).sort((a, b) => D(b.start) - D(a.start))[0] || sl.slice().sort((a, b) => D(a.start) - D(b.start))[0]).id; };
 function ScanApp() {
   if (!S.user || S.user.mfa || !S.adm) return Login('Door staff sign in', 'start scanning tickets');
   if (!S.adm.bo || S.adm.blocked) return AdminShell();
   if (S.adm.needs2fa) return Gate('Two-factor required', 'Set up two-factor sign-in in the back office (My security) before scanning.');
   if (!can('door.scan')) return Gate('No scanner access', 'Ask a box office admin to give you the “Scan tickets” permission.');
   const ev = S.adm.events.find(e => e.id === S.sc.evId);
-  return `<div class="sc">${ev ? ScanEvent(ev) : ScanPick()}</div>${S.sc.last ? ScanResult(S.sc.last) : ''}`;
+  const setup = ev && (S.sc.setup || (ev.entrances?.length && S.sc.entrance == null) || (ev.timeSlots?.length && S.sc.slot == null));
+  return `<div class="sc">${!ev ? ScanPick() : setup ? ScanSetup(ev) : ScanEvent(ev)}</div>${S.sc.last ? ScanResult(S.sc.last) : ''}`;
 }
 function ScanPick() {
   const today = new Date().toDateString();
   const evs = S.adm.events.filter(e => e.status === 'published' && D(e.end || e.start) >= Date.now() - 12 * 3600e3).sort((a, b) => D(a.start) - D(b.start));
-  return `<header class="sc-top"><div class="sc-logo">${logo()}</div><span class="sc-badge">Scanner</span><span style="flex:1"></span><a href="#/admin" class="sc-link">Box office</a></header>
+  return `<header class="sc-top"><div class="sc-logo">${logo()}</div><span class="sc-badge">Scanner</span><span style="flex:1"></span>${can('events.view') ? '<a href="#/admin" class="sc-link">Box office</a>' : ''}</header>
   <div class="sc-pad"><div class="sc-eyebrow">Choose an event</div><h1 class="sc-h">Who's coming in?</h1>
   ${evs.map(e => { const st = checkStats(e.id), tonight = D(e.start).toDateString() === today;
     return `<button class="sc-ev" data-action="scPick" data-id="${e.id}"><div class="sc-ev-art" style="${artBg(e)}"></div><div class="sc-ev-body">
       <div class="row" style="gap:6px">${tonight ? '<span class="chip gold">Tonight</span>' : ''}<span class="sc-dim">${esc(fmtDT(e.start))}</span></div>
       <b>${esc(e.name)}</b><span class="sc-dim">${esc(e.venue || '')}</span>
       <div class="sc-bar"><i style="width:${st.total ? st.inn / st.total * 100 : 0}%"></i></div><span class="sc-dim">${st.inn} of ${st.total} checked in</span></div><span class="sc-chev">›</span></button>`; }).join('') || '<p class="sc-dim">No upcoming events.</p>'}
-  </div><div class="sc-foot"><span>${esc(S.user.email)}</span><a href="#" data-action="signOut">Sign out</a></div>`;
+  </div><div class="sc-foot"><span>${esc(S.user.email)} · ${esc(scanDev().name)}</span><a href="#" data-action="signOut">Sign out</a></div>`;
+}
+// Once per event on this device: which door, which showtime, what the device is called.
+function ScanSetup(ev) {
+  const pk = S.sc.pick ||= { entrance: S.sc.entrance ?? (ev.entrances?.[0]?.id || ''), slot: S.sc.slot ?? nearSlot(ev), name: scanDev().name };
+  const opt = (k, v, label, sub = '') => `<button class="sc-opt ${pk[k] === v ? 'on' : ''}" data-action="scSet" data-k="${k}" data-v="${esc(v)}"><b>${esc(label)}</b>${sub ? `<span>${esc(sub)}</span>` : ''}</button>`;
+  const takes = en => [...(en.ticketTypeIds || []).map(id => ev.ticketTypes.find(t => t.id === id)?.name).filter(Boolean), ...(en.areas || [])].join(', ');
+  return `<header class="sc-top"><button class="sc-back" data-action="scBack" aria-label="All events">‹</button><div class="sc-title"><b>${esc(ev.name)}</b><span>${esc(fmtDT(ev.start))}</span></div></header>
+  <div class="sc-pad"><div class="sc-eyebrow">Set up this scanner</div><h1 class="sc-h">Where are you scanning?</h1>
+    ${ev.entrances?.length ? `<div class="sc-eyebrow" style="margin-top:6px">Entrance</div><div class="sc-opts">${ev.entrances.map(en => opt('entrance', en.id, en.name, takes(en) ? 'Only ' + takes(en) : 'Everyone')).join('')}${opt('entrance', '', 'Not at a specific entrance', 'Accept every ticket')}</div>` : ''}
+    ${ev.timeSlots?.length ? `<div class="sc-eyebrow" style="margin-top:16px">Showtime</div><div class="sc-opts">${ev.timeSlots.map(s => opt('slot', s.id, fmtTime(s.start), s.label || fmtDate(s.start, { weekday: 'short', month: 'short', day: 'numeric' }))).join('')}${opt('slot', '', 'All showtimes', 'Don\'t check the time')}</div>` : ''}
+    <div class="sc-eyebrow" style="margin-top:16px">This device</div><div class="sc-search"><input data-input="sc.devName" value="${esc(pk.name)}" placeholder="e.g. Door phone 1" maxlength="60" autocomplete="off"></div>
+    <p class="sc-dim" style="font-size:12px;margin-top:6px">Shown in the scan history so the box office knows which phone let each guest in.</p>
+    <button class="btn btn-accent btn-lg btn-block" style="margin-top:20px" data-action="scSetupDone">Start scanning</button></div>`;
 }
 function ScanEvent(ev) {
-  const st = checkStats(ev.id), tab = S.sc.tab, on = navigator.onLine;
+  const st = checkStats(ev.id, S.sc.slot), tab = S.sc.tab, on = navigator.onLine, en = scanEntrance(ev), slot = S.sc.slot && ev.timeSlots?.find(s => s.id === S.sc.slot);
   return `<header class="sc-top"><button class="sc-back" data-action="scBack" aria-label="All events">‹</button>
-    <div class="sc-title"><b>${esc(ev.name)}</b><span>${esc(fmtTime(ev.start))}${ev.venue ? ' · ' + esc(ev.venue) : ''}</span></div>
-    <span class="sc-net ${on ? '' : 'off'}">${ic('wifi', 13)} ${on ? 'Online' : 'Offline'}${S.sc.queue.length ? ' · ' + S.sc.queue.length + ' queued' : ''}</span></header>
-  <div class="sc-count"><div><span class="n">${st.inn}</span><span class="d"> / ${st.total} checked in</span></div><span class="d">${st.total - st.inn} to come</span></div>
+    <div class="sc-title"><b>${esc(ev.name)}</b><span>${esc(slot ? fmtTime(slot.start) + ' showtime' : fmtTime(ev.start))}${en ? ' · ' + esc(en.name) : ev.venue ? ' · ' + esc(ev.venue) : ''}</span></div>
+    <span class="sc-net ${on ? '' : 'off'}">${ic('wifi', 13)} ${on ? 'Online' : 'Offline'}${S.sc.queue.length ? ' · ' + S.sc.queue.length + ' queued' : ''}</span>
+    <button class="sc-gear" data-action="scSetup" aria-label="Scanner settings">${ic('gear', 18)}</button></header>
+  <div class="sc-count"><div><span class="n">${st.inn.toLocaleString()}</span><span class="d"> / ${st.total.toLocaleString()} checked in</span></div><span class="d">${(st.total - st.inn).toLocaleString()} to come · ${st.total ? Math.round(st.inn / st.total * 100) : 0}%</span></div>
   <div class="sc-progress"><i style="width:${st.total ? st.inn / st.total * 100 : 0}%"></i></div>
   <main class="sc-body">${tab === 'guests' ? ScanGuests(ev, st) : tab === 'stats' ? ScanStats(ev, st) : ScanCam()}</main>
-  <nav class="sc-tabs">${[['scan', 'Scan', 'scan'], ['guests', 'Guests', 'users'], ['stats', 'Stats', 'chart']].map(([k, t, i]) => `<button class="${tab === k ? 'on' : ''}" data-action="scTab" data-v="${k}">${ic(i, 21)}<span>${t}</span></button>`).join('')}</nav>`;
+  <nav class="sc-tabs">${[['scan', 'Scan', 'scan'], ['guests', 'Find guest', 'search'], ['stats', 'Totals', 'chart']].map(([k, t, i]) => `<button class="${tab === k ? 'on' : ''}" data-action="scTab" data-v="${k}">${ic(i, 21)}<span>${t}</span></button>`).join('')}</nav>`;
 }
 function ScanCam() {
   const live = !!CAM.stream;
@@ -2226,39 +2323,66 @@ function ScanCam() {
     <button class="sc-tool ${S.sc.sound ? 'on' : ''}" data-action="scSound">${ic(S.sc.sound ? 'sound' : 'mute', 20)}<span>Sound</span></button></div>
   ${S.sc.recent.length ? `<div class="sc-recent"><div class="sc-eyebrow">Recent</div>${S.sc.recent.slice(0, 5).map(r => `<div class="sc-rec"><span class="dot ${resKind(r.result)}"></span><b>${esc(r.ticket?.holder || r.code)}</b><span class="sc-dim">${esc(RES_TITLE[r.result])} · ${esc(fmtTime(new Date(r.at).toISOString()))}</span></div>`).join('')}</div>` : ''}`;
 }
-const RES_TITLE = { ok: 'Valid ticket', already: 'Already checked in', unknown: 'Not a valid ticket', cancelled: 'Ticket cancelled', wrong_event: 'Wrong event', undone: 'Check-in undone' };
-const resKind = r => r === 'ok' ? 'ok' : r === 'already' ? 'warn' : r === 'undone' ? 'info' : 'bad';
+// [title, colour] for every answer the server can give
+const RES = { ok: ['Valid', 'ok'], already: ['Already scanned', 'warn'], undone: ['Check-in undone', 'info'], unknown: ['Invalid QR code', 'bad'], cancelled: ['Ticket cancelled', 'bad'],
+  refunded: ['Ticket refunded', 'bad'], replaced: ['Replaced ticket', 'bad'], wrong_event: ['Wrong event', 'bad'], wrong_slot: ['Wrong showtime', 'bad'], wrong_entrance: ['Wrong entrance', 'warn'],
+  inactive: ['Ticket not active', 'bad'], device_off: ['Scanner switched off', 'bad'] };
+const RES_TITLE = Object.fromEntries(Object.entries(RES).map(([k, v]) => [k, v[0]]));
+const resKind = r => RES[r]?.[1] || 'bad';
 function ScanResult(r) {
-  const kind = resKind(r.result), t = r.ticket, ev = t && evById(t.event_id), tt = ev?.ticketTypes.find(x => x.id === t.ticket_type_id);
-  const o = t && S.adm.orders.find(x => x.id === t.order_id), slot = t?.slot_id && ev?.timeSlots?.find(s => s.id === t.slot_id);
-  return `<div class="sc-result ${kind}" data-action="scDismiss" role="alert"><div class="sc-res-icon">${ic(kind === 'ok' ? 'check' : kind === 'bad' ? 'x' : 'alert', 58)}</div>
+  const kind = resKind(r.result), t = doorView(r.ticket), show = t && !['unknown', 'wrong_event', 'device_off'].includes(r.result);
+  const sp = t?.seat ? { area: t.area || '', row: t.row || '', seat: t.seat_label || '', unit: t.unit || '' } : null, lines = sp ? seatLines(sp) : t ? [t.type || 'General admission'] : [];
+  const f = r.first || {}, note = {
+    already: `First scanned at ${fmtTime(f.at || t?.checked_in_at)}${f.entrance ? ' · ' + f.entrance : ''}${f.device_name ? ' · ' + f.device_name : ''}`,
+    replaced: 'This ticket was reissued, so this QR code no longer works. Ask the guest for their updated ticket (it was emailed to them).',
+    cancelled: 'This ticket was cancelled and can\'t be used.', refunded: 'This ticket was refunded and can\'t be used.',
+    wrong_event: t ? `This ticket is for ${t.event_name} · ${fmtDT(t.slot_start || t.event_start)}` : '',
+    wrong_slot: t?.slot_start ? `This ticket is for the ${fmtTime(t.slot_start)} showtime (${fmtDate(t.slot_start, { weekday: 'short', month: 'short', day: 'numeric' })})` : '',
+    wrong_entrance: r.entrances?.length ? 'Send this guest to the ' + r.entrances.join(' or ') : 'This entrance doesn\'t take this ticket',
+    inactive: 'The order isn\'t paid or the event is closed — send the guest to the box office.',
+    unknown: 'Not a ticket for this box office. Check the code, or look the guest up under Find guest.',
+    device_off: 'An admin switched this scanner off. Ask a manager to switch it back on.' }[r.result];
+  return `<div class="sc-result ${kind}" ${r.result === 'wrong_entrance' ? '' : 'data-action="scDismiss"'} role="alert"><div class="sc-res-icon">${ic(kind === 'ok' ? 'check' : kind === 'bad' ? 'x' : 'alert', 50)}</div>
     <div class="sc-res-t">${esc(RES_TITLE[r.result])}</div>
-    ${t ? `<div class="sc-res-name">${esc(t.holder)}</div><div class="sc-res-meta">${esc(tt?.name || '')}${t.seat ? ' · ' + esc(seatName(ev, t.seat, true, t)) : ''}${slot ? ' · ' + esc(fmtTime(slot.start)) : ''}</div><div class="sc-res-code">${esc(t.code)}${o ? ' · ' + esc(o.ref) : ''}</div>` : `<div class="sc-res-code">${esc(r.code || '')}</div>`}
-    ${r.result === 'already' ? `<div class="sc-res-note">First scanned at ${esc(fmtTime(t.checked_in_at))}</div>` : ''}
-    ${r.result === 'wrong_event' && ev ? `<div class="sc-res-note">This ticket is for ${esc(ev.name)} · ${esc(fmtDT(ev.start))}</div>` : ''}
-    ${r.result === 'ok' && o?.status === 'pending' ? `<div class="sc-res-note">Unpaid order — collect ${money(o.data.total, o.data.currency)}</div>` : ''}
+    ${show ? `${sp ? `<div class="sc-res-type">${esc(t.type)}${t.comp ? ' · Comp' : ''}</div>` : ''}<div class="sc-seat">${lines.map(l => `<div>${esc(l)}</div>`).join('')}</div>
+      ${t.admits > 1 ? `<div class="sc-res-type">Admits ${t.admits}</div>` : ''}<div class="sc-res-name">${esc(t.holder || '')}</div>
+      <div class="sc-res-code">${esc(t.code)}${t.order_ref ? ' · ' + esc(t.order_ref) : ''}${t.of > 1 ? ` · <span style="white-space:nowrap">ticket ${t.no} of ${t.of}</span>` : ''}</div>` : `<div class="sc-res-code">${esc(r.code || '')}</div>`}
+    ${note ? `<div class="sc-res-note">${esc(note)}</div>` : ''}
+    ${r.result === 'ok' && t?.due ? '<div class="sc-res-note">Balance due on this order — ask the guest to see the box office</div>' : ''}
+    ${r.override ? '<div class="sc-res-note">Let in here by override</div>' : ''}
     ${r.offline ? '<div class="sc-res-note">Saved offline — syncs when back online</div>' : ''}
-    <div class="sc-res-actions">${r.result === 'ok' ? `<button class="btn glass" data-action="scUndo" data-v="${esc(t.code)}">Undo</button>` : ''}<button class="btn sc-next" data-action="scDismiss">Next scan</button></div></div>`;
+    <div class="sc-res-actions">${r.result === 'ok' && can('door.undo', t?.event_id) ? `<button class="btn glass" data-action="scUndo" data-v="${esc(t.code)}">Undo</button>` : ''}${r.result === 'wrong_entrance' && can('door.override', t?.event_id) ? `<button class="btn glass" data-action="scOverride" data-v="${esc(t.code)}">Let in anyway</button>` : ''}<button class="btn sc-next" data-action="scDismiss">Next scan</button></div></div>`;
 }
+// Find a guest whose QR won't scan: by name, email, phone, order number or ticket number. Staff with “Look up guests” search the
+// server (email / phone / order); everyone else searches the names, codes and seats already on the phone.
 function ScanGuests(ev, st) {
-  const q = S.sc.q.trim().toLowerCase(), f = S.sc.filter;
-  const rows = st.tk.filter(t => (f === 'all' || (f === 'in') === !!t.checked_in_at) && (!q || [t.holder, t.code, t.seat, S.adm.orders.find(o => o.id === t.order_id)?.buyer_email].join(' ').toLowerCase().includes(q)))
+  const q = S.sc.q.trim().toLowerCase(), f = S.sc.filter, deep = can('door.search', ev.id) && q.length >= 2;
+  if (deep && S.sc.foundQ !== q) scanSearch(ev.id, q);
+  const ref = t => doorView(t).order_ref, hit = t => !q || [t.holder, t.code, ref(t), t.seat && seatName(ev, t.seat, true, t)].join(' ').toLowerCase().includes(q);
+  const found = deep && S.sc.foundQ === q ? (S.sc.found || []).map(x => S.adm.tickets.find(t => t.id === x.id) || x) : [];
+  const rows = [...new Map([...found, ...st.tk.filter(hit)].map(t => [t.id, t])).values()].filter(t => t.status === 'valid' && (f === 'all' || (f === 'in') === !!t.checked_in_at))
     .sort((a, b) => (a.holder || '').localeCompare(b.holder || ''));
-  return `<div class="sc-pad"><div class="sc-search">${ic('search', 17)}<input data-input="sc.q" placeholder="Search name, code, seat…" value="${esc(S.sc.q)}" autocomplete="off"></div>
+  return `<div class="sc-pad"><div class="sc-search">${ic('search', 17)}<input data-input="sc.q" placeholder="${can('door.search', ev.id) ? 'Name, email, phone, order or ticket no.' : 'Name, ticket code or seat'}" value="${esc(S.sc.q)}" autocomplete="off"></div>
     <div class="sc-chips">${[['all', 'All ' + st.total], ['out', 'Not in ' + (st.total - st.inn)], ['in', 'In ' + st.inn]].map(([k, t]) => `<button class="${f === k ? 'on' : ''}" data-action="scFilter" data-v="${k}">${t}</button>`).join('')}</div>
-    ${rows.slice(0, 250).map(t => { const tt = ev.ticketTypes.find(x => x.id === t.ticket_type_id);
-      return `<div class="sc-guest"><div><b>${esc(t.holder)}</b><span>${esc(tt?.name || '')}${t.seat ? ' · ' + esc(seatName(ev, t.seat, true, t)) : ''} · ${esc(t.code)}</span></div>
-        <button class="sc-tick ${t.checked_in_at ? 'on' : ''}" data-action="scToggle" data-v="${esc(t.code)}" data-undo="${t.checked_in_at ? 1 : 0}">${t.checked_in_at ? ic('check', 15) + ' ' + esc(fmtTime(t.checked_in_at)) : 'Check in'}</button></div>`; }).join('') || '<p class="sc-dim" style="padding:20px 0">No guests match.</p>'}</div>`;
+    ${rows.slice(0, 250).map(t => { const v = doorView(t);
+      return `<div class="sc-guest"><div><b>${esc(t.holder)}</b><span>${esc(v.type)}${t.seat ? ' · ' + esc(seatName(ev, t.seat, true, t)) : ''} · ${esc(t.code)}${v.order_ref ? ' · ' + esc(v.order_ref) : ''}</span></div>
+        ${can(t.checked_in_at ? 'door.undo' : 'door.checkin', ev.id) || !t.checked_in_at ? `<button class="sc-tick ${t.checked_in_at ? 'on' : ''}" data-action="scToggle" data-v="${esc(t.code)}" data-undo="${t.checked_in_at ? 1 : 0}">${t.checked_in_at ? ic('check', 15) + ' ' + esc(fmtTime(t.checked_in_at)) : 'Check in'}</button>` : `<span class="sc-tick on">${ic('check', 15)} ${esc(fmtTime(t.checked_in_at))}</span>`}</div>`; }).join('') || `<p class="sc-dim" style="padding:20px 0">${deep && S.sc.foundQ === q && !S.sc.found ? 'Searching…' : 'No guests match.'}</p>`}</div>`;
+}
+let _srch = 0;
+function scanSearch(evId, q) {
+  S.sc.foundQ = q; S.sc.found = null; clearTimeout(_srch);
+  _srch = setTimeout(async () => { try { const r = await DB.doorSearch(evId, q); if (S.sc.foundQ === q) { S.sc.found = r; mergeDoor(r); render(); } } catch (e) { S.sc.found = []; render(); } }, 220);
 }
 function ScanStats(ev, st) {
   const pct = st.total ? st.inn / st.total : 0, R = 70, C = 2 * Math.PI * R;
   const byTT = ev.ticketTypes.map(t => { const a = st.tk.filter(x => x.ticket_type_id === t.id); return { t, n: a.length, i: a.filter(x => x.checked_in_at).length }; }).filter(x => x.n);
   const now = Date.now(), bins = Array.from({ length: 12 }, (_, i) => ({ from: now - (12 - i) * 15 * 6e4, v: 0 }));
   st.tk.forEach(t => { if (!t.checked_in_at) return; const ts = D(t.checked_in_at).getTime(), b = bins.find(b => ts >= b.from && ts < b.from + 15 * 6e4); if (b) b.v++; });
-  const mx = Math.max(1, ...bins.map(b => b.v));
+  const mx = Math.max(1, ...bins.map(b => b.v)), ents = byEntrance(ev, st.tk);
   return `<div class="sc-pad">
     <div class="sc-ring"><svg viewBox="0 0 180 180"><circle cx="90" cy="90" r="${R}" class="trk"/><circle cx="90" cy="90" r="${R}" class="val" stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${(C * (1 - pct)).toFixed(1)}"/></svg><div><b>${Math.round(pct * 100)}%</b><span>checked in</span></div></div>
-    <div class="sc-kpis"><div><b>${st.inn}</b><span>In</span></div><div><b>${st.total - st.inn}</b><span>To come</span></div><div><b>${st.total}</b><span>Tickets</span></div></div>
+    <div class="sc-kpis"><div><b>${st.total.toLocaleString()}</b><span>Tickets</span></div><div><b>${st.inn.toLocaleString()}</b><span>Scanned in</span></div><div><b>${(st.total - st.inn).toLocaleString()}</b><span>Remaining</span></div></div>
+    ${ents.length ? `<div class="sc-card"><div class="sc-eyebrow">By entrance</div>${ents.map(x => `<div class="between" style="margin-top:10px"><span>${esc(x.name)}</span><b>${x.n}</b></div>`).join('')}</div>` : ''}
     <div class="sc-card"><div class="sc-eyebrow">Arrivals · last 3 hours</div><div class="sc-arr">${bins.map(b => `<i style="height:${Math.max(4, b.v / mx * 100)}%" title="${b.v} in"></i>`).join('')}</div>
       <div class="between sc-dim" style="font-size:11px;margin-top:6px"><span>${esc(fmtTime(new Date(bins[0].from).toISOString()))}</span><span>Now</span></div></div>
     <div class="sc-card"><div class="sc-eyebrow">By ticket type</div>${byTT.map(x => `<div style="margin-top:12px"><div class="between"><span>${esc(x.t.name)}</span><span class="sc-dim">${x.i} / ${x.n}</span></div><div class="sc-bar"><i style="width:${x.i / x.n * 100}%"></i></div></div>`).join('') || '<p class="sc-dim">No tickets sold yet.</p>'}</div></div>`;
@@ -2290,34 +2414,59 @@ function camLoop() {
   tick();
 }
 let _resTimer = 0;
-async function scanCheck(code, undo = false, quiet = false) {
+async function scanCheck(code, undo = false, quiet = false, extra = {}) {
   code = String(code).trim().toUpperCase(); if (!code) return;
+  const o = scanOpts(extra);
   let r;
-  try { if (DB.live && !navigator.onLine) throw new TypeError('offline'); r = await DB.checkin(code, undo, S.sc.evId || null); }
-  catch (e) { if (!(e instanceof TypeError)) return toast(e.message, true); r = localCheckin(code, undo); }   // network down → validate locally, queue
+  try { if (DB.live && !navigator.onLine) throw new TypeError('offline'); r = await DB.checkin(code, undo, S.sc.evId || null, o); }
+  catch (e) { if (!(e instanceof TypeError)) return toast(e.message, true); r = localCheckin(code, undo, o); }   // network down → validate locally, queue
   applyTicket(r); r.code = code; r.at = Date.now();
-  S.sc.recent.unshift(r); S.sc.recent.length = Math.min(S.sc.recent.length, 30); feedback(r.result);
+  S.sc.recent.unshift(r); S.sc.recent.length = Math.min(S.sc.recent.length, 30); feedback(resKind(r.result) === 'ok' ? 'ok' : r.result === 'already' ? 'already' : 'bad');
   if (quiet) { toast((r.ticket?.holder || code) + ' — ' + RES_TITLE[r.result], resKind(r.result) === 'bad'); return render(); }
   S.sc.last = r; render();
-  clearTimeout(_resTimer); _resTimer = setTimeout(() => { if (S.sc.last === r) { S.sc.last = null; render(); } }, r.result === 'ok' ? 1700 : 3800);
+  clearTimeout(_resTimer); if (r.result !== 'wrong_entrance') _resTimer = setTimeout(() => { if (S.sc.last === r) { S.sc.last = null; render(); } }, r.result === 'ok' ? 1700 : 3800);
 }
-function localCheckin(code, undo) {
-  const t = S.adm.tickets.find(x => x.code === code);
+// Offline: the same checks against what this phone last synced; check-ins queue and go to the server when the network is back.
+function localCheckin(code, undo, o) {
+  const t = S.adm.tickets.find(x => x.code === code), ev = evById(S.sc.evId), en = scanEntrance(ev), res = (result, more = {}) => ({ result, ticket: t ? { ...t } : null, offline: true, ...more });
   if (!t) return { result: 'unknown', offline: true };
-  if (t.status !== 'valid') return { result: 'cancelled', ticket: { ...t }, offline: true };
-  if (S.sc.evId && t.event_id !== S.sc.evId) return { result: 'wrong_event', ticket: { ...t }, offline: true };
+  if (S.sc.evId && t.event_id !== S.sc.evId) return res('wrong_event');
+  if (t.status === 'replaced') return res('replaced');
+  if (t.status !== 'valid') return res(t.refunded > 0 ? 'refunded' : 'cancelled');
+  if (S.sc.slot && t.slot_id && t.slot_id !== S.sc.slot) return res('wrong_slot');
+  const tk = { ...t, area: doorView(t).area };
+  if (!undo && !t.checked_in_at && en && !entranceTakes(en, tk) && !o.override) return res('wrong_entrance', { entrances: (ev.entrances || []).filter(x => entranceTakes(x, tk)).map(x => x.name) });
   const was = t.checked_in_at;
-  if (!was || undo) { S.sc.queue.push({ code, undo }); saveQueue(); }
-  return { result: undo ? 'undone' : was ? 'already' : 'ok', ticket: { ...t, checked_in_at: undo ? null : (was || new Date().toISOString()) }, offline: true };
+  if (!was || undo) { S.sc.queue.push({ code, undo, ev: S.sc.evId, o }); saveQueue(); }
+  if (was && !undo) return res('already', { first: { at: was, ...(t.checkin || {}) } });
+  return res(undo ? 'undone' : 'ok', { ticket: { ...t, checked_in_at: undo ? null : new Date().toISOString(), checkin: undo ? null : { entrance: o.entranceName, device: o.device, device_name: o.deviceName, by: S.user?.email } } });
 }
 function loadQueue() { try { return JSON.parse(localStorage.getItem('set_scan_queue')) || []; } catch (e) { return []; } }
 function saveQueue() { try { localStorage.setItem('set_scan_queue', JSON.stringify(S.sc.queue)); } catch (e) { } }
 async function flushQueue() {
-  while (S.sc.queue.length && navigator.onLine) { const q = S.sc.queue[0]; try { await DB.checkin(q.code, q.undo); S.sc.queue.shift(); saveQueue(); } catch (e) { break; } }
+  while (S.sc.queue.length && navigator.onLine) { const q = S.sc.queue[0]; try { await DB.checkin(q.code, q.undo, q.ev || null, q.o || {}); S.sc.queue.shift(); saveQueue(); } catch (e) { break; } }
   if (S.route.page === 'scan') render();
 }
 window.addEventListener('online', flushQueue);
 window.addEventListener('offline', () => { if (S.route.page === 'scan') render(); });
+// Every scanner pulls the event's tickets every few seconds, so a cancel, seat move, upgrade or reissue in the back office — or a check-in on
+// another phone — shows up here almost at once. (The scan itself is always decided by the server, so this only keeps the screen current.)
+const DOOR_KEYS = ['status', 'checked_in_at', 'checkin', 'seat', 'area', 'row', 'seat_label', 'unit', 'ticket_type_id', 'slot_id', 'holder', 'code'];
+function mergeDoor(list) {
+  let changed = false; const by = new Map(S.adm.tickets.map(t => [t.id, t]));
+  for (const x of list || []) {
+    const t = by.get(x.id); if (!t) { S.adm.tickets.push({ ...x, box_office_id: S.adm.bo.id }); changed = true; continue; }
+    for (const k of DOOR_KEYS) if (JSON.stringify(t[k] ?? null) !== JSON.stringify(x[k] ?? null)) { t[k] = x[k] ?? null; changed = true; }
+  }
+  return changed;
+}
+async function doorTick() {
+  if (S.route.page !== 'scan' || !S.sc.evId || !S.adm?.bo || document.hidden || (DB.live && !navigator.onLine) || S.sc.syncing) return;
+  S.sc.syncing = true;
+  const ev = S.sc.evId, since = S.sc.syncEv === ev ? S.sc.syncAt : null;
+  try { const r = await DB.doorSync(ev, since); if (S.sc.evId !== ev) return; S.sc.syncEv = ev; S.sc.syncAt = r.at; if (mergeDoor(r.tickets)) render(); } catch (e) { } finally { S.sc.syncing = false; }
+}
+setInterval(doorTick, 4000);
 function feedback(kind) {
   if (navigator.vibrate) navigator.vibrate(kind === 'ok' ? 60 : [80, 60, 80]);
   if (!S.sc.sound) return;
@@ -3141,6 +3290,7 @@ const A = {
     const live = S.adm.tickets.filter(t => t.order_id === o.id && t.status === 'valid'), sel = live.filter(t => S.ui.osel[t.id]).map(t => t.id), k = el.dataset.v, all = el.dataset.all === '1';
     const fut = futureEvents(), m = orderMoney(o), base = { kind: k, notify: true, note: '', _ev: (fut.find(e => o.event_ids.includes(e.id)) || fut[0])?.id };
     S.ui.op = k === 'change' ? { ...base, tickets: all || !sel.length ? live.map(t => t.id) : sel, map: {}, settle: 'collect', method: 'cash', downgrade: 'refund', to: 'original' }
+      : k === 'reissue' ? { ...base, tickets: all || !sel.length ? live.map(t => t.id) : sel }
       : k === 'cancel' ? { ...base, all: all || sel.length === live.length, tickets: all ? live.map(t => t.id) : sel, seat: 'release', refundMode: can('orders.refund', o.event_ids[0]) && wasPaid(o) ? 'tickets' : 'none', to: 'original' }
       : k === 'refund' ? { ...base, mode: sel.length ? 'tickets' : 'full', to: 'original', cancel: false, seat: 'release' }
       : k === 'holder' ? { ...base, ticket: el.dataset.id, name: live.find(t => t.id === el.dataset.id)?.holder || '' }
@@ -3190,24 +3340,46 @@ const A = {
   exportOrders: () => download('orders.csv', csv([['Order', 'Placed', 'Status', 'Name', 'Email', 'Phone', 'Events', 'Tickets & packages', 'Products', 'Face value', 'Subtotal', 'Discount', 'Fee discount', 'Code', 'Tracking code', 'Fees', 'Tax', 'Donation', 'Total', 'Payment', 'Source', 'Marketing opt-in'],
     ...filteredOrders().map(o => { const d = o.data, m = v => v == null ? '' : v / 100; return [o.ref, o.created_at, o.status, d.buyer.name, o.buyer_email, d.buyer.phone, [...new Set(d.lines.map(l => l.eventName))].join('; '), d.lines.filter(l => l.kind !== 'addon').map(l => l.qty + 'x ' + l.name).join('; '),
       d.lines.filter(l => l.kind === 'addon').map(l => l.qty + 'x ' + l.name).join('; '), m(d.faceValue), m(d.subtotal), m(d.discount), m(d.feeDiscount || 0), d.code || '', d.tracking || '', m(d.fee), m(d.tax), m(d.donation), m(d.total), d.payment, d.source || '', d.optIn ? 'yes' : 'no']; })])),
-  exportAtt: () => { const ev = evById(S.ui.attEv); download(slugify(ev?.name || 'attendees') + '-door-list.csv', csv([['Name', 'Email', 'Ticket type', 'Area', 'Row', 'Seat', 'Time slot', 'Code', 'Order', 'Checked in'],
-    ...S.adm.tickets.filter(t => t.event_id === S.ui.attEv && t.status === 'valid').map(t => { const o = S.adm.orders.find(x => x.id === t.order_id); const sp = t.seat ? seatParts(ev, t.seat, t) : {}; return [t.holder, o?.buyer_email, ev.ticketTypes.find(x => x.id === t.ticket_type_id)?.name, sp.area || '', sp.row || '', sp.seat || '', t.slot_id ? fmtDT(ev.timeSlots.find(s => s.id === t.slot_id)?.start) : '', t.code, o?.ref, t.checked_in_at || '']; })])); },
+  exportAtt: () => { const ev = evById(S.ui.attEv); download(slugify(ev?.name || 'attendees') + '-door-list.csv', csv([['Name', 'Email', 'Ticket type', 'Area', 'Table / box', 'Row', 'Seat', 'Time slot', 'Code', 'Order', 'Checked in', 'Entrance'],
+    ...S.adm.tickets.filter(t => t.event_id === S.ui.attEv && t.status === 'valid').map(t => { const o = S.adm.orders.find(x => x.id === t.order_id); const sp = t.seat ? seatParts(ev, t.seat, t) : {}; return [t.holder, o?.buyer_email, ev.ticketTypes.find(x => x.id === t.ticket_type_id)?.name, sp.area || '', sp.unit || '', sp.row || '', sp.seat || '', t.slot_id ? fmtDT(ev.timeSlots.find(s => s.id === t.slot_id)?.start) : '', t.code, o?.ref, t.checked_in_at || '', t.checkin?.entrance || '']; })])); },
   // one row per ticket: original type, face value, collected, discount + code, comp, tracking code, products, package, price override
   exportTickets: () => { const ids = new Set(liveOrders().filter(o => !S.ui.repEv || o.event_ids.includes(S.ui.repEv)).map(o => o.id));
-    download('ticket-detail.csv', csv([['Order', 'Placed', 'Status', 'Event', 'Showtime', 'Ticket type', 'Area', 'Row', 'Seat', 'Face value', 'Collected', 'Discount', 'Promo code', 'Complimentary', 'Price override', 'Tracking code', 'Package', 'Products', 'Holder', 'Ticket code', 'Checked in'],
+    download('ticket-detail.csv', csv([['Order', 'Placed', 'Status', 'Event', 'Showtime', 'Ticket type', 'Area', 'Table / box', 'Row', 'Seat', 'Face value', 'Collected', 'Discount', 'Promo code', 'Complimentary', 'Price override', 'Tracking code', 'Package', 'Products', 'Holder', 'Ticket code', 'Checked in'],
       ...S.adm.tickets.filter(t => ids.has(t.order_id) && (!S.ui.repEv || t.event_id === S.ui.repEv)).map(t => { const o = S.adm.orders.find(x => x.id === t.order_id), ev = evById(t.event_id), sp = t.seat ? seatParts(ev, t.seat, t) : {};
-        return [o.ref, o.created_at, t.status === 'valid' ? o.status : 'cancelled', ev?.name, t.slot_id ? ev?.timeSlots?.find(x => x.id === t.slot_id)?.start : '', ev?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name, sp.area || '', sp.row || '', sp.seat || '',
+        return [o.ref, o.created_at, t.status === 'valid' ? o.status : 'cancelled', ev?.name, t.slot_id ? ev?.timeSlots?.find(x => x.id === t.slot_id)?.start : '', ev?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name, sp.area || '', sp.unit || '', sp.row || '', sp.seat || '',
           t.face == null ? '' : t.face / 100, t.paid == null ? '' : t.paid / 100, t.discount == null ? '' : t.discount / 100, t.promo || '', t.comp ? 'yes' : '', t.price_override ? 'yes' : '', t.tracking || o.data.tracking || '', t.bundle?.name || '', (t.extras || []).join('; '), t.holder, t.code, t.checked_in_at || '']; })])); },
   exportReport: () => download('sales-report.csv', csv([['Event', 'Date', 'Tickets sold', 'Ticket revenue'], ...S.adm.events.map(e => { const s = evStats(e); return [e.name, e.start, s.sold, s.rev / 100]; })])),
   exportOptIn: () => download('mailing-list.csv', csv([['Email Address', 'First Name', 'Last Name'], ...[...new Map(S.adm.orders.filter(o => o.data.optIn).map(o => [o.buyer_email, o])).values()].map(o => { const [f, ...l] = o.data.buyer.name.split(' '); return [o.buyer_email, f, l.join(' ')]; })])),
   toggleIn: el => doCheckin(el.dataset.v, el.dataset.undo === '1'),
-  scPick: el => { S.sc.evId = el.dataset.id; S.sc.tab = 'scan'; S.sc.q = ''; try { localStorage.setItem('set_scan_ev', S.sc.evId); } catch (e) { } render(); },
-  scBack: () => { S.sc.evId = ''; camStop(); render(); },
+  scPick: el => { if (S.sc.evId !== el.dataset.id) { S.sc.entrance = S.sc.slot = null; } S.sc.evId = el.dataset.id; S.sc.tab = 'scan'; S.sc.q = ''; S.sc.pick = null; saveScanCtx(); render(); doorTick(); },
+  scBack: () => { S.sc.evId = ''; S.sc.setup = false; camStop(); saveScanCtx(); render(); },
+  scSetup: () => { S.sc.setup = true; S.sc.pick = null; camStop(); render(); },
+  scSet: el => { S.sc.pick[el.dataset.k] = el.dataset.v; render(); },
+  scSetupDone: () => {
+    const pk = S.sc.pick || {}, ev = evById(S.sc.evId), d = scanDev(), name = String(pk.name || '').trim().slice(0, 60) || d.name;
+    S.sc.entrance = ev?.entrances?.length ? pk.entrance ?? '' : ''; S.sc.slot = ev?.timeSlots?.length ? pk.slot ?? '' : '';
+    if (name !== d.name) { d.name = name; try { localStorage.setItem('set_scan_device', JSON.stringify(d)); } catch (e) { S.sc._dev = d; } }
+    S.sc.setup = false; S.sc.pick = null; S.sc.tab = 'scan'; saveScanCtx(); render();
+  },
+  enAdd: () => { (S.draft.entrances ||= []).push({ id: shortId('en_'), name: 'Entrance ' + (S.draft.entrances.length + 1), ticketTypeIds: [], areas: [] }); dirty(); render(); },
+  enDel: el => { S.draft.entrances.splice(+el.dataset.i, 1); dirty(); render(); },
+  enPick: el => { const en = S.draft.entrances[+el.dataset.i], k = el.dataset.k, l = en[k] ||= []; en[k] = el.checked ? [...new Set([...l, el.dataset.v])] : l.filter(x => x !== el.dataset.v); dirty(); render(); },
+  dlogF: el => { S.ui.dlog.f = el.dataset.v; render(); },
+  dlogRefresh: () => { S.ui.dlog = null; render(); },
+  dlogCsv: () => { const ev = evById(S.ui.dlog.ev), tk = id => S.adm.tickets.find(t => t.id === id);
+    download('scan-history.csv', csv([['Time', 'Result', 'Ticket', 'Guest', 'Seat', 'Entrance', 'Device', 'Staff', 'Manual', 'Override'], ...(S.ui.dlog.rows || []).map(r => { const t = tk(r.ticket_id);
+      return [r.at, RES_TITLE[r.result] || r.result, r.code, t?.holder || '', t?.seat ? seatName(ev, t.seat, false, t) : '', r.entrance, r.device_name, r.by, r.manual ? 'yes' : '', r.override ? 'yes' : '']; })]));
+    DB.log('export.scans', 'Exported the scan history of ' + (ev?.name || 'an event'), { target: ev?.id }); },
+  scOverride: el => { S.sc.last = null; scanCheck(el.dataset.v, false, false, { override: true }); },
+  devEdit: el => { S.ui.devEdit = el.dataset.id; S.ui.devName = null; render(); },
+  devSave: async el => { try { await DB.deviceAction(el.dataset.id, 'rename', S.ui.devName ?? S.ui.devs.list.find(d => d.id === el.dataset.id)?.name); S.ui.devEdit = null; S.ui.devs = null; toast('Device renamed'); render(); } catch (e) { toast(e.message, true); } },
+  devToggle: async el => { try { await DB.deviceAction(el.dataset.id, el.dataset.v); S.ui.devs = null; toast(el.dataset.v === 'disable' ? 'Switched off — it can\'t check anyone in now' : 'Switched back on'); render(); } catch (e) { toast(e.message, true); } },
+  devForget: async el => { if (!confirmIn('Remove this device from the list? It reappears if it scans again.')) return; try { await DB.deviceAction(el.dataset.id, 'forget'); S.ui.devs = null; render(); } catch (e) { toast(e.message, true); } },
   scTab: el => { S.sc.tab = el.dataset.v; render(); },
   scCam: () => camStart(),
-  scDismiss: (el, e) => { if (e.target.closest('[data-action="scUndo"]')) return; S.sc.last = null; render(); },
+  scDismiss: (el, e) => { if (e.target.closest('[data-action="scUndo"],[data-action="scOverride"]')) return; S.sc.last = null; render(); },
   scUndo: el => scanCheck(el.dataset.v, true),
-  scToggle: el => scanCheck(el.dataset.v, el.dataset.undo === '1', true),
+  scToggle: el => scanCheck(el.dataset.v, el.dataset.undo === '1', true, { manual: true }),   // from the guest search = a manual check-in
   scFilter: el => { S.sc.filter = el.dataset.v; render(); },
   scSound: () => { S.sc.sound = !S.sc.sound; render(); },
   scTorch: async () => { try { await CAM.stream.getVideoTracks()[0].applyConstraints({ advanced: [{ torch: !CAM.torch }] }); CAM.torch = !CAM.torch; render(); } catch (e) { toast('Torch isn\'t supported on this device', true); } },
@@ -3270,6 +3442,9 @@ document.addEventListener('input', e => {
     else if (k === 'findRef' || k === 'findEmail') (S.ui.find ||= {})[k === 'findRef' ? 'ref' : 'email'] = v;
     else if (k === 'loginEmail') S.ui.login.email = v; else if (k === 'loginCode') S.ui.login.code = v; else if (k === 'loginTotp') S.ui.login.totp = v;
     else if (k === 'sc.q') { S.sc.q = v; return render(); }
+    else if (k === 'sc.devName') { if (S.sc.pick) S.sc.pick.name = v; return; }
+    else if (k === 'devName') { S.ui.devName = v; return; }
+    else if (k.startsWith('entr:')) { const [, i, f] = k.split(':'); S.draft.entrances[+i][f] = v; dirty(); return; }
     else if (k.includes('.')) { const [a, b] = k.split('.'); (S.ui[a] ||= {})[b] = v; if (a === 'mo' && b === 'ev') Object.assign(S.ui.mo, { seats: [], adds: {}, tt: '', slot: '', credit: '', level: '' }); if (a === 'mo' && b === 'slot') S.ui.mo.seats = []; if (el.dataset.rr || (a === 'inv' && b === 'template')) render(); return; }
     else S.ui[k] = v;
     if (['homeq', 'homeWhen', 'q', 'ev', 'status', 'attEv', 'repEv'].includes(k)) render();
@@ -3362,7 +3537,7 @@ async function boot() {
     await loadCustomer();
     resumePay();
   } catch (e) { console.error(e); toast('Could not load events: ' + e.message, true); }
-  S.sc.queue = loadQueue(); try { S.sc.evId = localStorage.getItem('set_scan_ev') || ''; } catch (e) { }
+  S.sc.queue = loadQueue(); try { const c = JSON.parse(localStorage.getItem('set_scan_ctx') || 'null') || { evId: localStorage.getItem('set_scan_ev') || '' }; Object.assign(S.sc, { evId: c.evId || '', entrance: c.entrance ?? null, slot: c.slot ?? null }); } catch (e) { }
   S.loading = false; loadPixels(); onRoute(); flushQueue();
   setInterval(heartbeat, 15000);
 }

@@ -72,7 +72,7 @@ select t.ok((select count(*) from seat_log where seat in ('A-1','A-5') and actio
 select t.ok((select data->'tickets'->0->'from'->>'seat' from order_log where order_id = :'o1' and kind = 'change') like '%Seat 1%', 'change log keeps the original seat');
 select t.ok((select count(*) from outbox where order_id = :'o1' and kind = 'updated') = 1, 'updated tickets queued for the customer');
 set role authenticated; select t.who('owner@box.test');
-select t.ok(checkin(:'c1', false, null)->>'result' = 'cancelled', 'the replaced ticket no longer gets in');
+select t.ok(checkin(:'c1', false, null)->>'result' = 'replaced', 'the replaced ticket no longer gets in (scanner says “replaced”)');
 
 -- upgrade to VIP: $50 more, clerk cannot refund but can collect? (needs orders.edit) → owner collects in cash
 select t.who('clerk@box.test');
@@ -192,6 +192,88 @@ select t.err($$select seat_action('e0000000-0000-0000-0000-000000000001', '', 'm
 select seat_action('e0000000-0000-0000-0000-000000000001', '', 'move', array['A-4'], '{"to":"A-2"}');
 reset role;
 select t.ok((select count(*) from tickets where seat = 'A-4' and status = 'replaced') = 1 and (select count(*) from tickets where seat = 'A-2' and status = 'valid') = 1, 'inventory move replaces the ticket and keeps history');
+
+-- ── Stage 7: scanning — door view, duplicates across devices, wrong event / entrance, reissue, cancel / refund, devices, scan history ──
+insert into auth.users(email, email_confirmed_at) values ('scan@box.test', now()), ('door@box.test', now());
+insert into members(box_office_id, email, name, perms) values ('b0000000-0000-0000-0000-000000000001', 'scan@box.test', 'Scanner', '{door.scan,door.checkin}'),
+  ('b0000000-0000-0000-0000-000000000001', 'door@box.test', 'Door lead', '{door.scan,door.checkin,door.undo,door.override,door.search,door.log,door.devices,customers.names}');
+insert into events(id, box_office_id, slug, status, data) values ('e0000000-0000-0000-0000-000000000003', 'b0000000-0000-0000-0000-000000000001', 'box-night', 'published', '{
+  "name":"Box Night","start":"2099-03-01T20:00:00Z","currency":"USD","visibility":"public","timeSlots":[],
+  "ticketTypes":[{"id":"box","name":"Box seat","price":8000,"qty":0,"admits":1},{"id":"floor","name":"Floor","price":3000,"qty":0,"admits":1}],
+  "entrances":[{"id":"main","name":"Main entrance","ticketTypeIds":[],"areas":[]},{"id":"boxdoor","name":"Box seat entrance","ticketTypeIds":[],"areas":["Boxes"]}],
+  "seating":{"enabled":true,"noSingles":false,"index":{"BX4-1":"box","BX4-2":"box","BX4-3":"box","F-A1":"floor","F-A2":"floor"},
+    "meta":{"BX4-1":["Boxes","","1","Box 4"],"BX4-2":["Boxes","","2","Box 4"],"BX4-3":["Boxes","","3","Box 4"],"F-A1":["Floor","A","1"],"F-A2":["Floor","A","2"]},"rows":{}}}');
+reset role; set role anon; select t.who('');
+select place_order('{"buyer":{"name":"Bo Xer","email":"box@mail.test","phone":"(917) 555-0199"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000003","ticketTypeId":"box","qty":3,"seats":["BX4-1","BX4-2","BX4-3"]},{"eventId":"e0000000-0000-0000-0000-000000000003","ticketTypeId":"floor","qty":1,"seats":["F-A1"]}],"payment":"offline"}')->>'id' as o7 \gset
+reset role; set role authenticated; select t.who('owner@box.test');
+select order_action(:'o7', 'markPaid', '{"method":"cash"}');
+reset role;
+select code as k1 from tickets where order_id = :'o7' and seat = 'BX4-1' \gset
+select code as k2 from tickets where order_id = :'o7' and seat = 'BX4-2' \gset
+select code as k3 from tickets where order_id = :'o7' and seat = 'BX4-3' \gset
+select code as kf from tickets where order_id = :'o7' and seat = 'F-A1' \gset
+select ref as ref7 from orders where id = :'o7' \gset
+select t.ok((select unit = 'Box 4' and coalesce("row", '') = '' and seat_label = '1' and area = 'Boxes' from tickets where code = :'k1'), 'box seat ticket: area Boxes, Box 4, no row, seat 1');
+select t.ok((select count(distinct code) = 4 and bool_and(code ~ '^[A-Z0-9]{10}$') from tickets where order_id = :'o7'), 'every ticket has its own random 10-character code (the QR holds only this)');
+set role authenticated; select t.who('scan@box.test');
+select checkin(:'k1', false, 'e0000000-0000-0000-0000-000000000003', '{"device":"dev-a","deviceName":"Door phone 1","entrance":"main"}') as s1 \gset
+select t.ok((:'s1'::jsonb)->>'result' = 'ok' and (:'s1'::jsonb)->'ticket'->>'unit' = 'Box 4' and (:'s1'::jsonb)->'ticket'->>'seat_label' = '1' and (:'s1'::jsonb)->'ticket'->>'type' = 'Box seat', 'scanner: VALID with Box 4 · Seat 1');
+select t.ok(not ((:'s1'::jsonb)->'ticket' ? 'paid') and not ((:'s1'::jsonb)->'ticket' ? 'face') and not ((:'s1'::jsonb)->'ticket' ? 'answers') and (:'s1'::jsonb)->'ticket'->>'holder' = 'Guest', 'scanner staff see no money, answers or names');
+select t.ok((:'s1'::jsonb)->'ticket'->>'of' = '4' and (:'s1'::jsonb)->'ticket'->>'order_ref' like 'SET-%', 'scan shows the order number and ticket x of 4');
+select checkin(:'k1', false, 'e0000000-0000-0000-0000-000000000003', '{"device":"dev-b","deviceName":"Door phone 2","entrance":"main"}') as s2 \gset
+select t.ok((:'s2'::jsonb)->>'result' = 'already' and (:'s2'::jsonb)->'first'->>'device_name' = 'Door phone 1' and (:'s2'::jsonb)->'first'->>'entrance' = 'Main entrance' and (:'s2'::jsonb)->'first'->>'at' is not null, 'a second phone gets ALREADY SCANNED with the original time, door and device');
+select t.ok(checkin(:'k2', false, 'e0000000-0000-0000-0000-000000000001', '{}')->>'result' = 'wrong_event', 'wrong event is rejected');
+select t.ok(checkin(:'k2', false, 'e0000000-0000-0000-0000-000000000001', '{}')->'ticket'->>'event_name' = 'Box Night' and not (checkin(:'k2', false, 'e0000000-0000-0000-0000-000000000001', '{}')->'ticket' ? 'seat'), 'wrong event says which event, nothing else');
+select t.ok(checkin('NOTAREALCODE', false, 'e0000000-0000-0000-0000-000000000003', '{"device":"dev-a"}')->>'result' = 'unknown', 'an invalid QR code is rejected');
+select checkin(:'kf', false, 'e0000000-0000-0000-0000-000000000003', '{"device":"dev-a","entrance":"boxdoor"}') as s3 \gset
+select t.ok((:'s3'::jsonb)->>'result' = 'wrong_entrance' and (:'s3'::jsonb)->'entrances' ? 'Main entrance' and not ((:'s3'::jsonb)->'entrances' ? 'Box seat entrance'), 'a floor ticket at the box entrance: WRONG ENTRANCE → send to Main entrance');
+select t.err($$select checkin('$$ || :'kf' || $$', false, 'e0000000-0000-0000-0000-000000000003', '{"entrance":"boxdoor","override":true}')$$, 'permission', 'scanner staff cannot override the entrance warning');
+select t.err($$select checkin('$$ || :'k2' || $$', true, 'e0000000-0000-0000-0000-000000000003', '{}')$$, 'permission', 'scanner staff cannot undo check-ins');
+select t.err($$select door_search('e0000000-0000-0000-0000-000000000003', 'box')$$, 'permission', 'scanner staff cannot search guests by email / phone');
+select t.err($$select door_log('e0000000-0000-0000-0000-000000000003')$$, 'permission', 'scanner staff cannot read the scan history');
+select t.ok(jsonb_array_length(admin_load('b0000000-0000-0000-0000-000000000001', false)->'orders') = 0 and not exists(select 1 from jsonb_array_elements(admin_load('b0000000-0000-0000-0000-000000000001', false)->'tickets') x where x->>'paid' is not null or x->'answers' <> '{}'), 'scanner back office: no orders, no ticket money or answers');
+select t.who('door@box.test');
+select t.ok(checkin(:'kf', false, 'e0000000-0000-0000-0000-000000000003', '{"device":"dev-c","entrance":"boxdoor","override":true}')->>'override' = 'true', 'door lead lets the guest in anyway (override logged)');
+select t.ok(jsonb_array_length(door_search('e0000000-0000-0000-0000-000000000003', 'box@mail')) = 4 and jsonb_array_length(door_search('e0000000-0000-0000-0000-000000000003', '5550199')) = 4, 'manual search by email and by phone');
+select t.ok(not (door_search('e0000000-0000-0000-0000-000000000003', 'box@mail')->0 ? 'buyer_email') and door_search('e0000000-0000-0000-0000-000000000003', :'ref7')->0->>'holder' = 'Bo Xer', 'search by order number; results never include email or phone');
+select t.ok(checkin(:'k2', false, 'e0000000-0000-0000-0000-000000000003', '{"manual":true,"device":"dev-c"}')->>'result' = 'ok', 'manual check-in from the search');
+select t.ok(checkin(:'k2', true, 'e0000000-0000-0000-0000-000000000003', '{"device":"dev-c"}')->>'result' = 'undone', 'door lead can undo a check-in');
+-- reissue: new QR, old one dead at once
+select t.who('owner@box.test');
+select order_action(:'o7', 'reissue', json_build_object('tickets', json_build_array((select id from tickets where code = :'k3')))::jsonb) as ri \gset
+reset role; set role authenticated; select t.who('scan@box.test');
+select t.ok(checkin(:'k3', false, 'e0000000-0000-0000-0000-000000000003', '{}')->>'result' = 'replaced', 'reissue: the old QR code is rejected as replaced');
+select t.ok(checkin((:'ri'::jsonb)->'codes'->>0, false, 'e0000000-0000-0000-0000-000000000003', '{}')->>'result' = 'ok' and checkin((:'ri'::jsonb)->'codes'->>0, false, 'e0000000-0000-0000-0000-000000000003', '{}')->'ticket'->>'unit' = 'Box 4', 'reissue: the new code scans, same seat');
+reset role;
+select t.ok((select count(*) from outbox where order_id = :'o7' and kind = 'tickets') = 1 and (select count(*) from order_log where order_id = :'o7' and kind = 'reissue') = 1, 'reissue is in the order history and the updated tickets are queued');
+-- cancelled / refunded tickets: rejected at once
+set role authenticated; select t.who('owner@box.test');
+select t.ok(checkin((select code from tickets where order_id = ((:'r2'::jsonb)->>'id')::uuid and seat = 'A-3' and status = 'cancelled' limit 1), false, 'e0000000-0000-0000-0000-000000000001', '{}')->>'result' = 'cancelled', 'a cancelled ticket is rejected as cancelled');
+reset role; select id as t2 from tickets where code = :'k2' \gset
+set role authenticated; select t.who('owner@box.test');
+select order_action(:'o7', 'refund', json_build_object('mode', 'tickets', 'tickets', json_build_array(:'t2'), 'to', 'cash', 'cancel', true, 'seat', 'release')::jsonb);
+select t.ok(checkin(:'k2', false, 'e0000000-0000-0000-0000-000000000003', '{}')->>'result' = 'refunded', 'a refunded ticket is rejected as refunded');
+-- devices: switch one off → it can't check anyone in
+select t.who('door@box.test');
+select t.ok(jsonb_array_length(scan_devices_list('b0000000-0000-0000-0000-000000000001')) = 3, 'every scanning device is listed (3)');
+select scan_device_action('b0000000-0000-0000-0000-000000000001', 'dev-a', 'disable');
+select t.who('scan@box.test');
+select t.ok(checkin(:'kf', false, 'e0000000-0000-0000-0000-000000000003', '{"device":"dev-a"}')->>'result' = 'device_off', 'a switched-off device is refused');
+select t.err($$select scan_device_action('b0000000-0000-0000-0000-000000000001', 'dev-a', 'enable')$$, 'permission', 'scanner staff cannot manage devices');
+select t.who('door@box.test');
+select door_log('e0000000-0000-0000-0000-000000000003') as dl \gset
+select t.ok((select count(*) from jsonb_array_elements(:'dl'::jsonb) x where x->>'result' = 'already') >= 1 and (select count(*) from jsonb_array_elements(:'dl'::jsonb) x where x->>'result' = 'unknown') = 1
+  and (select count(*) from jsonb_array_elements(:'dl'::jsonb) x where x->>'result' = 'device_off') = 1 and (select bool_and(x->>'by' <> '') from jsonb_array_elements(:'dl'::jsonb) x), 'scan history: check-ins, duplicates, invalid and refused scans, with the employee');
+select t.ok((select count(*) from jsonb_array_elements(:'dl'::jsonb) x where (x->>'manual')::boolean) = 1 and (select count(*) from jsonb_array_elements(:'dl'::jsonb) x where (x->>'override')::boolean) = 1, 'scan history marks manual check-ins and overrides');
+-- sync: what changed since the last pull
+select door_sync('e0000000-0000-0000-0000-000000000003', null) as ds \gset
+select t.ok(jsonb_array_length((:'ds'::jsonb)->'tickets') >= 4 and ((:'ds'::jsonb)->'stats'->>'total')::int = 3 and ((:'ds'::jsonb)->'stats'->>'inn')::int = 3, 'door_sync: tickets + live totals (3 valid, 3 in)');
+select t.ok(jsonb_array_length(door_sync('e0000000-0000-0000-0000-000000000003', now() + interval '1 hour')->'tickets') = 0, 'door_sync: nothing changed since → empty');
+select t.who('');
+select t.err($$select door_sync('e0000000-0000-0000-0000-000000000003', null)$$, 'permission|sign in', 'signed out: no door data');
+reset role;
+-- a race: two scanners, same ticket, same instant — the conditional update lets exactly one through
+select t.ok((select count(*) from scan_log where code = :'k1' and result = 'ok') = 1, 'one ticket, two phones one after the other: accepted once');
 
 \o
 \pset tuples_only off
