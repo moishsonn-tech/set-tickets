@@ -64,6 +64,9 @@ textarea.inp{min-height:90px;resize:vertical}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .check{display:flex;gap:10px;align-items:flex-start;cursor:pointer;font-size:13px}
+.chip-check{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line,#e3e1da);border-radius:999px;padding:4px 10px;font-size:12px;cursor:pointer;background:var(--surface)}
+.chip-check input{margin:0}.chip-check.on{border-color:var(--ink);font-weight:600}
+.en-row{border-top:1px solid var(--line,#e3e1da);padding:12px 0}.en-row:first-of-type{border-top:0}
 .check input{margin-top:3px;accent-color:var(--ink)}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;background:#eef0f3;color:var(--text-2)}
 .chip.ok{background:var(--ok-bg);color:var(--ok)} .chip.warn{background:var(--warn-bg);color:var(--warn)}
@@ -404,12 +407,20 @@ body.scan-mode{background:#000}
 @keyframes pop{from{opacity:0;transform:scale(1.04)}}
 .sc-res-icon{width:104px;height:104px;border-radius:50%;background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;margin-bottom:18px}
 .sc-res-icon svg{stroke-width:2.6}
-.sc-res-t{font-size:13px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;opacity:.9}
-.sc-res-name{font-family:var(--display);text-transform:uppercase;font-size:44px;line-height:1;margin:10px 0 6px;text-wrap:balance}
+.sc-res-t{font-family:var(--display);font-size:40px;line-height:1;letter-spacing:.04em;text-transform:uppercase}
+.sc-res-type{font-size:13px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;opacity:.85;margin-top:18px}
+.sc-seat{font-family:var(--display);text-transform:uppercase;font-size:38px;line-height:1.05;margin:8px 0 4px;text-wrap:balance;background:rgba(0,0,0,.16);border-radius:16px;padding:14px 18px;max-width:100%}
+.sc-seat div+div{font-size:46px;margin-top:4px}
+.sc-res-name{font-size:20px;font-weight:700;margin:12px 0 2px;text-wrap:balance}
 .sc-res-meta{font-size:17px;font-weight:600}
 .sc-res-code{font-family:ui-monospace,Menlo,monospace;font-size:13px;opacity:.8;margin-top:6px;letter-spacing:.08em}
 .sc-res-note{margin-top:16px;background:rgba(0,0,0,.2);border-radius:12px;padding:10px 14px;font-size:14px;font-weight:600;max-width:320px}
-.sc-res-actions{display:flex;gap:10px;margin-top:28px}
+.sc-res-actions{display:flex;gap:10px;margin-top:24px;flex-wrap:wrap;justify-content:center}
+.sc-gear{background:none;border:0;color:var(--mut);padding:6px;cursor:pointer;flex:none}
+.sc-opts{display:grid;gap:8px;margin-top:8px}
+.sc-opt{display:flex;flex-direction:column;align-items:flex-start;gap:2px;text-align:left;background:var(--ink-2);border:1px solid var(--hair);border-radius:14px;padding:12px 14px;color:#fff;cursor:pointer;font:inherit}
+.sc-opt b{font-size:15px}.sc-opt span{font-size:12px;color:var(--mut)}
+.sc-opt.on{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
 .sc-next{background:#fff;color:var(--ink);padding:14px 30px;font-size:15px}
 @media (min-width:520px){body.scan-mode .sc{border-left:1px solid var(--hair);border-right:1px solid var(--hair)}.sc-result:not(.mock){left:calc(50% - 240px);right:calc(50% - 240px)}}
 @media (max-width:980px){.feat-grid{grid-template-columns:1fr 1fr}.promo{grid-template-columns:1fr;padding:32px 24px}}
@@ -460,7 +471,7 @@ body.scan-mode{background:#000}
 .sm-intro{display:flex;gap:16px;align-items:flex-start}
 .seat-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}.seat-chips .chip{cursor:pointer;border:0;text-transform:none;letter-spacing:0;font-size:12px}
 /* Stage 3 seating */
-.seat3{grid-column:1/-1;display:grid;grid-template-columns:2fr 1fr 1fr;gap:16px}
+.seat3{grid-column:1/-1;display:flex;gap:16px}.seat3>div{flex:1;min-width:0}.seat3>div:first-child{flex:2}
 .seat3 .v{font-size:17px;font-weight:700}
 .inv-seat{background:#f6f4ee;border-radius:12px;padding:12px;margin-top:4px}.inv-seat .k{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-3);font-weight:700}
 .sm-ga{stroke:#fff;stroke-width:2;opacity:.82}.sm-ga.buy{cursor:pointer}.sm-ga.buy:hover{opacity:1}.sm-ga.sel{stroke:var(--accent);stroke-width:5}
