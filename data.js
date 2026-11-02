@@ -46,7 +46,7 @@ const DEFAULT_TEMPLATES = [
 // member = {email, perms:[], events:'all'|[eventId], owner?, support?}; eventId optional (checks event scope too)
 const hasPerm = (m, key, eventId) => !!m && (m.owner || m.support || (m.perms || []).includes(key)) && (!eventId || m.owner || m.support || m.events === 'all' || (m.events || []).includes(eventId));
 const BO_STATUS = { pending: 'Awaiting approval', active: 'Active', suspended: 'Suspended', deactivated: 'Deactivated' };
-const DEFAULT_PLATFORM = { name: 'SET', publicRegistration: false, feePct: 1, feeFixed: 25, plans: 'Per-ticket platform fee only — no subscription.', admins: ['moishsonn@gmail.com'] };
+const DEFAULT_PLATFORM = { name: 'SET', publicRegistration: false, feePct: 1, feeFixed: 25, feePayer: 'organizer', plans: 'Per-ticket platform fee only — no subscription.', admins: ['moishsonn@gmail.com'] };
 const DEFAULT_BRANDING = { logo: '', banner: '', ink: '#020a16', accent: '#f4cd5e', font: 'Anton', tagline: '', phone: '', website: '', instagram: '', facebook: '', tiktok: '', x: '',
   refundPolicy: '', privacyPolicy: '', domain: '' };
 const FONTS = ['Anton', 'Bebas Neue', 'Oswald', 'Playfair Display', 'DM Serif Display', 'Montserrat'];
@@ -67,7 +67,41 @@ const DEFAULT_SETTINGS = {
   terms: 'All sales are final. Tickets are non-refundable except if the event is cancelled. Event schedule and line-up subject to change.',
   payments: { card: true, offline: true, door: true }, donations: true, pixels: { ga4: '', meta: '', tiktok: '' },
   contactEmail: '', reminderHours: 24, require2fa: false,
+  // Stage 5: who pays card processing, tax on fees, what checkout asks for, and questions asked on every order
+  passProcessing: false, taxOnFees: false, questions: [],
+  checkout: { phone: 'optional', address: 'off', promo: true, optIn: true, note: '', thanks: '' },
 };
+
+/* ── Payments (Stage 5): one gateway interface, many processors ──
+   A box office connects its OWN processor account (bo.gateway = {provider, account, status, test}); money goes straight to it and the
+   platform fee rides along as an application fee. Every processor plugs into the same three steps — create a payment for an order,
+   confirm it from the processor's webhook, refund — so adding one never touches checkout, orders or tickets. `adapter: true` = the
+   server-side adapter is written (supabase/functions/payments/providers/); the others are listed so a box office can ask for them. */
+const GATEWAYS = {
+  stripe: { name: 'Stripe', methods: ['Card', 'Apple Pay', 'Google Pay', 'Link'], pct: 2.9, fixed: 30, adapter: true, how: 'Stripe Connect — you sign in to (or create) your own Stripe account; payouts go straight to it' },
+  square: { name: 'Square', methods: ['Card', 'Apple Pay', 'Google Pay'], pct: 2.9, fixed: 30, how: 'Square OAuth' },
+  paypal: { name: 'PayPal / Braintree', methods: ['Card', 'PayPal', 'Venmo', 'Apple Pay', 'Google Pay'], pct: 3.49, fixed: 49, how: 'PayPal partner onboarding' },
+  authorizenet: { name: 'Authorize.net', methods: ['Card'], pct: 2.9, fixed: 30, how: 'API login ID + transaction key, stored server-side' },
+  custom: { name: 'Another processor', methods: ['Card'], pct: 0, fixed: 0, how: 'Any processor with a payments API — a new adapter file, nothing else changes' },
+  demo: { name: 'Demo test processor', methods: ['Card', 'Apple Pay', 'Google Pay'], pct: 2.9, fixed: 30, adapter: true, test: true, how: 'Built in for the demo — no real money moves' },
+};
+const PAY_MINUTES = 15;  // a card checkout keeps its seats / tickets this long while the buyer pays
+// demo test cards (the same numbers Stripe publishes for test mode)
+const TEST_CARDS = { '4242424242424242': '', '5555555555554444': '', '4000000000000002': 'Your card was declined.', '4000000000009995': 'Your card has insufficient funds.',
+  '4000000000000069': 'Your card has expired.', '4000000000000127': 'Your card\'s security code is incorrect.', '4000000000000119': 'An error occurred while processing your card. Try again in a little bit.' };
+const luhn = n => { let s = 0; for (let i = 0; i < n.length; i++) { let d = +n[n.length - 1 - i]; if (i % 2) { d *= 2; if (d > 9) d -= 9; } s += d; } return n.length >= 12 && s % 10 === 0; };
+const cardBrand = n => /^4/.test(n) ? 'Visa' : /^(5[1-5]|2[2-7])/.test(n) ? 'Mastercard' : /^3[47]/.test(n) ? 'Amex' : /^6/.test(n) ? 'Discover' : 'Card';
+const optNum = (v, d) => v === undefined || v === null || v === '' ? d : +v || 0;
+// the platform's own fee for one box office (super admin may override per box office) and who pays it
+const platformFeeFor = (plat, bo) => ({ pct: optNum(bo?.platformFee?.pct, +plat?.feePct || 0), fixed: optNum(bo?.platformFee?.fixed, +plat?.feeFixed || 0),
+  payer: bo?.platformFee?.payer || plat?.feePayer || 'organizer' });
+// everything quote() needs to price a cart for one box office: its settings + the platform fee + its processor's card rate
+function pricingSettings(bo, plat) {
+  const g = bo?.gateway, gw = GATEWAYS[g?.provider];
+  return { ...DEFAULT_SETTINGS, ...(bo?.settings || {}), platform: platformFeeFor(plat, bo),
+    card: { pct: gw ? optNum(g.pct, gw.pct) : 0, fixed: gw ? optNum(g.fixed, gw.fixed) : 0, pass: !!bo?.settings?.passProcessing } };
+}
+const cardReady = bo => !!bo?.gateway && bo.gateway.status === 'connected' && !!GATEWAYS[bo.gateway.provider];
 
 /* ── Pricing (Stage 4): the one pricing engine — display everywhere, authoritative in DEMO; SQL price_cart() mirrors it line for line.
    A ticket's price = its showtime price (slotPrices) or base price, replaced by the active price phase (early bird, a scheduled change,
@@ -141,9 +175,20 @@ function quote(cart, events, settings, promo, o = {}) {
   }
   const subtotal = lines.reduce((a, l) => a + l.unit * l.qty, 0), promoErr = promo ? applyPromo(lines, promo, events, subtotal) : '';
   const disc = lines.reduce((a, l) => a + (l.disc || 0), 0), feeDisc = lines.reduce((a, l) => a + (l.feeDisc || 0), 0);
-  const fee = lines.reduce((a, l) => a + l.fee, 0) - feeDisc, tax = Math.round((subtotal - disc) * (+settings.taxPct || 0) / 100);
-  const donation = Math.max(0, Math.round(+cart.donation || 0));
-  return { lines, subtotal, discount: disc, feeDiscount: feeDisc, fee, tax, donation, total: subtotal - disc + fee + tax + donation, promoErr,
+  const fee = lines.reduce((a, l) => a + l.fee, 0) - feeDisc, donation = Math.max(0, Math.round(+cart.donation || 0));
+  // Stage 5 money breakdown, each part stored separately on the order:
+  // platform fee (the platform's cut — the organizer pays it from the payout, or the buyer pays it as a "service fee"),
+  // tax (on tickets + products after discounts, plus fees when the box office taxes fees), card processing (the processor's cut,
+  // passed to the buyer only when the box office chooses to).
+  const pf = settings.platform || { pct: 0, fixed: 0, payer: 'organizer' }, paidTickets = lines.reduce((a, l) => a + (l.unit > 0 ? l.kind === 'ticket' ? l.qty : l.kind === 'bundle' ? l.qty * l.perCopy : 0 : 0), 0);
+  const platformFee = subtotal - disc > 0 ? Math.round((subtotal - disc) * (+pf.pct || 0) / 100) + paidTickets * (+pf.fixed || 0) : 0;
+  const serviceFee = pf.payer === 'buyer' ? platformFee : 0;
+  const tax = Math.round((subtotal - disc + (settings.taxOnFees ? fee + serviceFee : 0)) * (+settings.taxPct || 0) / 100);
+  const pre = subtotal - disc + fee + serviceFee + tax + donation, card = settings.card || { pct: 0, fixed: 0, pass: false };
+  const processingFee = o.method === 'card' && pre > 0 ? Math.round(pre * (+card.pct || 0) / 100) + (+card.fixed || 0) : 0, processing = card.pass ? processingFee : 0;
+  const sumKind = k => lines.filter(l => k.includes(l.kind)).reduce((a, l) => a + l.unit * l.qty, 0);
+  return { lines, subtotal, ticketsTotal: sumKind(['ticket', 'bundle']), addonsTotal: sumKind(['addon']), discount: disc, feeDiscount: feeDisc, fee, serviceFee, tax, donation,
+    processing, processingFee, platformFee, total: pre + processing, promoErr,
     faceValue: lines.reduce((a, l) => a + (l.kind === 'bundle' ? l.value : l.face * l.qty), 0), currency: lines.find(l => l.currency)?.currency || settings.currency };
 }
 // Promo code conditions + per-unit discounts. Returns '' or why the code can't be used on this cart.
@@ -192,7 +237,7 @@ function promoUsable(p, code, orders, email, now = new Date()) {
   if (!p || p.active === false) return 'That code is not valid';
   if (p.startsAt && new Date(p.startsAt) > now) return `Code ${p.code} isn't active yet`;
   if (p.expires && new Date(p.expires) <= now) return `Code ${p.code} has expired`;
-  const used = orders.filter(o => ['paid', 'pending'].includes(o.status) && o.data.promo?.id === p.id);
+  const used = orders.filter(o => orderCounts(o) && o.data.promo?.id === p.id);
   if (+p.maxUses > 0 && used.length >= +p.maxUses) return `Code ${p.code} has been fully used`;
   if ((p.codes || []).includes(String(code).toUpperCase()) && used.some(o => String(o.data.code).toUpperCase() === String(code).toUpperCase())) return `Code ${String(code).toUpperCase()} has already been used`;
   if (email && +p.perCustomer > 0 && used.filter(o => o.buyer_email === email.toLowerCase()).length >= +p.perCustomer) return `You've already used code ${p.code}`;
@@ -200,7 +245,7 @@ function promoUsable(p, code, orders, email, now = new Date()) {
 }
 const trackingUsable = (t, eventIds, orders, now = new Date()) => !!t && t.active !== false && inWindow(t.startsAt, t.expires, now)
   && (!(t.eventIds || []).length || eventIds.some(id => t.eventIds.includes(id)))
-  && !(+t.maxUses > 0 && orders.filter(o => o.box_office_id === t.box_office_id && ['paid', 'pending'].includes(o.status) && o.data.tracking === t.code).length >= +t.maxUses);
+  && !(+t.maxUses > 0 && orders.filter(o => o.box_office_id === t.box_office_id && orderCounts(o) && o.data.tracking === t.code).length >= +t.maxUses);
 // what a buyer's browser may know about a promo: the targeting it needs to show the discount, never the limits or the other unique codes
 const publicPromo = (p, code) => { const { codes, note, maxUses, perCustomer, created_at, created_by, box_office_id, ...pub } = p; return { ...pub, code: String(code).trim().toUpperCase() }; };
 // products a buyer can add right now, given what's in their selection (ticket types + seat areas)
@@ -209,15 +254,69 @@ function addonAllowed(ev, ad, tts, areas) {
   return (!(ad.ticketTypeIds || []).length || ad.ticketTypeIds.some(id => tts.includes(id))) && (!(ad.areas || []).length || ad.areas.some(a => areas.includes(a)));
 }
 
+/* ── Checkout questions (Stage 5) ──
+   scope: order (box office Settings — once per order) · event (once per event in the cart) · ticket (once per ticket / person).
+   type: text · select · checkbox · date · terms / waiver (must be ticked when required) · signature (typed full name, or a drawn PNG). */
+const Q_TYPES = [['text', 'Text'], ['select', 'Dropdown'], ['checkbox', 'Checkbox'], ['date', 'Date'], ['terms', 'Terms to accept'], ['waiver', 'Waiver'], ['signature', 'Signature']];
+const Q_SCOPES = [['event', 'Once per event'], ['ticket', 'Once per ticket / person']];
+function answerErr(q, v) {
+  const t = q.type || 'text', empty = v === undefined || v === null || v === '' || v === false;
+  if (empty) return q.required ? (t === 'terms' || t === 'waiver' ? `Please accept: ${q.label}` : t === 'signature' ? `Please sign: ${q.label}` : `Please answer: ${q.label}`) : '';
+  if (t === 'select' && !String(q.options || '').split(',').map(x => x.trim()).includes(String(v))) return `Choose an option for: ${q.label}`;
+  if (t === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(String(v))) return `Enter a date for: ${q.label}`;
+  if (t === 'signature' && (String(v).length > 200000 || (String(v).startsWith('data:') && !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(v)) || String(v).trim().length < 2)) return `Please sign: ${q.label}`;
+  if (String(v).length > 2000 && t !== 'signature') return `Answer too long: ${q.label}`;
+  return '';
+}
+// every required answer present and well formed. tickets = {eventId: number of tickets} for per-ticket questions.
+function checkAnswers(orderQs, events, answers = {}, tAnswers = {}, tickets = {}) {
+  for (const q of orderQs || []) { const e = answerErr(q, answers[q.id]); if (e) return e; }
+  for (const ev of events) for (const q of ev.questions || []) {
+    if (q.scope === 'ticket') { for (let i = 0; i < (tickets[ev.id] || 0); i++) { const e = answerErr(q, (tAnswers[q.id] || [])[i]); if (e) return e + ` (ticket ${i + 1}, ${ev.name})`; } }
+    else { const e = answerErr(q, answers[q.id]); if (e) return e + ` (${ev.name})`; }
+  }
+  return '';
+}
+
+/* ── What a listing shows (Stage 5): on sale · few left · sold out · coming soon · sales closed ── */
+function ticketsLeft(ev, av) {
+  if (!av) return null;
+  const caps = [], vis = (ev.ticketTypes || []).filter(t => !t.hidden && !t.adminOnly);
+  if (+ev.capacity > 0) caps.push([+ev.capacity - av.total, +ev.capacity]);
+  if (vis.length && vis.every(t => +t.qty > 0)) caps.push([vis.reduce((a, t) => a + Math.max(0, +t.qty - (av.tt[t.id] || 0)), 0), vis.reduce((a, t) => a + +t.qty, 0)]);
+  if (ev.seating?.enabled && !(ev.timeSlots || []).length) { const all = Object.keys(ev.seating.index || {}).length, off = new Set([...(av.seats || []), ...(av.off || [])].filter(k => k.startsWith('|'))).size; if (all) caps.push([all - off, all]); }
+  if (!caps.length) return null;
+  const c = caps.sort((a, b) => a[0] - b[0])[0]; return { left: Math.max(0, c[0]), of: c[1] };
+}
+function saleState(ev, av, now = Date.now()) {
+  if (ev.salesStart && new Date(ev.salesStart) > now) return 'soon';
+  if (ev.salesEnd && new Date(ev.salesEnd) < now) return 'closed';
+  const t = ticketsLeft(ev, av); if (!t) return 'onsale';
+  return t.left <= 0 ? 'soldout' : t.left <= Math.max(5, Math.ceil(t.of * .1)) ? 'low' : 'onsale';
+}
+
+/* ── Order states (Stage 5). Tickets exist only once an order is paid (or deliberately issued by staff).
+   awaiting_payment = a card checkout in progress: holds its seats / stock until expires_at, then becomes expired (released).
+   pending = "pay later / at the door" reservation the box office allowed: holds stock with no tickets until staff mark it paid. ── */
+const ORDER_STATUS = { paid: 'Paid', pending: 'Reserved — unpaid', awaiting_payment: 'Awaiting payment', expired: 'Checkout expired', cancelled: 'Cancelled', refunded: 'Refunded' };
+const reservedOrder = (o, now = Date.now()) => o.status === 'pending' || (o.status === 'awaiting_payment' && new Date(o.expires_at) > now);
+const orderCounts = o => o.status === 'paid' || reservedOrder(o);   // uses stock, promo uses and tracking uses
+// one entry per admitted ticket an order line will become: ticket type + seat (bundle lines: one per ticket inside)
+const lineUnits = l => l.kind === 'ticket' ? Array.from({ length: l.qty * (l.admits || 1) }, (_, i) => ({ tt: l.ticketTypeId, seat: l.seats?.[i] || null }))
+  : l.kind === 'bundle' ? (l.tts || []).map((tt, i) => ({ tt, seat: l.seats?.[i] || null })) : [];
+
 /* availability from a ticket list (DEMO) — same shape as the SQL availability() */
 // seats: sold "slot|seat" keys; off: seats nobody else can buy right now (blocked, held, unavailable, in someone else's checkout).
 // ad / bd: products and bundles already sold (from live orders; bundle products count against the product's stock)
 function availabilityFrom(tickets, eventId, statuses = [], token = '', orders = []) {
   const a = { tt: {}, slots: {}, seats: [], total: 0, off: [], ad: {}, bd: {} };
-  for (const o of orders) if (['paid', 'pending'].includes(o.status)) for (const l of o.data.lines || []) {
+  for (const o of orders) if (orderCounts(o)) for (const l of o.data.lines || []) {
     if (l.eventId !== eventId) continue;
     if (l.kind === 'addon') a.ad[l.addonId] = (a.ad[l.addonId] || 0) + l.qty;
     if (l.kind === 'bundle') { a.bd[l.bundleId] = (a.bd[l.bundleId] || 0) + l.qty; for (const x of l.addons || []) a.ad[x.addonId] = (a.ad[x.addonId] || 0) + x.qty * l.qty; }
+    if (o.status !== 'paid') for (const u of lineUnits(l)) {  // reserved, not yet ticketed: still off the shelf
+      a.total++; a.tt[u.tt] = (a.tt[u.tt] || 0) + 1; if (l.slotId) a.slots[l.slotId] = (a.slots[l.slotId] || 0) + 1; if (u.seat) a.seats.push((l.slotId || '') + '|' + u.seat);
+    }
   }
   for (const t of tickets) {
     if (t.event_id !== eventId || t.status !== 'valid') continue;
@@ -272,7 +371,7 @@ function sellout(ev, tickets = [], statuses = [], orders = []) {
       for (const { p, state, t } of seatStates(ev, { tickets, statuses, orders, slotId: sl.id }).values()) {
         const r = A[p.area] ||= { name: p.area, seats: 0, prices: new Set(), sold: 0, available: 0, blocked: 0, held: 0, comped: 0, unavailable: 0, potential: 0, actual: 0, remaining: 0 };
         const pr = p.tt ? price(ttById[p.tt] || {}) : 0; r.seats++; if (p.tt) r.prices.add(pr);
-        if (state === 'sold') { r.sold++; r.actual += paid(t); } else if (state === 'comp') r.comped++;
+        if (state === 'sold') { r.sold++; if (t) r.actual += paid(t); } else if (state === 'comp') r.comped++;
         else if (state === 'blocked') r.blocked++; else if (state === 'unavailable') r.unavailable++;
         else if (state === 'held' || state === 'checkout') r.held++; else r.available++;
         if (!['blocked', 'unavailable'].includes(state)) { r.potential += pr; if (p.tt) cap[p.tt] = (cap[p.tt] || 0) + 1; }
@@ -481,9 +580,11 @@ function activeStatuses(statuses, eventId, slotId = '', now = Date.now()) {
 function seatStates(ev, { tickets = [], statuses = [], orders = [], slotId = '', token = '' } = {}) {
   const out = new Map(), L = seatLayout(ev.seating), act = activeStatuses(statuses, ev.id, slotId), byTk = new Map(), ordById = new Map(orders.map(o => [o.id, o]));
   for (const t of tickets) if (t.event_id === ev.id && t.status === 'valid' && t.seat && (t.slot_id || '') === (slotId || '')) byTk.set(t.seat, t);
+  const resv = new Map();  // seats in unpaid orders: a card checkout in progress shows as "in checkout", a pay-later reservation as sold
+  for (const o of orders) if (o.status !== 'paid' && reservedOrder(o)) for (const l of o.data.lines || []) if (l.eventId === ev.id && (l.slotId || '') === (slotId || '')) for (const u of lineUnits(l)) if (u.seat) resv.set(u.seat, o);
   for (const p of L.seats) {
-    const t = byTk.get(p.id), s = act.get(p.id), o = t && ordById.get(t.order_id);
-    const state = t ? (t.comp || o?.data?.comp ? 'comp' : 'sold') : s && !(s.status === 'checkout' && token && s.token === token) ? s.status : !p.tt ? 'unavailable' : 'available';
+    const t = byTk.get(p.id), s = act.get(p.id), r = !t && resv.get(p.id), o = t ? ordById.get(t.order_id) : r;
+    const state = t ? (t.comp || o?.data?.comp ? 'comp' : 'sold') : r ? (r.status === 'pending' ? 'sold' : 'checkout') : s && !(s.status === 'checkout' && token && s.token === token) ? s.status : !p.tt ? 'unavailable' : 'available';
     out.set(p.id, { p, state, t, s: s || null, o: o || null });
   }
   return out;
@@ -501,7 +602,7 @@ function singleGaps(ev, isFree, chosen) {
 }
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v8';
+const DEMO_KEY = 'set_demo_v9';
 const Demo = {
   st: null,
   load() {
@@ -553,6 +654,10 @@ const gapMsg = (ev, gaps) => `Please don't leave a single empty seat next to you
 function demoPlaceOrder(p, asTeam) {
   const st = Demo.st, manual = p.payment === 'manual', now = new Date();
   if (manual && !asTeam) throw new Error('not allowed');
+  expireOrders(st);
+  // the same checkout submitted twice (double click, retry, flaky network) returns the first order — never a second one
+  const again = p.attempt && st.orders.find(o => o.attempt_key === p.attempt && o.buyer_email === String(p.buyer?.email || '').trim().toLowerCase() && orderCounts(o));
+  if (again) return { id: again.id, key: again.access_key, ref: again.ref, status: again.status, expires_at: again.expires_at, total: again.data.total, again: true };
   if (!String(p.buyer?.name || '').trim()) throw new Error('Name is required');
   if (!EMAIL_RE.test(p.buyer?.email || '')) throw new Error('A valid email is required');
   const items = p.items || [], addons = (p.addons || []).filter(a => +a.qty >= 1);
@@ -675,59 +780,140 @@ function demoPlaceOrder(p, asTeam) {
     else throw new Error('That code is not valid');
   }
   if (!tracking && p.tracking) { const f = findCode(st, bo.id, p.tracking); if (f?.tracking && trackingUsable(f.tracking, evIds, st.orders, now)) tracking = f.tracking.code; }  // a stale link never blocks a sale
-  const q = quote({ items, addons, donation: p.donation }, st.events, { ...DEFAULT_SETTINGS, ...bo.settings }, promo, { avail: avs, manual, now });
+  const set = pricingSettings(bo, st.platform);
+  const q = quote({ items, addons, donation: p.donation }, st.events, set, promo, { avail: avs, manual, now, method: p.payment });
   if (promo && q.promoErr) throw new Error(q.promoErr);
-  const plat = st.platform, nTk = q.lines.filter(l => l.kind === 'ticket' && l.unit > 0).reduce((t, l) => t + l.qty, 0) + q.lines.filter(l => l.kind === 'bundle' && l.unit > 0).reduce((t, l) => t + l.qty * l.perCopy, 0);
-  const platformFee = q.subtotal - q.discount > 0 ? Math.round((q.subtotal - q.discount) * (+plat.feePct || 0) / 100) + nTk * (+plat.feeFixed || 0) : 0;
-  if (q.total > 0 && !manual && !['offline', 'card'].includes(p.payment)) throw new Error('Choose a payment method');
+  // checkout questions: once per order (box office), once per event, once per ticket
+  const perEv = {}; q.lines.forEach(l => { perEv[l.eventId] = (perEv[l.eventId] || 0) + lineUnits(l).length; });
+  if (!manual) { const e = checkAnswers(set.questions, evIds.map(id => st.events.find(x => x.id === id)), p.answers || {}, p.ticketAnswers || {}, perEv); if (e) throw new Error(e); }
   if (p.comp) {  // complimentary: keeps the real ticket type and face value, collects $0
     if (!manual) throw new Error('not allowed');
     for (const id of evIds) if (!hasPerm(asTeam, 'tickets.comps', id)) throw new Error('You don\'t have permission to issue complimentary tickets');
     q.lines.forEach(l => Object.assign(l, { unit: 0, fee: 0, unitFee: 0, comp: true }));
-    Object.assign(q, { subtotal: 0, discount: 0, feeDiscount: 0, fee: 0, tax: 0, donation: 0, total: 0 });
+    Object.assign(q, { subtotal: 0, ticketsTotal: 0, addonsTotal: 0, discount: 0, feeDiscount: 0, fee: 0, serviceFee: 0, tax: 0, donation: 0, processing: 0, processingFee: 0, platformFee: 0, total: 0 });
   }
-  const status = (q.total === 0 || manual || p.payment === 'card') ? 'paid' : 'pending';
+  // how it's paid: free and staff orders are paid now; a card checkout waits for the processor; pay-later reserves without tickets
+  if (q.total > 0 && !manual) {
+    if (p.payment === 'card') { if (set.payments?.card === false || !cardReady(bo)) throw new Error('Card payments are not set up for this box office yet'); }
+    else if (p.payment === 'offline') { if (set.payments?.offline === false) throw new Error('Pay later is not available for this box office'); }
+    else throw new Error('Choose a payment method');
+  }
+  const status = q.total === 0 || manual ? 'paid' : p.payment === 'card' ? 'awaiting_payment' : 'pending';
   let ref; do { ref = 'SET-' + randCode(6); } while (st.orders.some(o => o.ref === ref));
-  const order = { id: uid(), box_office_id: bo.id, ref, access_key: uid(), status, buyer_email: email, event_ids: evIds, created_at: new Date().toISOString(),
-    data: { buyer: p.buyer, lines: q.lines, subtotal: q.subtotal, discount: q.discount, feeDiscount: q.feeDiscount, fee: q.fee, tax: q.tax, donation: q.donation,
-      total: q.total, faceValue: q.faceValue, code: promo?.code || null, promo: promo ? { id: promo.id, code: findCode(st, bo.id, promo.code).promo.code } : null, tracking,
-      payment: q.total === 0 ? 'free' : p.payment, answers: p.answers || {}, optIn: !!p.optIn, source: p.source || null, currency: q.currency,
-      platformFee: p.comp ? 0 : platformFee, ...(p.comp ? { comp: true } : {}) } };
+  const order = { id: uid(), box_office_id: bo.id, ref, access_key: uid(), status, buyer_email: email, event_ids: evIds, created_at: now.toISOString(),
+    attempt_key: p.attempt || null, expires_at: status === 'awaiting_payment' ? new Date(now.getTime() + PAY_MINUTES * 6e4).toISOString() : null,
+    payment: status === 'awaiting_payment' ? { provider: bo.gateway.provider, test: !!bo.gateway.test, attempts: [] } : null,
+    data: { buyer: p.buyer, lines: q.lines, subtotal: q.subtotal, ticketsTotal: q.ticketsTotal, addonsTotal: q.addonsTotal, discount: q.discount, feeDiscount: q.feeDiscount,
+      fee: q.fee, serviceFee: q.serviceFee, tax: q.tax, donation: q.donation, processing: q.processing, processingFee: q.processingFee, total: q.total, refunded: 0, faceValue: q.faceValue,
+      code: promo?.code || null, promo: promo ? { id: promo.id, code: findCode(st, bo.id, promo.code).promo.code } : null, tracking,
+      payment: q.total === 0 ? 'free' : p.payment, answers: p.answers || {}, ticketAnswers: p.ticketAnswers || {}, optIn: !!p.optIn, source: p.source || null, currency: q.currency,
+      platformFee: q.platformFee, ...(p.comp ? { comp: true } : {}) } };
   st.orders.push(order);
-  const by = asTeam?.email || DB._actor || order.buyer_email;
-  // Every ticket keeps: real ticket type, face value, amount collected, its discount + code, comp, tracking code, products and bundle.
-  const extras = evId => q.lines.filter(l => l.eventId === evId && l.kind === 'addon').map(l => `${l.name} × ${l.qty}`);
+  // the order now holds its seats itself (paid → tickets; unpaid → reserved until paid or expired), so this buyer's seat holds go
+  for (const l of q.lines) if (l.seats?.length) st.seatStatus = (st.seatStatus || []).filter(r => !(r.event_id === l.eventId && l.seats.includes(r.seat) && [l.slotId || '', ''].includes(r.slot_id || '') && (r.status === 'checkout' || (manual && r.status === 'held'))));
+  if (p.holdToken) st.seatStatus = (st.seatStatus || []).filter(r => !(r.status === 'checkout' && r.token === p.holdToken));
+  if (status === 'paid') issueOrderTickets(st, order, { manual, by: asTeam?.email || DB._actor || email });
+  Demo.save();
+  const res = { id: order.id, key: order.access_key, ref, status, expires_at: order.expires_at, total: q.total };
+  if (status === 'awaiting_payment' && p.card) { const r = demoCharge(st, order, p.card); Demo.save(); if (r.error) throw new Error(r.error); res.status = 'paid'; }  // demo shortcut: place + pay in one call
+  return res;
+}
+// Paid → tickets. Every ticket keeps: real ticket type, face value, amount collected, its discount + code, comp, tracking code, products,
+// package, and its own checkout answers. Runs once per order (placing a free/staff order, the processor confirming, or staff marking paid).
+function issueOrderTickets(st, order, o = {}) {
+  if (st.tickets.some(t => t.order_id === order.id)) return;
+  const d = order.data, comp = !!d.comp, tracking = d.tracking || null, code = d.code || null, by = o.by || order.buyer_email, idx = {};
+  const extras = evId => d.lines.filter(l => l.eventId === evId && l.kind === 'addon').map(l => `${l.name} × ${l.qty}`);
+  const tAns = evId => { const i = idx[evId] = (idx[evId] ?? -1) + 1, ev = st.events.find(e => e.id === evId), out = {};
+    for (const q of ev?.questions || []) if (q.scope === 'ticket' && d.ticketAnswers?.[q.id]?.[i] !== undefined) out[q.id] = d.ticketAnswers[q.id][i]; return out; };
   const issue = (l, ttId, seat, face, paid, discount, more = {}) => {
     const ev = st.events.find(e => e.id === l.eventId), inf = seat ? seatInfo(ev, seat) : null;
-    st.tickets.push({ id: uid(), box_office_id: bo.id, order_id: order.id, event_id: l.eventId, ticket_type_id: ttId, slot_id: l.slotId || null,
-      seat, ...(inf ? { area: inf.area, row: inf.row, seat_label: inf.seat } : {}), comp: !!p.comp, face, paid, discount, promo: discount > 0 ? promo.code : null, tracking,
-      bundle: null, extras: extras(l.eventId), price_override: !!l.override, ...more, code: randCode(10), holder: p.buyer.name, status: 'valid', checked_in_at: null });
-    if (seat) seatLog(ev, l.slotId, seat, p.comp ? 'comp' : 'sold', `${p.comp ? 'Complimentary ticket issued' : 'Sold'} to ${p.buyer.name}${discount > 0 ? ` · discount ${promo.code}` : ''}${more.bundle ? ` · ${more.bundle.name}` : ''} · ${money_(p.comp ? face : paid)}`, { ref, by, discount: discount > 0 ? promo.code : null });
+    st.tickets.push({ id: uid(), box_office_id: order.box_office_id, order_id: order.id, event_id: l.eventId, ticket_type_id: ttId, slot_id: l.slotId || null,
+      seat, ...(inf ? { area: inf.area, row: inf.row, seat_label: inf.seat } : {}), comp, face, paid, discount, promo: discount > 0 ? code : null, tracking,
+      bundle: null, extras: extras(l.eventId), price_override: !!l.override, answers: tAns(l.eventId), ...more, code: randCode(10), holder: d.buyer.name, status: 'valid', checked_in_at: null });
+    if (seat) seatLog(ev, l.slotId, seat, comp ? 'comp' : 'sold', `${comp ? 'Complimentary ticket issued' : 'Sold'} to ${d.buyer.name}${discount > 0 ? ` · discount ${code}` : ''}${more.bundle ? ` · ${more.bundle.name}` : ''} · ${money_(comp ? face : paid)}`, { ref: order.ref, by, discount: discount > 0 ? code : null });
   };
-  for (const l of q.lines) {
+  for (const l of d.lines) {
     if (l.kind === 'ticket') for (let u = 0; u < l.qty; u++) {
-      const d = l.discs?.[u] || 0, fs = spread(l.face, Array(l.admits).fill(1)), ps = spread(l.unit - d, Array(l.admits).fill(1)), ds = spread(d, Array(l.admits).fill(1));
+      const dd = l.discs?.[u] || 0, fs = spread(l.face, Array(l.admits).fill(1)), ps = spread(l.unit - dd, Array(l.admits).fill(1)), ds = spread(dd, Array(l.admits).fill(1));
       for (let j = 0; j < l.admits; j++) issue(l, l.ticketTypeId, l.seats[u * l.admits + j] || null, fs[j], ps[j], ds[j]);
     }
     if (l.kind === 'bundle') for (let c = 0; c < l.qty; c++) {  // the bundle price is shared over its tickets and products by their normal prices
-      const n = l.perCopy, tf = l.tfaces.slice(c * n, c * n + n), w = [...tf, ...l.addons.map(a => a.face * a.qty)], d = l.discs?.[c] || 0;
-      const ps = spread(l.unit - d, w), ds = spread(d, w);
+      const n = l.perCopy, tf = l.tfaces.slice(c * n, c * n + n), w = [...tf, ...l.addons.map(a => a.face * a.qty)], dd = l.discs?.[c] || 0;
+      const ps = spread(l.unit - dd, w), ds = spread(dd, w);
       for (let j = 0; j < n; j++) issue(l, l.tts[c * n + j], l.seats[c * n + j] || null, tf[j], ps[j], ds[j],
         { bundle: { id: l.bundleId, name: l.name, n: c + 1 }, extras: [...extras(l.eventId), ...l.addons.map(a => `${a.name} × ${a.qty} (in ${l.name})`)] });
     }
-    // seats sold out of a checkout hold or a staff hold leave the hold list
-    if (l.seats?.length) st.seatStatus = (st.seatStatus || []).filter(r => !(r.event_id === l.eventId && l.seats.includes(r.seat) && [l.slotId || '', ''].includes(r.slot_id || '') && (r.status === 'checkout' || (manual && r.status === 'held'))));
   }
-  if (p.holdToken) st.seatStatus = (st.seatStatus || []).filter(r => !(r.status === 'checkout' && r.token === p.holdToken));
-  Demo.save();
-  return { id: order.id, key: order.access_key, ref };
+  // ONE confirmation email per order, with every ticket (queued here; delivery is wired in Stage 8)
+  if (!(st.outbox ||= []).some(m => m.order_id === order.id && m.kind === 'confirmation'))
+    st.outbox.push({ id: uid(), box_office_id: order.box_office_id, order_id: order.id, kind: 'confirmation', to: order.buyer_email, at: nowIso(), status: 'queued' });
+}
+// The demo processor: Stripe's published test card numbers behave like Stripe test mode. Never stores the card — only brand + last 4.
+function demoCharge(st, order, card = {}) {
+  if (order.status === 'paid') return { status: 'paid', already: true };   // a second click / retry after success never charges twice
+  if (order.status !== 'awaiting_payment' || new Date(order.expires_at) <= Date.now()) { expireOrders(st); return { error: 'This checkout has expired and its seats were released. Please start again.' }; }
+  const atts = order.payment.attempts;
+  if (atts.length >= 8) return { error: 'Too many payment attempts on this order. Please start again.' };
+  let err = '', last4 = '', brand = card.wallet === 'apple_pay' ? 'Apple Pay' : card.wallet === 'google_pay' ? 'Google Pay' : '';
+  if (!card.wallet) {
+    const n = String(card.number || '').replace(/\D/g, ''), [mm, yy] = String(card.exp || '').split('/').map(x => +x);
+    last4 = n.slice(-4); brand = cardBrand(n);
+    if (!luhn(n)) err = 'Your card number is invalid.';
+    else if (!(mm >= 1 && mm <= 12) || new Date(2000 + yy, mm) <= new Date()) err = 'Your card\'s expiration date is invalid.';
+    else if (!/^\d{3,4}$/.test(String(card.cvc || ''))) err = 'Your card\'s security code is invalid.';
+    else if (!(n in TEST_CARDS)) err = 'Demo mode only accepts test cards — use 4242 4242 4242 4242.';
+    else err = TEST_CARDS[n];
+  }
+  atts.push({ at: nowIso(), ok: !err, method: card.wallet || 'card', brand, last4, error: err || null });
+  if (err) return { error: err };
+  confirmPayment(st, order, { provider: 'demo', ref: 'pi_demo_' + randCode(12).toLowerCase(), method: card.wallet || 'card', brand, last4, fee: order.data.processingFee });
+  return { status: 'paid' };
+}
+// The processor says the money arrived. Idempotent. A payment that lands after the checkout expired still gets its tickets if every seat /
+// ticket is still free; otherwise it is refunded automatically (never two buyers for one seat). → 'issued' | 'already' | 'refunded'
+function confirmPayment(st, order, pay) {
+  if (order.status === 'paid') return 'already';
+  const late = !reservedOrder(order);
+  if (late) {
+    const clash = order.data.lines.some(l => { const av = availabilityFrom(st.tickets, l.eventId, [], '', st.orders.filter(o => o.id !== order.id)), ev = st.events.find(e => e.id === l.eventId);
+      return lineUnits(l).some(u => (u.seat && av.seats.includes((l.slotId || '') + '|' + u.seat)) || (u.tt && +ev?.ticketTypes.find(t => t.id === u.tt)?.qty > 0 && (av.tt[u.tt] || 0) + 1 > +ev.ticketTypes.find(t => t.id === u.tt).qty)); });
+    if (clash || ['cancelled', 'refunded'].includes(order.status)) {
+      Object.assign(order, { status: 'refunded', payment: { ...order.payment, ...pay, refundedAt: nowIso(), note: 'Paid after the checkout expired and the seats were gone — refunded automatically' } });
+      order.data.refunded = order.data.total; return 'refunded';
+    }
+  }
+  Object.assign(order, { status: 'paid', paid_at: nowIso(), payment: { ...(order.payment || {}), ...pay } });
+  if (pay.fee != null) order.data.processingFee = pay.fee;
+  issueOrderTickets(st, order, { by: order.buyer_email });
+  return 'issued';
+}
+// Card checkouts that ran out of time: release their seats / stock (logged on each seat).
+function expireOrders(st, now = Date.now()) {
+  let n = 0;
+  for (const o of st.orders || []) if (o.status === 'awaiting_payment' && new Date(o.expires_at) <= now) {
+    o.status = 'expired'; n++;
+    for (const l of o.data.lines || []) for (const u of lineUnits(l)) if (u.seat) { const ev = st.events.find(e => e.id === l.eventId); if (ev) seatLog(ev, l.slotId, u.seat, 'released', `Checkout ${o.ref} expired unpaid — seat released`, { ref: o.ref, by: 'system' }); }
+  }
+  return n;
+}
+// what a buyer may see of their own order: never the platform's cut, the processor's cut or payment internals
+function buyerOrder(o) {
+  const { access_key, attempt_key, payment, ...order } = clone(o), { platformFee, processingFee, ...data } = order.data;
+  return { ...order, data, paidWith: payment?.last4 ? `${payment.brand} •••• ${payment.last4}` : payment?.brand || null, failures: (payment?.attempts || []).filter(a => !a.ok).length };
 }
 
 const rowToEvent = r => ({ ...(r.data || {}), id: r.id, box_office_id: r.box_office_id, slug: r.slug, status: r.status, created_at: r.created_at, ...(r.secrets ? { secrets: r.secrets } : {}) });
 const eventToRow = ev => { const { id, box_office_id, slug, status, secrets, created_at, ...data } = ev; return { id, box_office_id, slug, status, data, secrets: secrets || {}, updated_at: new Date().toISOString() }; };
 const clone = o => JSON.parse(JSON.stringify(o));
 const publicEvent = ev => { const { secrets, ...rest } = clone(ev); return rest; };
-const publicBo = b => ({ id: b.id, slug: b.slug, name: b.name, status: b.status, branding: { ...DEFAULT_BRANDING, ...b.branding }, settings: { ...DEFAULT_SETTINGS, ...b.settings, name: b.name } });
+const publicBo = b => ({ id: b.id, slug: b.slug, name: b.name, status: b.status, branding: { ...DEFAULT_BRANDING, ...b.branding }, settings: { ...DEFAULT_SETTINGS, ...b.settings, name: b.name },
+  gateway: b.gateway ? { provider: b.gateway.provider, status: b.gateway.status, test: !!b.gateway.test } : null, platformFee: b.platformFee || b.platform_fee || null });
+// demo customer passwords: PBKDF2-SHA256, salted (LIVE: Supabase Auth stores them)
+async function pwHash(pw, salt) {
+  const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(String(pw || '')), 'PBKDF2', false, ['deriveBits']);
+  return b32enc(new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: new TextEncoder().encode(salt), iterations: 100000, hash: 'SHA-256' }, k, 256)));
+}
 async function must(p) { const { data, error } = await p; if (error) throw new Error(error.message); return data; }
 const nowIso = () => new Date().toISOString();
 // page views → {total, unique, today, last10m, bySrc}; hits = [[ms, visitor, src]]
@@ -737,7 +923,7 @@ function viewStats(v) {
   return { total: hits.length, unique: new Set(hits.map(h => h[1])).size, today: hits.filter(h => h[0] >= day0).length, last10m: new Set(hits.filter(h => h[0] >= Date.now() - 6e5).map(h => h[1])).size, bySrc,
     byRef: Object.fromEntries(Object.entries(byRef).map(([k, r]) => [k, { views: r.views, unique: r.v.size }])) };
 }
-const MONEY_KEYS = ['subtotal', 'discount', 'feeDiscount', 'fee', 'tax', 'donation', 'total', 'faceValue', 'platformFee'], LINE_MONEY = ['face', 'value', 'tfaces', 'discs', 'feeDiscs', 'disc', 'feeDisc', 'fee', 'unitFee'];
+const MONEY_KEYS = ['subtotal', 'ticketsTotal', 'addonsTotal', 'discount', 'feeDiscount', 'fee', 'serviceFee', 'tax', 'donation', 'processing', 'processingFee', 'refunded', 'total', 'faceValue', 'platformFee'], LINE_MONEY = ['face', 'value', 'tfaces', 'discs', 'feeDiscs', 'disc', 'feeDisc', 'fee', 'unitFee'];
 const maskEmail = e => String(e || '').replace(/^(.)[^@]*@(.)[^.]*(\..+)$/, '$1•••@$2•••$3');
 
 /* ── DEMO "server": every organizer write passes need(), the same checks the SQL policies make in LIVE. ── */
@@ -805,10 +991,10 @@ const DB = {
     if (!LIVE) {
       const st = Demo.load(), act = new Set(st.boxOffices.filter(b => b.status === 'active').map(b => b.id));
       return { settings: { ...DEFAULT_SETTINGS }, events: st.events.map(normEvent).filter(e => eventListed(e) && act.has(e.box_office_id)).map(publicEvent),
-        bos: st.boxOffices.filter(b => act.has(b.id)).map(publicBo), platform: { name: st.platform.name, publicRegistration: st.platform.publicRegistration } };
+        bos: st.boxOffices.filter(b => act.has(b.id)).map(publicBo), platform: { name: st.platform.name, publicRegistration: st.platform.publicRegistration, feePct: st.platform.feePct, feeFixed: st.platform.feeFixed, feePayer: st.platform.feePayer || 'organizer' } };
     }
     const [plat, bos, evs] = await Promise.all([must(sb.from('platform_public').select('*').maybeSingle()),
-      must(sb.from('box_offices').select('id,slug,name,status,branding,settings').eq('status', 'active')),
+      must(sb.from('box_offices').select('id,slug,name,status,branding,settings,gateway,platform_fee').eq('status', 'active')),
       must(sb.from('events').select('id,box_office_id,slug,status,data,created_at').eq('status', 'published'))]);
     return { settings: { ...DEFAULT_SETTINGS }, events: evs.map(rowToEvent).map(normEvent), bos: bos.map(publicBo), platform: { ...DEFAULT_PLATFORM, ...(plat || {}) } };
   },
@@ -880,10 +1066,11 @@ const DB = {
     email = email.toLowerCase(); DB._actor = email;
     if (LIVE) {
       const r = await must(sb.rpc('admin_load', { p_bo: boId || null, p_support: support })); r.events = (r.events || []).map(rowToEvent);
-      if (r.bo) r.bo = { ...r.bo, templates: r.bo.templates?.length ? r.bo.templates : DEFAULT_TEMPLATES, branding: { ...DEFAULT_BRANDING, ...r.bo.branding }, settings: { ...DEFAULT_SETTINGS, ...r.bo.settings, name: r.bo.name } };
+      if (r.bo) r.bo = { ...r.bo, platformFee: r.bo.platform_fee || null, templates: r.bo.templates?.length ? r.bo.templates : DEFAULT_TEMPLATES, branding: { ...DEFAULT_BRANDING, ...r.bo.branding }, settings: { ...DEFAULT_SETTINGS, ...r.bo.settings, name: r.bo.name } };
       DB._bo = r.bo?.id || null; DB._support = !!r.me?.support; return r;
     }
     const st = Demo.fresh(), isSuper = st.platform.admins.includes(email);
+    if (expireOrders(st)) Demo.save();
     let mine = st.members.filter(m => m.email === email && m.status === 'active');
     if (!mine.length && !isSuper) {  // demo convenience: a new email gets an admin seat on the first sample box office
       const bo = st.boxOffices[0]; mine = [{ id: uid(), box_office_id: bo.id, email, name: email.split('@')[0], perms: [...ALL_PERMS], template: 'full', events: 'all', status: 'active', created_at: nowIso(), added_by: 'demo' }];
@@ -899,7 +1086,7 @@ const DB = {
     const m = me || memberFor(st, email, bo.id);
     if (bo.status !== 'active' && !m.support) return { super: isSuper, bos, bo: publicBo(bo), me: m, blocked: bo.status };
     if (bo.settings?.require2fa && !m.support && !st.mfa?.[email])  // nothing leaves the "server" until 2FA is set up
-      return { super: isSuper, bos, me: m, needs2fa: true, bo: publicBo(bo), events: [], orders: [], tickets: [], waitlist: [], team: [m], broadcasts: [], audit: [], seatStatus: [], seatLog: [], promos: [], tracking: [] };
+      return { super: isSuper, bos, me: m, needs2fa: true, bo: publicBo(bo), events: [], orders: [], tickets: [], waitlist: [], team: [m], broadcasts: [], audit: [], seatStatus: [], seatLog: [], promos: [], tracking: [], outbox: [] };
     const P = k => hasPerm(m, k);
     const events = st.events.filter(e => e.box_office_id === bo.id && (m.owner || m.support || m.events === 'all' || (m.events || []).includes(e.id)));
     const evIds = new Set(events.map(e => e.id));
@@ -911,6 +1098,8 @@ const DB = {
     if (!P('customers.names')) { orders.forEach(o => o.data.buyer.name = 'Guest'); tickets.forEach(t => t.holder = 'Guest'); }
     if (!P('customers.emails')) orders.forEach(o => { o.buyer_email = maskEmail(o.buyer_email); o.data.buyer.email = o.buyer_email; });
     if (!P('customers.phones')) orders.forEach(o => { if (o.data.buyer.phone) o.data.buyer.phone = '•••'; });
+    if (!P('finance.processing')) orders.forEach(o => { if (o.payment) o.payment = { provider: o.payment.provider }; delete o.data.processingFee; });
+    if (!P('finance.fees')) orders.forEach(o => delete o.data.platformFee);
     if (!P('finance.totals')) {
       orders.forEach(o => { for (const k of MONEY_KEYS) o.data[k] = null; o.data.lines.forEach(l => { for (const k of LINE_MONEY) delete l[k]; l.unit = null; }); });
       tickets.forEach(t => { t.face = t.paid = t.discount = null; });
@@ -926,7 +1115,8 @@ const DB = {
       seatStatus: clone((st.seatStatus || []).filter(r => evIds.has(r.event_id))).map(({ token, ...r }) => r),  // buyers' hold tokens never leave the server
       seatLog: P('seating.view') ? clone((st.seatLog || []).filter(r => evIds.has(r.event_id)).slice(0, 8000)) : [],
       promos: P('tickets.discounts') || P('tickets.discountsEdit') || P('finance.reports') ? clone((st.promos || []).filter(x => x.box_office_id === bo.id)) : [],
-      tracking: P('tickets.tracking') || P('finance.reports') ? clone((st.tracking || []).filter(x => x.box_office_id === bo.id)) : [] };
+      tracking: P('tickets.tracking') || P('finance.reports') ? clone((st.tracking || []).filter(x => x.box_office_id === bo.id)) : [],
+      outbox: P('orders.view') ? clone((st.outbox || []).filter(x => x.box_office_id === bo.id)) : [] };
   },
   async stillAllowed() { if (LIVE) return true; try { need(); return true; } catch (e) { return !e.revoked; } },
   async saveEvent(ev) {
@@ -978,6 +1168,8 @@ const DB = {
       const o = Demo.st.orders.find(x => x.id === id && x.box_office_id === DB._bo); if (!o) throw new Error('Order not found');
       need({ refunded: 'orders.refund', cancelled: 'orders.cancel' }[status] || 'orders.edit', o.event_ids[0]);
       const was = o.status; o.status = status;
+      if (status === 'paid' && was !== 'paid') { o.paid_at = nowIso(); o.payment = { ...(o.payment || {}), markedPaidBy: DB._actor }; issueOrderTickets(Demo.st, o, { manual: true, by: DB._actor }); }  // staff confirm the money arrived
+      if (status === 'refunded') o.data.refunded = o.data.total;
       if (cancel) Demo.st.tickets.forEach(t => { if (t.order_id !== id) return;
         if (t.status === 'valid' && t.seat) seatLog(Demo.st.events.find(e => e.id === t.event_id), t.slot_id, t.seat, 'cancelled', `Order ${o.ref} ${status} — seat released`, { ref: o.ref });
         t.status = 'cancelled'; });
@@ -1076,7 +1268,7 @@ const DB = {
   },
   // ── platform super admin ──
   async loadPlatform() {
-    if (LIVE) return must(sb.rpc('platform_overview'));
+    if (LIVE) { const r = await must(sb.rpc('platform_overview')); r.bos.forEach(b => b.platformFee = b.platform_fee || null); return r; }
     needSuper(); const st = Demo.st;
     const bos = st.boxOffices.map(b => {
       const os = st.orders.filter(o => o.box_office_id === b.id && ['paid', 'pending'].includes(o.status));
@@ -1118,7 +1310,7 @@ const DB = {
   },
   // ── buyer-facing ──
   async availability(eventId) {
-    if (!LIVE) { const st = Demo.fresh(); return availabilityFrom(st.tickets, eventId, st.seatStatus, this.holdToken(), st.orders); }
+    if (!LIVE) { const st = Demo.fresh(); if (expireOrders(st)) Demo.save(); return availabilityFrom(st.tickets, eventId, st.seatStatus, this.holdToken(), st.orders); }
     return must(sb.rpc('availability', { p_event: eventId, p_token: this.holdToken() }));
   },
   // This browser's checkout-hold id: seats picked here are held for HOLD_MINUTES while the buyer checks out.
@@ -1130,7 +1322,7 @@ const DB = {
     if (!ev || !eventLive(normEvent(ev))) throw new Error('Event is not on sale');
     if (!ev.seating?.enabled) return null;
     if (seats.length > 10) throw new Error('Maximum 10 seats per order');
-    const states = seatStates(ev, { tickets: st.tickets, statuses: st.seatStatus, slotId, token });
+    const states = seatStates(ev, { tickets: st.tickets, statuses: st.seatStatus, orders: st.orders, slotId, token });
     for (const id of seats) { const x = states.get(id); if (!x || x.state !== 'available') throw new Error(x?.state === 'checkout' ? `${seatText(ev, id)} is being held by another buyer — try again in a few minutes` : `${seatText(ev, id)} is no longer available`); }
     if (ev.seating.noSingles) { const g = singleGaps(ev, id => states.get(id)?.state === 'available', seats); if (g.length) throw new Error(gapMsg(ev, g)); }
     const expires = new Date(Date.now() + HOLD_MINUTES * 6e4).toISOString();
@@ -1257,10 +1449,92 @@ const DB = {
     if (!LIVE) return demoPlaceOrder(clone(payload), asTeam ? need('orders.edit') : null);
     return must(sb.rpc('place_order', { p: payload }));
   },
+  // ── Payments (Stage 5). DEMO: the built-in test processor. LIVE: the box office's processor through the `payments` Edge Function
+  //    (Stripe: a PaymentIntent on the box office's own Stripe account; the processor's webhook confirms the order and issues tickets).
+  async payOrder(id, key, card) {
+    if (LIVE) throw new Error('Card details go straight to the processor\'s secure form');
+    const st = Demo.fresh(), o = st.orders.find(x => x.id === id && x.access_key === key); if (!o) throw new Error('Order not found');
+    const r = demoCharge(st, o, card); Demo.save(); if (r.error) throw new Error(r.error); return r;
+  },
+  async startPayment(id, key) {   // LIVE: {provider, publishableKey, account, clientSecret}
+    if (!LIVE) { const o = Demo.fresh().orders.find(x => x.id === id && x.access_key === key); if (!o) throw new Error('Order not found'); return { provider: 'demo', expires_at: o.expires_at, total: o.data.total }; }
+    const { data, error } = await sb.functions.invoke('payments', { body: { action: 'intent', order: id, key } }); if (error || data?.error) throw new Error(data?.error || error.message); return data;
+  },
+  async cancelCheckout(id, key) {  // the buyer gives up: seats go back on sale now instead of when the timer runs out
+    if (LIVE) return must(sb.rpc('cancel_checkout', { p_id: id, p_key: key }));
+    const st = Demo.fresh(), o = st.orders.find(x => x.id === id && x.access_key === key);
+    if (o?.status === 'awaiting_payment') { o.expires_at = nowIso(); expireOrders(st); Demo.save(); }
+  },
+  async connectGateway(provider, test = true) {
+    if (LIVE) { const { data, error } = await sb.functions.invoke('payments', { body: { action: 'connect', bo: DB._bo, provider, return: location.href } }); if (error || data?.error) throw new Error(data?.error || error.message); return data; }
+    need('admin.payments'); const st = Demo.st, bo = st.boxOffices.find(b => b.id === DB._bo), gw = GATEWAYS[provider];
+    if (!gw) throw new Error('Unknown processor');
+    if (!gw.adapter) throw new Error(`${gw.name} isn't wired in yet — its adapter goes in supabase/functions/payments/providers/. Stripe works today.`);
+    const before = bo.gateway || null; bo.gateway = { provider, account: (provider === 'demo' ? 'demo_' : 'acct_demo_') + randCode(10).toLowerCase(), status: 'connected', test: !!test, connected_at: nowIso() };
+    audit('settings.payments', `Connected ${gw.name}${test ? ' (test mode)' : ''}`, { before, after: bo.gateway }); Demo.save(); return { gateway: clone(bo.gateway) };
+  },
+  async disconnectGateway() {
+    if (LIVE) return must(sb.rpc('disconnect_gateway', { p_bo: DB._bo }));
+    need('admin.payments'); const bo = Demo.st.boxOffices.find(b => b.id === DB._bo), before = bo.gateway; bo.gateway = null;
+    audit('settings.payments', `Disconnected ${GATEWAYS[before?.provider]?.name || 'payment processor'}`, { before, after: null }); Demo.save();
+  },
+  async setPlatformFee(boId, fee) {  // super admin: this box office's platform fee (blank = platform default) and who pays it
+    if (LIVE) return must(sb.rpc('set_platform_fee', { p_bo: boId, p: fee }));
+    needSuper(); const b = Demo.st.boxOffices.find(x => x.id === boId), before = b.platformFee || null; b.platformFee = fee;
+    audit('platform.fee', `Platform fee for ${b.name}: ${fee ? `${fee.pct === '' ? 'default %' : fee.pct + '%'} + ${fee.fixed === '' ? 'default' : money_(fee.fixed)} per ticket, paid by ${fee.payer || 'default'}` : 'platform default'}`, { before, after: fee, bo: b.id }); Demo.save();
+  },
+  // ── Customer accounts (Stage 5): optional — guest checkout always works. A wallet of the buyer's own orders + tickets, a profile and a password.
+  //    No refunds, cancellations, seat changes or transfers from here: those stay with the box office.
+  async custSession() {
+    if (LIVE) { const { data } = await sb.auth.getSession(); const u = data.session?.user; return u ? { email: u.email, name: u.user_metadata?.name || '', phone: u.user_metadata?.phone || '' } : null; }
+    const e = sessionStorage.getItem('set_cust'), c = e && (Demo.fresh().customers || []).find(x => x.email === e); return c ? { email: c.email, name: c.name, phone: c.phone || '' } : null;
+  },
+  async custSignUp({ name, email, password }) {
+    email = String(email || '').trim().toLowerCase(); name = String(name || '').trim();
+    if (!name) throw new Error('Please enter your name'); if (!EMAIL_RE.test(email)) throw new Error('Please enter a valid email');
+    if (String(password || '').length < 8) throw new Error('Use at least 8 characters for your password');
+    if (LIVE) { const { data, error } = await sb.auth.signUp({ email, password, options: { data: { name }, emailRedirectTo: location.origin + location.pathname + '#/account' } }); if (error) throw new Error(error.message); return { confirm: !data.session }; }
+    const st = Demo.fresh(); st.customers ||= [];
+    if (st.customers.some(c => c.email === email)) throw new Error('There\'s already an account for that email — sign in instead');
+    const salt = randCode(16); st.customers.push({ email, name, phone: '', salt, hash: await pwHash(password, salt), created_at: nowIso() }); Demo.save();
+    sessionStorage.setItem('set_cust', email); return { confirm: false };
+  },
+  async custSignIn(email, password) {
+    email = String(email || '').trim().toLowerCase();
+    if (LIVE) { const { error } = await sb.auth.signInWithPassword({ email, password }); if (error) throw new Error('Wrong email or password'); return; }
+    const c = (Demo.fresh().customers || []).find(x => x.email === email);
+    if (!c || c.hash !== await pwHash(password, c.salt)) throw new Error('Wrong email or password');
+    sessionStorage.setItem('set_cust', email);
+  },
+  async custSignOut() { if (LIVE) await sb.auth.signOut(); else sessionStorage.removeItem('set_cust'); },
+  async custForgot(email) {   // LIVE: Supabase emails a reset link. DEMO: nothing is sent.
+    if (LIVE) { const { error } = await sb.auth.resetPasswordForEmail(String(email).trim(), { redirectTo: location.origin + location.pathname + '#/account/password' }); if (error) throw new Error(error.message); }
+  },
+  async myOrders() {   // only orders bought with this account's email — by anyone signed in as that (verified) email
+    if (LIVE) return must(sb.rpc('my_orders'));
+    const me = await this.custSession(); if (!me) throw new Error('Please sign in');
+    const st = Demo.fresh(); if (expireOrders(st)) Demo.save();
+    const os = st.orders.filter(o => o.buyer_email === me.email && o.status !== 'expired');
+    return { orders: os.map(o => ({ ...buyerOrder(o), key: o.access_key })), tickets: clone(st.tickets.filter(t => os.some(o => o.id === t.order_id))) };
+  },
+  async saveProfile({ name, phone }) {
+    if (LIVE) { const { error } = await sb.auth.updateUser({ data: { name, phone } }); if (error) throw new Error(error.message); return; }
+    const me = await this.custSession(); if (!me) throw new Error('Please sign in');
+    if (!String(name || '').trim()) throw new Error('Please enter your name');
+    Object.assign(Demo.st.customers.find(c => c.email === me.email), { name: String(name).trim(), phone: String(phone || '').trim() }); Demo.save();
+  },
+  async changePassword(current, next) {
+    if (String(next || '').length < 8) throw new Error('Use at least 8 characters for your new password');
+    if (LIVE) { const { error } = await sb.auth.updateUser({ password: next }); if (error) throw new Error(error.message); return; }
+    const me = await this.custSession(); if (!me) throw new Error('Please sign in');
+    const c = Demo.st.customers.find(x => x.email === me.email); if (c.hash !== await pwHash(current, c.salt)) throw new Error('Your current password is wrong');
+    c.salt = randCode(16); c.hash = await pwHash(next, c.salt); Demo.save();
+  },
   async getOrder(id, key) {
     if (!LIVE) {
-      const o = Demo.st.orders.find(x => x.id === id && x.access_key === key); if (!o) return null;
-      const { access_key, ...order } = clone(o); return { order, tickets: clone(Demo.st.tickets.filter(t => t.order_id === id)) };
+      const st = Demo.fresh(); if (expireOrders(st)) Demo.save();
+      const o = st.orders.find(x => x.id === id && x.access_key === key); if (!o) return null;
+      return { order: buyerOrder(o), tickets: clone(st.tickets.filter(t => t.order_id === id)) };
     }
     return must(sb.rpc('get_order', { p_id: id, p_key: key }));
   },
@@ -1327,28 +1601,38 @@ function seedDemo() {
     summary: 'A one-day conference for early-stage founders.', venue: 'Hudson Conference Center', address: '75 Hudson Yards, New York, NY 10001',
     description: 'Talks, workshops and investor office hours. Lunch and coffee included.', capacity: 300,
     ticketTypes: [tt('Standard', 19900, 0), tt('Student', 4900, 60, { desc: 'Valid student ID required' })],
-    questions: [{ id: shortId('q_'), label: 'Company name', type: 'text', required: true }, { id: shortId('q_'), label: 'Dietary requirements', type: 'select', options: 'None, Vegetarian, Vegan, Gluten-free, Kosher, Halal', required: false }] });
+    questions: [{ id: shortId('q_'), label: 'Company name', type: 'text', required: true, scope: 'event' }, { id: shortId('q_'), label: 'Attendee name (for the badge)', type: 'text', required: true, scope: 'ticket' },
+      { id: shortId('q_'), label: 'Dietary requirements', type: 'select', options: 'None, Vegetarian, Vegan, Gluten-free, Kosher, Halal', required: false, scope: 'ticket' },
+      { id: shortId('q_'), label: 'I agree to the Founders Summit code of conduct', type: 'terms', text: 'Be respectful. No harassment of any kind. Organizers may remove anyone who breaks this code, without a refund.', required: true, scope: 'event' }] });
   const ev5 = mk({ slug: 'kids-science-show', name: 'Big Bang Science Show', category: 'Family', start: day(55, 11, 0), end: day(55, 17, 0),
     summary: 'Hourly hands-on science shows for kids.', venue: 'Discovery Hall', address: '2900 Campus Rd, Brooklyn, NY 11210', audience: 'Ages 4+',
     description: 'Explosions, slime and liquid nitrogen — hourly 45-minute shows from 11 AM to 4 PM. Under 2s free (no ticket needed).',
     ticketTypes: [tt('Adult', 2000, 0), tt('Child (2–12)', 1500, 0), tt('Family 4-pack', 6000, 0, { admits: 4, group: 'Groups' })],
-    timeSlots: [11, 12, 13, 14, 15, 16].map(h => ({ id: shortId('ts_'), start: day(55, h, 0), capacity: 180 })) });
+    timeSlots: [11, 12, 13, 14, 15, 16].map(h => ({ id: shortId('ts_'), start: day(55, h, 0), capacity: 180 })),
+    questions: [{ id: shortId('q_'), label: 'Activity & photo waiver', type: 'waiver', required: true, scope: 'event',
+      text: 'Shows include loud bangs, fog and cold materials handled by our presenters. Children must stay with an adult. Photos taken in the hall may be used on our website and social media.' },
+      { id: shortId('q_'), label: 'Parent / guardian signature', type: 'signature', required: true, scope: 'event' }] });
   const ev6 = mk({ slug: 'comedy-night', name: 'Late Night Comedy Club', category: 'Comedy', status: 'draft', start: day(70, 21, 0), end: day(70, 23, 0),
     summary: 'Five comics, one mic.', venue: 'TBA', address: '', description: 'Line-up coming soon.', ticketTypes: [tt('General', 2500, 120)] });
   // Two independent box offices (plus one registration waiting for approval) to show data separation.
   const boSet = name => ({ ...DEFAULT_SETTINGS, name, feePct: 3, feeFixed: 99 });
   const bo1 = { id: uid(), slug: 'skyline-live', name: 'Skyline Live', status: 'active', owner: 'moishsonn@gmail.com', created_at: day(-60), created_by: 'platform',
     branding: { ...DEFAULT_BRANDING, tagline: 'Concerts and live music across New York', website: 'https://example.com', instagram: 'skylinelive' },
-    settings: { ...boSet('Skyline Live'), contactEmail: 'help@skyline.example' }, templates: clone(DEFAULT_TEMPLATES) };
+    settings: { ...boSet('Skyline Live'), contactEmail: 'help@skyline.example', questions: [{ id: 'q_access', label: 'Accessibility needs (optional)', type: 'text', required: false, scope: 'order' }],
+      checkout: { ...DEFAULT_SETTINGS.checkout, note: 'Tickets are sent to your email right after payment. Questions? help@skyline.example' } }, templates: clone(DEFAULT_TEMPLATES),
+    gateway: { provider: 'demo', account: 'demo_skyline', status: 'connected', test: true, connected_at: day(-59) } };
   const bo2 = { id: uid(), slug: 'harbor-arts', name: 'Harbor Arts Center', status: 'active', owner: 'director@harborarts.example', created_at: day(-45), created_by: 'platform',
     branding: { ...DEFAULT_BRANDING, ink: '#0f3a33', accent: '#7fd3b4', font: 'Playfair Display', tagline: 'Festivals, talks and family days on the waterfront' },
-    settings: { ...boSet('Harbor Arts Center'), contactEmail: 'boxoffice@harborarts.example', taxPct: 8.875 }, templates: clone(DEFAULT_TEMPLATES) };
+    settings: { ...boSet('Harbor Arts Center'), contactEmail: 'boxoffice@harborarts.example', taxPct: 8.875, checkout: { ...DEFAULT_SETTINGS.checkout, address: 'optional' } }, templates: clone(DEFAULT_TEMPLATES),
+    gateway: { provider: 'demo', account: 'demo_harbor', status: 'connected', test: true, connected_at: day(-44) } };
   const bo3 = { id: uid(), slug: 'northside-comedy', name: 'Northside Comedy Collective', status: 'pending', owner: 'hello@northside.example', created_at: day(-1), created_by: 'self-registration',
     branding: { ...DEFAULT_BRANDING }, settings: boSet('Northside Comedy Collective'), templates: clone(DEFAULT_TEMPLATES) };
   [ev1, ev2, ev6].forEach(e => e.box_office_id = bo1.id); [ev3, ev4, ev5].forEach(e => e.box_office_id = bo2.id);
   ev1.contact = { name: 'Front of house', email: 'gala@skyline.example', phone: '(212) 555-0142' };
   ev1.policies = 'No refunds within 7 days of the performance. Latecomers are seated at a suitable break.';
   ev1.instructions = 'Bring your ticket QR on your phone. Coat check is on the lower level.';
+  ev1.page = { video: '', sponsors: [{ name: 'Lyric Bank', url: 'https://example.com' }, { name: 'Hudson Foundation', url: 'https://example.com' }],
+    blocks: [{ id: 'blk1', title: 'The programme', text: 'Tchaikovsky — The Nutcracker Suite\nVivaldi — Winter (The Four Seasons)\nHolst — Jupiter\nInterval of 20 minutes.' }], hide: {}, checkoutNote: 'Premium centre seats include a welcome drink.' };
   ev3.timeSlots.push({ id: shortId('ts_'), start: day(18, 19, 30), capacity: 120, label: 'Late tasting (private)', hidden: true });
   ev5.timeSlots[5].unavailable = true; ev5.timeSlots[0].soldOut = true; ev5.allDay = false; ev3.waitlistMode = 'always';
   ev3.ticketTypes[0].slotPrices = { [ev3.timeSlots[1].id]: 5900 };  // the evening session costs more
@@ -1402,7 +1686,9 @@ function seedDemo() {
   Demo.st.seatLog = Demo.st.seatStatus.map(r => ({ id: uid(), at: r.at, box_office_id: bo1.id, event_id: ev1.id, slot_id: '', seat: r.seat, action: r.status, detail: { blocked: 'Blocked', held: 'Held', unavailable: 'Made unavailable' }[r.status] + ' — ' + r.note, by: r.by, ref: null }));
   const first = ['Alex', 'Jordan', 'Sam', 'Maya', 'Chris', 'Priya', 'Daniel', 'Emma', 'Luis', 'Grace', 'Noah', 'Aisha', 'Ben', 'Chloe', 'Omar', 'Zoe'];
   const last = ['Carter', 'Nguyen', 'Patel', 'Rivera', 'Kim', 'Brooks', 'Cohen', 'Okafor', 'Silva', 'Hughes', 'Morgan', 'Reyes'];
-  let n = 0; const rnd = a => a[Math.floor(Math.random() * a.length)];
+  let n = 0; const rnd = a => a[Math.floor(Math.random() * a.length)], card = { number: '4242424242424242', exp: '12/34', cvc: '123' };
+  const qAns = ev => Object.fromEntries((ev.questions || []).filter(q => q.scope !== 'ticket').map(q => [q.id, q.type === 'terms' || q.type === 'waiver' ? true : q.type === 'signature' ? 'Sample Parent' : q.type === 'select' ? q.options.split(',')[0].trim() : 'Sample Co']));
+  const tAns = (ev, k) => Object.fromEntries((ev.questions || []).filter(q => q.scope === 'ticket').map(q => [q.id, Array.from({ length: k }, () => q.type === 'select' ? 'None' : rnd(first) + ' ' + rnd(last))]));
   for (const ev of events.filter(e => e.status === 'published')) {
     const count = ev === ev1 ? 46 : ev === ev2 ? 60 : 24;
     for (let i = 0; i < count; i++) {
@@ -1411,30 +1697,36 @@ function seedDemo() {
       if (t === vipTT && Math.random() < .55) continue;  // keep some Premium seats for the demo
       const item = { eventId: ev.id, ticketTypeId: t.id, qty, slotId: ev.timeSlots.length ? rnd(ev.timeSlots).id : null };
       if (ev.seating.enabled) {
-        const off = offSeats(availabilityFrom(Demo.st.tickets, ev.id, Demo.st.seatStatus), ''), free = Object.keys(ev.seating.index).filter(id => ev.seating.index[id] === t.id && !off.has(id));
+        const off = offSeats(availabilityFrom(Demo.st.tickets, ev.id, Demo.st.seatStatus, '', Demo.st.orders), ''), free = Object.keys(ev.seating.index).filter(id => ev.seating.index[id] === t.id && !off.has(id));
         const at = Math.floor(Math.random() * Math.max(1, free.length - qty)), seats = free.slice(at, at + qty);
         if (seats.length !== qty) continue; item.seats = seats;
       }
       try {
         const adds = (ev.addons || []).filter(a => !a.ticketTypeIds?.length && !a.areas?.length && Math.random() < .15).map(a => ({ eventId: ev.id, addonId: a.id, qty: 1 }));
-        const r = demoPlaceOrder({ buyer: { name, email, phone: '' }, items: [item], addons: adds, payment: Math.random() < .85 ? 'card' : 'offline', optIn: Math.random() < .6,
+        const r = demoPlaceOrder({ buyer: { name, email, phone: '' }, items: [item], addons: adds, payment: Math.random() < .85 ? 'card' : 'offline', card, optIn: Math.random() < .6, answers: qAns(ev), ticketAnswers: tAns(ev, qty * (t.admits || 1)),
           code: Math.random() < .14 ? rnd(codeFor[ev.id] || ['']) : '', tracking: Math.random() < .18 ? rnd(refFor[ev.box_office_id] || ['']) : '', source: rnd(['', '', 'instagram', 'facebook', 'newsletter']) }, { owner: true });
-        const o = Demo.st.orders.find(x => x.id === r.id); o.created_at = day(-Math.floor(Math.random() * 28), 8 + Math.floor(Math.random() * 14), Math.floor(Math.random() * 60));
-        if (Math.random() < .04) { o.status = 'refunded'; Demo.st.tickets.forEach(t => { if (t.order_id === o.id) { if (t.seat) seatLog(ev, t.slot_id, t.seat, 'cancelled', `Order ${o.ref} refunded — seat released`, { ref: o.ref, by: 'moishsonn@gmail.com' }); t.status = 'cancelled'; } }); }
+        const o = Demo.st.orders.find(x => x.id === r.id); o.created_at = day(-Math.floor(Math.random() * 28), 8 + Math.floor(Math.random() * 14), Math.floor(Math.random() * 60)); if (o.paid_at) o.paid_at = o.created_at;
+        if (o.status === 'paid' && Math.random() < .04) { o.status = 'refunded'; o.data.refunded = o.data.total; Demo.st.tickets.forEach(t => { if (t.order_id === o.id) { if (t.seat) seatLog(ev, t.slot_id, t.seat, 'cancelled', `Order ${o.ref} refunded — seat released`, { ref: o.ref, by: 'moishsonn@gmail.com' }); t.status = 'cancelled'; } }); }
       } catch (e) { /* sold out etc. — skip */ }
     }
   }
   { // two complimentary press seats on the gala
-    const off = offSeats(availabilityFrom(Demo.st.tickets, ev1.id, Demo.st.seatStatus), ''), free = Object.keys(ev1.seating.index).filter(id => ev1.seating.index[id] === stallsTT.id && !off.has(id)).slice(-2);
+    const off = offSeats(availabilityFrom(Demo.st.tickets, ev1.id, Demo.st.seatStatus, '', Demo.st.orders), ''), free = Object.keys(ev1.seating.index).filter(id => ev1.seating.index[id] === stallsTT.id && !off.has(id)).slice(-2);
     try { demoPlaceOrder({ buyer: { name: 'City Arts Review', email: 'press@example.com', phone: '' }, items: [{ eventId: ev1.id, ticketTypeId: stallsTT.id, qty: 2, seats: free }], addons: [], payment: 'manual', comp: true, source: 'box office' }, { owner: true, email: 'moishsonn@gmail.com' }); } catch (e) { }
   }
   { // a few bundle sales
-    const buy = (ev, it, extra = {}) => { try { const r = demoPlaceOrder({ buyer: { name: rnd(first) + ' ' + rnd(last), email: `bundle${n++}@example.com`, phone: '' }, items: [{ eventId: ev.id, ...it }], addons: [], payment: 'card', ...extra }, { owner: true });
-      Demo.st.orders.find(x => x.id === r.id).created_at = day(-Math.floor(Math.random() * 20), 9 + Math.floor(Math.random() * 12)); } catch (e) { } };
+    const buy = (ev, it, extra = {}) => { try { const r = demoPlaceOrder({ buyer: { name: rnd(first) + ' ' + rnd(last), email: `bundle${n++}@example.com`, phone: '' }, items: [{ eventId: ev.id, ...it }], addons: [], payment: 'card', card, answers: qAns(ev), ...extra }, { owner: true });
+      const o = Demo.st.orders.find(x => x.id === r.id); o.created_at = o.paid_at = day(-Math.floor(Math.random() * 20), 9 + Math.floor(Math.random() * 12)); } catch (e) { } };
     for (let i = 0; i < 4; i++) buy(ev2, { bundleId: ev2.bundles[0].id, qty: 1 + (i % 2) });
     for (let i = 0; i < 3; i++) buy(ev5, { bundleId: ev5.bundles[0].id, qty: 1, slotId: ev5.timeSlots[1 + i].id });
-    for (let i = 0; i < 2; i++) { const off = offSeats(availabilityFrom(Demo.st.tickets, ev1.id, Demo.st.seatStatus), ''), seat = Object.keys(ev1.seating.index).filter(id => ev1.seating.index[id] === vipTT.id && !off.has(id))[3 + i * 4];
+    for (let i = 0; i < 2; i++) { const off = offSeats(availabilityFrom(Demo.st.tickets, ev1.id, Demo.st.seatStatus, '', Demo.st.orders), ''), seat = Object.keys(ev1.seating.index).filter(id => ev1.seating.index[id] === vipTT.id && !off.has(id))[3 + i * 4];
       if (seat) buy(ev1, { bundleId: ev1.bundles[0].id, qty: 1, seats: [seat] }, i ? { tracking: 'HOTELPARTNER' } : {}); }
+  }
+  { // a sample customer account: one upcoming order tonight, one festival order, one pay-later reservation
+    Demo.st.customers = [{ email: 'maya@example.com', name: 'Maya Patel', phone: '(917) 555-0188', salt: 'SEEDSALTDEMO2026', hash: 'OAHNUKE7C6R6FZSZF5WLK4F6KZFWUDTRLBPIOBEJG2EFNHMGODT', created_at: day(-12) }];
+    const me = { name: 'Maya Patel', email: 'maya@example.com', phone: '(917) 555-0188' };
+    try { demoPlaceOrder({ buyer: me, items: [{ eventId: ev2.id, ticketTypeId: ev2.ticketTypes[0].id, qty: 2 }], addons: [], payment: 'card', card }, null); } catch (e) { }
+    try { demoPlaceOrder({ buyer: me, items: [{ eventId: ev3.id, ticketTypeId: ev3.ticketTypes[0].id, qty: 1, slotId: ev3.timeSlots[0].id }], addons: [], payment: 'offline' }, null); } catch (e) { }
   }
   ev1.seating.noSingles = true;  // switched on after the sample sales
   bo1.venues = [eventToVenue(ev1, 'Grand Lyric Theatre'), eventToVenue(bo1.eventTemplates[4].event, 'Skyline Roof — dinner layout')];
