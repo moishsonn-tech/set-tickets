@@ -281,6 +281,23 @@ pre.code{background:var(--ink);color:#d7e0ec;border-radius:12px;padding:14px 16p
 #toast{position:fixed;left:50%;bottom:calc(24px + var(--safe-b));transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:8px;align-items:center}
 .toast{background:var(--ink);color:#fff;padding:11px 18px;border-radius:999px;font-size:13px;font-weight:500;box-shadow:var(--shadow-lg);animation:up .2s}
 .toast.bad{background:var(--bad)}
+.bo-pick{background:var(--ink-2);color:#fff;border-color:#24344d;margin:8px 4px 0;font-size:13px;padding:8px 10px}
+.bo-name{color:#fff;font-weight:600;font-size:13px;margin:8px 12px 0}
+.demo-people{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.demo-p{border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:9px 10px;text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:2px;font:inherit;transition:border-color .15s}
+.demo-p:hover{border-color:var(--ink)}.demo-p b{font-size:12.5px}.demo-p span{font-size:11px;color:var(--text-2)}
+.perm-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}
+.perm-g h3{font-size:15px}.perm-g .tabs button{padding:5px 10px;font-size:11px}
+.perm-list{display:flex;flex-direction:column;gap:7px;margin-top:12px}
+.perm-evs{display:flex;flex-direction:column;gap:7px;max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:4px}
+.tpl-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
+.tpl-new{border:1.5px dashed var(--line);background:none;display:flex;align-items:center;justify-content:center;gap:8px;font:inherit;font-weight:600;color:var(--text-2);cursor:pointer;min-height:130px}
+.mfa-setup{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}.mfa-qr{width:150px;height:150px;flex:none;background:#fff;padding:6px;border:1px solid var(--line);border-radius:10px}.mfa-qr img,.mfa-qr canvas{width:100%!important;height:auto!important}
+.bo-hero{background:var(--ink) center/cover no-repeat;color:#fff;padding:120px 0 56px}
+.bo-hero h1{font-size:clamp(40px,7vw,76px)}.bo-hero p{opacity:.82;margin-top:8px;font-size:17px;max-width:620px}
+.bo-logo{height:64px;width:auto;margin-bottom:16px;display:block}
+.pub-nav .bo-brand img{height:36px;width:auto;display:block}
+.bo-word{font-family:var(--display);font-size:24px;text-transform:uppercase;letter-spacing:.01em;color:#fff;line-height:1}
 .mob-nav{display:none}
 
 /* embed widget mode */
@@ -460,6 +477,7 @@ body.scan-mode{background:#000}
   .hero{padding:110px 16px 70px;min-height:480px}
   .hero .mark{height:96px}
   .grid2,.grid3{grid-template-columns:1fr}
+  .demo-people{grid-template-columns:1fr}.perm-grid{grid-template-columns:1fr}
   .e-ticket{grid-template-columns:1fr}
   .e-ticket .r{border-left:0;border-top:2px dashed var(--line-2)}
   .e-ticket .r::before,.e-ticket .r::after{display:none}
