@@ -129,6 +129,7 @@ async function onRoute() {
   if (r.page === 'order') loadOrder(r.params[0], r.params[1]);
   if (r.page === 'platform' && r.params[0] !== S._platSub) { S._platSub = r.params[0]; S.plat = null; }  // fresh numbers on each platform page
   setContext();
+  if (r.page === 'admin' && r.sub === 'venues' && r.params[0]) { const v = (S.adm?.bo?.venues || []).find(x => x.id === r.params[0]); if (v && S.draft?._venue !== v.id) { S.draft = venueDraft(v); S.dirty = false; S.ui.smSel = ''; S.ui.smMulti = []; S.ui.smSeats = []; } }
   if (r.page === 'admin' && r.sub === 'event') { const ev = S.adm?.events.find(e => e.id === r.params[0]); if (ev && S.draft?.id !== ev.id) { S.draft = JSON.parse(JSON.stringify(ev)); S.dirty = false; } }
   render(); if (!location.hash.includes('#/admin/event/')) window.scrollTo(0, 0);
 }
@@ -341,7 +342,7 @@ function TicketPanel(ev, sel, av) {
   const slotOK = !ev.timeSlots?.length || sel.slotId;
   const tierOf = id => ev.seating?.index?.[id];
   const seatCount = tt => sel.seats.filter(s => tierOf(s) === tt.id).length;
-  const takenNow = new Set((av.seats || []).filter(k => k.startsWith((sel.slotId || '') + '|')).map(k => k.split('|')[1]));
+  const takenNow = offSeats(av, sel.slotId);
   const left = t => seated ? Object.keys(ev.seating.index || {}).filter(id => tierOf(id) === t.id && !takenNow.has(id)).length
     : +t.qty > 0 ? Math.max(0, +t.qty - (av.tt[t.id] || 0)) : Infinity;
   const evLeft = +ev.capacity > 0 ? Math.max(0, +ev.capacity - av.total) : Infinity;
@@ -375,45 +376,77 @@ function TicketPanel(ev, sel, av) {
 }
 const TIER_COLORS = ['#020a16', '#2f66b2', '#7a5aa6', '#1f8a5b', '#b35c34', '#0e7490', '#9d174d', '#4d7c0f'];
 const tierColor = (ev, ttId) => { const i = ev.ticketTypes.findIndex(t => t.id === ttId); return i < 0 ? '#c9c5ba' : TIER_COLORS[i % TIER_COLORS.length]; };
+// back-office seat state colours (available seats keep their price colour)
+const STATE_COLORS = { sold: '#4b5361', comp: '#9b7fd4', checkout: '#e0a23a', held: '#f08a24', blocked: '#ffffff', unavailable: '#e4e1d8' };
 const _layoutMemo = new WeakMap();
-const layoutOf = st => { const k = JSON.stringify([st.sections, st.prices, st.stage]); const m = _layoutMemo.get(st); if (m && m.k === k) return m.L; const L = seatLayout(st); _layoutMemo.set(st, { k, L }); return L; };
-// "Stalls centre · Row A · Seat 12" (long) or "Stalls centre A12" (short)
-function seatName(ev, id, short) {
-  const p = ev?.seating?.sections && layoutOf(ev.seating).seats.find(x => x.id === id); if (!p) return id || '';
-  if (p.sec.kind === 'table') return short ? `${p.sec.name} · ${p.num}` : `${p.sec.name} · Seat ${p.num}`;
-  return short ? `${p.sec.name} ${p.row}${p.num}` : `${p.sec.name} · Row ${p.row} · Seat ${p.num}`;
+const layoutOf = st => { const k = JSON.stringify([st.sections, st.prices, st.stage, st.levels, st.removed, st.labels, st.areas]); const m = _layoutMemo.get(st); if (m && m.k === k) return m.L;
+  const L = seatLayout(st); L.byId = new Map(L.seats.map(p => [p.id, p])); _layoutMemo.set(st, { k, L }); return L; };
+// Area / Row / Seat — from the ticket when it has them (what was sold), else from the map.
+function seatParts(ev, id, t) {
+  if (t?.area != null) return { area: t.area, row: t.row || '', seat: t.seat_label || '' };
+  const p = ev?.seating?.sections && layoutOf(ev.seating).byId.get(id); if (p) return { area: p.area, row: p.row, seat: p.label };
+  return seatInfo(ev, id, t);
 }
-// One SVG renderer for buyers (mode '') and the designer (mode 'move' | 'paint' | 'block').
+// "Stalls centre · Row A · Seat 12" (long) or "Stalls centre A12" (short)
+function seatName(ev, id, short, t) {
+  const i = seatParts(ev, id, t); if (!i.area && !i.row) return i.seat || id || '';
+  if (short) return [i.area, i.row ? i.row + i.seat : i.seat].filter(Boolean).join(' ');
+  return [i.area, i.row && 'Row ' + i.row, i.seat && 'Seat ' + i.seat].filter(Boolean).join(' · ');
+}
+const levelsOf = st => st?.levels?.length ? st.levels : [{ id: '', name: 'Main floor' }];
+// One SVG renderer for buyers (mode ''), the builder ('move' | 'paint' | 'seats') and the inventory ('inv').
+// o: {level, off:Set (buyer: can't pick), mine:Set, selected:Set(section ids), seatSel:Set, states:Map (inv), filter (inv state), ghosts (show removed seats)}
 function SeatCanvas(ev, o = {}) {
-  const st = ev.seating, L = layoutOf(st), b = L.bounds, pad = 24, design = !!o.mode;
-  const blocked = new Set(st.blocked || []), taken = o.taken || new Set(), mine = new Set(o.mine || []), sold = o.sold || new Set();
-  const stg = st.stage;
+  const st = ev.seating, L = layoutOf(st), lv = o.level ?? L.lv0, b = boundsOf(L, lv, st.stage), pad = 24, design = !!o.mode, inv = o.mode === 'inv';
+  const off = o.off || new Set(), mine = new Set(o.mine || []), seatSel = o.seatSel || new Set(), selSecs = o.selected || new Set(), stg = st.stage;
+  const stageHere = stg && (stg.level || L.lv0 || '') === lv, bg = st.bg?.src && (design || st.bg.public) && (st.bg.level || L.lv0 || '') === lv ? st.bg : null;
   const vb = `${b.x0 - pad} ${b.y0 - pad} ${b.x1 - b.x0 + 2 * pad} ${b.y1 - b.y0 + 2 * pad}`;
+  const ttOf = id => ev.ticketTypes.find(x => x.id === id);
   return `<svg class="sm ${design ? 'sm-design sm-' + o.mode : ''}" viewBox="${vb}" preserveAspectRatio="xMidYMin meet" role="img" aria-label="Seating map">
-    ${stg ? `<g class="sm-stage ${design ? 'drag' : ''}" data-stage="1" transform="translate(${+stg.x} ${+stg.y})"><rect width="${+stg.w}" height="${+stg.h}" rx="12"/><text x="${stg.w / 2}" y="${stg.h / 2 + 5}">${esc(stg.label || 'STAGE')}</text></g>` : ''}
-    ${L.secs.map(g => { const sec = g.sec, on = o.selected === sec.id;
-      const rows = sec.kind === 'table' ? '' : [...new Set(g.local.map(p => p.row))].map(r => { const rs = g.local.filter(p => p.row === r), f = rs.reduce((a, p) => p.x < a.x ? p : a, rs[0]), l = rs.reduce((a, p) => p.x > a.x ? p : a, rs[0]);
+    ${bg ? `<image class="sm-bg" href="${esc(bg.src)}" x="${+bg.x || 0}" y="${+bg.y || 0}" width="${+bg.w || 800}" opacity="${bg.opacity ?? .35}" preserveAspectRatio="xMinYMin meet"/>` : ''}
+    ${stageHere ? `<g class="sm-stage ${o.mode === 'move' ? 'drag' : ''}" data-stage="1" transform="translate(${+stg.x} ${+stg.y})"><rect width="${+stg.w}" height="${+stg.h}" rx="12"/><text x="${stg.w / 2}" y="${stg.h / 2 + 5}">${esc(stg.label || 'STAGE')}</text></g>` : ''}
+    ${L.secs.filter(g => g.level === lv).map(g => { const sec = g.sec, on = selSecs.has(sec.id);
+      const rows = g.kind !== 'rows' ? '' : [...new Set(g.all.map(p => p.row))].map(r => { const rs = g.all.filter(p => p.row === r), f = rs.reduce((a, p) => p.x < a.x ? p : a, rs[0]), l = rs.reduce((a, p) => p.x > a.x ? p : a, rs[0]);
         return `<text class="sm-row" data-row="${sec.id}|${esc(r)}" x="${f.x - 20}" y="${f.y + 4}">${esc(r)}</text><text class="sm-row" data-row="${sec.id}|${esc(r)}" x="${l.x + 20}" y="${l.y + 4}">${esc(r)}</text>`; }).join('');
+      let ga = '';
+      if (g.kind === 'ga') {
+        const spots = g.local, t = ttOf(sec.ticketTypeId), bx = g.box;
+        const free = inv ? spots.filter(p => o.states?.get(p.id)?.state === 'available').length : spots.filter(p => !off.has(p.id) && !mine.has(p.id)).length, picked = spots.filter(p => mine.has(p.id)).length;
+        const buy = !design && !o.preview && t && free > 0, selN = spots.filter(p => seatSel.has(p.id)).length;
+        ga = `<rect class="sm-ga ${buy ? 'buy' : ''} ${selN ? 'sel' : ''}" x="${bx.x}" y="${bx.y}" width="${bx.w}" height="${bx.h}" rx="12" fill="${t ? tierColor(ev, t.id) : '#c9c5ba'}" ${buy ? `data-action="pickGa" data-v="${esc(sec.code)}"` : ''} data-ga="${sec.id}"><title>${esc(g.local[0]?.area || sec.name)}${t ? ' — ' + esc(t.name) + ' ' + money(t.price, ev.currency) : ''}</title></rect>
+          <text class="sm-ga-t" x="${bx.x + bx.w / 2}" y="${bx.y + bx.h / 2 - 2}">${esc(sec.name)}</text><text class="sm-ga-n" x="${bx.x + bx.w / 2}" y="${bx.y + bx.h / 2 + 15}">${inv ? `${spots.length - free} / ${spots.length} taken` : picked ? `${picked} selected · ${free} left` : free ? `${free} left · tap to add` : 'Sold out'}</text>`;
+      }
       return `<g class="sm-sec ${on ? 'on' : ''}" data-sec="${sec.id}" transform="translate(${+sec.x || 0} ${+sec.y || 0}) rotate(${+sec.rot || 0} ${g.cx} ${g.cy})">
         ${design ? `<rect class="sm-hit" x="${g.minx - 32}" y="${g.miny - 40}" width="${g.maxx - g.minx + 64}" height="${g.maxy - g.miny + 58}" rx="14"/>` : ''}
-        <text class="sm-name" x="${g.cx}" y="${g.miny - 22}">${esc(sec.name)}</text>
-        ${sec.kind === 'table' ? `<circle class="sm-table" cx="0" cy="0" r="${g.R}"/>` : rows}
-        ${g.local.map(p => {
-          const isB = blocked.has(p.id), isT = taken.has(p.id) || (design && sold.has(p.id)), isM = mine.has(p.id), t = ev.ticketTypes.find(x => x.id === p.tt);
-          const fill = isB ? 'none' : isT && !design ? '#d7d4cb' : tierColor(ev, p.tt);
-          const buy = !design && !isB && !isT && t;
-          return `<circle class="st ${isB ? 'blk' : ''} ${isT ? 'tkn' : ''} ${isM ? 'mine' : ''} ${!t ? 'nop' : ''}" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="10.5" fill="${fill}" data-seat="${esc(p.id)}" ${buy ? `data-action="pickSeat" data-v="${esc(p.id)}"` : ''}><title>${esc(seatName(ev, p.id))}${t ? ' — ' + esc(t.name) + ' ' + money(t.price, ev.currency) : ' — not for sale'}${isT ? ' (sold)' : isB ? ' (blocked)' : ''}</title></circle>${sec.kind === 'table' || isB ? '' : `<text class="sm-num" x="${p.x.toFixed(1)}" y="${(p.y + 3.5).toFixed(1)}">${p.num}</text>`}`;
+        <text class="sm-name" ${inv || o.mode === 'seats' ? `data-secname="${sec.id}"` : ''} x="${g.cx}" y="${g.miny - 22}">${esc(sec.name)}</text>
+        ${g.kind === 'table' ? `<circle class="sm-table" cx="0" cy="0" r="${g.R}"/>` : g.kind === 'booth' ? `<rect class="sm-table" x="${g.box.x}" y="${g.box.y}" width="${g.box.w}" height="${g.box.h}" rx="8"/>` : g.kind === 'ga' ? ga : rows}
+        ${g.kind === 'ga' ? '' : (o.ghosts ? g.all : g.local).map(p => {
+          if (p.removed) return `<circle class="st rm ${seatSel.has(p.id) ? 'sel' : ''}" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="10.5" data-seat="${esc(p.id)}"><title>${esc(p.id)} — removed (click to select, then Restore)</title></circle>`;
+          const t = ttOf(p.tt), x = inv ? o.states?.get(p.id) : null, isOff = off.has(p.id), isM = mine.has(p.id), sel = seatSel.has(p.id);
+          let fill = tierColor(ev, p.tt), cls = '';
+          if (inv) { if (x.state !== 'available') fill = STATE_COLORS[x.state]; cls = 'inv-' + x.state + (o.filter && !(o.filter === x.state || (o.filter === 'discount' && x.o?.data?.code) || (o.filter === 'released' && o.released?.has(p.id))) ? ' dim' : ''); }
+          else if (!design && (isOff || !t)) { fill = '#d7d4cb'; cls = 'tkn'; }
+          const buy = !design && !o.preview && !isOff && t;
+          const tip = `${seatName(ev, p.id)}${t ? ' — ' + t.name + ' ' + money(t.price, ev.currency) : ' — not for sale'}${inv ? ' · ' + SEAT_STATES[x.state] + (x.t ? ' · ' + x.t.holder : '') + (x.s?.note ? ' · ' + x.s.note : '') : isOff ? ' (unavailable)' : ''}`;
+          return `<circle class="st ${cls} ${isM ? 'mine' : ''} ${sel ? 'sel' : ''} ${!t ? 'nop' : ''}" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="10.5" fill="${fill}" data-seat="${esc(p.id)}" ${buy ? `data-action="pickSeat" data-v="${esc(p.id)}"` : ''}><title>${esc(tip)}</title></circle>${g.kind === 'table' ? '' : `<text class="sm-num" x="${p.x.toFixed(1)}" y="${(p.y + 3.5).toFixed(1)}">${esc(p.label)}</text>`}`;
         }).join('')}</g>`; }).join('')}
   </svg>`;
 }
-function BuyerSeatMap(ev, av, sel) {
-  const taken = new Set((av?.seats || []).filter(k => k.startsWith((sel?.slotId || '') + '|')).map(k => k.split('|')[1]));
-  const used = [...new Set(Object.values(ev.seating.index || {}))], z = S.ui.zoom || 1;
+function LevelTabs(st, cur, action) {
+  const lv = levelsOf(st); if (lv.length < 2) return '';
+  return `<div class="tabs sm-levels">${lv.map(l => `<button type="button" class="${cur === l.id ? 'on' : ''}" data-action="${action}" data-v="${esc(l.id)}">${esc(l.name)}</button>`).join('')}</div>`;
+}
+function BuyerSeatMap(ev, av, sel, preview) {
+  const off = offSeats(av, sel?.slotId), used = [...new Set(Object.values(ev.seating.index || {}))], z = S.ui.zoom || 1;
+  const lvs = levelsOf(ev.seating), lv = lvs.some(l => l.id === S.ui.bLevel) ? S.ui.bLevel : lvs[0].id;
+  const mineOn = id => (sel?.seats || []).filter(s => (layoutOf(ev.seating).byId.get(s)?.level ?? '') === id).length;
   return `<div class="card sm-buy"><div class="between wrap" style="margin-bottom:10px"><div><div class="eyebrow dash">Choose your seats</div><p class="small muted" style="margin-top:4px">Tap seats to select them. Tap again to remove.</p></div>
       <div class="row"><button class="icon-btn" data-action="zoom" data-d="-1" aria-label="Zoom out">−</button><button class="icon-btn" data-action="zoom" data-d="1" aria-label="Zoom in">+</button></div></div>
-    <div class="sm-scroll"><div style="width:${z * 100}%">${SeatCanvas(ev, { taken, mine: sel?.seats })}</div></div>
+    ${lvs.length > 1 ? `<div class="tabs sm-levels">${lvs.map(l => `<button type="button" class="${lv === l.id ? 'on' : ''}" data-action="bLevel" data-v="${esc(l.id)}">${esc(l.name)}${mineOn(l.id) ? ` · ${mineOn(l.id)}` : ''}</button>`).join('')}</div>` : ''}
+    <div class="sm-scroll"><div style="width:${z * 100}%">${SeatCanvas(ev, { off, mine: sel?.seats, level: lv, preview })}</div></div>
     <div class="legend">${ev.ticketTypes.filter(t => used.includes(t.id)).map(t => `<span><i style="background:${tierColor(ev, t.id)}"></i>${esc(t.name)} ${money(t.price, ev.currency)}</span>`).join('')}
-      <span><i style="background:#d7d4cb"></i>Sold</span><span><i style="background:var(--accent);box-shadow:0 0 0 2px var(--ink)"></i>Your seats</span></div></div>`;
+      <span><i style="background:#d7d4cb"></i>Unavailable</span><span><i style="background:var(--accent);box-shadow:0 0 0 2px var(--ink)"></i>Your seats</span></div>
+    ${ev.seating.noSingles ? '<p class="small muted" style="margin-top:8px">Please don\'t leave a single empty seat between your seats and the next ones.</p>' : ''}</div>`;
 }
 function Waitlist(ev, why) {
   if (ev.waitlistMode === 'off' || (why === 'presale' && !['presale', 'always'].includes(ev.waitlistMode))) return why === 'soldout' ? '<h3>Sold out</h3><p class="muted small">This event is sold out.</p>' : '';
@@ -442,6 +475,7 @@ function Checkout() {
     <div>
       <a href="javascript:history.back()" class="small muted" style="text-decoration:none">← Keep shopping</a>
       <h1 class="display" style="font-size:44px;margin:10px 0 22px">Checkout</h1>
+      ${Object.values(S.cart.holds || {}).some(Boolean) ? `<div class="banner info hold-banner">${ic('lock', 14)} <span data-hold="${esc(Object.values(S.cart.holds).filter(Boolean).sort()[0])}">${holdText(Object.values(S.cart.holds).filter(Boolean).sort()[0])}</span></div>` : ''}
       <div class="card stack">
         <div class="eyebrow dash">Your details</div>
         <div class="grid2"><div><label class="fl">Full name *</label><input class="inp" data-bind="co.name" autocomplete="name" value="${esc(co.name)}"></div>
@@ -484,6 +518,10 @@ function Checkout() {
   </div></div>`;
 }
 
+function holdText(exp) { const ms = D(exp) - Date.now(); if (ms <= 0) return 'Your seat hold has ended — the seats are yours if nobody else has taken them. Complete your order now.';
+  const m = Math.floor(ms / 6e4), sec = Math.floor(ms / 1000) % 60; return `Your seats are held for you for ${m}:${String(sec).padStart(2, '0')}`; }
+setInterval(() => document.querySelectorAll('[data-hold]').forEach(el => { el.textContent = holdText(el.dataset.hold); }), 1000);
+
 // ── Order confirmation + e-tickets ───────────────────────────────────────────
 async function loadOrder(id, key) {
   if (S.order?.order?.id === id) return;
@@ -502,7 +540,7 @@ function OrderPage() {
       <h1 class="display" style="font-size:48px;margin:12px 0 6px">${ord.status === 'cancelled' || ord.status === 'refunded' ? 'Order ' + esc(ord.status) : 'You\'re going!'}</h1>
       <p class="muted">Order <b>${esc(ord.ref)}</b> · confirmation sent to <b>${esc(ord.buyer_email)}</b></p>
       <div class="row wrap" style="margin:18px 0 26px">
-        <button class="btn btn-dark" data-action="print">Download / print tickets</button>
+        <button class="btn btn-dark" data-action="print">Download PDF / print tickets</button>
         ${[...new Set(d.lines.map(l => l.eventId))].map(id => evById(id) ? `<button class="btn btn-ghost" data-action="ics" data-id="${id}">${ic('cal', 14)} Add ${esc(evById(id).name)} to calendar</button>` : '').join('')}
         <button class="btn btn-ghost" data-action="resendMine">Email my tickets again</button>
       </div>
@@ -514,9 +552,12 @@ function OrderPage() {
         <h3 style="margin-top:6px">${esc(ev.name)}</h3>
         <div class="kv"><div><div class="k">Date</div><div class="v">${esc(fmtDate(t.slot_id ? l.slotStart : ev.start, { month: 'short', day: 'numeric', year: 'numeric' }))}</div></div>
           <div><div class="k">Time</div><div class="v">${esc(fmtTime(t.slot_id ? l.slotStart : ev.start))}</div></div>
-          <div><div class="k">${t.seat ? 'Seat' : 'Entry'}</div><div class="v">${esc(t.seat ? seatName(ev, t.seat, true) : 'General')}</div></div>
+          ${t.seat ? (sp => `<div class="seat3"><div><div class="k">Ticket type / Area</div><div class="v">${esc(sp.area && sp.area !== l.name ? `${l.name || ''} · ${sp.area}` : sp.area || l.name || '')}</div></div>
+            <div><div class="k">Row</div><div class="v">${esc(sp.row || '—')}</div></div><div><div class="k">Seat</div><div class="v">${esc(sp.seat || '—')}</div></div></div>`)(seatParts(ev, t.seat, t))
+            : `<div><div class="k">Entry</div><div class="v">General admission</div></div>`}
           <div><div class="k">Name</div><div class="v">${esc(t.holder)}</div></div>
-          <div style="grid-column:span 2"><div class="k">Venue</div><div class="v">${esc(ev.venue || '')}</div></div></div>
+          <div><div class="k">Order</div><div class="v">${esc(ord.ref)}</div></div>
+          <div style="grid-column:span 2"><div class="k">Venue</div><div class="v">${esc([ev.venue, ev.address].filter(Boolean).join(' · '))}</div></div></div>
       </div><div class="r"><div class="qr" data-qr="${esc(t.code)}"></div><div class="code">${esc(t.code)}</div><div class="small muted">${t.checked_in_at ? 'Checked in ' + esc(fmtDT(t.checked_in_at)) : 'Show at the door'}</div></div></div>`;
     }).join('')}
     <div class="card no-print" style="margin-top:20px"><h3>Receipt</h3>
@@ -542,7 +583,7 @@ function FindTickets() {
 //  ORGANIZER BACK OFFICE
 // ══════════════════════════════════════════════════════════════════════════════
 const NAV = [
-  ['dashboard', 'Dashboard', 'home'], ['events', 'Events', 'cal', 'events.view'], ['orders', 'Orders', 'cart', 'orders.view'], ['attendees', 'Door list', 'users', 'door.attendees'],
+  ['dashboard', 'Dashboard', 'home'], ['events', 'Events', 'cal', 'events.view'], ['venues', 'Venues', 'pin', 'seating.view'], ['orders', 'Orders', 'cart', 'orders.view'], ['attendees', 'Door list', 'users', 'door.attendees'],
   ['checkin', 'Scanner app', 'scan', 'door.scan'], ['reports', 'Reports', 'chart', 'finance.reports'], ['marketing', 'Marketing', 'mega', 'comms.email'],
   ['team', 'Team', 'team', 'admin.invite|admin.perms|admin.remove'], ['branding', 'Branding', 'brush', 'admin.settings'], ['settings', 'Settings', 'gear', 'admin.settings'], ['security', 'My security', 'lock'],
 ];
@@ -553,7 +594,7 @@ function AdminShell() {
   if (!S.adm) return `<div class="empty" style="padding-top:30vh">Loading…</div>`;
   if (!S.adm.bo) return S.adm.super ? (setTimeout(() => { location.hash = '#/platform'; }), '') : Gate('No box office yet', `${esc(S.user.email)} isn't on any box office team. Ask an owner to invite you.`);
   if (S.adm.blocked) return Gate(S.adm.bo.name + ' is ' + BO_STATUS[S.adm.blocked].toLowerCase(), S.adm.blocked === 'pending' ? 'The platform team is reviewing this box office. You\'ll get an email when it\'s approved.' : 'Event pages and checkout are offline and staff access is paused. Contact the platform team.');
-  const sub = S.route.sub, page = { dashboard: Dashboard, events: EventsList, event: EventEditor, orders: Orders, attendees: Attendees, checkin: CheckIn, reports: Reports, marketing: Marketing, team: Team, branding: Branding, settings: Settings, security: Security }[sub] || Dashboard;
+  const sub = S.route.sub, page = { dashboard: Dashboard, events: EventsList, event: EventEditor, venues: Venues, orders: Orders, attendees: Attendees, checkin: CheckIn, reports: Reports, marketing: Marketing, team: Team, branding: Branding, settings: Settings, security: Security }[sub] || Dashboard;
   const allowed = NAV.filter(navOk), navKey = sub === 'event' ? 'events' : sub, entry = NAV.find(n => n[0] === navKey);
   const body = S.adm.needs2fa && sub !== 'security' ? Gate2fa() : entry && !navOk(entry) ? `<div class="empty"><div class="display" style="font-size:28px">No access</div><p class="muted" style="margin-top:8px">You don't have permission to open ${esc(entry[1])}. Ask a box office admin.</p></div>` : page();
   return `<div class="admin">
@@ -672,13 +713,13 @@ function NewEventModal() {
   modal('New event', `<div class="new-ev"><button class="item-card" data-action="blankEvent"><b>Blank event</b><span class="small muted">Start from scratch</span></button>
     ${list.map(t => `<button class="item-card" data-action="fromTemplate" data-v="${t.id}"><b>${esc(t.name)}</b><span class="small muted">${esc(t.event.ticketTypes.length)} ticket types${t.event.seating?.enabled ? ' · seating map' : ''}</span></button>`).join('')}</div>`);
 }
-const ETABS = [['overview', 'Overview'], ['details', 'Details'], ['tickets', 'Tickets'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['checkout', 'Checkout'], ['discounts', 'Discounts'],
+const ETABS = [['overview', 'Overview'], ['details', 'Details'], ['tickets', 'Tickets'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['inventory', 'Seat inventory'], ['checkout', 'Checkout'], ['discounts', 'Discounts'],
   ['emails', 'Emails'], ['waitlist', 'Waitlist'], ['team', 'Team'], ['history', 'History'], ['share', 'Share & embed']];
 function EventEditor() {
   const ev = S.draft; if (!ev) return '<p class="muted">Event not found.</p>';
   const tab = S.route.params[1] || 'overview', ro = !can('events.edit', ev.id), pub = can('events.publish', ev.id);
-  const body = { overview: EdOverview, details: EdDetails, tickets: EdTickets, schedule: EdSchedule, seating: EdSeating, checkout: EdCheckout, discounts: EdDiscounts, emails: EdEmails, waitlist: EdWaitlist, team: EdTeam, history: EdHistory, share: EdShare }[tab] || EdOverview;
-  const live = ['overview', 'team', 'history', 'waitlist'].includes(tab);  // these tabs act immediately, not through "Save changes"
+  const body = { overview: EdOverview, details: EdDetails, tickets: EdTickets, schedule: EdSchedule, seating: EdSeating, inventory: EdInventory, checkout: EdCheckout, discounts: EdDiscounts, emails: EdEmails, waitlist: EdWaitlist, team: EdTeam, history: EdHistory, share: EdShare }[tab] || EdOverview;
+  const live = ['overview', 'team', 'history', 'waitlist', 'inventory'].includes(tab);  // these tabs act immediately, not through "Save changes"
   return `<a href="#/admin/events" class="small muted" style="text-decoration:none">← Events</a>
   ${head(esc(ev.name || 'Untitled event'), `${evChip(ev)} ${S.dirty ? '<span class="chip warn">Unsaved changes</span>' : ''}`,
     `<a class="btn btn-ghost" href="#/e/${esc(ev.slug)}?preview=1" target="_blank">Preview</a>
@@ -690,11 +731,11 @@ function EventEditor() {
 }
 function EdOverview(ev) {
   const saved = S.adm.events.find(e => e.id === ev.id) || ev, tks = S.adm.tickets.filter(t => t.event_id === ev.id), valid = tks.filter(t => t.status === 'valid');
-  const so = sellout(saved, tks), fin = can('finance.totals'), v = S.adm.views?.[ev.id] || { total: 0, unique: 0, today: 0, last10m: 0, bySrc: {} };
+  const so = sellout(saved, tks, S.adm.seatStatus, S.adm.orders), fin = can('finance.totals'), v = S.adm.views?.[ev.id] || { total: 0, unique: 0, today: 0, last10m: 0, bySrc: {} };
   const os = S.adm.orders.filter(o => o.event_ids.includes(ev.id) && ['paid', 'pending'].includes(o.status));
   const paidOrders = new Set(os.filter(o => o.status === 'paid' && !o.data.comp).map(o => o.id)), compOrders = new Set(os.filter(o => o.data.comp).map(o => o.id));
   const collected = sum(os.filter(o => o.status === 'paid'), o => sum(o.data.lines.filter(l => l.eventId === ev.id), l => l.unit * l.qty) - (o.data.discount || 0) * (sum(o.data.lines.filter(l => l.eventId === ev.id), l => l.unit * l.qty) / Math.max(1, o.data.subtotal)));
-  const s = evStats(saved), blocked = (saved.seating?.enabled ? (saved.seating.blocked || []).length : 0) * so.shows;
+  const s = evStats(saved), blocked = sum(so.byArea, r => r.blocked);
   const pct = x => (x * 100).toFixed(x && x < .1 ? 1 : 0) + '%';
   const kpi = (l, val, d = '', dark) => `<div class="kpi ${dark ? 'dark' : ''}"><div class="eyebrow">${l}</div><div class="v">${val}</div>${d ? `<div class="d" ${dark ? 'style="color:var(--mut)"' : ''}>${d}</div>` : ''}</div>`;
   const slots = (saved.timeSlots || []);
@@ -704,8 +745,11 @@ function EdOverview(ev) {
   <div class="bar big" style="margin:-4px 0 22px"><i style="width:${Math.min(100, so.pct * 100)}%"></i></div>
   <div class="cols"><div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>By ticket type</h3></div><table class="tbl"><thead><tr><th>Ticket</th><th>Price</th><th>Inventory</th><th>Sold</th><th>Potential</th><th>Remaining</th></tr></thead><tbody>
     ${so.byTT.map(r => `<tr><td>${esc(r.tt.name)}${r.tt.hidden ? ' <span class="chip">hidden</span>' : ''}</td><td class="tnum">${money(r.tt.price)}</td><td class="tnum">${r.capacity == null ? '∞' : r.capacity}</td><td class="tnum">${r.sold}</td><td class="tnum">${money(r.potential)}</td><td class="tnum">${money(Math.max(0, r.potential - r.soldValue))}</td></tr>`).join('')}</tbody></table></div>
-  ${so.bySec.length ? `<div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>By seating section</h3></div><table class="tbl"><thead><tr><th>Section</th><th>Seats</th><th>Sold</th><th>Blocked</th><th>Potential</th><th>Remaining</th></tr></thead><tbody>
-    ${so.bySec.map(r => `<tr><td>${esc(r.name)}</td><td class="tnum">${r.seats}</td><td class="tnum">${r.sold}</td><td class="tnum">${r.blocked}</td><td class="tnum">${money(r.potential)}</td><td class="tnum">${money(Math.max(0, r.potential - r.soldValue))}</td></tr>`).join('')}</tbody></table></div>` : `<div class="card"><h3>How this is calculated</h3><p class="small muted" style="margin-top:6px">Every sellable ticket × its price, per showtime. It updates by itself when prices, quantities, showtimes, seats or blocks change, and as tickets sell. Comps use up inventory but count at $0 collected.</p></div>`}</div>` : ''}
+  ${`<div class="card"><h3>How this is calculated</h3><p class="small muted" style="margin-top:6px">Every sellable ticket × its price, per showtime. It updates by itself when prices, quantities, showtimes, seats or blocks change, and as tickets sell. Comps use up inventory but count at $0 collected.</p></div>`}</div>
+  ${so.byArea.length ? `<div class="card" style="padding:0;margin-top:16px"><div class="between" style="padding:16px 20px 4px"><h3>By seating area</h3>${can('seating.view', ev.id) ? `<a class="small" href="#/admin/event/${ev.id}/inventory">Seat inventory →</a>` : ''}</div><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Area</th><th>Seats</th><th>Price</th><th>Sold</th><th>Available</th><th>Blocked</th><th>Comped</th><th>Potential</th><th>Actual</th><th>Remaining</th></tr></thead><tbody>
+    ${so.byArea.map(r => `<tr><td><b>${esc(r.name)}</b></td><td class="tnum">${r.seats}</td><td class="tnum">${r.prices.length ? r.prices.map(p => money(p)).join(' / ') : '—'}</td><td class="tnum">${r.sold}</td><td class="tnum">${r.available}${r.held ? `<div class="small muted">+${r.held} held</div>` : ''}</td><td class="tnum">${r.blocked}${r.unavailable ? `<div class="small muted">+${r.unavailable} unavail.</div>` : ''}</td><td class="tnum">${r.comped}</td><td class="tnum">${money(r.potential)}</td><td class="tnum">${money(r.actual)}</td><td class="tnum">${money(r.remaining)}</td></tr>`).join('')}
+    <tr><td><b>All areas</b></td>${['seats'].map(k => `<td class="tnum"><b>${sum(so.byArea, r => r[k])}</b></td>`).join('')}<td></td>${['sold', 'available', 'blocked', 'comped'].map(k => `<td class="tnum"><b>${sum(so.byArea, r => r[k])}</b></td>`).join('')}${['potential', 'actual', 'remaining'].map(k => `<td class="tnum"><b>${money(sum(so.byArea, r => r[k]))}</b></td>`).join('')}</tr></tbody></table></div>
+    <p class="small muted" style="padding:10px 20px 16px">Potential = every seat not blocked or unavailable at its price${so.shows > 1 ? `, × ${so.shows} showtimes` : ''}. Actual = what paid orders collected for those seats after discounts. Remaining = seats still available or held.</p></div>` : ''}` : ''}
   <div class="eyebrow dash" style="margin:22px 0 12px">Performance</div>
   <div class="kpis">${kpi('Page views', v.total.toLocaleString(), `${v.unique.toLocaleString()} unique · ${v.today} today`)}${kpi('Viewing now', v.last10m, 'last 10 minutes')}
     ${kpi('Conversion', v.unique ? pct(os.length / v.unique) : '—', `${os.length} orders from ${v.unique} visitors`)}${kpi('Tickets issued', valid.length, `${valid.filter(t => paidOrders.has(t.order_id)).length} paid · ${valid.filter(t => compOrders.has(t.order_id)).length} comp`)}</div>
@@ -801,6 +845,98 @@ function EdTeam(ev) {
       : `<span class="chip">No</span>${edit && m.email !== S.adm.me.email ? ` <button class="btn btn-ghost btn-sm" data-action="evAccess" data-v="${esc(m.email)}" data-on="1">Add to this event</button>` : ''}`}</td></tr>`).join('')}</tbody></table></div>
   ${!edit ? '<p class="small muted" style="margin-top:10px">You need “Edit team permissions” to change access.</p>' : ''}`;
 }
+// ── Seat inventory (Eli Step 3 §7–10): live counts, click a count to see its seats, bulk actions, per-seat history ──
+const invLevel = st => { const l = levelsOf(st); return l.some(x => x.id === S.ui.iv?.level) ? S.ui.iv.level : l[0].id; };
+const INV_KPIS = [['total', 'Total seats'], ['available', 'Available'], ['sold', 'Sold'], ['checkout', 'In checkout'], ['held', 'Held'], ['blocked', 'Blocked'], ['unavailable', 'Unavailable'], ['comp', 'Complimentary'], ['discount', 'Discount-code sales'], ['released', 'Cancelled / released']];
+const SEAT_ACTION_LABEL = { sold: 'Sold', comp: 'Comp issued', cancelled: 'Cancelled', blocked: 'Blocked', unblock: 'Unblocked', held: 'Held', released: 'Released', unavailable: 'Unavailable', available: 'Available', moved: 'Moved', price: 'Price changed', area: 'Area changed' };
+function invData(ev) {
+  const slots = (ev.timeSlots || []).slice().sort((a, b) => D(a.start) - D(b.start)), iv = S.ui.iv ||= {};
+  const slot = slots.length ? (slots.some(x => x.id === iv.slot) ? iv.slot : slots[0].id) : '';
+  const states = seatStates(ev, { tickets: S.adm.tickets, statuses: S.adm.seatStatus, orders: S.adm.orders, slotId: slot });
+  const released = new Set((S.adm.seatLog || []).filter(r => r.event_id === ev.id && r.action === 'cancelled' && [slot, ''].includes(r.slot_id || '')).map(r => r.seat).filter(id => states.get(id)?.state === 'available'));
+  const match = (id, x, f) => !f || f === 'total' || (f === 'discount' ? (x.state === 'sold' && !!x.o?.data?.code) : f === 'released' ? released.has(id) : x.state === f);
+  const counts = Object.fromEntries(INV_KPIS.map(([k]) => [k, [...states].filter(([id, x]) => match(id, x, k)).length]));
+  return { slots, slot, states, released, counts, match };
+}
+function EdInventory(ev) {
+  const saved = S.adm.events.find(e => e.id === ev.id);
+  if (!saved?.seating?.enabled) return `<div class="card"><h3>No seating chart yet</h3><p class="muted small" style="margin-top:6px">Turn on reserved seating in the <a href="#/admin/event/${ev.id}/seating">Seating</a> tab and save, then manage individual seats here.</p></div>`;
+  const d = invData(saved), iv = S.ui.iv, f = iv.filter || '', lv = invLevel(saved.seating), sel = new Set(S.ui.invSel || []), L = layoutOf(saved.seating);
+  const selIds = [...sel].filter(id => d.states.has(id)), one = selIds.length === 1 ? d.states.get(selIds[0]) : null;
+  const ok = k => can(k, ev.id), showList = f && f !== 'total' ? [...d.states].filter(([id, x]) => d.match(id, x, f)) : selIds.length > 1 ? selIds.map(id => [id, d.states.get(id)]) : [];
+  const slotName = id => { const x = d.slots.find(z => z.id === id); return x ? fmtDT(x.start) : 'every showtime'; };
+  return `${S.dirty ? '<div class="banner warn">You have unsaved changes in the editor. Save them before changing prices or seating areas here.</div>' : ''}
+  <div class="card inv-head"><div class="between wrap">
+    <div><h3>Live seat inventory</h3><p class="small muted" style="margin-top:2px">Exact counts right now${d.slots.length ? ' for one showtime' : ''}. Click a count to see exactly which seats it includes.</p></div>
+    ${d.slots.length ? `<select class="inp inp-sm" data-input="iv.slot" data-rr="1">${d.slots.map(x => `<option value="${x.id}" ${x.id === d.slot ? 'selected' : ''}>${esc(fmtDT(x.start))}${x.label ? ' · ' + esc(x.label) : ''}</option>`).join('')}</select>` : ''}</div>
+    <div class="inv-kpis">${INV_KPIS.map(([k, l]) => `<button type="button" class="inv-k ${f === k ? 'on' : ''}" data-action="invFilter" data-v="${k}"><i style="background:${k === 'available' || k === 'total' || k === 'discount' || k === 'released' ? 'var(--line-2)' : STATE_COLORS[k]};${k === 'blocked' ? 'box-shadow:inset 0 0 0 1.5px #555' : ''}"></i><span>${l}</span><b class="tnum">${d.counts[k]}</b></button>`).join('')}
+      <div class="inv-k dark"><span>Remaining sellable</span><b class="tnum">${d.counts.available}</b></div></div></div>
+  <div class="sm-wrap" style="margin-top:16px">
+    <div class="card sm-main">
+      ${LevelTabs(saved.seating, lv, 'invLevel')}
+      <p class="small muted" style="margin:0 0 6px">${S.ui.invMove ? `<b style="color:var(--ink)">Moving ${esc(seatName(saved, S.ui.invMove))}</b> — click the new seat. <a href="#" data-action="invMoveCancel">Cancel</a>` : 'Click seats to select them, drag a box over empty space to select many, or click a row letter or section name to select it all. No limit on how many.'}</p>
+      <div class="sm-canvas">${SeatCanvas(saved, { mode: 'inv', level: lv, states: d.states, filter: f === 'total' ? '' : f, seatSel: sel, released: d.released })}</div>
+      <div class="legend">${Object.entries(SEAT_STATES).filter(([k]) => k !== 'available').map(([k, l]) => `<span><i style="background:${STATE_COLORS[k]};${k === 'blocked' ? 'box-shadow:inset 0 0 0 1.5px #555' : ''}"></i>${l}</span>`).join('')}<span><i style="background:${TIER_COLORS[0]}"></i>Available (price colour)</span></div>
+    </div>
+    <div class="card sm-panel">
+      ${selIds.length ? `<div class="between"><b>${selIds.length} seat${selIds.length === 1 ? '' : 's'} selected</b><button type="button" class="btn btn-ghost btn-sm" data-action="invClear">Clear</button></div>
+        ${d.slots.length ? `<div class="field" style="margin-top:10px"><label class="fl">Apply to</label><select class="inp inp-sm" data-input="iv.scope"><option value="">This showtime only</option><option value="all" ${iv.scope === 'all' ? 'selected' : ''}>Every showtime</option></select></div>` : ''}
+        <div class="inv-acts">
+          ${ok('seating.block') ? `<button type="button" class="btn btn-dark btn-sm" data-action="invDo" data-v="block">Block</button>` : ''}${ok('seating.unblock') ? `<button type="button" class="btn btn-ghost btn-sm" data-action="invDo" data-v="unblock">Unblock</button>` : ''}
+          ${ok('seating.edit') ? `<button type="button" class="btn btn-ghost btn-sm" data-action="invDo" data-v="unavailable">Make unavailable</button><button type="button" class="btn btn-ghost btn-sm" data-action="invDo" data-v="available">Make available</button>` : ''}</div>
+        ${ok('seating.block') || ok('seating.unblock') ? `<div class="field"><label class="fl">Hold for someone</label><div class="row">${ok('seating.block') ? `<input class="inp inp-sm" data-input="iv.note" placeholder="Note, e.g. Artist family" value="${esc(iv.note || '')}"><button type="button" class="btn btn-ghost btn-sm" data-action="invDo" data-v="hold">Hold</button>` : ''}${ok('seating.unblock') ? '<button type="button" class="btn btn-ghost btn-sm" data-action="invDo" data-v="release">Release</button>' : ''}</div></div>` : ''}
+        ${ok('seating.edit') && ok('tickets.pricing') ? `<div class="field"><label class="fl">Change price</label><div class="row"><select class="inp inp-sm" data-input="iv.tt"><option value="">Section default</option>${saved.ticketTypes.map(t => `<option value="${t.id}" ${iv.tt === t.id ? 'selected' : ''}>${esc(t.name)} · ${money(t.price, saved.currency)}</option>`).join('')}</select><button type="button" class="btn btn-ghost btn-sm" data-action="invDo" data-v="price">Set</button></div></div>` : ''}
+        ${ok('seating.edit') ? `<div class="field"><label class="fl">Change seating area</label><div class="row"><input class="inp inp-sm" data-input="iv.area" placeholder="e.g. Orchestra Left" value="${esc(iv.area || '')}"><button type="button" class="btn btn-ghost btn-sm" data-action="invDo" data-v="area">Set</button></div></div>` : ''}
+        ${one && one.t && ok('seating.move') ? `<button type="button" class="btn btn-ghost btn-sm" data-action="invMove" data-v="${esc(selIds[0])}">Move this customer to another seat…</button>` : ''}
+        <div class="sep"></div>` : `<p class="small muted">Select seats on the map to block, hold, release or re-price them — one seat, a row, a section or hundreds at once.</p>${f && f !== 'total' && d.counts[f] ? `<button type="button" class="btn btn-ghost btn-sm" style="margin-top:8px" data-action="invSelAll">Select all ${d.counts[f]} ${esc(INV_KPIS.find(k => k[0] === f)[1].toLowerCase())}</button>` : ''}<div class="sep"></div>`}
+      ${one ? SeatDetail(saved, selIds[0], one, d.slot) : ''}
+    </div></div>
+  ${showList.length ? `<div class="card" style="padding:0;margin-top:16px"><div class="between" style="padding:16px 20px 4px"><h3>${f && f !== 'total' ? esc(INV_KPIS.find(k => k[0] === f)[1]) : 'Selected seats'} · ${showList.length}</h3><button type="button" class="btn btn-ghost btn-sm" data-action="invExport">Export CSV</button></div>
+    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Seat</th><th>Area</th><th>Row</th><th>Seat</th><th>Status</th><th>Customer / note</th><th>Order</th><th>By</th><th>When</th></tr></thead><tbody>
+    ${showList.slice(0, 400).map(([id, x]) => { const sp = seatParts(saved, id, x.t); return `<tr class="click" data-action="invPick" data-v="${esc(id)}"><td class="tnum">${esc(id)}</td><td>${esc(sp.area)}</td><td>${esc(sp.row || '—')}</td><td>${esc(sp.seat || '—')}</td><td><span class="chip inv-${x.state}">${SEAT_STATES[x.state]}</span>${x.o?.data?.code ? ` <span class="chip">${esc(x.o.data.code)}</span>` : ''}</td>
+      <td>${esc(x.t?.holder || x.s?.note || '')}${x.s?.status === 'checkout' ? ' <span class="small muted">until ' + esc(fmtTime(x.s.expires_at)) + '</span>' : ''}</td><td class="tnum">${esc(x.o?.ref || '')}</td><td class="small">${esc(x.s?.by || '')}</td><td class="small muted">${esc(x.s ? ago(x.s.at) : x.o ? ago(x.o.created_at) : '')}</td></tr>`; }).join('')}
+    </tbody></table></div>${showList.length > 400 ? `<p class="small muted" style="padding:10px 20px">Showing 400 of ${showList.length} — export for the full list.</p>` : ''}</div>` : ''}`;
+  function SeatDetail(ev, id, x, slot) {
+    const log = (S.adm.seatLog || []).filter(r => r.event_id === ev.id && r.seat === id && [slot, ''].includes(r.slot_id || ''));
+    const sp = seatParts(ev, id, x.t), tt = ev.ticketTypes.find(t => t.id === L.byId.get(id)?.tt);
+    return `<div class="seat3 inv-seat"><div><div class="k">Area</div><div class="v">${esc(sp.area)}</div></div><div><div class="k">Row</div><div class="v">${esc(sp.row || '—')}</div></div><div><div class="k">Seat</div><div class="v">${esc(sp.seat || '—')}</div></div></div>
+      <p class="small" style="margin:8px 0"><span class="chip inv-${x.state}">${SEAT_STATES[x.state]}</span> ${tt ? esc(tt.name) + ' · ' + money(tt.price, ev.currency) : 'no price'}${x.s ? ` · ${x.s.slot_id ? 'this showtime' : d.slots.length ? 'every showtime' : ''}${x.s.note ? ' · ' + esc(x.s.note) : ''}` : ''}</p>
+      ${x.t ? `<p class="small" style="margin-bottom:8px"><b>${esc(x.t.holder)}</b> · ticket ${esc(x.t.code)}${x.o ? ` · <a href="#" data-action="openOrder" data-id="${x.o.id}">order ${esc(x.o.ref)}</a>` : ''}${x.o?.data?.code ? ' · code ' + esc(x.o.data.code) : ''}</p>` : ''}
+      <div class="eyebrow" style="margin:12px 0 6px">Seat history</div>
+      ${log.length ? `<div class="seat-log">${log.map(r => `<div><span class="chip">${esc(SEAT_ACTION_LABEL[r.action] || r.action)}</span><div><div class="small">${esc(r.detail)}${r.ref ? ' · ' + esc(r.ref) : ''}</div><div class="small muted">${esc(r.by)} · ${esc(fmtDT(r.at))}${r.slot_id && !slot ? '' : r.slot_id ? ' · ' + esc(slotName(r.slot_id)) : ''}</div></div></div>`).join('')}</div>` : '<p class="small muted">Nothing has happened to this seat yet.</p>'}`;
+  }
+}
+// ── Venue library: master seating charts that events copy ──
+function venueDraft(v) {
+  return { id: 'venue-' + v.id, _venue: v.id, name: v.name, address: v.address || '', venue: v.name, currency: S.adm.bo.settings.currency,
+    ticketTypes: (v.tiers || []).map(t => ({ ...t })), seating: { ...JSON.parse(JSON.stringify(v.chart || {})), enabled: true } };
+}
+function Venues() {
+  if (S.route.params[0]) return VenueEditor();
+  const list = S.adm.bo.venues || [], edit = can('seating.edit');
+  return `${head('Venues', '', edit ? '<button class="btn btn-accent" data-action="newVenue">New venue chart</button>' : '')}
+  <p class="muted" style="margin:-4px 0 18px;max-width:720px">Master seating charts for the venues you use. Attach one to an event from the event's Seating tab: the event gets its own copy, so changes for one event never change the master or future events.</p>
+  ${list.length ? `<div class="ven-grid">${list.map(v => { const pe = venueDraft(v), L = layoutOf(pe.seating), used = S.adm.events.filter(e => e.seating?.venueId === v.id).length;
+    return `<div class="card ven-card"><div class="ven-pv">${pe.seating.sections?.length ? SeatCanvas(pe, { preview: true }) : '<div class="muted small" style="padding:40px;text-align:center">Empty chart</div>'}</div>
+      <h3>${esc(v.name)}</h3><p class="small muted">${esc(v.address || '')}</p>
+      <p class="small" style="margin:8px 0">${L.seats.length} seats · ${(v.chart?.sections || []).length} sections${(v.chart?.levels || []).length > 1 ? ' · ' + v.chart.levels.length + ' levels' : ''} · used by ${used} event${used === 1 ? '' : 's'}</p>
+      <div class="legend" style="margin:0 0 12px">${(v.tiers || []).map((t, i) => `<span><i style="background:${TIER_COLORS[i % TIER_COLORS.length]}"></i>${esc(t.name)} ${money(t.price)}</span>`).join('')}</div>
+      <div class="row wrap">${edit ? `<a class="btn btn-dark btn-sm" href="#/admin/venues/${v.id}">Edit chart</a><button class="btn btn-ghost btn-sm" data-action="dupVenue" data-v="${v.id}">Duplicate</button><button class="btn btn-ghost btn-sm" data-action="delVenue" data-v="${v.id}">Delete</button>` : `<a class="btn btn-ghost btn-sm" href="#/admin/venues/${v.id}">View</a>`}</div></div>`; }).join('')}</div>`
+    : `<div class="empty"><div class="display" style="font-size:28px">No venue charts yet</div><p class="muted" style="margin-top:8px">Create one here, or open any seated event and choose “Save to venue library”.</p></div>`}`;
+}
+function VenueEditor() {
+  const ev = S.draft; if (!ev?._venue) return '<p class="muted">Venue chart not found. <a href="#/admin/venues">Back to venues</a></p>';
+  const ro = !can('seating.edit');
+  return `<a href="#/admin/venues" class="small muted" style="text-decoration:none">← Venues</a>
+  ${head(esc(ev.name || 'Venue chart'), `<span class="chip">Master chart</span> ${S.dirty ? '<span class="chip warn">Unsaved changes</span>' : ''}`, ro ? '' : `<button class="btn btn-accent" data-action="saveVenue" ${S.dirty ? '' : 'disabled'}>Save chart</button>`)}
+  <fieldset ${ro ? 'disabled' : ''} style="border:0">
+  <div class="cols" style="margin-bottom:16px"><div class="card"><div class="grid2">${inp('name', 'Venue name')}${inp('address', 'Address')}</div>
+    <p class="small muted">Saving updates this master chart only. Events that already use it keep their own copy.</p></div>
+    <div class="card"><div class="between" style="margin-bottom:8px"><h3>Price tiers</h3><button type="button" class="btn btn-ghost btn-sm" data-action="addTier">${ic('plus', 13)} Tier</button></div>
+      <p class="small muted" style="margin-bottom:10px">When the chart is attached to an event, each tier becomes (or matches by name) one of the event's ticket types.</p>
+      ${ev.ticketTypes.map((t, i) => `<div class="row" style="margin-bottom:6px"><i class="tier-dot" style="background:${tierColor(ev, t.id)}"></i>${inp(`ticketTypes.${i}.name`, '', { cls: 'grow' })}${inp(`ticketTypes.${i}.price`, '', { t: 'money' })}<button type="button" class="btn btn-ghost btn-sm" data-action="delTier" data-i="${i}">Remove</button></div>`).join('')}</div></div>
+  ${EdSeating(ev)}</fieldset>`;
+}
 function EdHistory(ev) {
   const list = (S.adm.audit || []).filter(a => a.target === ev.id);
   return `<p class="muted" style="margin:-4px 0 16px">Every change to this event — dates, venue, capacity, status, visibility, ticket settings and prices, showtimes and seating — with who made it and the before/after values.</p>${AuditTable(list)}`;
@@ -831,68 +967,121 @@ function EdTickets(ev) {
   </div>`).join('')}`;
 }
 function soldSeatIds(ev) { return S.adm.tickets.filter(t => t.event_id === ev.id && t.status === 'valid' && t.seat).map(t => t.seat); }
+const smMulti = () => new Set(S.ui.smMulti?.length ? S.ui.smMulti : S.ui.smSel ? [S.ui.smSel] : []);
+const smLevel = st => { const l = levelsOf(st); return l.some(x => x.id === S.ui.smLevel) ? S.ui.smLevel : l[0].id; };
+// The builder edits S.draft — an event, or a venue chart (draft._venue) with its price tiers as ticketTypes.
 function EdSeating(ev) {
-  const st = ev.seating || (ev.seating = { enabled: false });
-  if (!st.enabled) return `<div class="card"><div class="sm-intro">${ic('ticket', 28)}<div><h3>Reserved seating</h3><p class="muted">Build your room — sections, rows and tables — then assign prices. Buyers pick their exact seats on a map.</p>
-    <div style="margin-top:14px">${chk('seating.enabled', '<b>Turn on reserved seating for this event</b>')}</div></div></div></div>`;
-  st.sections ||= []; st.prices ||= {}; st.blocked ||= []; st.stage ||= { x: -150, y: -120, w: 300, h: 46, label: 'STAGE' };
-  const L = layoutOf(st), mode = S.ui.smMode || 'move', sold = new Set(soldSeatIds(ev));
-  const i = st.sections.findIndex(x => x.id === S.ui.smSel), sec = st.sections[i];
-  const counts = {}; L.seats.forEach(p => { if (!st.blocked.includes(p.id)) counts[p.tt || ''] = (counts[p.tt || ''] || 0) + 1; });
-  const hint = { move: 'Drag sections and the stage to arrange your room. Click a section to edit it.', paint: 'Pick a price, then click or drag across seats. Click a row letter to price the whole row.', block: 'Click or drag across seats to block them (pillars, sound desk, holds). Click again to unblock.' }[mode];
-  return `<div class="sm-wrap">
+  const st = ev.seating || (ev.seating = { enabled: false }), venue = !!ev._venue;
+  if (!st.enabled) return `<div class="card"><div class="sm-intro">${ic('ticket', 28)}<div><h3>Reserved seating</h3><p class="muted">Build your room — sections, rows, tables, booths and standing areas — then assign prices. Buyers pick their exact seats on a map.</p>
+    <div style="margin-top:14px">${chk('seating.enabled', '<b>Turn on reserved seating for this event</b>')}</div>
+    ${(S.adm.bo.venues || []).length ? `<p class="small muted" style="margin-top:12px">Or start from one of your venue charts:</p><div class="row wrap" style="margin-top:6px">${S.adm.bo.venues.map(v => `<button type="button" class="btn btn-ghost btn-sm" data-action="loadVenue" data-v="${v.id}">${esc(v.name)}</button>`).join('')}</div>` : ''}</div></div></div>`;
+  st.sections ||= []; st.prices ||= {}; st.stage ||= { x: -150, y: -120, w: 300, h: 46, label: 'STAGE' };
+  const L = layoutOf(st), mode = S.ui.smMode || 'move', sold = new Set(venue ? [] : soldSeatIds(ev)), lv = smLevel(st), multi = smMulti();
+  const i = st.sections.findIndex(x => x.id === S.ui.smSel), sec = st.sections[i], seatSel = new Set(S.ui.smSeats || []);
+  const counts = {}; L.seats.forEach(p => { counts[p.tt || ''] = (counts[p.tt || ''] || 0) + 1; });
+  const hint = { move: 'Drag sections and the stage to arrange the room. Click a section to edit it; Shift-click to select several and move or edit them together.', paint: 'Pick a price, then click or drag across seats. Click a row letter to price the whole row.', seats: 'Click or drag across seats (or drag a box on empty space) to select them — then remove them, restore them, rename them or change their seating area. Click a row letter or section name to select it all.' }[mode];
+  const ven = (S.adm.bo.venues || []).find(v => v.id === st.venueId);
+  const panel = mode === 'seats' && seatSel.size ? SeatsPanel(ev, seatSel) : multi.size > 1 ? MultiPanel(ev, multi) : sec ? SectionPanel(ev, sec, i, sold) : RoomPanel(ev, L, lv);
+  return `${venue ? '' : `<div class="card sm-venue"><div><b>${ven ? 'Venue chart: ' + esc(ven.name) : st.venueName ? 'Copied from venue chart “' + esc(st.venueName) + '”' : 'This event\'s own seating chart'}</b>
+      <div class="small muted">${ven || st.venueName ? 'This is the event\'s own copy — changes here never touch the master chart or other events.' : 'Save it to your venue library to reuse it for future events.'}</div></div>
+      <div class="row wrap">${(S.adm.bo.venues || []).length ? `<select class="inp inp-sm" data-input="venPick">${S.adm.bo.venues.map(v => `<option value="${v.id}" ${(S.ui.venPick || st.venueId) === v.id ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}</select><button type="button" class="btn btn-ghost btn-sm" data-action="loadVenue">Load chart</button>` : ''}
+        ${can('seating.edit') ? '<button type="button" class="btn btn-ghost btn-sm" data-action="saveToVenue">Save to venue library</button>' : ''}<button type="button" class="btn btn-dark btn-sm" data-action="smPreview">Customer preview</button></div></div>`}
+  <div class="sm-wrap">
     <div class="card sm-main">
       <div class="sm-toolbar">
-        <div class="tabs">${[['move', 'Arrange'], ['paint', 'Assign prices'], ['block', 'Block seats']].map(([k, t]) => `<button type="button" class="${mode === k ? 'on' : ''}" data-action="smMode" data-v="${k}">${t}</button>`).join('')}</div>
-        <div class="row wrap"><button type="button" class="btn btn-ghost btn-sm" data-action="smAdd" data-v="rows">${ic('plus', 14)} Seated section</button><button type="button" class="btn btn-ghost btn-sm" data-action="smAdd" data-v="table">${ic('plus', 14)} Table</button></div>
+        <div class="tabs">${[['move', 'Arrange'], ['paint', 'Assign prices'], ['seats', 'Edit seats']].map(([k, t]) => `<button type="button" class="${mode === k ? 'on' : ''}" data-action="smMode" data-v="${k}">${t}</button>`).join('')}</div>
+        <div class="row wrap">${[['rows', 'Seated section'], ['table', 'Table'], ['booth', 'Booth'], ['ga', 'Standing area']].map(([k, t]) => `<button type="button" class="btn btn-ghost btn-sm" data-action="smAdd" data-v="${k}">${ic('plus', 14)} ${t}</button>`).join('')}</div>
       </div>
+      ${levelsOf(st).length > 1 ? LevelTabs(st, lv, 'smLevel') : ''}
       ${mode === 'paint' ? `<div class="sm-palette">${ev.ticketTypes.map(t => `<button type="button" class="${(S.ui.smPaint ?? ev.ticketTypes[0]?.id) === t.id ? 'on' : ''}" data-action="smPaint" data-v="${t.id}"><i style="background:${tierColor(ev, t.id)}"></i>${esc(t.name)} · ${money(t.price, ev.currency)}</button>`).join('')}
         <button type="button" class="${S.ui.smPaint === '' ? 'on' : ''}" data-action="smPaint" data-v=""><i style="background:#fff;border:1.5px dashed #999"></i>Section default</button>
-        <a class="small" href="#/admin/event/${ev.id}/tickets">Add a price level →</a></div>` : ''}
+        ${venue ? '' : `<a class="small" href="#/admin/event/${ev.id}/tickets">Add a price level →</a>`}</div>` : ''}
       <p class="small muted" style="margin:8px 0 6px">${hint}</p>
-      ${st.sections.length ? `<div class="sm-canvas">${SeatCanvas(ev, { mode, selected: S.ui.smSel, sold })}</div>` : `<div class="sm-empty"><h3>Start from a layout</h3><p class="muted small" style="margin:4px 0 16px">You can change everything afterwards.</p><div class="sm-tpls">
-        ${[['theatre', 'Theatre', 'Centre + side stalls and a curved circle'], ['banquet', 'Banquet', '12 round tables of 10'], ['hall', 'Hall', 'One block of straight rows']].map(([k, t, d]) => `<button type="button" class="sm-tpl" data-action="smTemplate" data-v="${k}"><b>${t}</b><span>${d}</span></button>`).join('')}
+      ${st.sections.length ? `<div class="sm-canvas">${SeatCanvas(ev, { mode, level: lv, selected: multi, sold, seatSel, ghosts: mode === 'seats' })}</div>` : `<div class="sm-empty"><h3>Start from a layout</h3><p class="muted small" style="margin:4px 0 16px">You can change everything afterwards.</p><div class="sm-tpls">
+        ${[['theatre', 'Theatre', 'Centre + side stalls and a curved circle'], ['banquet', 'Banquet', '12 round tables of 10'], ['hall', 'Hall', 'One block of straight rows'], ['club', 'Club', 'Standing floor, booths and a balcony']].map(([k, t, d]) => `<button type="button" class="sm-tpl" data-action="smTemplate" data-v="${k}"><b>${t}</b><span>${d}</span></button>`).join('')}
         <button type="button" class="sm-tpl" data-action="smAdd" data-v="rows"><b>Blank</b><span>Add sections yourself</span></button></div></div>`}
       <div class="legend" style="margin-top:12px">${ev.ticketTypes.filter(t => counts[t.id]).map(t => `<span><i style="background:${tierColor(ev, t.id)}"></i>${esc(t.name)} ${money(t.price, ev.currency)} · <b>${counts[t.id]}</b> seats</span>`).join('')}
-        ${counts[''] ? `<span style="color:var(--warn)"><i style="background:#c9c5ba"></i>${counts['']} seats have no price (not sold)</span>` : ''}${st.blocked.length ? `<span><i style="border:1.5px dashed #999"></i>${st.blocked.length} blocked</span>` : ''}${sold.size ? `<span><i style="background:#d7d4cb"></i>${sold.size} sold</span>` : ''}</div>
+        ${counts[''] ? `<span style="color:var(--warn)"><i style="background:#c9c5ba"></i>${counts['']} seats have no price (not sold)</span>` : ''}${(st.removed || []).length ? `<span><i style="border:1.5px dashed #999"></i>${st.removed.length} removed</span>` : ''}${sold.size ? `<span><i style="background:#fff;box-shadow:0 0 0 2px var(--ink) inset"></i>${sold.size} sold</span>` : ''}</div>
     </div>
-    <div class="card sm-panel">${sec ? SectionPanel(ev, sec, i, sold) : `
-      <h3>Room</h3><p class="small muted" style="margin:4px 0 14px">${L.seats.length - st.blocked.length} sellable seats in ${st.sections.length} section${st.sections.length === 1 ? '' : 's'}.</p>
-      ${inp('seating.stage.label', 'Stage label')}<div class="grid2">${inp('seating.stage.w', 'Stage width', { t: 'int' })}${inp('seating.stage.h', 'Stage depth', { t: 'int' })}</div>
-      <div class="sep"></div><div class="eyebrow" style="margin-bottom:8px">Sections</div>
-      ${st.sections.map(x => `<button type="button" class="sm-li" data-action="smSel" data-id="${x.id}"><i style="background:${tierColor(ev, x.ticketTypeId)}"></i><b>${esc(x.name)}</b><span>${esc(x.code)} · ${layoutOf(st).seats.filter(p => p.sec.id === x.id).length} seats</span></button>`).join('') || '<p class="small muted">No sections yet.</p>'}
-      <div class="sep"></div>${chk('seating.enabled', 'Reserved seating on')}`}
-    </div></div>`;
+    <div class="card sm-panel">${panel}</div></div>`;
+}
+function RoomPanel(ev, L, lv) {
+  const st = ev.seating, lvs = st.levels || [];
+  return `<h3>Room</h3><p class="small muted" style="margin:4px 0 14px">${L.seats.length} seats in ${st.sections.length} section${st.sections.length === 1 ? '' : 's'}${lvs.length > 1 ? ` on ${lvs.length} levels` : ''}.</p>
+    ${inp('seating.stage.label', 'Stage label')}<div class="grid2">${inp('seating.stage.w', 'Stage width', { t: 'int' })}${inp('seating.stage.h', 'Stage depth', { t: 'int' })}</div>
+    <div class="sep"></div><div class="between" style="margin-bottom:8px"><div class="eyebrow">Floors / levels</div><button type="button" class="btn btn-ghost btn-sm" data-action="smAddLevel">${ic('plus', 13)} Level</button></div>
+    ${lvs.length ? lvs.map((l, k) => `<div class="row" style="margin-bottom:6px"><input class="inp inp-sm" data-bind="draft.seating.levels.${k}.name" value="${esc(l.name)}"><button type="button" class="btn btn-ghost btn-sm" data-action="smDelLevel" data-i="${k}" ${lvs.length < 2 ? 'disabled' : ''}>Remove</button></div>`).join('') : '<p class="small muted">One level. Add a level for a balcony, mezzanine or second floor.</p>'}
+    <div class="sep"></div><div class="eyebrow" style="margin-bottom:8px">Venue map image</div>
+    ${st.bg?.src ? `<p class="small muted" style="margin-bottom:8px">Shown under the seats so you can build over it.</p>
+      <div class="grid2">${inp('seating.bg.w', 'Width', { t: 'int' })}<div class="field"><label class="fl">Opacity</label><input type="range" class="range" min="0.05" max="1" step="0.05" data-bind="draft.seating.bg.opacity" data-t="num" value="${st.bg.opacity ?? .35}"></div></div>
+      <div class="grid2">${inp('seating.bg.x', 'Left', { t: 'num' })}${inp('seating.bg.y', 'Top', { t: 'num' })}</div>
+      ${chk('seating.bg.public', 'Show it to buyers too')}<button type="button" class="btn btn-ghost btn-sm" style="margin-top:8px" data-action="smBgRemove">Remove image</button>`
+      : `<p class="small muted" style="margin-bottom:8px">Upload a floor plan or venue photo and trace your sections over it.</p><input type="file" accept="image/*" class="inp" data-action-change="smBg">`}
+    <div class="sep"></div><div class="eyebrow" style="margin-bottom:8px">Sections</div>
+    ${st.sections.filter(x => (x.level || L.lv0) === lv).map(x => `<button type="button" class="sm-li" data-action="smSel" data-id="${x.id}"><i style="background:${tierColor(ev, x.ticketTypeId)}"></i><b>${esc(x.name)}</b><span>${esc(x.code)} · ${secKind(x) === 'ga' ? (+x.capacity || 100) + ' standing' : L.seats.filter(p => p.sec.id === x.id).length + ' seats'}</span></button>`).join('') || '<p class="small muted">No sections on this level yet.</p>'}
+    ${ev._venue ? '' : `<div class="sep"></div>${chk('seating.noSingles', 'Don\'t let buyers leave a single empty seat')}<div style="margin-top:6px">${chk('seating.enabled', 'Reserved seating on')}</div>`}`;
 }
 function SectionPanel(ev, sec, i, sold) {
-  const P = `seating.sections.${i}`, hasSold = [...sold].some(id => id.startsWith(sec.code + '-'));
-  const overrides = Object.keys(ev.seating.prices || {}).filter(k => k.startsWith(sec.code + '-')).length;
-  const rows = Math.max(1, +sec.rows || 1);
-  return `<div class="between"><button type="button" class="small muted sm-backlink" data-action="smDeselect">← Room</button><div class="row"><button type="button" class="btn btn-ghost btn-sm" data-action="smDup">Duplicate</button><button type="button" class="btn btn-danger btn-sm" data-action="smDel">Delete</button></div></div>
-    <h3 style="margin:12px 0 12px">${esc(sec.name)}</h3>
+  const P = `seating.sections.${i}`, hasSold = [...sold].some(id => id.startsWith(sec.code + '-')), kind = secKind(sec), st = ev.seating;
+  const overrides = Object.keys(st.prices || {}).filter(k => k.startsWith(sec.code + '-')).length, rows = Math.max(1, +sec.rows || 1);
+  const lvs = st.levels || [], clip = S.ui.rowClip;
+  return `<div class="between"><button type="button" class="small muted sm-backlink" data-action="smDeselect">← Room</button><div class="row"><button type="button" class="btn btn-ghost btn-sm" data-action="smDup">Duplicate</button><button type="button" class="btn btn-ghost btn-sm" data-action="smMirror">Mirror</button><button type="button" class="btn btn-danger btn-sm" data-action="smDel">Delete</button></div></div>
+    <h3 style="margin:12px 0 12px">${esc(sec.name)} <span class="chip">${{ rows: 'Seated rows', table: 'Table', booth: 'Booth', ga: 'Standing area' }[kind]}</span></h3>
     <div class="grid2">${inp(`${P}.name`, 'Section name')}${inp(`${P}.code`, 'Code', { ro: hasSold, hint: hasSold ? 'Locked — seats sold' : 'Prefix on seat IDs' })}</div>
+    <div class="grid2">${inp(`${P}.area`, 'Seating area', { ph: sec.name, hint: 'Printed on tickets. Blank = section name.' })}${lvs.length > 1 ? sel(`${P}.level`, 'Level', lvs.map(l => [l.id, l.name])) : '<div></div>'}</div>
     ${sel(`${P}.ticketTypeId`, 'Price for this section', [['', '— not for sale —'], ...ev.ticketTypes.map(t => [t.id, `${t.name} · ${money(t.price, ev.currency)}`])])}
     ${overrides ? `<div class="banner info" style="display:flex;justify-content:space-between;align-items:center">${overrides} seats have their own price<button type="button" class="btn btn-ghost btn-sm" data-action="smClearPrices">Reset</button></div>` : ''}
-    ${sec.kind === 'table' ? inp(`${P}.seats`, 'Seats at table', { t: 'int' }) : `
+    ${kind === 'ga' ? `<div class="grid3">${inp(`${P}.capacity`, 'Capacity', { t: 'int', hint: 'Max ' + GA_MAX })}${inp(`${P}.w`, 'Width', { t: 'int' })}${inp(`${P}.h`, 'Depth', { t: 'int' })}</div>`
+    : kind !== 'rows' ? `${inp(`${P}.seats`, kind === 'booth' ? 'Seats in booth' : 'Seats at table', { t: 'int' })}${spacing(P, sec, false)}` : `
       <div class="grid2">${inp(`${P}.rows`, 'Rows', { t: 'int' })}${inp(`${P}.seatsPerRow`, 'Seats per row', { t: 'int' })}</div>
-      <div class="grid2">${inp(`${P}.rowStart`, 'First row', { hint: 'A, or 1 for numbers' })}<div class="field"><label class="fl">Seat numbers</label>${chk(`${P}.reverse`, 'Right to left')}</div></div>
+      <div class="grid2">${inp(`${P}.rowStart`, 'First row', { hint: 'A, or 1 for numbers' })}${inp(`${P}.rowLabels`, 'Custom row labels', { ph: 'AA, BB, CC', hint: 'Comma-separated, front to back' })}</div>
+      <div class="grid3">${inp(`${P}.seatStart`, 'First seat no.', { t: 'int', ph: '1' })}${sel(`${P}.numbering`, 'Numbering', [['seq', '1, 2, 3…'], ['odd', 'Odd only'], ['even', 'Even only']])}<div class="field"><label class="fl">Direction</label>${chk(`${P}.reverse`, 'Right to left')}</div></div>
       <div class="field"><label class="fl">Curve <span class="muted">${+sec.curve || 0}%</span></label><input type="range" min="0" max="100" step="5" data-bind="draft.${P}.curve" data-t="int" value="${+sec.curve || 0}" class="range"></div>
-      <details class="sm-rows"${sec.rowSeats?.some(Boolean) ? ' open' : ''}><summary>Seats in each row</summary><p class="small muted" style="margin:6px 0 8px">Make rows shorter or longer. Blank = ${+sec.seatsPerRow || 10}.</p>
-        <div class="sm-rowgrid">${Array.from({ length: rows }, (_, r) => `<label><span>${esc(rowLabel(sec.rowStart || 'A', r))}</span><input class="inp" type="number" min="1" data-bind="draft.${P}.rowSeats.${r}" data-t="int" value="${(sec.rowSeats || [])[r] || ''}" placeholder="${+sec.seatsPerRow || 10}"></label>`).join('')}</div>
-        ${sec.rowSeats?.some(Boolean) ? '<button type="button" class="btn btn-ghost btn-sm" style="margin-top:8px" data-action="smEqualRows">Make all rows equal</button>' : ''}</details>`}
-    <div class="field" style="margin-top:12px"><label class="fl">Rotate <span class="muted">${+sec.rot || 0}°</span></label><input type="range" min="-45" max="45" step="1" data-bind="draft.${P}.rot" data-t="int" value="${+sec.rot || 0}" class="range"></div>`;
+      ${spacing(P, sec, true)}
+      <details class="sm-rows"${S.ui.rowsOpen ? ' open' : ''} data-action="rowsOpen"><summary>Rows — length, copy, paste, delete</summary><p class="small muted" style="margin:6px 0 8px">Seats in each row (blank = ${+sec.seatsPerRow || 10}).</p>
+        <div class="sm-rowlist">${Array.from({ length: rows }, (_, r) => `<div class="sm-rowline"><span>${esc(secRowLabel(sec, r))}</span><input class="inp" type="number" min="1" data-bind="draft.${P}.rowSeats.${r}" data-t="int" value="${(sec.rowSeats || [])[r] || ''}" placeholder="${+sec.seatsPerRow || 10}">
+          <button type="button" class="icon-btn" title="Duplicate row" data-action="rowDup" data-i="${r}" ${hasSold ? 'disabled' : ''}>⧉</button><button type="button" class="icon-btn" title="Copy row" data-action="rowCopy" data-i="${r}">⎘</button><button type="button" class="icon-btn" title="Delete row" data-action="rowDel" data-i="${r}" ${hasSold || rows < 2 ? 'disabled' : ''}>✕</button></div>`).join('')}</div>
+        <div class="row wrap" style="margin-top:8px">${clip ? `<button type="button" class="btn btn-ghost btn-sm" data-action="rowPaste">Paste row (${clip} seats) at the back</button>` : ''}${sec.rowSeats?.some(Boolean) ? '<button type="button" class="btn btn-ghost btn-sm" data-action="smEqualRows">Make all rows equal</button>' : ''}</div></details>`}
+    <div class="field" style="margin-top:12px"><label class="fl">Rotate <span class="muted">${+sec.rot || 0}°</span></label><input type="range" min="-180" max="180" step="1" data-bind="draft.${P}.rot" data-t="int" value="${+sec.rot || 0}" class="range"></div>
+    <div class="row wrap">${kind === 'rows' ? '<button type="button" class="btn btn-ghost btn-sm" data-action="smStraighten">Straighten</button>' : ''}${kind !== 'ga' ? '<button type="button" class="btn btn-ghost btn-sm" data-action="smEven">Even spacing</button>' : ''}</div>`;
+}
+const spacing = (P, sec, rows) => `<div class="grid2"><div class="field"><label class="fl">Seat spacing <span class="muted">${+sec.gap || SEAT}</span></label><input type="range" min="18" max="50" step="1" data-bind="draft.${P}.gap" data-t="int" value="${+sec.gap || SEAT}" class="range"></div>
+  ${rows ? `<div class="field"><label class="fl">Row spacing <span class="muted">${+sec.rowGap || ROWH}</span></label><input type="range" min="22" max="70" step="1" data-bind="draft.${P}.rowGap" data-t="int" value="${+sec.rowGap || ROWH}" class="range"></div>` : '<div></div>'}</div>`;
+function MultiPanel(ev, multi) {
+  const secs = ev.seating.sections.filter(x => multi.has(x.id)), lvs = ev.seating.levels || [];
+  return `<div class="between"><button type="button" class="small muted sm-backlink" data-action="smDeselect">← Room</button><span class="chip">${secs.length} sections</span></div>
+    <h3 style="margin:12px 0 4px">Edit ${secs.length} sections together</h3><p class="small muted" style="margin-bottom:12px">${esc(secs.map(x => x.name).join(', '))}. Drag any of them to move them all.</p>
+    <div class="field"><label class="fl">Price</label><select class="inp" data-input="mpTT"><option value="">— keep —</option>${ev.ticketTypes.map(t => `<option value="${t.id}">${esc(t.name)} · ${money(t.price, ev.currency)}</option>`).join('')}<option value="none">— not for sale —</option></select></div>
+    <div class="field"><label class="fl">Seating area</label><input class="inp" data-input="mpArea" placeholder="e.g. Orchestra Left — blank keeps each section's"></div>
+    ${lvs.length > 1 ? `<div class="field"><label class="fl">Level</label><select class="inp" data-input="mpLevel"><option value="">— keep —</option>${lvs.map(l => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join('')}</select></div>` : ''}
+    <button type="button" class="btn btn-dark btn-sm" data-action="mpApply">Apply to all ${secs.length}</button>
+    <div class="sep"></div><div class="row wrap"><button type="button" class="btn btn-ghost btn-sm" data-action="smStraighten">Straighten</button><button type="button" class="btn btn-ghost btn-sm" data-action="smEven">Even spacing</button><button type="button" class="btn btn-ghost btn-sm" data-action="smDup">Duplicate</button><button type="button" class="btn btn-ghost btn-sm" data-action="smMirror">Mirror</button><button type="button" class="btn btn-danger btn-sm" data-action="smDel">Delete</button></div>`;
+}
+function SeatsPanel(ev, seatSel) {
+  const st = ev.seating, L = layoutOf(st), ids = [...seatSel], rm = new Set(st.removed || []), nRm = ids.filter(x => rm.has(x)).length, one = ids.length === 1 ? ids[0] : null, p = one && L.byId.get(one);
+  return `<div class="between"><button type="button" class="small muted sm-backlink" data-action="smSeatsClear">← Clear selection</button><span class="chip">${ids.length} seat${ids.length === 1 ? '' : 's'}</span></div>
+    <h3 style="margin:12px 0 4px">${one ? esc(p ? seatName(ev, one) : one + ' (removed)') : ids.length + ' seats selected'}</h3>
+    <p class="small muted" style="margin-bottom:12px">${nRm ? nRm + ' removed · ' : ''}${ids.length - nRm} on the map</p>
+    <div class="row wrap">${ids.length - nRm ? '<button type="button" class="btn btn-ghost btn-sm" data-action="seatsRemove">Remove from map</button>' : ''}${nRm ? '<button type="button" class="btn btn-ghost btn-sm" data-action="seatsRestore">Restore</button>' : ''}</div>
+    <div class="sep"></div>
+    <div class="field"><label class="fl">Seating area</label><div class="row"><input class="inp" data-input="spArea" placeholder="${esc(p?.area || 'e.g. Orchestra Left')}"><button type="button" class="btn btn-ghost btn-sm" data-action="seatsArea">Set</button></div><div class="small muted" style="margin-top:4px">Blank resets to the section's area.</div></div>
+    <div class="field"><label class="fl">Price</label><div class="row"><select class="inp" data-input="spTT"><option value="">Section default</option>${ev.ticketTypes.map(t => `<option value="${t.id}">${esc(t.name)} · ${money(t.price, ev.currency)}</option>`).join('')}</select><button type="button" class="btn btn-ghost btn-sm" data-action="seatsPrice">Set</button></div></div>
+    ${one && p && secKind(p.sec) !== 'ga' ? `<div class="field"><label class="fl">Seat label</label><div class="row"><input class="inp" data-input="spLabel" placeholder="${esc(String(p.num))}" value="${esc((st.labels || {})[one] || '')}"><button type="button" class="btn btn-ghost btn-sm" data-action="seatsLabel">Set</button></div><div class="small muted" style="margin-top:4px">What's printed as the seat number, e.g. 12A. The seat keeps its ID.</div></div>` : ''}`;
 }
 function nextCode(prefix) { const used = new Set(S.draft.seating.sections.map(x => x.code)); let n = 1; while (used.has(prefix + n)) n++; return prefix + n; }
 function addSection(kind) {
-  const st = S.draft.seating, b = st.sections.length ? layoutOf(st).bounds : { y1: -40, x0: 0 };
-  const sec = kind === 'table'
-    ? { id: shortId('sec_'), code: nextCode('T'), name: 'Table ' + nextCode('T').slice(1), kind: 'table', seats: 10, x: 0, y: b.y1 + 70, rot: 0, ticketTypeId: S.draft.ticketTypes[0]?.id || '' }
-    : { id: shortId('sec_'), code: nextCode('S'), name: 'Section ' + (st.sections.length + 1), kind: 'rows', rows: 5, seatsPerRow: 10, rowStart: 'A', curve: 0, x: -117, y: b.y1 + 60, rot: 0, ticketTypeId: S.draft.ticketTypes[0]?.id || '' };
-  st.sections.push(sec); S.ui.smSel = sec.id; S.ui.smMode = 'move'; dirty(); render();
+  const st = S.draft.seating, lv = smLevel(st), L = layoutOf(st), b = st.sections.length ? boundsOf(L, lv, st.stage) : { y1: -40, x0: 0 }, tt = S.draft.ticketTypes[0]?.id || '';
+  const base = { id: shortId('sec_'), x: kind === 'rows' ? -117 : 0, y: b.y1 + 70, rot: 0, ticketTypeId: tt, ...(st.levels?.length ? { level: lv } : {}) };
+  const code = nextCode({ table: 'T', booth: 'B', ga: 'GA' }[kind] || 'S');
+  const sec = kind === 'table' ? { ...base, code, name: 'Table ' + code.slice(1), kind, seats: 10 }
+    : kind === 'booth' ? { ...base, code, name: 'Booth ' + code.slice(1), kind, seats: 6 }
+    : kind === 'ga' ? { ...base, code, name: 'Standing floor', kind, capacity: 150, w: 260, h: 130, x: -130 }
+    : { ...base, code, name: 'Section ' + (st.sections.length + 1), kind: 'rows', rows: 5, seatsPerRow: 10, rowStart: 'A', curve: 0 };
+  st.sections.push(sec); S.ui.smSel = sec.id; S.ui.smMulti = [sec.id]; S.ui.smMode = 'move'; dirty(); render();
 }
 function applySeatTemplate(k) {
   const st = S.draft.seating, T = S.draft.ticketTypes, t = n => (T[n] || T[T.length - 1] || {}).id || '', id = () => shortId('sec_');
-  st.prices = {}; st.blocked = []; st.stage = { x: -170, y: -120, w: 340, h: 46, label: 'STAGE' };
+  st.prices = {}; st.areas = {}; st.removed = []; st.labels = {}; delete st.levels; st.stage = { x: -170, y: -120, w: 340, h: 46, label: 'STAGE' };
   if (k === 'theatre') st.sections = [
     { id: id(), code: 'LFT', name: 'Stalls left', kind: 'rows', x: -365, y: 18, rot: 9, rows: 8, seatsPerRow: 6, rowStart: 'A', ticketTypeId: t(1) },
     { id: id(), code: 'CEN', name: 'Stalls centre', kind: 'rows', x: -169, y: 0, rot: 0, rows: 8, seatsPerRow: 14, rowStart: 'A', curve: 25, ticketTypeId: t(0) },
@@ -900,33 +1089,58 @@ function applySeatTemplate(k) {
     { id: id(), code: 'CIR', name: 'Circle', kind: 'rows', x: -299, y: 320, rot: 0, rows: 3, seatsPerRow: 24, rowStart: 'J', curve: 40, ticketTypeId: t(2) }];
   if (k === 'banquet') { st.stage = { x: -200, y: -150, w: 400, h: 46, label: 'STAGE' }; st.sections = Array.from({ length: 12 }, (_, n) => ({ id: id(), code: 'T' + (n + 1), name: 'Table ' + (n + 1), kind: 'table', seats: 10, x: -330 + (n % 4) * 220, y: Math.floor(n / 4) * 200, rot: 0, ticketTypeId: n < 4 ? t(0) : t(1) })); }
   if (k === 'hall') st.sections = [{ id: id(), code: 'H', name: 'Hall', kind: 'rows', x: -247, y: 0, rot: 0, rows: 12, seatsPerRow: 20, rowStart: 'A', ticketTypeId: t(0) }];
-  S.ui.smSel = ''; dirty(); render();
+  if (k === 'club') { st.levels = [{ id: 'L1', name: 'Main floor' }, { id: 'L2', name: 'Balcony' }]; st.sections = [
+    { id: id(), code: 'GA', name: 'Standing floor', kind: 'ga', capacity: 300, w: 340, h: 170, x: -170, y: 0, rot: 0, level: 'L1', ticketTypeId: t(0) },
+    ...[0, 1, 2].map(n => ({ id: id(), code: 'B' + (n + 1), name: 'Booth ' + (n + 1), kind: 'booth', seats: 6, x: -330, y: 10 + n * 85, rot: 90, level: 'L1', ticketTypeId: t(1) })),
+    ...[0, 1, 2].map(n => ({ id: id(), code: 'B' + (n + 4), name: 'Booth ' + (n + 4), kind: 'booth', seats: 6, x: 280, y: 10 + n * 85, rot: -90, level: 'L1', ticketTypeId: t(1) })),
+    { id: id(), code: 'BAL', name: 'Balcony', kind: 'rows', x: -260, y: 0, rot: 0, rows: 4, seatsPerRow: 20, rowStart: 'A', curve: 30, level: 'L2', ticketTypeId: t(2) }]; }
+  S.ui.smSel = ''; S.ui.smMulti = []; dirty(); render();
 }
-// Designer pointer interactions: drag sections/stage (Arrange), paint/block seats by click or drag.
+// selection helpers shared by the builder ("Edit seats") and the inventory
+function seatsInBox(L, lv, a, b, all) {
+  const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x), y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y);
+  return L.secs.filter(g => g.level === lv && g.kind !== 'ga').flatMap(g => (all ? g.all : g.local).filter(p => p.gx >= x0 && p.gx <= x1 && p.gy >= y0 && p.gy <= y1).map(p => p.id));
+}
+const rowIds = (L, secId, row, all) => L.secs.find(g => g.sec.id === secId)?.[all ? 'all' : 'local'].filter(p => p.row === row).map(p => p.id) || [];
+const secIds = (L, secId, all) => L.secs.find(g => g.sec.id === secId)?.[all ? 'all' : 'local'].map(p => p.id) || [];
+// Designer + inventory pointer interactions.
 let SM = null;
 function svgPt(svg, e) { const p = svg.createSVGPoint(); p.x = e.clientX; p.y = e.clientY; return p.matrixTransform(svg.getScreenCTM().inverse()); }
 function smApply(el) {
   const st = S.draft.seating, id = el.dataset.seat;
-  if (SM.kind === 'block') { const b = new Set(st.blocked); SM.val ? b.add(id) : b.delete(id); st.blocked = [...b]; el.classList.toggle('blk', SM.val); el.setAttribute('fill', SM.val ? 'none' : el.dataset.fill || el.getAttribute('fill')); }
-  else { const p = layoutOf(st).seats.find(x => x.id === id); if (!SM.val || SM.val === p?.sec.ticketTypeId) delete st.prices[id]; else st.prices[id] = SM.val; el.setAttribute('fill', tierColor(S.draft, SM.val || p?.sec.ticketTypeId)); }
+  if (SM.kind === 'select') { const set = SM.set; SM.val ? set.add(id) : set.delete(id); el.classList.toggle('sel', SM.val); }
+  else { const p = layoutOf(st).byId.get(id); if (!p) return; if (!SM.val || SM.val === p.sec.ticketTypeId) delete st.prices[id]; else st.prices[id] = SM.val; el.setAttribute('fill', tierColor(S.draft, SM.val || p.sec.ticketTypeId)); }
   SM.changed = true;
 }
+// which seat list a selection gesture edits: the builder's (S.ui.smSeats) or the inventory's (S.ui.invSel)
+const selTarget = svg => svg.classList.contains('sm-inv') ? 'invSel' : 'smSeats';
 document.addEventListener('pointerdown', e => {
   const svg = e.target.closest?.('svg.sm-design'); if (!svg || !S.draft) return;
-  const mode = S.ui.smMode || 'move', st = S.draft.seating;
+  const inv = svg.classList.contains('sm-inv'), mode = inv ? 'select' : S.ui.smMode || 'move';
+  const ev = inv ? S.adm.events.find(x => x.id === S.draft.id) : S.draft, st = ev.seating, L = layoutOf(st);
   if (mode === 'move') {
     const secEl = e.target.closest('[data-sec]'), stgEl = e.target.closest('[data-stage]');
-    const target = secEl ? st.sections.find(x => x.id === secEl.dataset.sec) : stgEl ? st.stage : null;
-    if (!target) { if (S.ui.smSel) { S.ui.smSel = ''; render(); } return; }
-    const p = svgPt(svg, e); SM = { kind: 'drag', svg, el: secEl || stgEl, target, sx: p.x, sy: p.y, ox: +target.x || 0, oy: +target.y || 0, moved: false, secId: secEl?.dataset.sec || '' };
-    e.preventDefault(); return;
+    if (!secEl && !stgEl) { if (S.ui.smSel || S.ui.smMulti?.length) { S.ui.smSel = ''; S.ui.smMulti = []; render(); } return; }
+    const p = svgPt(svg, e);
+    if (stgEl) { SM = { kind: 'drag', svg, items: [{ el: stgEl, t: st.stage, ox: +st.stage.x || 0, oy: +st.stage.y || 0 }], sx: p.x, sy: p.y, moved: false, secId: '' }; e.preventDefault(); return; }
+    const id = secEl.dataset.sec; let multi = smMulti();
+    if (e.shiftKey) { multi.has(id) ? multi.delete(id) : multi.add(id); S.ui.smMulti = [...multi]; S.ui.smSel = multi.size === 1 ? [...multi][0] : ''; render(); return; }
+    if (!multi.has(id)) multi = new Set([id]);
+    const items = [...multi].map(sid => ({ el: svg.querySelector(`[data-sec="${sid}"]`), t: st.sections.find(x => x.id === sid) })).filter(x => x.el && x.t).map(x => ({ ...x, ox: +x.t.x || 0, oy: +x.t.y || 0 }));
+    SM = { kind: 'drag', svg, items, sx: p.x, sy: p.y, moved: false, secId: id, multi: [...multi] }; e.preventDefault(); return;
   }
-  const rowEl = e.target.closest('[data-row]');
-  if (rowEl) { const [secId, row] = rowEl.dataset.row.split('|'); const ids = layoutOf(st).seats.filter(p => p.sec.id === secId && p.row === row).map(p => p.id);
-    SM = { kind: mode, val: mode === 'block' ? !ids.every(x => st.blocked.includes(x)) : (S.ui.smPaint ?? S.draft.ticketTypes[0]?.id ?? '') };
-    ids.forEach(x => { const el = svg.querySelector(`[data-seat="${CSS.escape(x)}"]`); if (el) smApply(el); }); SM = null; dirty(); render(); return; }
-  const seatEl = e.target.closest('[data-seat]'); if (!seatEl) return;
-  SM = { kind: mode, svg, val: mode === 'block' ? !st.blocked.includes(seatEl.dataset.seat) : (S.ui.smPaint ?? S.draft.ticketTypes[0]?.id ?? '') };
+  if (inv && S.ui.invMove) { const seatEl = e.target.closest('[data-seat]'); if (seatEl) { A.invMoveTo(seatEl.dataset.seat); e.preventDefault(); } return; }
+  const key = mode === 'paint' ? null : selTarget(svg), set = key ? new Set(S.ui[key] || []) : null, ghosts = !inv;
+  const rowEl = e.target.closest('[data-row]'), nameEl = e.target.closest('[data-secname]'), gaEl = e.target.closest('[data-ga]');
+  if (rowEl || nameEl || gaEl) {
+    const ids = rowEl ? rowIds(L, ...rowEl.dataset.row.split('|'), ghosts && mode !== 'paint') : secIds(L, (nameEl || gaEl).dataset.secname || (nameEl || gaEl).dataset.ga, ghosts && mode !== 'paint');
+    if (mode === 'paint') { SM = { kind: 'paint', val: S.ui.smPaint ?? S.draft.ticketTypes[0]?.id ?? '' }; ids.forEach(x => { const el = svg.querySelector(`[data-seat="${CSS.escape(x)}"]`); if (el) smApply(el); else { const p = L.byId.get(x); if (p) { if (!SM.val || SM.val === p.sec.ticketTypeId) delete st.prices[x]; else st.prices[x] = SM.val; } } }); SM = null; dirty(); render(); return; }
+    const on = !ids.every(x => set.has(x)); ids.forEach(x => on ? set.add(x) : set.delete(x)); S.ui[key] = [...set]; render(); return;
+  }
+  const seatEl = e.target.closest('[data-seat]');
+  if (!seatEl) { if (mode === 'paint') return; const p = svgPt(svg, e); SM = { kind: 'box', svg, key, set, a: p, L, lv: inv ? invLevel(st) : smLevel(st), all: !inv, add: e.shiftKey || e.metaKey }; e.preventDefault(); return; }
+  if (mode === 'paint') SM = { kind: 'paint', svg, val: S.ui.smPaint ?? S.draft.ticketTypes[0]?.id ?? '' };
+  else SM = { kind: 'select', svg, key, set, val: !set.has(seatEl.dataset.seat) };
   smApply(seatEl); e.preventDefault();
 });
 document.addEventListener('pointermove', e => {
@@ -934,8 +1148,14 @@ document.addEventListener('pointermove', e => {
   if (SM.kind === 'drag') {
     const p = svgPt(SM.svg, e), dx = p.x - SM.sx, dy = p.y - SM.sy;
     if (!SM.moved && Math.abs(dx) + Math.abs(dy) < 4) return; SM.moved = true;
-    SM.target.x = Math.round((SM.ox + dx) / 5) * 5; SM.target.y = Math.round((SM.oy + dy) / 5) * 5;
-    SM.el.setAttribute('transform', SM.el.getAttribute('transform').replace(/translate\([^)]*\)/, `translate(${SM.target.x} ${SM.target.y})`));
+    for (const it of SM.items) { it.t.x = Math.round((it.ox + dx) / 5) * 5; it.t.y = Math.round((it.oy + dy) / 5) * 5;
+      it.el.setAttribute('transform', it.el.getAttribute('transform').replace(/translate\([^)]*\)/, `translate(${it.t.x} ${it.t.y})`)); }
+    return;
+  }
+  if (SM.kind === 'box') {
+    const p = svgPt(SM.svg, e); SM.b = p; let r = SM.svg.querySelector('.sm-box');
+    if (!r) { r = document.createElementNS('http://www.w3.org/2000/svg', 'rect'); r.setAttribute('class', 'sm-box'); SM.svg.appendChild(r); }
+    r.setAttribute('x', Math.min(SM.a.x, p.x)); r.setAttribute('y', Math.min(SM.a.y, p.y)); r.setAttribute('width', Math.abs(p.x - SM.a.x)); r.setAttribute('height', Math.abs(p.y - SM.a.y));
     return;
   }
   const el = document.elementFromPoint(e.clientX, e.clientY)?.closest?.('[data-seat]');
@@ -943,7 +1163,13 @@ document.addEventListener('pointermove', e => {
 });
 document.addEventListener('pointerup', () => {
   if (!SM) return; const m = SM; SM = null;
-  if (m.kind === 'drag') { if (m.moved) dirty(); else S.ui.smSel = m.secId; render(); }
+  if (m.kind === 'drag') { if (m.moved) dirty(); else if (m.secId) { S.ui.smSel = m.secId; S.ui.smMulti = [m.secId]; } render(); }
+  else if (m.kind === 'box') {
+    if (m.b) { const ids = seatsInBox(m.L, m.lv, m.a, m.b, m.all), set = m.add ? m.set : new Set(); ids.forEach(x => set.add(x)); S.ui[m.key] = [...set]; }
+    else if (!m.add) S.ui[m.key] = [];
+    render();
+  }
+  else if (m.kind === 'select') { S.ui[m.key] = [...m.set]; render(); }
   else if (m.changed) { dirty(); render(); }
 });
 function EdCheckout(ev) {
@@ -1026,11 +1252,27 @@ function OrderModal(id) {
     <div class="sum-line total"><span>Total</span><span>${money(d.total, d.currency)}</span></div>
     ${qs.length ? `<div class="sep"></div>${qs.map(q => `<div class="small"><span class="muted">${esc(q.label)}:</span> ${esc(d.answers?.[q.id] === true ? 'Yes' : d.answers?.[q.id] || '—')}</div>`).join('')}` : ''}
     <div class="sep"></div><div class="eyebrow" style="margin-bottom:8px">Tickets</div>
-    ${tks.map(t => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="tnum"><b>${esc(t.code)}</b> ${t.seat ? '· ' + esc(seatName(evById(t.event_id), t.seat, true)) : ''}</span><span>${t.status !== 'valid' ? '<span class="chip bad">void</span>' : t.checked_in_at ? '<span class="chip ok">in ' + esc(fmtTime(t.checked_in_at)) + '</span>' : '<span class="chip">not in</span>'}</span></div>`).join('')}`,
+    ${tks.map(t => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="tnum"><b>${esc(t.code)}</b> ${t.seat ? '· ' + esc(seatName(evById(t.event_id), t.seat, true, t)) : ''}</span><span>${t.status !== 'valid' ? '<span class="chip bad">void</span>' : t.checked_in_at ? '<span class="chip ok">in ' + esc(fmtTime(t.checked_in_at)) + '</span>' : '<span class="chip">not in</span>'}</span></div>`).join('')}`,
     `<a class="btn btn-ghost btn-sm" target="_blank" href="#/order/${o.id}/${o.access_key || ''}">Buyer's page</a>
+     <button class="btn btn-ghost btn-sm" data-action="emailPv" data-id="${o.id}">Confirmation email</button>
      <button class="btn btn-ghost btn-sm" data-action="resend" data-id="${o.id}">Resend tickets</button>
      ${can('orders.edit', o.event_ids[0]) && o.status === 'pending' ? `<button class="btn btn-dark btn-sm" data-action="orderStatus" data-id="${o.id}" data-v="paid">Mark paid</button>` : ''}
      ${can(o.status === 'paid' ? 'orders.refund' : 'orders.cancel', o.event_ids[0]) && ['paid', 'pending'].includes(o.status) ? `<button class="btn btn-danger btn-sm" data-action="orderStatus" data-id="${o.id}" data-v="${o.status === 'paid' ? 'refunded' : 'cancelled'}">${o.status === 'paid' ? 'Refund & cancel' : 'Cancel'}</button>` : ''}`);
+}
+// The order confirmation: ONE email per order with every ticket and its Area / Row / Seat, plus one PDF of all tickets.
+function OrderEmail(o, tks) {
+  const d = o.data, valid = tks.filter(t => t.status === 'valid'), evs = [...new Set(d.lines.map(l => l.eventId))].map(evById).filter(Boolean), bo = boOf(evs[0]) || S.adm?.bo;
+  return `<div class="email-pv"><div class="em-brand">${esc(bo?.name || 'SET')}</div>
+    <h2>Your tickets — ${esc(evs.map(e => e.name).join(' & '))}</h2>
+    <p>Hi ${esc((d.buyer.name || '').split(' ')[0])}, thank you for your order <b>${esc(o.ref)}</b>. ${valid.length === 1 ? 'Your ticket is' : `All ${valid.length} tickets are`} below and attached as one PDF.</p>
+    ${evs.map(ev => `<div class="em-ev"><b>${esc(ev.name)}</b><div class="small">${esc(fmtDT(ev.start))} · ${esc([ev.venue, ev.address].filter(Boolean).join(', '))}</div>
+      ${ev.emails?.confirmation ? `<p class="small" style="margin-top:8px">${esc(ev.emails.confirmation)}</p>` : ''}
+      <table><thead><tr><th>Ticket type / Area</th><th>Row</th><th>Seat</th><th>Ticket no.</th></tr></thead><tbody>
+      ${valid.filter(t => t.event_id === ev.id).map(t => { const tt = ev.ticketTypes.find(x => x.id === t.ticket_type_id), sp = t.seat ? seatParts(ev, t.seat, t) : null;
+        return `<tr><td>${esc(sp ? (sp.area && sp.area !== tt?.name ? `${tt?.name || ''} · ${sp.area}` : sp.area) : tt?.name || 'Ticket')}</td><td>${esc(sp?.row || '—')}</td><td>${esc(sp?.seat || (sp ? '—' : 'General'))}</td><td class="tnum">${esc(t.code)}</td></tr>`; }).join('')}</tbody></table></div>`).join('')}
+    <div class="em-btn">View &amp; download your tickets</div>
+    <p class="small muted">📎 tickets-${esc(o.ref)}.pdf — ${valid.length} page${valid.length === 1 ? '' : 's'}, one ticket per page with its QR code</p>
+    <div class="em-tot"><span>Order total</span><b>${money(d.total, d.currency)}</b></div></div>`;
 }
 function ManualOrderModal() {
   const m = S.ui.mo || (S.ui.mo = { ev: S.adm.events[0]?.id, tt: '', qty: 1, slot: '', name: '', email: '', status: 'paid' });
@@ -1053,7 +1295,7 @@ function Attendees() {
   return head('Door list', ev ? `${esc(ev.name)} · ${inn} of ${tks.length} checked in` : '', `<button class="btn btn-ghost" data-action="print">Print door list</button><button class="btn btn-ghost" data-action="exportAtt">Export CSV</button>`) + `
   <div class="toolbar no-print"><select class="inp" data-input="attEv">${evOptions(evId, 'Choose event')}</select><input class="inp" data-input="q" placeholder="Search name, code, seat…" value="${esc(S.ui.q)}"></div>
   <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Ticket</th><th>Seat / time</th><th>Code</th><th>Order</th><th>Checked in</th></tr></thead><tbody>
-  ${tks.map(({ t, o, tt, slot }) => `<tr><td><b>${esc(t.holder)}</b><div class="small muted">${esc(o?.buyer_email || '')}</div></td><td>${esc(tt?.name || '')}</td><td>${esc(t.seat ? seatName(ev, t.seat, true) : (slot ? fmtTime(slot.start) : '—'))}</td><td class="tnum">${esc(t.code)}</td><td class="tnum">${esc(o?.ref || '')}${o?.status === 'pending' ? ' <span class="chip warn">unpaid</span>' : ''}</td>
+  ${tks.map(({ t, o, tt, slot }) => `<tr><td><b>${esc(t.holder)}</b><div class="small muted">${esc(o?.buyer_email || '')}</div></td><td>${esc(tt?.name || '')}</td><td>${esc(t.seat ? seatName(ev, t.seat, false, t) : (slot ? fmtTime(slot.start) : '—'))}</td><td class="tnum">${esc(t.code)}</td><td class="tnum">${esc(o?.ref || '')}${o?.status === 'pending' ? ' <span class="chip warn">unpaid</span>' : ''}</td>
     <td>${can(t.checked_in_at ? 'door.undo' : 'door.checkin', t.event_id) ? `<button class="btn btn-sm ${t.checked_in_at ? 'btn-dark' : 'btn-ghost'}" data-action="toggleIn" data-v="${esc(t.code)}" data-undo="${t.checked_in_at ? 1 : 0}">${t.checked_in_at ? '✓ ' + esc(fmtTime(t.checked_in_at)) : 'Check in'}</button>` : (t.checked_in_at ? '✓' : '')}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">No tickets yet.</td></tr>'}
   </tbody></table></div>`;
 }
@@ -1127,7 +1369,7 @@ function ScanResult(r) {
   const o = t && S.adm.orders.find(x => x.id === t.order_id), slot = t?.slot_id && ev?.timeSlots?.find(s => s.id === t.slot_id);
   return `<div class="sc-result ${kind}" data-action="scDismiss" role="alert"><div class="sc-res-icon">${ic(kind === 'ok' ? 'check' : kind === 'bad' ? 'x' : 'alert', 58)}</div>
     <div class="sc-res-t">${esc(RES_TITLE[r.result])}</div>
-    ${t ? `<div class="sc-res-name">${esc(t.holder)}</div><div class="sc-res-meta">${esc(tt?.name || '')}${t.seat ? ' · ' + esc(seatName(ev, t.seat, true)) : ''}${slot ? ' · ' + esc(fmtTime(slot.start)) : ''}</div><div class="sc-res-code">${esc(t.code)}${o ? ' · ' + esc(o.ref) : ''}</div>` : `<div class="sc-res-code">${esc(r.code || '')}</div>`}
+    ${t ? `<div class="sc-res-name">${esc(t.holder)}</div><div class="sc-res-meta">${esc(tt?.name || '')}${t.seat ? ' · ' + esc(seatName(ev, t.seat, true, t)) : ''}${slot ? ' · ' + esc(fmtTime(slot.start)) : ''}</div><div class="sc-res-code">${esc(t.code)}${o ? ' · ' + esc(o.ref) : ''}</div>` : `<div class="sc-res-code">${esc(r.code || '')}</div>`}
     ${r.result === 'already' ? `<div class="sc-res-note">First scanned at ${esc(fmtTime(t.checked_in_at))}</div>` : ''}
     ${r.result === 'wrong_event' && ev ? `<div class="sc-res-note">This ticket is for ${esc(ev.name)} · ${esc(fmtDT(ev.start))}</div>` : ''}
     ${r.result === 'ok' && o?.status === 'pending' ? `<div class="sc-res-note">Unpaid order — collect ${money(o.data.total, o.data.currency)}</div>` : ''}
@@ -1141,7 +1383,7 @@ function ScanGuests(ev, st) {
   return `<div class="sc-pad"><div class="sc-search">${ic('search', 17)}<input data-input="sc.q" placeholder="Search name, code, seat…" value="${esc(S.sc.q)}" autocomplete="off"></div>
     <div class="sc-chips">${[['all', 'All ' + st.total], ['out', 'Not in ' + (st.total - st.inn)], ['in', 'In ' + st.inn]].map(([k, t]) => `<button class="${f === k ? 'on' : ''}" data-action="scFilter" data-v="${k}">${t}</button>`).join('')}</div>
     ${rows.slice(0, 250).map(t => { const tt = ev.ticketTypes.find(x => x.id === t.ticket_type_id);
-      return `<div class="sc-guest"><div><b>${esc(t.holder)}</b><span>${esc(tt?.name || '')}${t.seat ? ' · ' + esc(seatName(ev, t.seat, true)) : ''} · ${esc(t.code)}</span></div>
+      return `<div class="sc-guest"><div><b>${esc(t.holder)}</b><span>${esc(tt?.name || '')}${t.seat ? ' · ' + esc(seatName(ev, t.seat, true, t)) : ''} · ${esc(t.code)}</span></div>
         <button class="sc-tick ${t.checked_in_at ? 'on' : ''}" data-action="scToggle" data-v="${esc(t.code)}" data-undo="${t.checked_in_at ? 1 : 0}">${t.checked_in_at ? ic('check', 15) + ' ' + esc(fmtTime(t.checked_in_at)) : 'Check in'}</button></div>`; }).join('') || '<p class="sc-dim" style="padding:20px 0">No guests match.</p>'}</div>`;
 }
 function ScanStats(ev, st) {
@@ -1550,7 +1792,7 @@ function Register() {
 // ══════════════════════════════════════════════════════════════════════════════
 //  ACTIONS
 // ══════════════════════════════════════════════════════════════════════════════
-const dirty = () => { S.dirty = true; const b = $('[data-action="saveEvent"]'); if (b) b.disabled = false; };
+const dirty = () => { S.dirty = true; document.querySelectorAll('[data-action="saveEvent"],[data-action="saveVenue"]').forEach(b => { b.disabled = false; }); };
 const newTT = () => ({ id: shortId('tt_'), name: 'General admission', price: 0, qty: 0, min: 1, max: 10, admits: 1, desc: '', hidden: false });
 function upsertLocal(list, item, key = 'id') { const i = list.findIndex(x => x[key] === item[key]); if (i >= 0) list[i] = item; else list.push(item); }
 async function persistEvent(ev) {
@@ -1562,13 +1804,36 @@ async function persistEvent(ev) {
     if (codes.some(c => !/^[A-Z0-9]{1,6}$/.test(c))) throw new Error('Section codes must be 1–6 letters or numbers');
     if (new Set(codes).size !== codes.length) throw new Error('Two sections share the same code');
     ev.seating.sections.forEach((x, i) => x.code = codes[i]);
-    ev.seating.index = seatIndex(ev.seating);
+    const seen = new Set(), dup = seatLayout(ev.seating).seats.map(p => p.id).find(id => seen.has(id) || !seen.add(id));
+    if (dup) throw new Error(`Two seats would share the ID ${dup} — check the row labels and seat numbers of that section`);
+    delete ev.seating.blocked; pruneSeatKeys(ev.seating); Object.assign(ev.seating, seatDerive(ev.seating));
     if (!Object.keys(ev.seating.index).length) throw new Error('The seating map has no seats with a price');
   }
   const saved = await DB.saveEvent(ev);
   upsertLocal(S.adm.events, JSON.parse(JSON.stringify(saved)));
   S.events = S.events.filter(e => e.id !== saved.id); if (eventLive(normEvent(saved))) { const { secrets, ...pub } = saved; S.events.push({ ...pub, hasPassword: !!secrets?.password, ticketTypes: pub.ticketTypes.map(t => ({ ...t, locked: !!secrets?.ticketPasswords?.[t.id] })) }); }
   return saved;
+}
+// edit a seated section's row list (lengths, plus custom labels if it has them). op: dup | del | paste
+function rowEdit(op, r) {
+  const sec = S.draft.seating.sections.find(x => x.id === S.ui.smSel); if (!sec || secKind(sec) !== 'rows') return;
+  const n = Math.max(1, +sec.rows || 1), per = +sec.seatsPerRow || 10, counts = Array.from({ length: n }, (_, k) => +(sec.rowSeats || [])[k] || per);
+  const labels = sec.rowLabels ? Array.from({ length: n }, (_, k) => String(sec.rowLabels).split(',').map(x => x.trim())[k] || '') : null;
+  if (op === 'dup') { counts.splice(r + 1, 0, counts[r]); labels?.splice(r + 1, 0, ''); }
+  if (op === 'del') { counts.splice(r, 1); labels?.splice(r, 1); }
+  if (op === 'paste') { counts.push(S.ui.rowClip); labels?.push(''); }
+  const rowMap = op === 'dup' ? x => x > r ? x + 1 : x : op === 'del' ? x => x === r ? -1 : x > r ? x - 1 : x : x => x;
+  remapSeatKeys(S.draft.seating, sec.id, () => {
+    sec.rows = counts.length; sec.rowSeats = counts.map(c => c === per ? 0 : c); if (!sec.rowSeats.some(Boolean)) delete sec.rowSeats;
+    if (labels) sec.rowLabels = labels.join(', ').replace(/(, )+$/, '');
+  }, rowMap);
+  S.ui.rowsOpen = true; dirty(); render();
+}
+// per-seat override maps (prices / areas / labels): a value equal to the section's own clears the override
+function seatMapEdit(key, val, dflt) {
+  const st = S.draft.seating, L = layoutOf(st), m = st[key] ||= {}; let n = 0;
+  for (const id of S.ui.smSeats || []) { const p = L.byId.get(id); if (!p) continue; if (!val || val === dflt(p)) delete m[id]; else m[id] = val; n++; }
+  dirty(); render(); toast(n + ' seat' + (n === 1 ? '' : 's') + ' updated');
 }
 const A = {
   go: el => { location.hash = el.dataset.v; },
@@ -1585,18 +1850,29 @@ const A = {
   addon: el => { const a = S.sel.addons; a[el.dataset.id] = Math.max(0, (a[el.dataset.id] || 0) + +el.dataset.d); render(); },
   pickSeat: el => { const s = el.dataset.v, a = S.sel.seats; const i = a.indexOf(s); if (i >= 0) a.splice(i, 1); else if (a.length < 10) a.push(s); else toast('Maximum 10 seats per order'); render(); },
   unlock: async () => { const ev = evById(S.sel.eventId); try { const r = await DB.unlock(ev.id, S.sel.pw); if (r?.event || r?.ticketTypes?.length) { S.sel.unlocked = { event: S.sel.unlocked.event || r.event, tts: [...S.sel.unlocked.tts, ...(r.ticketTypes || [])] }; S.cart.unlock[ev.id] = S.sel.pw; saveCart(); toast('Unlocked'); } else toast('That code isn\'t valid', true); render(); } catch (e) { toast(e.message, true); } },
-  addToCart: () => {
+  pickGa: el => { const ev = evById(S.sel.eventId), off = offSeats(S.avail[ev.id], S.sel.slotId), a = S.sel.seats;
+    const spot = layoutOf(ev.seating).seats.find(p => p.sec.code === el.dataset.v && !off.has(p.id) && !a.includes(p.id));
+    if (!spot) return toast('That area is sold out', true); if (a.length >= 10) return toast('Maximum 10 seats per order'); a.push(spot.id); render(); },
+  bLevel: el => { S.ui.bLevel = el.dataset.v; if (S.ui.pvOpen && document.querySelector('.modal .sm-buy')) A.smPreview(); else render(); },
+  addToCart: async () => {
     const ev = evById(S.sel.eventId), sel = S.sel;
+    let hold;
+    if (ev.seating?.enabled) {  // hold the seats for this buyer while they check out
+      try { hold = (await DB.holdSeats(ev.id, sel.slotId || '', sel.seats))?.expires || null; }
+      catch (e) { toast(e.message, true); refreshAvail(ev.id); return; }
+    }
     const items = ev.seating?.enabled
       ? ev.ticketTypes.map(t => ({ eventId: ev.id, ticketTypeId: t.id, slotId: sel.slotId || null, seats: sel.seats.filter(s => ev.seating.index?.[s] === t.id) })).filter(i => i.seats.length).map(i => ({ ...i, qty: i.seats.length }))
       : Object.entries(sel.qty).filter(([, q]) => q > 0).map(([id, q]) => ({ eventId: ev.id, ticketTypeId: id, slotId: sel.slotId || null, qty: q, seats: [] }));
     if (S.cart.items.some(i => boOf(evById(i.eventId))?.id !== ev.box_office_id)) { S.cart = { items: [], addons: [], donation: 0, unlock: {} }; S.co.disc = null; toast('Your cart had another organizer\'s tickets — it now holds just this event'); }
+    if (hold !== undefined) (S.cart.holds ||= {})[ev.id] = hold;
     S.cart.items = S.cart.items.filter(i => i.eventId !== ev.id).concat(items);
     S.cart.addons = S.cart.addons.filter(a => a.eventId !== ev.id).concat(Object.entries(sel.addons).filter(([, q]) => q > 0).map(([id, q]) => ({ eventId: ev.id, addonId: id, qty: q })));
     if (sel.pw) S.cart.unlock[ev.id] = sel.pw;
     saveCart(); location.hash = S.route.page === 'embed' ? '#/cart?embed' : '#/cart';
   },
-  removeEv: el => { S.cart.items = S.cart.items.filter(i => i.eventId !== el.dataset.id); S.cart.addons = S.cart.addons.filter(i => i.eventId !== el.dataset.id); saveCart(); render(); },
+  removeEv: el => { if (S.cart.holds?.[el.dataset.id] !== undefined) { DB.releaseSeats(el.dataset.id).catch(() => { }); delete S.cart.holds[el.dataset.id]; }
+    S.cart.items = S.cart.items.filter(i => i.eventId !== el.dataset.id); S.cart.addons = S.cart.addons.filter(i => i.eventId !== el.dataset.id); saveCart(); render(); },
   donate: el => { S.cart.donation = +el.dataset.v; saveCart(); render(); },
   pay: el => { S.co.payment = el.dataset.v; render(); },
   showTerms: () => modal('Terms & conditions', `<p style="white-space:pre-line">${esc(S.settings.terms)}</p>`),
@@ -1613,7 +1889,7 @@ const A = {
     try {
       const q = cartQuote();
       const r = await DB.placeOrder({ buyer: { name: co.name.trim(), email: co.email.trim(), phone: co.phone.trim() }, items: S.cart.items, addons: S.cart.addons, code: co.disc?.code || '',
-        donation: S.cart.donation || 0, payment: q.total === 0 ? 'free' : co.payment, answers: co.answers, optIn: co.optIn, source: sessionStorage.getItem('set_src') || null, unlock: S.cart.unlock });
+        donation: S.cart.donation || 0, payment: q.total === 0 ? 'free' : co.payment, answers: co.answers, optIn: co.optIn, source: sessionStorage.getItem('set_src') || null, unlock: S.cart.unlock, holdToken: DB.holdToken() });
       S.cart = { items: [], addons: [], donation: 0, unlock: {} }; saveCart();
       S.co = { ...S.co, busy: false, disc: null, code: '', answers: {}, terms: false };
       S.avail = {}; _availReq.clear(); S.order = null;
@@ -1714,7 +1990,7 @@ const A = {
   },
   fromTemplate: async el => {
     const t = S.adm.bo.eventTemplates.find(x => x.id === el.dataset.v); closeModal();
-    const ev = eventFromTemplate(t); if (ev.seating?.enabled) ev.seating.index = seatIndex(ev.seating);
+    const ev = eventFromTemplate(t);
     try { const s = await persistEvent(ev); toast('Created from “' + t.name + '” — set the date and publish'); location.hash = '#/admin/event/' + s.id + '/details'; } catch (e) { toast(e.message, true); }
   },
   saveTemplate: async () => {
@@ -1776,17 +2052,102 @@ const A = {
   smPaint: el => { S.ui.smPaint = el.dataset.v; render(); },
   smTemplate: el => { applySeatTemplate(el.dataset.v); },
   smAdd: el => { addSection(el.dataset.v); },
-  smDup: () => { const st = S.draft.seating, src = st.sections.find(x => x.id === S.ui.smSel); if (!src) return;
-    const c = { ...JSON.parse(JSON.stringify(src)), id: shortId('sec_'), code: nextCode(src.kind === 'table' ? 'T' : 'S'), name: src.name + ' copy', x: (+src.x || 0) + 40, y: (+src.y || 0) + 40 };
-    st.sections.push(c); S.ui.smSel = c.id; dirty(); render(); },
-  smDel: () => { const st = S.draft.seating, sec = st.sections.find(x => x.id === S.ui.smSel); if (!sec) return;
-    if (soldSeatIds(S.draft).some(id => id.startsWith(sec.code + '-'))) return toast('Seats in this section are sold — block them instead', true);
-    st.sections = st.sections.filter(x => x !== sec); Object.keys(st.prices || {}).forEach(k => { if (k.startsWith(sec.code + '-')) delete st.prices[k]; });
-    S.ui.smSel = ''; dirty(); render(); },
+  // ── seat inventory ──
+  invFilter: el => { const iv = S.ui.iv ||= {}; iv.filter = iv.filter === el.dataset.v ? '' : el.dataset.v; render(); },
+  invLevel: el => { (S.ui.iv ||= {}).level = el.dataset.v; render(); },
+  invSelAll: () => { const ev = S.adm.events.find(e => e.id === S.draft.id), d = invData(ev); S.ui.invSel = [...d.states].filter(([id, x]) => d.match(id, x, S.ui.iv.filter)).map(([id]) => id); render(); },
+  invClear: () => { S.ui.invSel = []; S.ui.invMove = ''; render(); },
+  invPick: el => { S.ui.invSel = [el.dataset.v]; const p = layoutOf(S.adm.events.find(e => e.id === S.draft.id).seating).byId.get(el.dataset.v); if (p) (S.ui.iv ||= {}).level = p.level; render(); window.scrollTo({ top: 0, behavior: 'smooth' }); },
+  invDo: async el => {
+    const ev = S.adm.events.find(e => e.id === S.draft.id), d = invData(ev), iv = S.ui.iv, act = el.dataset.v, seats = (S.ui.invSel || []).filter(id => d.states.has(id));
+    if (['price', 'area'].includes(act) && S.dirty) return toast('Save your other changes first', true);
+    if (act === 'hold' && !iv.note?.trim()) return toast('Add a note saying who the seats are held for', true);
+    const slot = iv.scope === 'all' ? '' : d.slot;
+    try { await DB.seatAction(ev.id, slot, act, seats, { note: iv.note || '', ttId: iv.tt || '', area: iv.area || '' });
+      S.ui.invSel = []; iv.note = ''; await reloadAdmin(); toast(`${{ block: 'Blocked', unblock: 'Unblocked', hold: 'Held', release: 'Released', unavailable: 'Made unavailable', available: 'Made available', price: 'Re-priced', area: 'Moved to the new area' }[act]} — ${seats.length} seat${seats.length === 1 ? '' : 's'}`); render(); }
+    catch (e) { toast(e.message, true); } },
+  invMove: el => { S.ui.invMove = el.dataset.v; render(); },
+  invMoveCancel: () => { S.ui.invMove = ''; render(); },
+  invMoveTo: async to => { const ev = S.adm.events.find(e => e.id === S.draft.id), d = invData(ev), from = S.ui.invMove; if (to === from) return;
+    try { await DB.seatAction(ev.id, d.slot, 'move', [from], { to }); S.ui.invMove = ''; S.ui.invSel = [to]; await reloadAdmin(); toast('Customer moved to ' + seatName(ev, to)); render(); } catch (e) { toast(e.message, true); } },
+  invExport: () => { const ev = S.adm.events.find(e => e.id === S.draft.id), d = invData(ev), f = S.ui.iv.filter;
+    const rows = f && f !== 'total' ? [...d.states].filter(([id, x]) => d.match(id, x, f)) : (S.ui.invSel || []).map(id => [id, d.states.get(id)]).filter(r => r[1]);
+    download(slugify(ev.name) + '-seats.csv', csv([['Seat ID', 'Area', 'Row', 'Seat', 'Status', 'Price level', 'Customer', 'Order', 'Discount code', 'Note', 'By', 'At'],
+      ...rows.map(([id, x]) => { const sp = seatParts(ev, id, x.t); return [id, sp.area, sp.row, sp.seat, SEAT_STATES[x.state], ev.ticketTypes.find(t => t.id === x.p.tt)?.name || '', x.t?.holder || '', x.o?.ref || '', x.o?.data?.code || '', x.s?.note || '', x.s?.by || '', x.s?.at || x.o?.created_at || '']; })])); },
+  // ── venue library ──
+  newVenue: async () => { const list = JSON.parse(JSON.stringify(S.adm.bo.venues || [])), v = { id: shortId('ven_'), name: 'New venue', address: '', updated_at: new Date().toISOString(), updated_by: S.user.email,
+      chart: { stage: { x: -150, y: -120, w: 300, h: 46, label: 'STAGE' }, sections: [] }, tiers: [{ id: shortId('tt_'), name: 'Standard', price: 5000 }] };
+    try { await DB.saveVenues([...list, v]); S.adm.bo.venues = [...list, v]; location.hash = '#/admin/venues/' + v.id; } catch (e) { toast(e.message, true); } },
+  dupVenue: async el => { const list = JSON.parse(JSON.stringify(S.adm.bo.venues || [])), src = list.find(v => v.id === el.dataset.v); if (!src) return;
+    const v = { ...JSON.parse(JSON.stringify(src)), id: shortId('ven_'), name: src.name + ' (copy)', updated_at: new Date().toISOString() };
+    try { await DB.saveVenues([...list, v]); S.adm.bo.venues = [...list, v]; toast('Duplicated'); render(); } catch (e) { toast(e.message, true); } },
+  delVenue: async el => { const v = S.adm.bo.venues.find(x => x.id === el.dataset.v); if (!confirmIn(`Delete the venue chart “${v.name}”? Events that use it keep their own copy.`)) return;
+    const list = S.adm.bo.venues.filter(x => x.id !== v.id); try { await DB.saveVenues(list); S.adm.bo.venues = list; render(); } catch (e) { toast(e.message, true); } },
+  saveVenue: async () => { const d = S.draft, list = JSON.parse(JSON.stringify(S.adm.bo.venues || [])), i = list.findIndex(v => v.id === d._venue); if (i < 0) return;
+    const seen = new Set(), dup = seatLayout(d.seating).seats.map(p => p.id).find(id => seen.has(id) || !seen.add(id)); if (dup) return toast(`Two seats would share the ID ${dup} — check row labels and seat numbers`, true);
+    const v = { ...eventToVenue(d, (d.name || '').trim() || 'Venue', d._venue), address: d.address || '', tiers: d.ticketTypes.map(t => ({ id: t.id, name: t.name, price: +t.price || 0 })) };
+    list[i] = v; try { await DB.saveVenues(list); S.adm.bo.venues = list; S.dirty = false; toast('Venue chart saved'); render(); } catch (e) { toast(e.message, true); } },
+  addTier: () => { S.draft.ticketTypes.push({ id: shortId('tt_'), name: 'Tier ' + (S.draft.ticketTypes.length + 1), price: 0 }); dirty(); render(); },
+  delTier: el => { const t = S.draft.ticketTypes.splice(+el.dataset.i, 1)[0], st = S.draft.seating; (st.sections || []).forEach(x => { if (x.ticketTypeId === t.id) x.ticketTypeId = ''; });
+    Object.keys(st.prices || {}).forEach(k => { if (st.prices[k] === t.id) delete st.prices[k]; }); dirty(); render(); },
+  smDup: () => { const st = S.draft.seating, ids = [...smMulti()], made = [];
+    for (const id of ids) { const src = st.sections.find(x => x.id === id); if (!src) continue;
+      const c = { ...JSON.parse(JSON.stringify(src)), id: shortId('sec_'), code: nextCode({ table: 'T', booth: 'B', ga: 'GA' }[secKind(src)] || 'S'), name: src.name + ' copy', x: (+src.x || 0) + 40, y: (+src.y || 0) + 40 };
+      st.sections.push(c); made.push(c.id); }
+    S.ui.smMulti = made; S.ui.smSel = made.length === 1 ? made[0] : ''; dirty(); render(); },
+  // a mirrored copy on the other side of the stage's centre line (seat numbers run the other way)
+  smMirror: () => { const st = S.draft.seating, L = layoutOf(st), M = st.stage ? +st.stage.x + +st.stage.w / 2 : 0, made = [];
+    for (const id of smMulti()) { const src = st.sections.find(x => x.id === id), g = L.secs.find(x => x.sec.id === id); if (!src || !g) continue;
+      const c = { ...JSON.parse(JSON.stringify(src)), id: shortId('sec_'), code: nextCode({ table: 'T', booth: 'B', ga: 'GA' }[secKind(src)] || 'S'), name: src.name + ' (mirror)', rot: -(+src.rot || 0), reverse: !src.reverse };
+      c.x = Math.round(2 * M - (+src.x || 0) - 2 * g.cx); st.sections.push(c); made.push(c.id); }
+    S.ui.smMulti = made; S.ui.smSel = made.length === 1 ? made[0] : ''; dirty(); render(); },
+  smDel: () => { const st = S.draft.seating, ids = smMulti(), secs = st.sections.filter(x => ids.has(x.id)); if (!secs.length) return;
+    const sold = soldSeatIds(S.draft); if (secs.some(sec => sold.some(id => id.startsWith(sec.code + '-')))) return toast('Seats in this section are sold — block them in Seat inventory instead', true);
+    st.sections = st.sections.filter(x => !ids.has(x.id)); for (const sec of secs) for (const m of [st.prices, st.areas, st.labels]) Object.keys(m || {}).forEach(k => { if (k.startsWith(sec.code + '-')) delete m[k]; });
+    S.ui.smSel = ''; S.ui.smMulti = []; dirty(); render(); },
   smClearPrices: () => { const st = S.draft.seating, sec = st.sections.find(x => x.id === S.ui.smSel); Object.keys(st.prices || {}).forEach(k => { if (k.startsWith(sec.code + '-')) delete st.prices[k]; }); dirty(); render(); },
-  smDeselect: () => { S.ui.smSel = ''; render(); },
-  smSel: el => { S.ui.smSel = el.dataset.id; S.ui.smMode = 'move'; render(); },
+  smDeselect: () => { S.ui.smSel = ''; S.ui.smMulti = []; render(); },
+  smSel: el => { S.ui.smSel = el.dataset.id; S.ui.smMulti = [el.dataset.id]; S.ui.smMode = 'move'; render(); },
   smEqualRows: () => { const sec = S.draft.seating.sections.find(x => x.id === S.ui.smSel); delete sec.rowSeats; dirty(); render(); },
+  smStraighten: () => { S.draft.seating.sections.filter(x => smMulti().has(x.id)).forEach(x => { x.curve = 0; x.rot = 0; }); dirty(); render(); },
+  smEven: () => { S.draft.seating.sections.filter(x => smMulti().has(x.id)).forEach(x => { delete x.gap; delete x.rowGap; }); dirty(); render(); },
+  smLevel: el => { S.ui.smLevel = el.dataset.v; S.ui.smSel = ''; S.ui.smMulti = []; render(); },
+  smAddLevel: () => { const st = S.draft.seating; if (!st.levels?.length) st.levels = [{ id: 'L1', name: 'Main floor' }];
+    let n = st.levels.length + 1; while (st.levels.some(l => l.id === 'L' + n)) n++; st.levels.push({ id: 'L' + n, name: 'Level ' + n }); S.ui.smLevel = 'L' + n; dirty(); render(); },
+  smDelLevel: el => { const st = S.draft.seating, l = st.levels[+el.dataset.i], lv0 = st.levels[0].id;
+    if (st.sections.some(x => (x.level || lv0) === l.id)) return toast('Move or delete the sections on ' + l.name + ' first', true);
+    st.sections.forEach(x => { x.level ||= lv0; }); st.levels.splice(+el.dataset.i, 1); if (st.levels.length < 2) { delete st.levels; st.sections.forEach(x => delete x.level); } dirty(); render(); },
+  smBgRemove: () => { delete S.draft.seating.bg; dirty(); render(); },
+  rowsOpen: el => { setTimeout(() => { S.ui.rowsOpen = el.open; }); },
+  rowDup: el => rowEdit('dup', +el.dataset.i),
+  rowDel: el => rowEdit('del', +el.dataset.i),
+  rowCopy: el => { const sec = S.draft.seating.sections.find(x => x.id === S.ui.smSel); S.ui.rowClip = +(sec.rowSeats || [])[+el.dataset.i] || +sec.seatsPerRow || 10; S.ui.rowsOpen = true; toast('Row copied — open any section and paste it'); render(); },
+  rowPaste: () => rowEdit('paste'),
+  mpApply: () => { const secs = S.draft.seating.sections.filter(x => smMulti().has(x.id)), u = S.ui;
+    secs.forEach(x => { if (u.mpTT) x.ticketTypeId = u.mpTT === 'none' ? '' : u.mpTT; if (u.mpArea?.trim()) x.area = u.mpArea.trim(); if (u.mpLevel) x.level = u.mpLevel; });
+    u.mpTT = u.mpArea = u.mpLevel = ''; dirty(); render(); toast('Applied to ' + secs.length + ' sections'); },
+  smSeatsClear: () => { S.ui.smSeats = []; render(); },
+  seatsRemove: () => { const st = S.draft.seating, sold = new Set(soldSeatIds(S.draft)), ids = (S.ui.smSeats || []).filter(id => layoutOf(st).byId.get(id));
+    if (ids.some(id => sold.has(id))) return toast('Some of these seats are sold — move those customers first', true);
+    st.removed = [...new Set([...(st.removed || []), ...ids])]; S.ui.smSeats = []; dirty(); render(); },
+  seatsRestore: () => { const st = S.draft.seating, sel = new Set(S.ui.smSeats || []); st.removed = (st.removed || []).filter(id => !sel.has(id)); S.ui.smSeats = []; dirty(); render(); },
+  seatsArea: () => seatMapEdit('areas', (S.ui.spArea || '').trim(), p => p.sec.area || p.sec.name),
+  seatsPrice: () => seatMapEdit('prices', S.ui.spTT || '', p => p.sec.ticketTypeId),
+  seatsLabel: () => seatMapEdit('labels', (S.ui.spLabel || '').trim().slice(0, 8), p => String(p.num)),
+  smPreview: () => { const ev = { ...S.draft, seating: { ...S.draft.seating, ...seatDerive(S.draft.seating) } }, saved = S.adm.events.find(e => e.id === ev.id);
+    const slot = (ev.timeSlots || [])[0]?.id || '', av = saved ? availabilityFrom(S.adm.tickets, ev.id, S.adm.seatStatus) : { seats: [], off: [] };
+    S.ui.pvOpen = true; modal('Customer preview', `<p class="small muted" style="margin-bottom:10px">Exactly what buyers see${slot ? ' for the first showtime' : ''}, including unsaved changes. Seats can't be picked here.</p>${BuyerSeatMap(ev, av, { slotId: slot, seats: [] }, true)}`); },
+  loadVenue: el => { const v = (S.adm.bo.venues || []).find(x => x.id === (el.dataset.v || S.ui.venPick || S.adm.bo.venues[0]?.id)); if (!v) return;
+    if (S.draft.seating?.sections?.length && !confirmIn(`Replace this event's seating chart with “${v.name}”? Price tiers are matched to ticket types by name (missing ones are added).`)) return;
+    const r = venueToEvent(v, S.draft); S.draft.ticketTypes = r.ticketTypes; S.draft.seating = r.seating; if (!S.draft.venue || S.draft.venue === 'TBA') { S.draft.venue = v.name; S.draft.address ||= v.address; }
+    S.ui.smSel = ''; S.ui.smMulti = []; dirty(); render(); toast('Loaded “' + v.name + '” — save to keep it'); },
+  saveToVenue: async () => {
+    const list = JSON.parse(JSON.stringify(S.adm.bo.venues || [])), cur = list.find(v => v.id === S.draft.seating.venueId); let v;
+    if (cur && confirmIn(`Update the master chart “${cur.name}” with this layout? Events that already use it keep their own copy.`)) v = { ...eventToVenue(S.draft, cur.name, cur.id), address: cur.address };
+    else { const name = window.prompt('Name for this venue chart', S.draft.venue || 'My venue'); if (!name?.trim()) return; v = eventToVenue(S.draft, name.trim()); }
+    const i = list.findIndex(x => x.id === v.id); if (i >= 0) list[i] = v; else list.push(v);
+    try { await DB.saveVenues(list); S.adm.bo.venues = list; S.draft.seating.venueId = v.id; S.draft.seating.venueName = v.name; dirty(); toast('Saved to venue library as “' + v.name + '”'); render(); } catch (e) { toast(e.message, true); }
+  },
   addQ: () => { (S.draft.questions ||= []).push({ id: shortId('q_'), label: 'New question', type: 'text', options: '', required: false }); dirty(); render(); },
   delQ: el => { S.draft.questions.splice(+el.dataset.i, 1); dirty(); render(); },
   addAddon: () => { (S.draft.addons ||= []).push({ id: shortId('ad_'), name: 'New product', price: 1000, qty: 0 }); dirty(); render(); },
@@ -1801,6 +2162,7 @@ const A = {
       toast('Queued for ' + el.dataset.n + ' buyers — sending is off until email is connected'); render(); } catch (e) { toast(e.message, true); } },
   exportWL: el => { download('waitlist.csv', csv([['Name', 'Email', 'Phone', 'Joined', 'Notified'], ...S.adm.waitlist.filter(w => w.event_id === el.dataset.id).map(w => [w.name, w.email, w.phone || '', w.created_at, w.notified_at || ''])])); DB.log('export.waitlist', 'Exported the waitlist'); },
   openOrder: el => OrderModal(el.dataset.id),
+  emailPv: el => { const o = S.adm.orders.find(x => x.id === el.dataset.id); modal('Confirmation email · ' + esc(o.ref), `<p class="small muted" style="margin-bottom:12px">One email per order — every ticket together, with the PDF tickets attached. (Sending switches on with email delivery in Stage 8; this is exactly what it will contain.)</p>${OrderEmail(o, S.adm.tickets.filter(t => t.order_id === o.id))}`); },
   pick: el => { S.ui.picked[el.dataset.id] = el.checked; render(); },
   orderStatus: async el => { if (['cancelled', 'refunded'].includes(el.dataset.v) && !confirmIn('Cancel this order and void its tickets?' + (el.dataset.v === 'refunded' ? ' Refund the card in Stripe.' : ''))) return;
     try { await DB.setOrderStatus(el.dataset.id, el.dataset.v); await reloadAdmin(); toast('Order ' + el.dataset.v); OrderModal(el.dataset.id); render(); } catch (e) { toast(e.message, true); } },
@@ -1813,8 +2175,8 @@ const A = {
     const m = S.ui.mo, ev = S.adm.events.find(e => e.id === m.ev); if (!ev) return;
     const tt = m.tt || ev.ticketTypes[0].id, qty = Math.max(1, +m.qty || 1), slot = ev.timeSlots?.length ? (m.slot || ev.timeSlots[0].id) : null;
     let seats = [];
-    if (ev.seating?.enabled) { const av = availabilityFrom(S.adm.tickets, ev.id);
-      seats = Object.keys(ev.seating.index || {}).filter(id => ev.seating.index[id] === tt && !av.seats.includes((slot || '') + '|' + id)).slice(0, qty);
+    if (ev.seating?.enabled) { const off = offSeats(availabilityFrom(S.adm.tickets, ev.id, S.adm.seatStatus), slot);
+      seats = Object.keys(ev.seating.index || {}).filter(id => ev.seating.index[id] === tt && !off.has(id)).slice(0, qty);
       if (seats.length < qty) return toast('Not enough free seats in that tier', true); }
     try { await DB.placeOrder({ buyer: { name: m.name, email: m.email, phone: '' }, items: [{ eventId: ev.id, ticketTypeId: tt, qty, slotId: slot, seats }], addons: [], payment: 'manual', comp: !!m.comp, source: 'box office' }, true);
       closeModal(); await reloadAdmin(); toast('Order created'); render(); } catch (e) { toast(e.message, true); }
@@ -1822,8 +2184,8 @@ const A = {
   exportOrders: () => download('orders.csv', csv([['Order', 'Placed', 'Status', 'Name', 'Email', 'Phone', 'Events', 'Tickets', 'Subtotal', 'Discount', 'Code', 'Fees', 'Tax', 'Donation', 'Total', 'Payment', 'Source', 'Marketing opt-in'],
     ...filteredOrders().map(o => { const d = o.data; return [o.ref, o.created_at, o.status, d.buyer.name, o.buyer_email, d.buyer.phone, [...new Set(d.lines.map(l => l.eventName))].join('; '), d.lines.filter(l => l.kind === 'ticket').map(l => l.qty + 'x ' + l.name).join('; '),
       d.subtotal / 100, d.discount / 100, d.code || '', d.fee / 100, d.tax / 100, d.donation / 100, d.total / 100, d.payment, d.source || '', d.optIn ? 'yes' : 'no']; })])),
-  exportAtt: () => { const ev = evById(S.ui.attEv); download(slugify(ev?.name || 'attendees') + '-door-list.csv', csv([['Name', 'Email', 'Ticket', 'Seat', 'Time slot', 'Code', 'Order', 'Checked in'],
-    ...S.adm.tickets.filter(t => t.event_id === S.ui.attEv && t.status === 'valid').map(t => { const o = S.adm.orders.find(x => x.id === t.order_id); return [t.holder, o?.buyer_email, ev.ticketTypes.find(x => x.id === t.ticket_type_id)?.name, t.seat || '', t.slot_id ? fmtDT(ev.timeSlots.find(s => s.id === t.slot_id)?.start) : '', t.code, o?.ref, t.checked_in_at || '']; })])); },
+  exportAtt: () => { const ev = evById(S.ui.attEv); download(slugify(ev?.name || 'attendees') + '-door-list.csv', csv([['Name', 'Email', 'Ticket type', 'Area', 'Row', 'Seat', 'Time slot', 'Code', 'Order', 'Checked in'],
+    ...S.adm.tickets.filter(t => t.event_id === S.ui.attEv && t.status === 'valid').map(t => { const o = S.adm.orders.find(x => x.id === t.order_id); const sp = t.seat ? seatParts(ev, t.seat, t) : {}; return [t.holder, o?.buyer_email, ev.ticketTypes.find(x => x.id === t.ticket_type_id)?.name, sp.area || '', sp.row || '', sp.seat || '', t.slot_id ? fmtDT(ev.timeSlots.find(s => s.id === t.slot_id)?.start) : '', t.code, o?.ref, t.checked_in_at || '']; })])); },
   exportReport: () => download('sales-report.csv', csv([['Event', 'Date', 'Tickets sold', 'Ticket revenue'], ...S.adm.events.map(e => { const s = evStats(e); return [e.name, e.start, s.sold, s.rev / 100]; })])),
   exportOptIn: () => download('mailing-list.csv', csv([['Email Address', 'First Name', 'Last Name'], ...[...new Map(S.adm.orders.filter(o => o.data.optIn).map(o => [o.buyer_email, o])).values()].map(o => { const [f, ...l] = o.data.buyer.name.split(' '); return [o.buyer_email, f, l.join(' ')]; })])),
   toggleIn: el => doCheckin(el.dataset.v, el.dataset.undo === '1'),
@@ -1844,6 +2206,13 @@ const A = {
 };
 const confirmIn = msg => window.confirm(msg);
 const CHANGE = {
+  // a floor plan under the builder: downscaled in the browser so it stays small enough to store with the event
+  smBg: el => { const f = el.files?.[0]; if (!f) return; if (!/^image\//.test(f.type)) return toast('Choose an image file', true);
+    const img = new Image(), url = URL.createObjectURL(f);
+    img.onload = () => { const k = Math.min(1, 1600 / img.width), c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
+      const b = layoutOf(S.draft.seating).bounds; S.draft.seating.bg = { src: c.toDataURL('image/jpeg', .72), x: Math.round(b.x0), y: Math.round(b.y0), w: Math.round(b.x1 - b.x0), opacity: .35 }; dirty(); render(); };
+    img.onerror = () => toast('That image could not be read', true); img.src = url; },
   switchBo: async el => { try { S.ui.support = null; S.ui.set = S.ui.brand = S.ui.pe = null; await reloadAdmin(el.value); location.hash = '#/admin/dashboard'; setContext(); render(); } catch (e) { toast(e.message, true); } },
   applyTpl: el => { const t = S.adm.bo.templates.find(x => x.id === el.value); if (!t) return; S.ui.pe.obj.perms = [...t.perms]; S.ui.pe.obj.template = t.id; S.ui.pe.dirty = true; render(); },
 };
@@ -1868,7 +2237,8 @@ document.addEventListener('input', e => {
     else if (t === 'list') v = el.value.split(',').map(x => x.trim()).filter(Boolean).map(Number);
     const target = root === 'draft' ? S.draft : root === 'co' ? S.co : root === 'set' ? S.ui.set : root === 'ui' ? S.ui : null;
     if (!target) return;
-    setPath(target, path, v);
+    const secM = root === 'draft' && path.match(/^seating\.sections\.(\d+)\./);
+    if (secM && S.draft.seating.sections[+secM[1]]) remapSeatKeys(S.draft.seating, S.draft.seating.sections[+secM[1]].id, () => setPath(target, path, v)); else setPath(target, path, v);
     if (root === 'ui' && path.startsWith('pe.')) { S.ui.pe.dirty = true; const b = $('[data-action="savePerms"]'); if (b) b.disabled = false; }
     if (root === 'ui' && path.startsWith('brand.branding.') && el.type !== 'text' && el.type !== 'url') { render(); return; }
     if (root === 'draft') { dirty(); if (path === 'name' && S.draft.status === 'draft' && /^new-event-/.test(S.draft.slug)) S.draft.slug = slugify(v); }

@@ -98,16 +98,21 @@ function quote(cart, events, settings, discount) {
 }
 
 /* availability from a ticket list (DEMO) — same shape as the SQL availability() */
-function availabilityFrom(tickets, eventId) {
-  const a = { tt: {}, slots: {}, seats: [], total: 0 };
+// seats: sold "slot|seat" keys; off: seats nobody else can buy right now (blocked, held, unavailable, in someone else's checkout).
+function availabilityFrom(tickets, eventId, statuses = [], token = '') {
+  const a = { tt: {}, slots: {}, seats: [], total: 0, off: [] };
   for (const t of tickets) {
     if (t.event_id !== eventId || t.status !== 'valid') continue;
     a.total++; a.tt[t.ticket_type_id] = (a.tt[t.ticket_type_id] || 0) + 1;
     if (t.slot_id) a.slots[t.slot_id] = (a.slots[t.slot_id] || 0) + 1;
     if (t.seat) a.seats.push((t.slot_id || '') + '|' + t.seat);
   }
+  const now = Date.now();
+  for (const r of statuses) if (r.event_id === eventId && !(r.status === 'checkout' && (new Date(r.expires_at) <= now || (token && r.token === token)))) a.off.push((r.slot_id || '') + '|' + r.seat);
   return a;
 }
+// seats a buyer can't pick for one showtime ('' rows apply to every showtime)
+const offSeats = (av, slotId) => { const out = new Set(); for (const k of [...(av?.seats || []), ...(av?.off || [])]) { const i = k.indexOf('|'), sl = k.slice(0, i); if (!sl || sl === (slotId || '')) out.add(k.slice(i + 1)); } return out; };
 
 
 /* ── Events: lifecycle, visibility, showtimes, sellout value (Stage 2). Shared by buyer pages, back office and DEMO checks. ──
@@ -133,23 +138,33 @@ function slotState(s, av) {
   return +s.capacity > 0 && (av?.slots?.[s.id] || 0) >= +s.capacity ? 'soldout' : 'open';
 }
 // Maximum revenue if everything sellable sells, at face value — and what's already sold/comped against it.
-// tickets: this event's tickets (any status); lines from orders give the face value actually sold.
-function sellout(ev, tickets = []) {
-  const shows = Math.max(1, (ev.timeSlots || []).filter(s => !s.hidden && !s.unavailable).length);
+// tickets: this event's tickets (any status); statuses: seat_status rows; orders give what was actually collected.
+// Seated events also get byArea (Eli Step 3 §11): seats, price, sold, available, blocked, comped, potential, actual, remaining.
+function sellout(ev, tickets = [], statuses = [], orders = []) {
+  const visible = (ev.timeSlots || []).filter(s => !s.hidden && !s.unavailable), shows = Math.max(1, visible.length);
   const tts = ev.ticketTypes || [], price = t => +t.price || 0, valid = tickets.filter(t => t.event_id === ev.id && t.status === 'valid');
   const soldBy = id => valid.filter(t => t.ticket_type_id === id), unitOf = t => price(t) / Math.max(1, +t.admits || 1);
-  const byTT = [], bySec = []; let total = 0, estimate = false, unknown = false;
+  const byTT = [], byArea = []; let total = 0, estimate = false, unknown = false;
   if (ev.seating?.enabled) {
-    const L = seatLayout(ev.seating), blocked = new Set(ev.seating.blocked || []);
-    for (const g of L.secs) {
-      const seats = g.local.filter(p => p.tt && !blocked.has(p.id)), pot = sum2(seats, p => price(tts.find(t => t.id === p.tt) || {})) * shows;
-      const ids = new Set(g.local.map(p => p.id)), sold = valid.filter(t => ids.has(t.seat));
-      bySec.push({ name: g.sec.name || g.sec.code, seats: seats.length * shows, blocked: g.local.filter(p => blocked.has(p.id)).length * shows, sold: sold.length,
-        potential: pot, soldValue: sum2(sold, t => price(tts.find(x => x.id === t.ticket_type_id) || {})) });
+    const ttById = Object.fromEntries(tts.map(t => [t.id, t])), A = {}, cap = {};
+    const paid = t => { const o = orders.find(x => x.id === t.order_id); if (!o || o.status !== 'paid' || o.data.comp) return 0;
+      const l = o.data.lines.find(x => x.kind === 'ticket' && x.ticketTypeId === t.ticket_type_id && x.eventId === ev.id); const unit = +l?.unit || 0;
+      return Math.round(unit * (1 - (+o.data.discount || 0) / Math.max(1, +o.data.subtotal || 0))); };
+    for (const sl of visible.length ? visible : [{ id: '' }]) {
+      for (const { p, state, t } of seatStates(ev, { tickets, statuses, orders, slotId: sl.id }).values()) {
+        const r = A[p.area] ||= { name: p.area, seats: 0, prices: new Set(), sold: 0, available: 0, blocked: 0, held: 0, comped: 0, unavailable: 0, potential: 0, actual: 0, remaining: 0 };
+        const pr = p.tt ? price(ttById[p.tt] || {}) : 0; r.seats++; if (p.tt) r.prices.add(pr);
+        if (state === 'sold') { r.sold++; r.actual += paid(t); } else if (state === 'comp') r.comped++;
+        else if (state === 'blocked') r.blocked++; else if (state === 'unavailable') r.unavailable++;
+        else if (state === 'held' || state === 'checkout') r.held++; else r.available++;
+        if (!['blocked', 'unavailable'].includes(state)) { r.potential += pr; if (p.tt) cap[p.tt] = (cap[p.tt] || 0) + 1; }
+        if (['available', 'held', 'checkout'].includes(state)) r.remaining += pr;
+      }
     }
-    for (const t of tts) { const n = Object.values(ev.seating.index || {}).filter(x => x === t.id).length * shows; byTT.push({ tt: t, capacity: n, potential: n * price(t) }); }
+    byArea.push(...Object.values(A).map(r => ({ ...r, prices: [...r.prices].sort((a, b) => a - b) })));
+    for (const t of tts) byTT.push({ tt: t, capacity: cap[t.id] || 0, potential: (cap[t.id] || 0) * price(t) });
   } else {
-    const cap = (ev.timeSlots || []).length ? sum2(ev.timeSlots.filter(s => !s.hidden && !s.unavailable), s => +s.capacity) : +ev.capacity || 0;
+    const cap = (ev.timeSlots || []).length ? sum2(visible, s => +s.capacity) : +ev.capacity || 0;
     let left = cap;
     for (const t of tts.filter(t => +t.qty > 0)) { const n = cap ? Math.min(+t.qty, left) : +t.qty; left = Math.max(0, left - n); byTT.push({ tt: t, capacity: n, potential: n * unitOf(t) }); }
     const open = tts.filter(t => !(+t.qty > 0)), main = open.find(t => !t.hidden) || open[0];
@@ -158,7 +173,7 @@ function sellout(ev, tickets = []) {
   byTT.forEach(r => { const s = soldBy(r.tt.id); r.sold = s.length; r.soldValue = s.length * unitOf(r.tt); });
   total = sum2(byTT, r => r.potential);
   const soldValue = sum2(byTT, r => r.soldValue);
-  return { total, byTT, bySec, soldValue, remaining: Math.max(0, total - soldValue), pct: total ? soldValue / total : 0, estimate, unknown, shows };
+  return { total, byTT, byArea, soldValue, remaining: Math.max(0, total - soldValue), pct: total ? soldValue / total : 0, estimate, unknown, shows };
 }
 const sum2 = (a, f) => a.reduce((t, x) => t + (+f(x) || 0), 0);
 // A copy of an event's set-up with fresh ids — no orders, tickets, codes or schedule state carry over.
@@ -186,60 +201,185 @@ function eventToTemplate(ev, name) {
 function eventFromTemplate(tpl, dayIso) {
   const e = cloneEventStructure(tpl.event), d = dayIso ? new Date(dayIso) : new Date(Date.now() + 30 * 864e5);
   d.setHours(tpl.at?.[0] ?? 20, tpl.at?.[1] ?? 0, 0, 0);
+  if (e.seating?.enabled) Object.assign(e.seating, seatDerive(e.seating));
   return Object.assign(e, { name: e.name || tpl.name, slug: 'new-event-' + randCode(4).toLowerCase(), start: d.toISOString(), end: new Date(d.getTime() + (tpl.minutes || 180) * 6e4).toISOString(), timeSlots: [] });
 }
 
-/* ── Seat maps ───────────────────────────────────────────────────────────────────
-   seating = {enabled, stage:{x,y,w,h,label}, sections:[...], prices:{seatId:ttId}, blocked:[seatId], index:{seatId:ttId}}
-   section = {id, code, name, kind:'rows'|'table', x, y, rot, ticketTypeId,
-              rows, seatsPerRow, rowSeats:[n per row], rowStart:'A', reverse, curve(0-100)  |  seats (table)}
-   Seat ids are "<code>-<row><num>" (rows) or "<code>-<num>" (tables). `index` is DERIVED on save from the
-   layout (the server checks each seat is sold as its own ticket type) — sections/prices stay the source. */
-const SEAT = 26, ROWH = 30, ROW_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+/* ── Seat maps (Stage 3) ──────────────────────────────────────────────────────────
+   seating = {enabled, stage:{x,y,w,h,label}, sections:[...], levels:[{id,name}], bg:{src,x,y,w,opacity,public},
+              prices:{seatId:ttId}, areas:{seatId:area}, labels:{seatId:label}, removed:[seatId], noSingles, venueId, venueName,
+              index, meta, rows (DERIVED on save by seatDerive — the server checks against these)}
+   section = {id, code, name, area?, level?, kind:'rows'|'table'|'booth'|'ga', x, y, rot, ticketTypeId, gap?, rowGap?,
+              rows, seatsPerRow, rowSeats:[n per row], rowStart:'A', rowLabels:'AA,BB', seatStart, numbering:'seq'|'odd'|'even', reverse, curve(0-100)
+              | seats (table, booth) | capacity, w, h (ga — standing area sold as numbered spots)}
+   Seat ids are "<code>-<row><num>" (rows) or "<code>-<num>" (tables, booths, standing spots). Blocks, holds and
+   "unavailable" are NOT in the event — they are seat_status rows, so changing them never rewrites the layout. */
+const SEAT = 26, ROWH = 30, ROW_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ', GA_MAX = 2000;
 function rowLabel(start, i) {
   if (/^\d+$/.test(String(start))) return String(+start + i);
   let k = Math.max(0, ROW_LETTERS.indexOf(String(start || 'A').toUpperCase())) + i, out = '';
   do { out = ROW_LETTERS[k % 24] + out; k = Math.floor(k / 24) - 1; } while (k >= 0);
   return out;
 }
+const secRowLabel = (sec, r) => String(sec.rowLabels || '').split(',').map(x => x.trim().toUpperCase())[r] || rowLabel(sec.rowStart || 'A', r);
+// seat number k (0-based from the left, or right if reversed): 1,2,3… or odd/even house numbering
+function seatNum(sec, i, n) {
+  const k = sec.reverse ? n - 1 - i : i, s = Math.max(0, Math.round(+sec.seatStart || 1));
+  if (sec.numbering !== 'odd' && sec.numbering !== 'even') return s + k;
+  const first = (s % 2 === 1) === (sec.numbering === 'odd') ? s : s + 1; return first + 2 * k;
+}
+const secKind = sec => ['table', 'booth', 'ga'].includes(sec.kind) ? sec.kind : 'rows';
 function seatLayout(st) {
-  const seats = [], secs = [];
+  const seats = [], secs = [], removed = new Set(st?.removed || []), areas = st?.areas || {}, labels = st?.labels || {}, lv0 = st?.levels?.[0]?.id || '';
   for (const sec of st?.sections || []) {
-    const local = []; let R = 0;
-    if (sec.kind === 'table') {
-      const n = Math.max(1, Math.min(40, +sec.seats || 8)); R = Math.max(26, n * SEAT / (2 * Math.PI) - 4);
-      for (let i = 0; i < n; i++) { const a = -Math.PI / 2 + i * 2 * Math.PI / n; local.push({ id: `${sec.code}-${i + 1}`, x: Math.cos(a) * (R + 15), y: Math.sin(a) * (R + 15), row: '', num: i + 1 }); }
+    const local = [], rowsOrder = {}, kind = secKind(sec), gap = Math.max(16, Math.min(60, +sec.gap || SEAT)), rg = Math.max(20, Math.min(80, +sec.rowGap || ROWH));
+    let R = 0, box = null;
+    if (kind === 'table') {
+      const n = Math.max(1, Math.min(40, +sec.seats || 8)); R = Math.max(26, n * gap / (2 * Math.PI) - 4);
+      for (let i = 0; i < n; i++) { const a = -Math.PI / 2 + i * 2 * Math.PI / n; local.push({ id: `${sec.code}-${i + 1}`, x: Math.cos(a) * (R + 15), y: Math.sin(a) * (R + 15), row: '', num: i + 1, r: 0, i }); }
+    } else if (kind === 'booth') {  // a bench each side of a long table
+      const n = Math.max(2, Math.min(24, +sec.seats || 6)), top = Math.ceil(n / 2), W = (top - 1) * gap;
+      box = { x: -14, y: 13, w: W + 28, h: 30 };
+      for (let i = 0; i < n; i++) { const b = i >= top, j = b ? i - top : i; local.push({ id: `${sec.code}-${i + 1}`, x: j * gap, y: b ? 56 : 0, row: '', num: i + 1, r: 0, i }); }
+    } else if (kind === 'ga') {  // standing / unreserved area: numbered spots, bought by quantity, never drawn one by one
+      const n = Math.max(1, Math.min(GA_MAX, +sec.capacity || 100)), w = Math.max(80, +sec.w || 220), h = Math.max(50, +sec.h || 120);
+      box = { x: 0, y: 0, w, h };
+      for (let i = 0; i < n; i++) local.push({ id: `${sec.code}-${i + 1}`, x: w / 2, y: h / 2, row: '', num: i + 1, r: 0, i, ga: true });
     } else {
       const rows = Math.max(1, Math.min(60, +sec.rows || 1)), per = Math.max(1, Math.min(80, +sec.seatsPerRow || 10));
       const counts = Array.from({ length: rows }, (_, r) => Math.max(1, Math.min(80, +(sec.rowSeats || [])[r] || per)));
-      const M = Math.max(...counts), W = (M - 1) * SEAT, bend = (+sec.curve || 0) / 100 * W * .22;
+      const M = Math.max(...counts), W = (M - 1) * gap, bend = (+sec.curve || 0) / 100 * W * .22;
       counts.forEach((n, r) => {
-        const label = rowLabel(sec.rowStart || 'A', r), off = (M - n) * SEAT / 2;
-        for (let i = 0; i < n; i++) { const x = off + i * SEAT, t = W ? (x - W / 2) / (W / 2) : 0, num = sec.reverse ? n - i : i + 1;
-          local.push({ id: `${sec.code}-${label}${num}`, x, y: r * ROWH - bend * t * t, row: label, num }); }
+        const label = secRowLabel(sec, r), off = (M - n) * gap / 2, order = rowsOrder[label] = [];
+        for (let i = 0; i < n; i++) { const x = off + i * gap, t = W ? (x - W / 2) / (W / 2) : 0, num = seatNum(sec, i, n), id = `${sec.code}-${label}${num}`;
+          order.push(removed.has(id) ? null : id); local.push({ id, x, y: r * rg - bend * t * t, row: label, num, r, i }); }
       });
     }
-    const xs = local.map(p => p.x), ys = local.map(p => p.y);
-    const g = { sec, local, R, minx: Math.min(...xs), maxx: Math.max(...xs), miny: Math.min(...ys), maxy: Math.max(...ys) };
+    const xs = local.map(p => p.x).concat(box ? [box.x, box.x + box.w] : []), ys = local.map(p => p.y).concat(box ? [box.y, box.y + box.h] : []);
+    const g = { sec, kind, level: sec.level || lv0, local: [], all: local, rowsOrder, R, box, minx: Math.min(...xs), maxx: Math.max(...xs), miny: Math.min(...ys), maxy: Math.max(...ys) };
     g.cx = (g.minx + g.maxx) / 2; g.cy = (g.miny + g.maxy) / 2;
     const a = (+sec.rot || 0) * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a);
     for (const p of local) {
       const dx = p.x - g.cx, dy = p.y - g.cy;
       p.gx = (+sec.x || 0) + g.cx + dx * c - dy * sn; p.gy = (+sec.y || 0) + g.cy + dx * sn + dy * c;
-      p.sec = sec; p.tt = (st.prices || {})[p.id] || sec.ticketTypeId || '';
-      seats.push(p);
+      p.sec = sec; p.tt = (kind === 'ga' ? '' : (st.prices || {})[p.id]) || sec.ticketTypeId || '';
+      p.area = areas[p.id] || sec.area || sec.name || sec.code; p.label = kind === 'ga' ? '' : labels[p.id] || String(p.num); p.level = g.level;
+      p.removed = removed.has(p.id);
+      if (!p.removed) { seats.push(p); g.local.push(p); }
     }
     secs.push(g);
   }
-  const st0 = st?.stage, xs = seats.map(p => p.gx), ys = seats.map(p => p.gy);
-  if (st0) { xs.push(+st0.x, +st0.x + +st0.w); ys.push(+st0.y, +st0.y + +st0.h); }
-  const bounds = xs.length ? { x0: Math.min(...xs) - 20, x1: Math.max(...xs) + 20, y0: Math.min(...ys) - 40, y1: Math.max(...ys) + 20 } : { x0: -200, x1: 200, y0: -150, y1: 150 };
-  return { seats, secs, bounds };
+  const L = { seats, secs, lv0 }; L.bounds = boundsOf(L, null, st?.stage); return L;
 }
-const seatIndex = st => { const b = new Set(st.blocked || []); return Object.fromEntries(seatLayout(st).seats.filter(p => p.tt && !b.has(p.id)).map(p => [p.id, p.tt])); };
+// Drawing bounds for one level (null = everything).
+function boundsOf(L, level, stage) {
+  const xs = [], ys = [];
+  for (const g of L.secs) {
+    if (level != null && g.level !== level) continue;
+    const a = (+g.sec.rot || 0) * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a);
+    for (const [px, py] of [[g.minx, g.miny], [g.maxx, g.miny], [g.minx, g.maxy], [g.maxx, g.maxy]]) {
+      const dx = px - g.cx, dy = py - g.cy; xs.push((+g.sec.x || 0) + g.cx + dx * c - dy * sn); ys.push((+g.sec.y || 0) + g.cy + dx * sn + dy * c);
+    }
+  }
+  if (stage && (level == null || level === (stage.level || L.lv0 || ''))) { xs.push(+stage.x, +stage.x + +stage.w); ys.push(+stage.y, +stage.y + +stage.h); }
+  return xs.length ? { x0: Math.min(...xs) - 30, x1: Math.max(...xs) + 30, y0: Math.min(...ys) - 44, y1: Math.max(...ys) + 24 } : { x0: -200, x1: 200, y0: -150, y1: 150 };
+}
+// What the server checks against: price per seat (index), what goes on the ticket (meta: [area, row, seat]),
+// and row order for the single-seat gap rule (rows: "SEC|A" → [seatId | null for a removed seat]).
+function seatDerive(st) {
+  const L = seatLayout(st), index = {}, meta = {}, rows = {};
+  for (const p of L.seats) { if (p.tt) index[p.id] = p.tt; meta[p.id] = [p.area, p.row, p.label]; }
+  for (const g of L.secs) for (const [r, ids] of Object.entries(g.rowsOrder)) rows[g.sec.code + '|' + r] = ids;
+  return { index, meta, rows };
+}
+const seatIndex = st => seatDerive(st).index;
+// Seat IDs come from row labels and seat numbers, so renaming rows / renumbering seats re-keys them. Carry each seat's
+// overrides (price, area, label, removed) to its new ID by position. rowMap: old row index → new (-1 = row deleted).
+function remapSeatKeys(st, secId, mutate, rowMap = r => r) {
+  const one = () => { const sec = st.sections.find(x => x.id === secId); return sec ? seatLayout({ sections: [sec] }).secs[0].all : []; };
+  const before = one(); mutate(); const after = new Map(one().map(p => [p.r + ':' + p.i, p.id])), ren = new Map();
+  for (const p of before) { const r2 = rowMap(p.r), id2 = r2 < 0 ? null : after.get(r2 + ':' + p.i) || null; if (id2 !== p.id) ren.set(p.id, id2); }
+  if (!ren.size) return;
+  for (const k of ['prices', 'areas', 'labels']) { if (!st[k]) continue; const out = {};
+    for (const [id, v] of Object.entries(st[k])) if (!ren.has(id)) out[id] ??= v; else if (ren.get(id)) out[ren.get(id)] = v;
+    st[k] = out; }
+  if (st.removed) st.removed = [...new Set(st.removed.map(id => ren.has(id) ? ren.get(id) : id).filter(Boolean))];
+}
+// drop per-seat overrides for seats that no longer exist on the map
+function pruneSeatKeys(st) {
+  const ids = new Set(seatLayout(st).secs.flatMap(g => g.all.map(p => p.id)));
+  for (const k of ['prices', 'areas', 'labels']) if (st[k]) st[k] = Object.fromEntries(Object.entries(st[k]).filter(([id]) => ids.has(id)));
+  if (st.removed) st.removed = st.removed.filter(id => ids.has(id));
+}
+// Ticket Type / Area, Row and Seat — kept separate on every ticket (Eli: never one combined label).
+function seatInfo(ev, id, t) {
+  if (t?.area !== undefined && t.area !== null) return { area: t.area, row: t.row || '', seat: t.seat_label || '' };
+  const m = ev?.seating?.meta?.[id]; return m ? { area: m[0], row: m[1], seat: m[2] } : { area: '', row: '', seat: id || '' };
+}
+
+// Venue chart <-> event. A chart keeps the layout plus named price tiers; attaching it to an event copies it and maps
+// each tier to the event's ticket type of the same name (creating it if missing).
+const CHART_KEYS = ['stage', 'sections', 'levels', 'bg', 'prices', 'areas', 'labels', 'removed'];
+function eventToVenue(ev, name, id) {
+  const se = ev.seating || {}, used = new Set(seatLayout(se).seats.map(p => p.tt).filter(Boolean));
+  return { id: id || shortId('ven_'), name: name || ev.venue || 'Venue', address: ev.address || '', updated_at: nowIso(), updated_by: DB._actor || 'system',
+    chart: clone(Object.fromEntries(CHART_KEYS.filter(k => se[k] !== undefined).map(k => [k, se[k]]))),
+    tiers: (ev.ticketTypes || []).filter(t => used.has(t.id)).map(t => ({ id: t.id, name: t.name, price: +t.price || 0 })) };
+}
+function venueToEvent(v, ev) {
+  const map = {}, ticketTypes = clone(ev.ticketTypes || []);
+  for (const t of v.tiers || []) {
+    let x = ticketTypes.find(y => y.name.trim().toLowerCase() === t.name.trim().toLowerCase());
+    if (!x) ticketTypes.push(x = { id: shortId('tt_'), name: t.name, price: +t.price || 0, qty: 0, min: 1, max: 10, admits: 1, desc: '', hidden: false });
+    map[t.id] = x.id;
+  }
+  const ch = clone(v.chart || {}); (ch.sections || []).forEach(x => { x.ticketTypeId = map[x.ticketTypeId] || ''; });
+  ch.prices = Object.fromEntries(Object.entries(ch.prices || {}).map(([k, id]) => [k, map[id] || '']).filter(([, id]) => id));
+  const seating = { ...(ev.seating || {}), ...ch, enabled: true, venueId: v.id, venueName: v.name };
+  return { ticketTypes, seating: Object.assign(seating, seatDerive(seating)) };
+}
+
+/* ── Seat statuses (Stage 3) ──
+   seat_status rows: {id, box_office_id, event_id, slot_id ('' = every showtime), seat, status, note, by, at, expires_at?, token?}
+   status: 'checkout' (a buyer's 10-minute hold) | 'held' (staff hold) | 'blocked' | 'unavailable'.
+   A seat's state = a valid ticket (sold / comp) > unavailable > blocked > held > checkout > no price (unavailable) > available. */
+const SEAT_STATES = { available: 'Available', sold: 'Sold', checkout: 'In checkout', held: 'Held', blocked: 'Blocked', unavailable: 'Unavailable', comp: 'Complimentary' };
+const STATUS_RANK = { unavailable: 4, blocked: 3, held: 2, checkout: 1 };
+const HOLD_MINUTES = 10;
+function activeStatuses(statuses, eventId, slotId = '', now = Date.now()) {
+  const m = new Map();
+  for (const r of statuses || []) {
+    if (r.event_id !== eventId || (r.slot_id || '') !== '' && (r.slot_id || '') !== (slotId || '')) continue;
+    if (r.status === 'checkout' && new Date(r.expires_at) <= now) continue;
+    const cur = m.get(r.seat); if (!cur || STATUS_RANK[r.status] > STATUS_RANK[cur.status]) m.set(r.seat, r);
+  }
+  return m;
+}
+// state of every seat on the map for one showtime. token = this buyer's checkout hold (counts as theirs, not taken).
+function seatStates(ev, { tickets = [], statuses = [], orders = [], slotId = '', token = '' } = {}) {
+  const out = new Map(), L = seatLayout(ev.seating), act = activeStatuses(statuses, ev.id, slotId), byTk = new Map(), ordById = new Map(orders.map(o => [o.id, o]));
+  for (const t of tickets) if (t.event_id === ev.id && t.status === 'valid' && t.seat && (t.slot_id || '') === (slotId || '')) byTk.set(t.seat, t);
+  for (const p of L.seats) {
+    const t = byTk.get(p.id), s = act.get(p.id), o = t && ordById.get(t.order_id);
+    const state = t ? (t.comp || o?.data?.comp ? 'comp' : 'sold') : s && !(s.status === 'checkout' && token && s.token === token) ? s.status : !p.tt ? 'unavailable' : 'available';
+    out.set(p.id, { p, state, t, s: s || null, o: o || null });
+  }
+  return out;
+}
+// Single-seat gap rule: seats this selection would leave stranded alone in a row (already-stranded seats don't count).
+function singleGaps(ev, isFree, chosen) {
+  const pick = new Set(chosen), bad = [];
+  for (const ids of Object.values(ev.seating?.rows || {})) {
+    if (!ids.some(id => pick.has(id))) continue;
+    const before = ids.map(id => !!id && isFree(id)), after = ids.map((id, i) => before[i] && !pick.has(id));
+    const alone = (f, i) => f[i] && !f[i - 1] && !f[i + 1];
+    ids.forEach((id, i) => { if (alone(after, i) && !alone(before, i)) bad.push(id); });
+  }
+  return bad;
+}
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v6';
+const DEMO_KEY = 'set_demo_v7';
 const Demo = {
   st: null,
   load() {
@@ -262,6 +402,25 @@ function findDiscount(ev, code, orders) {
   const { limit, ...pub } = d; return pub;
 }
 
+// "Stalls centre · Row A · Seat 12" from the saved ticket meta (data layer has no layout renderer)
+const seatText = (ev, id) => { const m = ev?.seating?.meta?.[id]; return m ? [m[0], m[1] && 'Row ' + m[1], m[2] && 'Seat ' + m[2]].filter(Boolean).join(' · ') : id; };
+const money_ = c => '$' + (Math.round(+c || 0) / 100).toFixed(2);
+// Per-seat history (Eli Step 3 §9). action: sold | comp | cancelled | blocked | unblocked | held | released | unavailable | available | moved | price | area
+function seatLog(ev, slotId, seat, action, detail, o = {}) {
+  const st = Demo.st; (st.seatLog ||= []).unshift({ id: uid(), at: nowIso(), box_office_id: ev.box_office_id, event_id: ev.id, slot_id: slotId || '', seat, action, detail: detail || '',
+    by: o.by || DB._actor || 'system', ref: o.ref || null, discount: o.discount || null });
+  if (st.seatLog.length > 40000) st.seatLog.length = 40000;
+}
+// price and seating-area changes per seat, for the seat history (layout saves from the builder)
+function logSeatEdits(prev, row) {
+  const pi = prev.seating.index || {}, ni = row.seating.index || {}, pm = prev.seating.meta || {}, nm = row.seating.meta || {}, tn = (e, id) => (e.ticketTypes || []).find(t => t.id === id)?.name || 'not for sale';
+  const ids = [...new Set([...Object.keys(pi), ...Object.keys(ni)])].filter(id => nm[id] && pm[id]);
+  for (const id of ids) {
+    if (pi[id] !== ni[id]) seatLog(row, '', id, 'price', `Price level ${tn(prev, pi[id])} → ${tn(row, ni[id])}`);
+    if (pm[id][0] !== nm[id][0]) seatLog(row, '', id, 'area', `Seating area ${pm[id][0]} → ${nm[id][0]}`);
+  }
+}
+const gapMsg = (ev, gaps) => `Please don't leave a single empty seat next to your selection (${gaps.map(g => seatText(ev, g)).join('; ')}). Move over one seat, or include it.`;
 function demoPlaceOrder(p, asTeam) {
   const st = Demo.st, manual = p.payment === 'manual';
   if (manual && !asTeam) throw new Error('not allowed');
@@ -304,12 +463,22 @@ function demoPlaceOrder(p, asTeam) {
     }
     if (ev.seating?.enabled) {
       if ((it.seats || []).length !== it.qty) throw new Error(`Pick ${it.qty} seat(s)`);
+      const act = activeStatuses(st.seatStatus, ev.id, it.slotId || '');
       for (const s of it.seats) {
-        const key = (it.slotId || '') + '|' + s;
-        if ((ev.seating.blocked || []).includes(s) || !ev.seating.index?.[s]) throw new Error(`Seat ${s} is unavailable`);
-        if (ev.seating.index[s] !== tt.id) throw new Error(`Seat ${s} isn't a ${tt.name} seat`);
-        if (av.seats.includes(key) || pending.seats.includes(ev.id + key)) throw new Error(`Seat ${s} was just taken`);
+        const key = (it.slotId || '') + '|' + s, h = act.get(s);
+        if (!ev.seating.index?.[s]) throw new Error(`${seatText(ev, s)} is unavailable`);
+        if (ev.seating.index[s] !== tt.id) throw new Error(`${seatText(ev, s)} isn't a ${tt.name} seat`);
+        if (av.seats.includes(key) || pending.seats.includes(ev.id + key)) throw new Error(`${seatText(ev, s)} was just taken`);
+        // staff may sell a seat they're holding; nobody sells a blocked/unavailable seat or one in another buyer's checkout
+        if (h && !(h.status === 'checkout' && p.holdToken && h.token === p.holdToken) && !(manual && h.status === 'held'))
+          throw new Error(h.status === 'checkout' ? `${seatText(ev, s)} is being held by another buyer — try again in a few minutes` : `${seatText(ev, s)} is unavailable`);
         pending.seats.push(ev.id + key);
+      }
+      if (ev.seating.noSingles && !manual) {
+        const mine = it.seats.concat(pending.seats.filter(k => k.startsWith(ev.id + (it.slotId || '') + '|')).map(k => k.split('|')[1]));
+        const taken = new Set(av.seats.filter(k => k.startsWith((it.slotId || '') + '|')).map(k => k.split('|')[1]));
+        const gaps = singleGaps(ev, id => !!ev.seating.index[id] && !taken.has(id) && !(act.get(id) && !(act.get(id).status === 'checkout' && act.get(id).token === p.holdToken)), [...new Set(mine)]);
+        if (gaps.length) throw new Error(gapMsg(ev, gaps));
       }
     }
     if (p.code && !disc) disc = findDiscount(ev, p.code, st.orders);
@@ -335,10 +504,19 @@ function demoPlaceOrder(p, asTeam) {
       total: q.total, code: disc?.code || null, payment: q.total === 0 ? 'free' : p.payment, answers: p.answers || {}, optIn: !!p.optIn,
       source: p.source || null, currency: q.currency, platformFee: p.comp ? 0 : platformFee, ...(p.comp ? { comp: true, faceValue: q.faceValue } : {}) } };
   st.orders.push(order);
-  for (const l of q.lines.filter(l => l.kind === 'ticket'))
-    for (let i = 0; i < l.qty * l.admits; i++)
+  const by = asTeam?.email || DB._actor || order.buyer_email;
+  for (const l of q.lines.filter(l => l.kind === 'ticket')) {
+    const ev = st.events.find(e => e.id === l.eventId);
+    for (let i = 0; i < l.qty * l.admits; i++) {
+      const seat = l.seats[i] || null, inf = seat ? seatInfo(ev, seat) : null;
       st.tickets.push({ id: uid(), box_office_id: bo.id, order_id: order.id, event_id: l.eventId, ticket_type_id: l.ticketTypeId, slot_id: l.slotId || null,
-        seat: l.seats[i] || null, code: randCode(10), holder: p.buyer.name, status: 'valid', checked_in_at: null });
+        seat, ...(inf ? { area: inf.area, row: inf.row, seat_label: inf.seat } : {}), ...(p.comp ? { comp: true } : {}), code: randCode(10), holder: p.buyer.name, status: 'valid', checked_in_at: null });
+      if (seat) seatLog(ev, l.slotId, seat, p.comp ? 'comp' : 'sold', `${p.comp ? 'Complimentary ticket issued' : 'Sold'} to ${p.buyer.name}${disc ? ` · discount ${disc.code}` : ''} · ${money_(l.unit || l.face || 0)}`, { ref, by, discount: disc?.code });
+    }
+    // seats sold out of a checkout hold or a staff hold leave the hold list
+    if (l.seats.length) st.seatStatus = (st.seatStatus || []).filter(r => !(r.event_id === l.eventId && l.seats.includes(r.seat) && [l.slotId || '', ''].includes(r.slot_id || '') && (r.status === 'checkout' || (manual && r.status === 'held'))));
+  }
+  if (p.holdToken) st.seatStatus = (st.seatStatus || []).filter(r => !(r.status === 'checkout' && r.token === p.holdToken));
   Demo.save();
   return { id: order.id, key: order.access_key, ref };
 }
@@ -402,8 +580,12 @@ function eventDiff(a, b) {
   }
   const sa = Object.fromEntries((a?.timeSlots || []).map(s => [s.id, showtimeSig(s)])), sb = Object.fromEntries((b?.timeSlots || []).map(s => [s.id, showtimeSig(s)]));
   for (const id of new Set([...Object.keys(sa), ...Object.keys(sb)])) if (sa[id] !== sb[id]) out.push(['Showtime', sa[id] || '(new)', sb[id] || '(removed)']);
-  if (j(a?.seating?.blocked) !== j(b?.seating?.blocked)) out.push(['Blocked seats', (a?.seating?.blocked || []).length, (b?.seating?.blocked || []).length]);
-  if (j(a?.seating?.sections) !== j(b?.seating?.sections) || j(a?.seating?.prices) !== j(b?.seating?.prices)) out.push(['Seating map', 'changed', '']);
+  const sa2 = a?.seating || {}, sb2 = b?.seating || {}, changedKeys = (x, y) => [...new Set([...Object.keys(x || {}), ...Object.keys(y || {})])].filter(k => (x || {})[k] !== (y || {})[k]).length;
+  if (!!sa2.enabled !== !!sb2.enabled) out.push(['Reserved seating', sa2.enabled ? 'on' : 'off', sb2.enabled ? 'on' : 'off']);
+  if (j(sa2.sections) !== j(sb2.sections) || j(sa2.stage) !== j(sb2.stage) || j(sa2.levels) !== j(sb2.levels) || j(sa2.removed) !== j(sb2.removed) || j(sa2.labels) !== j(sb2.labels)) out.push(['Seating map', 'changed', '']);
+  if (j(sa2.index) !== j(sb2.index)) out.push(['Seat prices', '', changedKeys(sa2.index, sb2.index) + ' seats changed']);
+  if (j(sa2.areas) !== j(sb2.areas)) out.push(['Seating areas', '', changedKeys(sa2.areas, sb2.areas) + ' seats changed']);
+  if (!!sa2.noSingles !== !!sb2.noSingles) out.push(['Single-seat gap rule', sa2.noSingles ? 'on' : 'off', sb2.noSingles ? 'on' : 'off']);
   if (!!a?.secrets?.password !== !!b?.secrets?.password) out.push(['Password', a?.secrets?.password ? 'on' : 'off', b?.secrets?.password ? 'on' : 'off']);
   return out.map(d => d[0] === 'Seating map' ? [d[0], 'previous layout', 'new layout'] : d);
 }
@@ -508,7 +690,7 @@ const DB = {
     const m = me || memberFor(st, email, bo.id);
     if (bo.status !== 'active' && !m.support) return { super: isSuper, bos, bo: publicBo(bo), me: m, blocked: bo.status };
     if (bo.settings?.require2fa && !m.support && !st.mfa?.[email])  // nothing leaves the "server" until 2FA is set up
-      return { super: isSuper, bos, me: m, needs2fa: true, bo: publicBo(bo), events: [], orders: [], tickets: [], waitlist: [], team: [m], broadcasts: [], audit: [] };
+      return { super: isSuper, bos, me: m, needs2fa: true, bo: publicBo(bo), events: [], orders: [], tickets: [], waitlist: [], team: [m], broadcasts: [], audit: [], seatStatus: [], seatLog: [] };
     const P = k => hasPerm(m, k);
     const events = st.events.filter(e => e.box_office_id === bo.id && (m.owner || m.support || m.events === 'all' || (m.events || []).includes(e.id)));
     const evIds = new Set(events.map(e => e.id));
@@ -528,7 +710,9 @@ const DB = {
       team: P('admin.invite') || P('admin.perms') || P('admin.remove') ? clone(st.members.filter(x => x.box_office_id === bo.id && x.status === 'active')).map(x => ({ ...x, owner: x.email === bo.owner })) : [{ ...m }],
       broadcasts: P('comms.email') || P('comms.notify') ? clone(st.broadcasts.filter(b => evIds.has(b.event_id))) : [],
       audit: clone(st.audit.filter(a => a.box_office_id === bo.id && (P('admin.perms') || a.actor === email || (a.target && hasPerm(m, 'events.edit', a.target)))).slice(0, 1500)),
-      views: Object.fromEntries([...evIds].map(id => [id, viewStats(st.views?.[id])])) };
+      views: Object.fromEntries([...evIds].map(id => [id, viewStats(st.views?.[id])])),
+      seatStatus: clone((st.seatStatus || []).filter(r => evIds.has(r.event_id))).map(({ token, ...r }) => r),  // buyers' hold tokens never leave the server
+      seatLog: P('seating.view') ? clone((st.seatLog || []).filter(r => evIds.has(r.event_id)).slice(0, 8000)) : [] };
   },
   async stillAllowed() { if (LIVE) return true; try { need(); return true; } catch (e) { return !e.revoked; } },
   async saveEvent(ev) {
@@ -538,6 +722,11 @@ const DB = {
       if (prev && prev.status !== ev.status) need('events.publish', ev.id);
       if (prev && prev.box_office_id !== DB._bo) throw new Error('not allowed');
       const row = clone({ ...ev, box_office_id: DB._bo }), diff = eventDiff(prev, row);
+      if (prev && row.seating?.enabled) {  // a layout edit can never delete a seat somebody holds a ticket for
+        const lost = st.tickets.filter(t => t.event_id === ev.id && t.status === 'valid' && t.seat && !row.seating.meta?.[t.seat]);
+        if (lost.length) throw new Error(`${lost.length} sold seat${lost.length === 1 ? '' : 's'} would disappear from the map (${[...new Set(lost.map(t => t.seat))].slice(0, 4).join(', ')}). Move those customers first, or block the seats instead.`);
+        if (prev.seating?.enabled) logSeatEdits(prev, row);
+      }
       if (i >= 0) st.events[i] = row; else st.events.push(row);
       if (prev && !!prev.archived !== !!row.archived) need('events.publish', ev.id);
       if (!prev) audit('event.created', 'Created event “' + row.name + '”', { target: row.id });
@@ -574,7 +763,9 @@ const DB = {
       const o = Demo.st.orders.find(x => x.id === id && x.box_office_id === DB._bo); if (!o) throw new Error('Order not found');
       need({ refunded: 'orders.refund', cancelled: 'orders.cancel' }[status] || 'orders.edit', o.event_ids[0]);
       const was = o.status; o.status = status;
-      if (cancel) Demo.st.tickets.forEach(t => { if (t.order_id === id) t.status = 'cancelled'; });
+      if (cancel) Demo.st.tickets.forEach(t => { if (t.order_id !== id) return;
+        if (t.status === 'valid' && t.seat) seatLog(Demo.st.events.find(e => e.id === t.event_id), t.slot_id, t.seat, 'cancelled', `Order ${o.ref} ${status} — seat released`, { ref: o.ref });
+        t.status = 'cancelled'; });
       audit('order.' + status, `Order ${o.ref}: ${was} → ${status}`, { target: o.event_ids[0], before: { status: was }, after: { status } }); Demo.save(); return;
     }
     await must(sb.from('orders').update({ status }).eq('id', id));
@@ -711,8 +902,79 @@ const DB = {
   },
   // ── buyer-facing ──
   async availability(eventId) {
-    if (!LIVE) return availabilityFrom(Demo.st.tickets, eventId);
-    return must(sb.rpc('availability', { p_event: eventId }));
+    if (!LIVE) { const st = Demo.fresh(); return availabilityFrom(st.tickets, eventId, st.seatStatus, this.holdToken()); }
+    return must(sb.rpc('availability', { p_event: eventId, p_token: this.holdToken() }));
+  },
+  // This browser's checkout-hold id: seats picked here are held for HOLD_MINUTES while the buyer checks out.
+  holdToken() { try { let t = localStorage.getItem('set_hold'); if (!t) localStorage.setItem('set_hold', t = uid()); return t; } catch (e) { return this._ht ||= uid(); } },
+  async holdSeats(eventId, slotId, seats) {
+    const token = this.holdToken();
+    if (LIVE) return must(sb.rpc('hold_seats', { p_event: eventId, p_slot: slotId || '', p_seats: seats, p_token: token }));
+    const st = Demo.fresh(), ev = st.events.find(e => e.id === eventId);
+    if (!ev || !eventLive(normEvent(ev))) throw new Error('Event is not on sale');
+    if (!ev.seating?.enabled) return null;
+    if (seats.length > 10) throw new Error('Maximum 10 seats per order');
+    const states = seatStates(ev, { tickets: st.tickets, statuses: st.seatStatus, slotId, token });
+    for (const id of seats) { const x = states.get(id); if (!x || x.state !== 'available') throw new Error(x?.state === 'checkout' ? `${seatText(ev, id)} is being held by another buyer — try again in a few minutes` : `${seatText(ev, id)} is no longer available`); }
+    if (ev.seating.noSingles) { const g = singleGaps(ev, id => states.get(id)?.state === 'available', seats); if (g.length) throw new Error(gapMsg(ev, g)); }
+    const expires = new Date(Date.now() + HOLD_MINUTES * 6e4).toISOString();
+    st.seatStatus = (st.seatStatus || []).filter(r => !(r.status === 'checkout' && r.token === token && r.event_id === eventId)).concat(
+      seats.map(seat => ({ id: uid(), box_office_id: ev.box_office_id, event_id: eventId, slot_id: slotId || '', seat, status: 'checkout', note: '', by: 'buyer', at: nowIso(), expires_at: expires, token })));
+    Demo.save(); return { expires };
+  },
+  async releaseSeats(eventId) {
+    const token = this.holdToken();
+    if (LIVE) return must(sb.rpc('release_seats', { p_event: eventId, p_token: token }));
+    const st = Demo.fresh(); st.seatStatus = (st.seatStatus || []).filter(r => !(r.status === 'checkout' && r.token === token && (!eventId || r.event_id === eventId))); Demo.save();
+  },
+  // Staff seat management (Eli Step 3 §10) — any number of seats in one go. slotId '' = every showtime.
+  // action: block | unblock | hold | release | unavailable | available | price {ttId} | area {area} | move {to}
+  async seatAction(eventId, slotId, action, seats, o = {}) {
+    if (LIVE) return must(sb.rpc('seat_action', { p_event: eventId, p_slot: slotId || '', p_action: action, p_seats: seats, p: o }));
+    const PERM = { block: 'seating.block', hold: 'seating.block', unblock: 'seating.unblock', release: 'seating.unblock', unavailable: 'seating.edit', available: 'seating.edit', price: 'seating.edit', area: 'seating.edit', move: 'seating.move' };
+    if (!PERM[action]) throw new Error('Unknown seat action');
+    need(PERM[action], eventId); if (action === 'price') need('tickets.pricing', eventId);
+    const st = Demo.st, ev = st.events.find(e => e.id === eventId && e.box_office_id === DB._bo); if (!ev?.seating?.enabled) throw new Error('Event not found');
+    seats = [...new Set(seats)].filter(id => ev.seating.meta?.[id]); if (!seats.length) throw new Error('Select at least one seat');
+    const slot = slotId || '', scope = slot ? 'this showtime' : (ev.timeSlots || []).length ? 'every showtime' : '', st2 = st.seatStatus ||= [];
+    const label = { block: 'Blocked', hold: 'Held', unavailable: 'Made unavailable', unblock: 'Unblocked', release: 'Released', available: 'Made available' };
+    if (['block', 'hold', 'unavailable'].includes(action)) {
+      const status = action === 'hold' ? 'held' : action === 'block' ? 'blocked' : 'unavailable';
+      st.seatStatus = st2.filter(r => !(r.event_id === eventId && (r.slot_id || '') === slot && seats.includes(r.seat) && r.status !== 'checkout'));
+      for (const seat of seats) { st.seatStatus.push({ id: uid(), box_office_id: ev.box_office_id, event_id: eventId, slot_id: slot, seat, status, note: String(o.note || '').slice(0, 200), by: DB._actor, at: nowIso() });
+        seatLog(ev, slot, seat, status === 'held' ? 'held' : status, [label[action], scope && 'for ' + scope, o.note && '— ' + o.note].filter(Boolean).join(' ')); }
+    } else if (['unblock', 'release', 'available'].includes(action)) {
+      const kinds = { unblock: ['blocked'], release: ['held', 'checkout'], available: ['unavailable'] }[action];
+      st.seatStatus = st2.filter(r => !(r.event_id === eventId && seats.includes(r.seat) && kinds.includes(r.status) && (r.slot_id === '' || (r.slot_id || '') === slot)));
+      for (const seat of seats) if (st2.some(r => r.event_id === eventId && r.seat === seat && kinds.includes(r.status) && (r.slot_id === '' || (r.slot_id || '') === slot))) seatLog(ev, slot, seat, action === 'release' ? 'released' : action, label[action]);
+    } else if (action === 'price' || action === 'area') {
+      const se = ev.seating, L = seatLayout(se), byId = new Map(L.seats.map(p => [p.id, p]));
+      if (action === 'price' && o.ttId && !ev.ticketTypes.some(t => t.id === o.ttId)) throw new Error('Unknown price level');
+      const before = clone(ev);
+      for (const id of seats) { const p = byId.get(id); if (!p) continue;
+        if (action === 'price') { if (!o.ttId || o.ttId === p.sec.ticketTypeId) delete (se.prices ||= {})[id]; else (se.prices ||= {})[id] = o.ttId; }
+        else { const a = String(o.area || '').trim().slice(0, 60); if (!a || a === (p.sec.area || p.sec.name)) delete (se.areas ||= {})[id]; else (se.areas ||= {})[id] = a; } }
+      Object.assign(se, seatDerive(se)); logSeatEdits(before, ev);
+    } else if (action === 'move') {
+      const to = o.to, from = seats[0], t = st.tickets.find(x => x.event_id === eventId && x.status === 'valid' && x.seat === from && (x.slot_id || '') === slot);
+      if (!t) throw new Error('That seat has no ticket to move'); if (!ev.seating.meta?.[to]) throw new Error('Choose the new seat');
+      const x = seatStates(ev, { tickets: st.tickets, statuses: st.seatStatus, slotId: slot }).get(to);
+      if (!x || !['available', 'held'].includes(x.state)) throw new Error(`${seatText(ev, to)} isn't free`);
+      if (ev.seating.index[to] !== t.ticket_type_id) throw new Error('That seat is a different price level — changing price (upgrade / downgrade) comes with order editing in Stage 6');
+      const ord = st.orders.find(z => z.id === t.order_id), inf = seatInfo(ev, to);
+      Object.assign(t, { seat: to, area: inf.area, row: inf.row, seat_label: inf.seat });
+      ord?.data.lines.forEach(l => { if (l.eventId === eventId && l.seats?.includes(from)) l.seats = l.seats.map(z => z === from ? to : z); });
+      st.seatStatus = st.seatStatus.filter(r => !(r.event_id === eventId && r.seat === to && r.status === 'held' && [slot, ''].includes(r.slot_id || '')));
+      seatLog(ev, slot, from, 'moved', `${t.holder} moved to ${seatText(ev, to)} — seat released`, { ref: ord?.ref }); seatLog(ev, slot, to, 'moved', `${t.holder} moved here from ${seatText(ev, from)}`, { ref: ord?.ref });
+    }
+    audit('seats.' + action, `${{ price: 'Changed price of', area: 'Changed seating area of', move: 'Moved a customer from' }[action] || label[action]} ${action === 'move' ? seatText(ev, seats[0]) + ' to ' + seatText(ev, o.to) : seats.length + ' seat' + (seats.length === 1 ? '' : 's')}${scope ? ' (' + scope + ')' : ''} — ${ev.name}`, { target: eventId });
+    Demo.save();
+  },
+  // Master venue charts: a library on the box office. Attaching one to an event copies it, so later edits never touch other events.
+  async saveVenues(list) {
+    if (!LIVE) { need('seating.edit'); const bo = Demo.st.boxOffices.find(b => b.id === DB._bo), was = (bo.venues || []).length; bo.venues = clone(list);
+      audit('venues.saved', list.length === was ? 'Edited venue charts' : list.length > was ? 'Added a venue chart' : 'Deleted a venue chart'); Demo.save(); return; }
+    await must(sb.rpc('save_venues', { p_bo: DB._bo, p: list }));
   },
   async checkDiscount(eventId, code) {
     if (!LIVE) { const ev = Demo.st.events.find(e => e.id === eventId); return ev ? findDiscount(ev, code, Demo.st.orders) : null; }
@@ -771,19 +1033,21 @@ function seedDemo() {
     venue: 'Grand Lyric Theatre', address: '1500 Broadway, New York, NY 10036',
     description: 'An evening of seasonal favourites performed by a 60-piece orchestra and guest soloists.\n\nDoors open 6:45 PM. The performance begins promptly at 7:30 PM. Seats are reserved — pick yours on the seat map.',
     ticketTypes: [vipTT, stallsTT, circleTT],
-    seating: { enabled: true, stage: { x: -170, y: -120, w: 340, h: 46, label: 'STAGE' }, blocked: ['CEN-A1', 'CEN-A14', 'CIR-K1', 'CIR-K24'], prices: {},
+    seating: { enabled: true, stage: { x: -170, y: -120, w: 340, h: 46, label: 'STAGE' }, prices: {},
+      levels: [{ id: 'L1', name: 'Stalls (ground floor)' }, { id: 'L2', name: 'Circle (upstairs)' }],
       sections: [
         { id: shortId('sec_'), code: 'LFT', name: 'Stalls left', kind: 'rows', x: -365, y: 18, rot: 9, rows: 8, seatsPerRow: 6, rowStart: 'A', ticketTypeId: stallsTT.id },
         { id: shortId('sec_'), code: 'CEN', name: 'Stalls centre', kind: 'rows', x: -169, y: 0, rot: 0, rows: 8, seatsPerRow: 14, rowSeats: [12, 13, 14], rowStart: 'A', curve: 25, ticketTypeId: stallsTT.id },
         { id: shortId('sec_'), code: 'RGT', name: 'Stalls right', kind: 'rows', x: 235, y: 18, rot: -9, rows: 8, seatsPerRow: 6, rowStart: 'A', ticketTypeId: stallsTT.id },
-        { id: shortId('sec_'), code: 'CIR', name: 'Circle', kind: 'rows', x: -299, y: 320, rot: 0, rows: 3, seatsPerRow: 24, rowStart: 'J', curve: 40, ticketTypeId: circleTT.id },
+        { id: shortId('sec_'), code: 'CIR', name: 'Circle', level: 'L2', kind: 'rows', x: -299, y: 40, rot: 0, rows: 3, seatsPerRow: 24, rowStart: 'J', curve: 40, ticketTypeId: circleTT.id },
       ] },
     addons: [{ id: shortId('ad_'), name: 'Printed programme', price: 800, qty: 0 }, { id: shortId('ad_'), name: 'Parking pass', price: 2500, qty: 150 }],
     questions: [{ id: shortId('q_'), label: 'How did you hear about us?', type: 'select', options: 'Instagram, Email, Friend, Poster, Other', required: false }],
     secrets: { password: '', ticketPasswords: {}, discounts: [{ id: shortId('dc_'), code: 'EARLYBIRD', type: 'pct', amount: 15, limit: 100, expires: day(20), ticketTypeIds: [] }] } });
-  // Premium = front three rows of the centre block (per-seat price overrides).
-  const L1 = seatLayout(ev1.seating); L1.seats.filter(p => p.sec.code === 'CEN' && ['A', 'B', 'C'].includes(p.row)).forEach(p => { ev1.seating.prices[p.id] = vipTT.id; });
-  ev1.seating.index = seatIndex(ev1.seating);
+  // Premium = front three rows of the centre block (per-seat price + area overrides).
+  ev1.seating.areas = {}; const L1 = seatLayout(ev1.seating); L1.seats.filter(p => p.sec.code === 'CEN' && ['A', 'B', 'C'].includes(p.row)).forEach(p => { ev1.seating.prices[p.id] = vipTT.id; });
+  L1.seats.filter(p => p.sec.code === 'CEN' && ['A', 'B', 'C'].includes(p.row)).forEach(p => { ev1.seating.areas[p.id] = 'Premium centre'; });
+  Object.assign(ev1.seating, seatDerive(ev1.seating));
   const ev2 = mk({ slug: 'neon-nights-live', name: 'Neon Nights Live', category: 'Live music', start: day(0, 20, 0), end: day(0, 23, 30), doors: '7:00 PM',
     summary: 'Tonight — three bands, one stage.', venue: 'The Warehouse', address: '210 Kent Ave, Brooklyn, NY 11249', audience: '18+ · ID required',
     description: 'Three of the city\'s best live acts on one stage. Standing room, full bar.\n\nPhoto ID required at the door.',
@@ -834,7 +1098,7 @@ function seedDemo() {
     eventToTemplate({ ...ev2, name: 'General Admission Event', ticketTypes: [tt('General admission', 3000, 0)], capacity: 300 }, 'General Admission Event'),
     eventToTemplate({ ...ev1, name: "Women's Show", audience: 'Women & girls only' }, "Women's Show"),
     eventToTemplate({ ...ev2, name: 'Dinner Concert', ticketTypes: [tt('Dinner + show', 12500, 0)], capacity: 160,
-      seating: { enabled: true, stage: { x: -150, y: -140, w: 300, h: 40, label: 'STAGE' }, blocked: [], prices: {}, sections: Array.from({ length: 12 }, (_, i) => ({ id: shortId('sec_'), code: 'T' + (i + 1), name: 'Table ' + (i + 1), kind: 'table', seats: 10, x: -260 + (i % 4) * 170, y: -20 + Math.floor(i / 4) * 150, rot: 0, ticketTypeId: '' })) } }, 'Dinner Concert')];
+      seating: { enabled: true, stage: { x: -150, y: -140, w: 300, h: 40, label: 'STAGE' }, prices: {}, sections: Array.from({ length: 12 }, (_, i) => ({ id: shortId('sec_'), code: 'T' + (i + 1), name: 'Table ' + (i + 1), area: 'Dinner tables', kind: 'table', seats: 10, x: -260 + (i % 4) * 170, y: -20 + Math.floor(i / 4) * 150, rot: 0, ticketTypeId: '' })) } }, 'Dinner Concert')];
   { const dc = bo1.eventTemplates[4].event; dc.seating.sections.forEach(x => x.ticketTypeId = dc.ticketTypes[0].id); }
   const tpl = id => DEFAULT_TEMPLATES.find(t => t.id === id).perms;
   const mem = (bo, email, name, template, evs = 'all') => ({ id: uid(), box_office_id: bo.id, email, name, perms: [...tpl(template)], template, events: evs, status: 'active', created_at: day(-40), added_by: bo.owner });
@@ -848,6 +1112,11 @@ function seedDemo() {
   // A few weeks of realistic sales so the dashboard has something to show.
   Demo.st = { platform: clone(DEFAULT_PLATFORM), boxOffices: [bo1, bo2, bo3], members, events, orders: [], tickets: [], waitlist: [], broadcasts: [],
     audit: [], sessions: [], mfa: {}, locks: {} };
+  // Seat statuses on the gala: camera positions blocked, a family hold, a broken seat (Stage 3).
+  const sst = (seat, status, note) => ({ id: uid(), box_office_id: bo1.id, event_id: ev1.id, slot_id: '', seat, status, note, by: 'moishsonn@gmail.com', at: day(-6, 11) });
+  Demo.st.seatStatus = [sst('CEN-A1', 'blocked', 'Camera position'), sst('CEN-A12', 'blocked', 'Camera position'), sst('CIR-K1', 'blocked', 'Sound desk'), sst('CIR-K24', 'blocked', 'Sound desk'),
+    sst('CEN-E7', 'held', 'Artist family'), sst('CEN-E8', 'held', 'Artist family'), sst('LFT-H6', 'unavailable', 'Broken seat — repair booked')];
+  Demo.st.seatLog = Demo.st.seatStatus.map(r => ({ id: uid(), at: r.at, box_office_id: bo1.id, event_id: ev1.id, slot_id: '', seat: r.seat, action: r.status, detail: { blocked: 'Blocked', held: 'Held', unavailable: 'Made unavailable' }[r.status] + ' — ' + r.note, by: r.by, ref: null }));
   const first = ['Alex', 'Jordan', 'Sam', 'Maya', 'Chris', 'Priya', 'Daniel', 'Emma', 'Luis', 'Grace', 'Noah', 'Aisha', 'Ben', 'Chloe', 'Omar', 'Zoe'];
   const last = ['Carter', 'Nguyen', 'Patel', 'Rivera', 'Kim', 'Brooks', 'Cohen', 'Okafor', 'Silva', 'Hughes', 'Morgan', 'Reyes'];
   let n = 0; const rnd = a => a[Math.floor(Math.random() * a.length)];
@@ -858,7 +1127,7 @@ function seedDemo() {
       const t = rnd(ev.ticketTypes.filter(x => !x.hidden)), qty = t.admits > 1 ? 1 : 1 + Math.floor(Math.random() * 3);
       const item = { eventId: ev.id, ticketTypeId: t.id, qty, slotId: ev.timeSlots.length ? rnd(ev.timeSlots).id : null };
       if (ev.seating.enabled) {
-        const av = availabilityFrom(Demo.st.tickets, ev.id), free = Object.keys(ev.seating.index).filter(id => ev.seating.index[id] === t.id && !av.seats.includes('|' + id));
+        const off = offSeats(availabilityFrom(Demo.st.tickets, ev.id, Demo.st.seatStatus), ''), free = Object.keys(ev.seating.index).filter(id => ev.seating.index[id] === t.id && !off.has(id));
         const at = Math.floor(Math.random() * Math.max(1, free.length - qty)), seats = free.slice(at, at + qty);
         if (seats.length !== qty) continue; item.seats = seats;
       }
@@ -866,10 +1135,17 @@ function seedDemo() {
         const r = demoPlaceOrder({ buyer: { name, email, phone: '' }, items: [item], addons: [], payment: Math.random() < .85 ? 'card' : 'offline', optIn: Math.random() < .6,
           code: Math.random() < .12 ? (ev.secrets.discounts[0]?.code || '') : '', source: rnd(['', '', 'instagram', 'facebook', 'newsletter']) }, { owner: true });
         const o = Demo.st.orders.find(x => x.id === r.id); o.created_at = day(-Math.floor(Math.random() * 28), 8 + Math.floor(Math.random() * 14), Math.floor(Math.random() * 60));
-        if (Math.random() < .04) { o.status = 'refunded'; Demo.st.tickets.forEach(t => { if (t.order_id === o.id) t.status = 'cancelled'; }); }
+        if (Math.random() < .04) { o.status = 'refunded'; Demo.st.tickets.forEach(t => { if (t.order_id === o.id) { if (t.seat) seatLog(ev, t.slot_id, t.seat, 'cancelled', `Order ${o.ref} refunded — seat released`, { ref: o.ref, by: 'moishsonn@gmail.com' }); t.status = 'cancelled'; } }); }
       } catch (e) { /* sold out etc. — skip */ }
     }
   }
+  { // two complimentary press seats on the gala
+    const off = offSeats(availabilityFrom(Demo.st.tickets, ev1.id, Demo.st.seatStatus), ''), free = Object.keys(ev1.seating.index).filter(id => ev1.seating.index[id] === stallsTT.id && !off.has(id)).slice(-2);
+    try { demoPlaceOrder({ buyer: { name: 'City Arts Review', email: 'press@example.com', phone: '' }, items: [{ eventId: ev1.id, ticketTypeId: stallsTT.id, qty: 2, seats: free }], addons: [], payment: 'manual', comp: true, source: 'box office' }, { owner: true, email: 'moishsonn@gmail.com' }); } catch (e) { }
+  }
+  ev1.seating.noSingles = true;  // switched on after the sample sales
+  bo1.venues = [eventToVenue(ev1, 'Grand Lyric Theatre'), eventToVenue(bo1.eventTemplates[4].event, 'Skyline Roof — dinner layout')];
+  bo1.venues[1].address = ev7.address; ev1.seating.venueId = bo1.venues[0].id; ev1.seating.venueName = bo1.venues[0].name;
   // ev2 is tonight: doors are open and some guests are already in (for the scanner app).
   Demo.st.tickets.filter(t => t.event_id === ev2.id && t.status === 'valid').forEach(t => { if (Math.random() < .4) t.checked_in_at = new Date(Date.now() - Math.pow(Math.random(), .6) * 110 * 6e4).toISOString(); });
   Demo.st.audit.push({ id: uid(), at: day(-1, 9, 12), actor: 'hello@northside.example', box_office_id: bo3.id, kind: 'platform.registered', summary: 'Registration request: ' + bo3.name, before: null, after: null },

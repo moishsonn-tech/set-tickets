@@ -64,22 +64,22 @@ async function edit(slug, fn){ const id=ev(slug).id; W().location.hash='#/admin/
   const tp=E("S.adm.bo.eventTemplates.find(t=>t.name==='Gala layout')");
   ok(tp && tp.event.secrets.discounts.length===0 && tp.event.seating.sections.length===4 && !tp.event.start,'save as template: keeps seating, drops dates & codes');
   // sellout
-  const so=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets)`);
-  const manual=E(`(()=>{const e=S.adm.events.find(e=>e.id==='${g.id}');const b=new Set(e.seating.blocked);return seatLayout(e.seating).seats.filter(p=>p.tt&&!b.has(p.id)).reduce((t,p)=>t+e.ticketTypes.find(x=>x.id===p.tt).price,0)})()`);
+  const so=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets, S.adm.seatStatus, S.adm.orders)`);
+  const manual=E(`(()=>{const e=S.adm.events.find(e=>e.id==='${g.id}');return [...seatStates(e,{tickets:S.adm.tickets,statuses:S.adm.seatStatus,orders:S.adm.orders}).values()].filter(x=>x.p.tt&&!['blocked','unavailable'].includes(x.state)).reduce((t,x)=>t+e.ticketTypes.find(y=>y.id===x.p.tt).price,0)})()`);
   ok(so.total===manual && so.total>0,'potential sellout = every unblocked seat at its price: '+so.total);
-  ok(Math.abs(so.byTT.reduce((t,r)=>t+r.potential,0)-so.total)<1 && Math.abs(so.bySec.reduce((t,r)=>t+r.potential,0)-so.total)<1,'by ticket type and by section add up');
-  const seat=Object.keys(g.seating.index).find(s=>!E('S.adm.tickets').some(t=>t.seat===s));
+  ok(Math.abs(so.byTT.reduce((t,r)=>t+r.potential,0)-so.total)<1 && Math.abs(so.byArea.reduce((t,r)=>t+r.potential,0)-so.total)<1,'by ticket type and by seating area add up');
+  const seat=E(`[...seatStates(S.adm.events.find(e=>e.id==='${g.id}'),{tickets:S.adm.tickets,statuses:S.adm.seatStatus}).values()].find(x=>x.state==='available').p.id`);
   const price=g.ticketTypes.find(t=>t.id===g.seating.index[seat]).price;
-  await edit('winter-orchestra-gala', `d=>d.seating.blocked.push('${seat}')`);
-  const so2=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets)`);
+  await E(`DB.seatAction('${g.id}','','block',['${seat}'])`); await E('reloadAdmin()');
+  const so2=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets, S.adm.seatStatus, S.adm.orders)`);
   ok(so.total-so2.total===price,'blocking a seat lowers potential by its price');
   await edit('winter-orchestra-gala', `d=>{d.ticketTypes[2].price+=1000; d.venue='Grand Lyric Hall'}`);
-  const so3=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets)`);
+  const so3=E(`sellout(S.adm.events.find(e=>e.id==='${g.id}'), S.adm.tickets, S.adm.seatStatus, S.adm.orders)`);
   ok(so3.total>so2.total,'price change updates potential');
   ok(so3.soldValue>0 && so3.remaining===so3.total-so3.soldValue,'sold vs remaining potential');
   // history
   const hist=E(`S.adm.audit.filter(a=>a.target==='${g.id}')`);
-  ok(hist.some(a=>a.after&&a.after['Venue']==='Grand Lyric Hall'&&a.before['Venue']==='Grand Lyric Theatre') && hist.some(a=>Object.keys(a.after||{}).some(k=>k.startsWith('Price'))) && hist.some(a=>a.after&&a.after['Blocked seats']!==undefined),'history: venue, price and seat-block changes with before/after');
+  ok(hist.some(a=>a.after&&a.after['Venue']==='Grand Lyric Hall'&&a.before['Venue']==='Grand Lyric Theatre') && hist.some(a=>Object.keys(a.after||{}).some(k=>k.startsWith('Price'))) && hist.some(a=>a.kind==='seats.block'),'history: venue, price and seat-block changes with before/after');
   // showtimes generator
   const ksid=E("Demo.st.events.find(e=>e.slug==='comedy-night').id");
   W().location.hash='#/admin/event/'+ksid+'/schedule'; await until(()=>E('S.draft&&S.draft.id')===ksid && E('S.ui.gen'));

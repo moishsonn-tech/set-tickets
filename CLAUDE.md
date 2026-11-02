@@ -26,6 +26,13 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   showtimes (`timeSlots` with hidden/unavailable/soldOut), `sellout()` = potential revenue at face value. Event
   templates live on the box office (`eventToTemplate` / `eventFromTemplate` / `cloneEventStructure`). Comps keep the
   real ticket type with `face` value and `unit: 0`. Audit rows carry `target` (event id) → per-event History tab.
+- **Seating (Stage 3):** the layout lives in `event.seating` (sections: rows | table | booth | ga standing area; levels; per-seat
+  `prices` / `areas` / `labels` / `removed` overrides keyed by seat id). `seatDerive()` builds what the server checks — `index`
+  (seat → ticket type), `meta` (seat → [area, row, seat label], copied onto every ticket as `area`/`row`/`seat_label`) and `rows`
+  (for the single-seat gap rule `singleGaps()` / SQL `single_gaps()`). Seat ids come from row labels + numbers, so renaming rows goes
+  through `remapSeatKeys()`. Blocks, staff holds, "unavailable" and buyers' 10-minute checkout holds are `seat_status` rows (never in
+  the event) — `seatStates()` merges them with tickets; staff change them via `seatAction()` / `seat_action()`. Every seat change is in
+  `seat_log`. Master venue charts are `box_offices.venues`; `venueToEvent()` copies one into an event (tiers matched to ticket types by name).
 - **Money is integer cents everywhere.** `quote()` in data.js is the one pricing function on the client.
 - **Not yet wired:** Stripe card payments (needs a Supabase Edge Function + webhook), outbound email/SMS
   (confirmations, reminders, broadcasts are recorded but not sent), Apple Wallet passes.

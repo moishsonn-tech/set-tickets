@@ -1,0 +1,216 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Stage 3 — seating charts, sections, rows & inventory (Eli's Step 3). Run from the local server: /stage3-e2e.html
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow; const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=6000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t);
+const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+']'));
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+async function throwsP(code){ try{ await E(code); return false }catch(e){ return e.message||true } }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const states=(slug,slot='')=>E(`seatStates(Demo.st.events.find(e=>e.slug==='${slug}'),{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders,slotId:'${slot}'})`);
+const count=(m,st)=>[...m.values()].filter(x=>x.state===st).length;
+const freeRun=(slug,n)=>{ // n+1 available seats at the start of a row, plus one more free after them (so taking any n leaves no stranded single)
+  const e=ev(slug), m=states(slug); for (const ids of Object.values(e.seating.rows)) { if(ids.slice(0,n+2).every(id=>id&&m.get(id)?.state==='available')) return ids.slice(0,n+1); } return null; };
+const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({buyer:{name:'Seat Test',email:'seat@test.co'},items:[{eventId:'${e.id}',ticketTypeId:'${e.seating.index[seats[0]]}',qty:${seats.length},seats:${JSON.stringify(seats)}}],addons:[],payment:'card'${extra}})`; };
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  const g=ev('winter-orchestra-gala');
+
+  // ── §4 + §7: statuses and separate Area / Row / Seat ──
+  const m0=states('winter-orchestra-gala');
+  ok(count(m0,'blocked')===4 && count(m0,'held')===2 && count(m0,'unavailable')===1 && count(m0,'comp')===2 && count(m0,'sold')>20,`seat statuses: ${['sold','comp','held','blocked','unavailable','available'].map(k=>k+' '+count(m0,k)).join(', ')}`);
+  const tk=E(`Demo.st.tickets.filter(t=>t.event_id==='${g.id}'&&t.seat)`);
+  ok(tk.length>20 && tk.every(t=>t.area&&t.row&&t.seat_label&&!t.seat_label.includes(t.row)),'every seated ticket stores Area, Row and Seat separately');
+  ok(E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.meta['CEN-B5'].join('|')`)==='Premium centre|B|5','seat meta: Premium centre / B / 5');
+
+  // ── buyer map: levels, unavailable seats, holds ──
+  W().location.hash='#/e/winter-orchestra-gala'; await until(()=>W().document.querySelector('.sm-buy .st'));
+  ok(W().document.querySelectorAll('.sm-buy .sm-levels button').length===2,'two-level venue shows level tabs to buyers');
+  const blk=W().document.querySelector('.sm-buy [data-seat="CEN-A1"]'), held=W().document.querySelector('.sm-buy [data-seat="CEN-E7"]');
+  ok(blk && !blk.dataset.action && held && !held.dataset.action,'blocked and held seats cannot be picked');
+  await E(`A.bLevel({dataset:{v:'L2'}})`); await sleep(60);
+  ok(W().document.querySelector('.sm-buy [data-seat^="CIR-"]') && !W().document.querySelector('.sm-buy [data-seat^="CEN-"]'),'Circle level shows only upstairs seats');
+  E(`A.bLevel({dataset:{v:'L1'}})`);
+
+  const run=freeRun('winter-orchestra-gala',3); ok(!!run,'found a free row start '+run);
+  // gap rule: taking seats 2+3 would strand seat 1 at the row end
+  ok(/single empty seat/.test(String(await throwsP(`DB.holdSeats('${g.id}','',${JSON.stringify(run.slice(1,3))})`))),'single-seat gap rule refuses stranding seat '+run[0]);
+  const mine=run.slice(0,2);
+  const h=await E(`DB.holdSeats('${g.id}','',${JSON.stringify(mine)})`);
+  ok(h && new Date(h.expires)-Date.now()>9*6e4,'checkout hold for 10 minutes');
+  ok(count(states('winter-orchestra-gala'),'checkout')===2,'held seats show as “in checkout” in the back office');
+  const myTok=E('DB.holdToken()'); W().localStorage.setItem('set_hold','other-buyer');
+  ok(/held by another buyer/.test(String(await throwsP(`DB.holdSeats('${g.id}','',${JSON.stringify(mine)})`))),'another buyer cannot hold the same seats');
+  ok(/held by another buyer/.test(String(await throwsP(order('winter-orchestra-gala',mine,",holdToken:'other-buyer'")))),'another buyer cannot buy seats in someone\'s checkout');
+  W().localStorage.setItem('set_hold',myTok);
+  const r1=await E(order('winter-orchestra-gala',mine,`,holdToken:'${myTok}'`));
+  ok(r1.ref && !E(`Demo.st.seatStatus.some(r=>r.token==='${myTok}')`),'buyer completes order with own hold; hold cleared');
+  ok(E(`Demo.st.seatLog.filter(r=>r.ref==='${r1.ref}'&&r.action==='sold').length`)===2,'seat history: sold, with order ref');
+  // expired holds free up
+  const run2=freeRun('winter-orchestra-gala',2); await E(`DB.holdSeats('${g.id}','',${JSON.stringify(run2.slice(0,2))})`);
+  E(`Demo.st.seatStatus.filter(r=>r.status==='checkout').forEach(r=>r.expires_at=new Date(Date.now()-1000).toISOString())`);
+  W().localStorage.setItem('set_hold','other-buyer');
+  ok(!!(await E(`DB.holdSeats('${g.id}','',${JSON.stringify(run2.slice(0,2))})`)),'an expired hold no longer blocks other buyers');
+  await E(`DB.releaseSeats('${g.id}')`); W().localStorage.setItem('set_hold',myTok);
+  ok(!E(`Demo.st.seatStatus.some(r=>r.status==='checkout'&&r.token==='other-buyer')`),'removing seats from the cart releases the hold');
+
+  // ── buyer UI flow: pick → cart (hold + countdown) → order → e-ticket boxes ──
+  W().location.hash='#/e/winter-orchestra-gala'; await until(()=>W().document.querySelector('.sm-buy .st[data-action]'));
+  const run3=freeRun('winter-orchestra-gala',2).slice(0,2);
+  for (const id of run3) W().document.querySelector(`.sm-buy [data-seat="${id}"]`).dispatchEvent(new MouseEvent('click',{bubbles:true}));
+  await sleep(50); await E('A.addToCart()'); await until(()=>W().location.hash.startsWith('#/cart'));
+  await until(()=>W().document.querySelector('[data-hold]')); ok(/held for you for 9:5\d|10:00/.test(W().document.querySelector('[data-hold]').textContent),'checkout shows the hold countdown: '+W().document.querySelector('[data-hold]').textContent);
+  E(`S.co.name='Flow Buyer';S.co.email='flow@example.com';S.co.terms=true`); await E('A.placeOrder()'); await until(()=>W().document.querySelector('.e-ticket'));
+  const et=W().document.querySelector('.e-ticket').textContent;
+  ok(/Ticket type \/ Area/.test(et) && /Row/.test(et) && /Seat/.test(et),'e-ticket shows Ticket type / Area, Row and Seat as separate fields');
+  ok(W().document.querySelectorAll('.e-ticket').length===2,'two e-tickets on the order page');
+
+  // ── staff seat actions + permissions ──
+  await as('moishsonn@gmail.com');
+  const free=[...states('winter-orchestra-gala').values()].filter(x=>x.state==='available').map(x=>x.p.id);
+  const many=free.slice(0,120);
+  await E(`DB.seatAction('${g.id}','','block',${JSON.stringify(many)},{note:'Production'})`);
+  ok(count(states('winter-orchestra-gala'),'blocked')===124,'bulk-block 120 seats in one action (no limit)');
+  ok(E(`Demo.st.seatLog.filter(r=>r.action==='blocked'&&r.event_id==='${g.id}').length`)>=124,'every blocked seat gets its own history entry');
+  await E(`DB.seatAction('${g.id}','','unblock',${JSON.stringify(many)})`);
+  ok(count(states('winter-orchestra-gala'),'blocked')===4 && E(`Demo.st.seatLog.filter(r=>r.action==='unblock').length`)===120,'bulk-unblock + history');
+  await E(`DB.seatAction('${g.id}','','hold',${JSON.stringify(free.slice(0,3))},{note:'Sponsor'})`);
+  ok(E(`Demo.st.seatStatus.filter(r=>r.status==='held'&&r.note==='Sponsor').length`)===3,'hold with a note');
+  await E(`DB.seatAction('${g.id}','','release',${JSON.stringify(free.slice(0,3))})`);
+  ok(!E(`Demo.st.seatStatus.some(r=>r.note==='Sponsor')`) && E(`Demo.st.seatLog.filter(r=>r.action==='released'&&r.event_id==='${g.id}').length`)>=3,'release + history');
+  await E(`DB.seatAction('${g.id}','','unavailable',['${free[5]}'])`); ok(states('winter-orchestra-gala').get(free[5]).state==='unavailable','make a seat unavailable');
+  await E(`DB.seatAction('${g.id}','','available',['${free[5]}'])`); ok(states('winter-orchestra-gala').get(free[5]).state==='available','make it available again');
+  // price + area changes
+  const prem=g.ticketTypes[0].id, stalls=g.ticketTypes[1].id, two=free.filter(id=>ev('winter-orchestra-gala').seating.index[id]===stalls).slice(0,2);
+  const so0=E(`sellout(Demo.st.events.find(e=>e.slug==='winter-orchestra-gala'),Demo.st.tickets,Demo.st.seatStatus,Demo.st.orders)`).total;
+  await E(`DB.seatAction('${g.id}','','price',${JSON.stringify(two)},{ttId:'${prem}'})`);
+  const so1=E(`sellout(Demo.st.events.find(e=>e.slug==='winter-orchestra-gala'),Demo.st.tickets,Demo.st.seatStatus,Demo.st.orders)`);
+  ok(two.every(id=>ev('winter-orchestra-gala').seating.index[id]===prem) && so1.total-so0===2*(g.ticketTypes[0].price-g.ticketTypes[1].price),'bulk price change re-prices seats and the sellout value follows');
+  ok(E(`Demo.st.seatLog.filter(r=>r.action==='price').length`)===2,'price change in seat history');
+  await E(`DB.seatAction('${g.id}','','area',${JSON.stringify(two)},{area:'Orchestra Left'})`);
+  ok(two.every(id=>ev('winter-orchestra-gala').seating.meta[id][0]==='Orchestra Left'),'bulk change of seating area');
+  const sumPot=so1.byArea.reduce((t,r)=>t+r.potential,0);
+  ok(so1.byArea.some(r=>r.name==='Premium centre') && sumPot===so1.total && so1.byArea.every(r=>'comped' in r&&'actual' in r&&'remaining' in r),'revenue by area: seats/sold/blocked/comped/potential/actual/remaining, adds up to the total');
+  // move a customer
+  const t0=E(`Demo.st.tickets.find(t=>t.event_id==='${g.id}'&&t.status==='valid'&&t.ticket_type_id==='${stalls}'&&t.seat)`);
+  const dest=[...states('winter-orchestra-gala').values()].find(x=>x.state==='available'&&x.p.tt===stalls&&x.p.id!==t0.seat).p.id;
+  await E(`DB.seatAction('${g.id}','','move',['${t0.seat}'],{to:'${dest}'})`);
+  const t1=E(`Demo.st.tickets.find(t=>t.id==='${t0.id}')`);
+  ok(t1.seat===dest && t1.row===ev('winter-orchestra-gala').seating.meta[dest][1] && E(`Demo.st.seatLog.filter(r=>r.action==='moved').length`)===2,'move a customer: ticket, row/seat and both seats\' history updated');
+  const premSeat=[...states('winter-orchestra-gala').values()].find(x=>x.state==='available'&&x.p.tt===prem).p.id;
+  ok(/different price level/.test(String(await throwsP(`DB.seatAction('${g.id}','','move',['${dest}'],{to:'${premSeat}'})`))),'moving to a different price level is refused (upgrades are Stage 6)');
+  // cancel → released
+  const oid=t1.order_id, oseats=E(`Demo.st.tickets.filter(t=>t.order_id==='${oid}').map(t=>t.seat)`);
+  await E(`DB.setOrderStatus('${oid}','cancelled')`);
+  ok(oseats.every(s=>states('winter-orchestra-gala').get(s).state==='available') && E(`Demo.st.seatLog.filter(r=>r.action==='cancelled'&&r.seat==='${dest}').length`)===1,'cancelled order releases its seats, logged');
+  // layout guard
+  ok(/would disappear/.test(String(await throwsP(`DB.saveEvent((()=>{const e=JSON.parse(JSON.stringify(Demo.st.events.find(e=>e.slug==='winter-orchestra-gala')));e.seating.sections=e.seating.sections.filter(s=>s.code!=='CEN');Object.assign(e.seating,seatDerive(e.seating));return e})())`))),'a layout change can\'t delete seats that have tickets');
+  // permissions
+  await as('support@skyline.example');
+  ok(/permission/.test(String(await throwsP(`DB.seatAction('${g.id}','','block',['${free[9]}'])`))),'customer service cannot block seats');
+  await as('door@example.com');
+  ok(/permission/.test(String(await throwsP(`DB.seatAction('${g.id}','','unblock',['CEN-A1'])`))),'door staff cannot unblock seats');
+  await as('manager@skyline.example');
+  await E(`DB.seatAction('${g.id}','','block',['${free[9]}'],{})`); ok(states('winter-orchestra-gala').get(free[9]).state==='blocked','event manager (gala only) can block seats on the gala');
+  ok(E(`Demo.st.seatLog.find(r=>r.seat==='${free[9]}'&&r.action==='blocked').by`)==='manager@skyline.example','history records who made the change');
+
+  // ── inventory screen ──
+  await as('moishsonn@gmail.com');
+  W().location.hash=`#/admin/event/${g.id}/inventory`; await until(()=>W().document.querySelector('.inv-kpis'));
+  const k=[...W().document.querySelectorAll('.inv-k')].map(x=>x.textContent.replace(/\s+/g,' ').trim());
+  ok(['Total seats','Available','Sold','In checkout','Held','Blocked','Unavailable','Complimentary','Discount-code sales','Cancelled / released','Remaining sellable'].every(l=>k.some(x=>x.startsWith(l))),'inventory shows all live counts: '+k.join(' | '));
+  E(`A.invFilter({dataset:{v:'blocked'}})`); await sleep(60);
+  ok(W().document.querySelectorAll('.tbl tr.click').length===5 && W().document.querySelectorAll('.sm-inv .st.dim').length>100,'click “Blocked” → exactly those seats listed and highlighted');
+  E('A.invSelAll()'); await sleep(40); ok(E('S.ui.invSel.length')===5,'select all blocked seats');
+  W().document.querySelector('[data-action="invDo"][data-v="unblock"]').click(); await until(()=>E('S.ui.invSel.length')===0); await sleep(80);
+  ok(count(states('winter-orchestra-gala'),'blocked')===0,'unblock them from the inventory screen');
+  E(`A.invFilter({dataset:{v:'blocked'}})`);
+  // row-label click selects a whole row
+  const rowEl=W().document.querySelector('.sm-inv [data-row]'); rowEl.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true})); await sleep(60);
+  const [rs,rr]=rowEl.dataset.row.split('|'); ok(E('S.ui.invSel.length')===E(`layoutOf(S.adm.events.find(e=>e.id==='${g.id}').seating).seats.filter(p=>p.sec.id==='${rs}'&&p.row==='${rr}').length`),'clicking a row letter selects the full row ('+E('S.ui.invSel.length')+')');
+  E(`S.ui.invSel=['CEN-E7']`); E('render()'); await sleep(40);
+  ok(has('Seat history') && has('Artist family'),'single seat shows its status, note and history');
+  // email + ticket PDF layout
+  const o=E(`S.adm.orders.find(o=>o.data.lines.some(l=>l.seats&&l.seats.length===2)&&o.status==='paid')`);
+  E(`A.emailPv({dataset:{id:'${o.id}'}})`); await sleep(40);
+  ok(W().document.querySelectorAll('.email-pv .em-ev tbody tr').length===2 && W().document.querySelector('.email-pv').textContent.includes('one ticket per page'),'one confirmation email per order, listing every ticket with area/row/seat');
+  E('closeModal()');
+
+  // ── builder: levels, booths, standing, mirror, rows, seats, background, preview ──
+  const c=ev('late-night-comedy-club')||ev('comedy-night');
+  W().location.hash=`#/admin/event/${c.id}/seating`; await until(()=>E('S.draft&&S.draft.id')===c.id);
+  E("S.draft.ticketTypes.push(newTT(),newTT())"); E("S.draft.ticketTypes[1].name='Booth';S.draft.ticketTypes[1].price=9000;S.draft.ticketTypes[2].name='Balcony';S.draft.ticketTypes[2].price=3000");
+  E("S.draft.seating.enabled=true"); E('render()'); await sleep(40);
+  E(`applySeatTemplate('club')`); await sleep(40);
+  const L=E('layoutOf(S.draft.seating)');
+  ok(L.secs.length===8 && L.secs.filter(x=>x.kind==='ga')[0].local.length===300 && L.secs.filter(x=>x.kind==='booth').length===6,'club template: standing area (300), 6 booths, balcony');
+  ok(W().document.querySelectorAll('.sm-levels button').length===2,'builder shows level tabs');
+  E(`S.ui.smSel=S.draft.seating.sections.find(s=>s.code==='B1').id;S.ui.smMulti=[S.ui.smSel]`); E('A.smMirror()');
+  const mir=E("S.draft.seating.sections.find(s=>s.name==='Booth 1 (mirror)')"), b1=E("S.draft.seating.sections.find(s=>s.code==='B1')");
+  ok(mir && mir.rot===-b1.rot && !!mir.reverse && mir.x!==b1.x,'mirror section');
+  E(`S.ui.smSel=S.draft.seating.sections.find(s=>s.code==='BAL').id;S.ui.smMulti=[S.ui.smSel]`);
+  E("A.rowDup({dataset:{i:'1'}})"); E("A.rowCopy({dataset:{i:'0'}})"); E('A.rowPaste()');
+  ok(E("S.draft.seating.sections.find(s=>s.code==='BAL').rows")===6,'duplicate and copy/paste rows');
+  E("S.draft.seating.sections.find(s=>s.code==='BAL').rowSeats=[0,18]"); E('A.rowDel({dataset:{i:"1"}})');
+  ok(E("S.draft.seating.sections.find(s=>s.code==='BAL').rows")===5,'delete a row');
+  E("S.ui.smMode='seats';S.ui.smSeats=['BAL-A1','BAL-A2']"); E('A.seatsRemove()');
+  ok(!E("layoutOf(S.draft.seating).byId.has('BAL-A1')") && E("layoutOf(S.draft.seating).byId.has('BAL-A3')"),'remove individual seats (others keep their numbers)');
+  E("S.ui.smSeats=['BAL-A2']"); E('A.seatsRestore()'); ok(E("layoutOf(S.draft.seating).byId.has('BAL-A2')"),'restore a removed seat');
+  E("S.ui.smSeats=['BAL-B3']"); E("S.ui.spLabel='3A'"); E('A.seatsLabel()');
+  E("S.ui.smSeats=['BAL-B1','BAL-B2']"); E("S.ui.spArea='Balcony front'"); E('A.seatsArea()');
+  E("S.ui.smSel=S.draft.seating.sections.find(s=>s.code==='BAL').id"); E("Object.assign(S.draft.seating.sections.find(s=>s.code==='BAL'),{numbering:'odd',seatStart:1})");
+  ok(E("layoutOf(S.draft.seating).byId.has('BAL-C5')") && !E("layoutOf(S.draft.seating).byId.has('BAL-C2')"),'odd-only seat numbering');
+  E("S.draft.seating.sections.find(s=>s.code==='BAL').numbering='seq'");
+  E("S.ui.smMulti=S.draft.seating.sections.filter(s=>s.kind==='booth').map(s=>s.id);S.ui.smSel=''"); E("S.ui.mpArea='Booths'"); E('A.mpApply()');
+  ok(E("S.draft.seating.sections.filter(s=>s.kind==='booth').every(s=>s.area==='Booths')"),'bulk-edit several sections at once');
+  // background image
+  const blob=await new Promise(r=>{const cv=document.createElement('canvas');cv.width=400;cv.height=300;const x=cv.getContext('2d');x.fillStyle='#ccc';x.fillRect(0,0,400,300);cv.toBlob(r,'image/png')});
+  W().CHANGE_TEST=new File([blob],'plan.png',{type:'image/png'}); E('CHANGE.smBg({files:[CHANGE_TEST]})');
+  await until(()=>E("S.draft.seating.bg&&S.draft.seating.bg.src.startsWith('data:image/jpeg')"));
+  E("S.ui.smMode='move';S.ui.smSeats=[]"); E('render()'); await sleep(40); ok(W().document.querySelector('.sm-design image.sm-bg'),'upload a venue map image and build over it');
+  // custom row labels that collide are caught
+  E("S.draft.seating.sections.find(s=>s.code==='BAL').rowLabels='A, A'");
+  E("S.draft.name='Comedy Club Night'"); E('S.dirty=true'); await E('A.saveEvent()'); await sleep(50);
+  ok(E('S.dirty')===true,'duplicate row labels refuse to save');
+  E("S.ui.smSel=S.draft.seating.sections.find(s=>s.code==='BAL').id;S.ui.smMulti=[S.ui.smSel];S.ui.smMode='move'");
+  E("S.draft.seating.sections.find(s=>s.code==='BAL').rowLabels=''"); E('render()'); await sleep(30);
+  const rl=W().document.querySelector('[data-bind$=".rowLabels"]'); rl.value='AA, BB, CC'; rl.dispatchEvent(new Event('input',{bubbles:true})); await sleep(40);
+  E('S.dirty=true'); await E('A.saveEvent()'); await sleep(60);
+  const cs=E(`S.adm.events.find(e=>e.id==='${c.id}').seating`);
+  ok(!E('S.dirty') && cs.meta['BAL-BB3'][2]==='3A' && cs.meta['BAL-BB1'][0]==='Balcony front' && cs.meta['BAL-AA3'][1]==='AA' && cs.rows['BAL|AA'][0]===null,'renaming rows keeps each seat\'s label, area and removed state; saved with custom row labels');
+  E('A.smPreview()'); await sleep(50); ok(W().document.querySelector('.modal .sm-buy .sm') && !W().document.querySelector('.modal [data-action="pickSeat"]'),'customer preview of the chart'); E('closeModal()');
+  // publish and buy standing spots
+  E("S.draft.status='published';S.dirty=true"); await E('A.saveEvent()'); await sleep(60); await E('refreshPublic()');
+  W().location.hash='#/e/'+E(`S.adm.events.find(e=>e.id==='${c.id}').slug`); await until(()=>W().document.querySelector('.sm-buy .sm-ga'));
+  W().document.querySelector('.sm-ga.buy').dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(30); W().document.querySelector('.sm-ga.buy').dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(30);
+  ok(E('S.sel.seats.length')===2 && E('S.sel.seats').every(x=>x.startsWith('GA-')),'standing area: tap to add spots');
+  await E('A.addToCart()'); await until(()=>W().location.hash.startsWith('#/cart'));
+  E(`S.co.name='Standing Fan';S.co.email='floor@example.com';S.co.terms=true`); await E('A.placeOrder()'); await until(()=>W().document.querySelector('.e-ticket'));
+  const gt=E(`S.order.tickets`); ok(gt.length===2 && gt.every(t=>t.area==='Standing floor' && t.row===''),'standing tickets carry their area, no row/seat');
+
+  // ── venue library ──
+  await as('moishsonn@gmail.com');
+  ok(E('S.adm.bo.venues.length')===2,'two master venue charts seeded');
+  W().location.hash='#/admin/venues'; await until(()=>W().document.querySelector('.ven-card')); ok(W().document.querySelectorAll('.ven-card .sm').length===2,'venue library page with chart previews');
+  const v0=E('S.adm.bo.venues[0]');
+  // attach to another event
+  const j=ev('spring-jazz-brunch'); W().location.hash=`#/admin/event/${j.id}/seating`; await until(()=>E('S.draft&&S.draft.id')===j.id);
+  await E(`A.loadVenue({dataset:{v:'${v0.id}'}})`); await sleep(30);
+  ok(E('S.draft.seating.venueId')===v0.id && E('S.draft.ticketTypes.length')===j.ticketTypes.length+3 && Object.keys(E('S.draft.seating.index')).length===Object.keys(g.seating.index).length,'attach a venue chart: layout copied, price tiers added as ticket types');
+  E('S.dirty=true'); await E('A.saveEvent()'); await sleep(60);
+  // edit the master — events keep their own copy
+  W().location.hash='#/admin/venues/'+v0.id; await until(()=>E('S.draft&&S.draft._venue')===v0.id);
+  E("S.draft.seating.sections[0].name='Renamed in master'"); E('S.dirty=true'); await E('A.saveVenue()'); await sleep(40);
+  ok(E(`Demo.st.boxOffices.find(b=>b.slug==='skyline-live').venues[0].chart.sections[0].name`)==='Renamed in master' && !ev('spring-jazz-brunch').seating.sections.some(s=>s.name==='Renamed in master') && !ev('winter-orchestra-gala').seating.sections.some(s=>s.name==='Renamed in master'),'editing a master chart never changes events that use it');
+  // save an event's chart to the library
+  W().location.hash=`#/admin/event/${c.id}/seating`; await until(()=>E('S.draft&&S.draft.id')===c.id);
+  W().prompt=()=>'Club venue'; E("S.draft.seating.venueId=''"); await E('A.saveToVenue()');
+  ok(E('S.adm.bo.venues.length')===3 && E('S.adm.bo.venues[2].name')==='Club venue' && E('S.adm.bo.venues[2].tiers.length')===3,'save an event\'s chart to the venue library');
+  ok(E("Demo.st.audit.some(a=>a.kind==='venues.saved')"),'venue changes are in the activity log');
+  log('DONE');
+}catch(e){log('ERROR '+e.message+'\n'+e.stack)}})();
+</script></body></html>

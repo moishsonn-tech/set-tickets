@@ -25,6 +25,7 @@ create table if not exists box_offices (
   settings jsonb not null default '{}',     -- public: currency, fees, tax, terms, require2fa, pixels
   templates jsonb not null default '[]',    -- permission templates [{id,name,perms[]}]
   event_templates jsonb not null default '[]',  -- reusable event set-ups [{id,name,at,minutes,event}]
+  venues jsonb not null default '[]',       -- master seating charts [{id,name,address,chart,tiers}] (Stage 3); events copy them
   created_by text, created_at timestamptz default now());
 
 create table if not exists members (
@@ -67,6 +68,7 @@ create table if not exists tickets (
   order_id uuid not null references orders(id),
   event_id uuid not null references events(id),
   ticket_type_id text not null, slot_id text, seat text,
+  area text, "row" text, seat_label text, comp boolean not null default false,   -- Ticket type / Area, Row, Seat kept separately (Stage 3)
   code text unique not null, holder text,
   status text not null default 'valid' check (status in ('valid','cancelled')),
   checked_in_at timestamptz);
@@ -86,6 +88,21 @@ create index if not exists audit_target on audit_log(target, at desc);
 create table if not exists event_views (id bigint generated always as identity primary key, event_id uuid not null references events(id) on delete cascade,
   at timestamptz not null default now(), visitor text not null, src text);
 create index if not exists event_views_ev on event_views(event_id, at);
+-- Seat statuses (Stage 3). slot_id '' = every showtime. status: checkout (a buyer's 10-minute hold, keyed by a browser token) |
+-- held (staff hold with a note) | blocked | unavailable. Sold / comp come from tickets. Written only through the RPCs below.
+create table if not exists seat_status (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id),
+  event_id uuid not null references events(id) on delete cascade, slot_id text not null default '', seat text not null,
+  status text not null check (status in ('checkout','held','blocked','unavailable')), note text, by text, at timestamptz not null default now(),
+  expires_at timestamptz, token text, unique (event_id, slot_id, seat, status));
+create index if not exists seat_status_ev on seat_status(event_id);
+-- Per-seat history: sold, comp, cancelled, blocked, unblock, held, released, unavailable, available, moved, price, area.
+create table if not exists seat_log (id bigint generated always as identity primary key, at timestamptz not null default now(), box_office_id uuid not null,
+  event_id uuid not null references events(id) on delete cascade, slot_id text not null default '', seat text not null, action text not null, detail text,
+  by text, ref text, discount text);
+create index if not exists seat_log_ev on seat_log(event_id, seat, at desc);
+-- for databases created before Stage 3
+alter table box_offices add column if not exists venues jsonb not null default '[]';
+alter table tickets add column if not exists area text, add column if not exists "row" text, add column if not exists seat_label text, add column if not exists comp boolean not null default false;
 
 -- ── Who is asking ──────────────────────────────────────────────────────────────
 create or replace function me_email() returns text language sql stable as $$ select lower(coalesce(auth.jwt() ->> 'email', '')) $$;
@@ -146,6 +163,9 @@ create policy tickets_update on tickets for update using (has_perm(box_office_id
 create policy waitlist_team on waitlist for select using (has_perm(box_office_id, 'orders.view', event_id) or has_perm(box_office_id, 'comms.lists', event_id));
 alter table event_views enable row level security;
 create policy views_team on event_views for select using (exists(select 1 from events e where e.id = event_id and has_perm(e.box_office_id, 'events.view', e.id)));
+alter table seat_status enable row level security; alter table seat_log enable row level security;
+create policy seat_status_team on seat_status for select using (has_perm(box_office_id, 'seating.view', event_id));
+create policy seat_log_team on seat_log for select using (has_perm(box_office_id, 'seating.view', event_id));
 create policy broadcasts_read on broadcasts for select using (has_perm(box_office_id, 'comms.email', event_id) or has_perm(box_office_id, 'comms.notify', event_id));
 create policy broadcasts_insert on broadcasts for insert with check (has_perm(box_office_id, 'comms.email', event_id));
 create policy audit_read on audit_log for select using (is_super() or has_perm(box_office_id, 'admin.perms') or actor = me_email() or (target is not null and has_perm(box_office_id, 'events.edit', target)));
@@ -158,6 +178,8 @@ grant select (id, box_office_id, slug, status, data, created_at, updated_at) on 
 revoke select on box_offices from anon;
 grant select (id, slug, name, status, branding, settings) on box_offices to anon;
 grant select on platform_public to anon, authenticated;
+revoke select on seat_status from anon, authenticated;   -- buyers' hold tokens never leave the server
+grant select (id, box_office_id, event_id, slot_id, seat, status, note, by, at, expires_at) on seat_status to authenticated;
 
 -- ── Guard rails no client can bypass ─────────────────────────────────────────────
 -- Members: no privilege escalation, owner is untouchable, nobody edits their own permissions; every change logged.
@@ -219,8 +241,26 @@ begin
     if (new.data->k) is distinct from (old.data->k) then b := b || jsonb_build_object(k, old.data->k); a := a || jsonb_build_object(k, new.data->k); end if;
   end loop;
   if (new.data->'ticketTypes') is distinct from (old.data->'ticketTypes') then b := b || jsonb_build_object('ticketTypes', old.data->'ticketTypes'); a := a || jsonb_build_object('ticketTypes', new.data->'ticketTypes'); end if;
-  if (new.data->'seating'->'blocked') is distinct from (old.data->'seating'->'blocked') then b := b || jsonb_build_object('Blocked seats', jsonb_array_length(coalesce(old.data->'seating'->'blocked','[]'))); a := a || jsonb_build_object('Blocked seats', jsonb_array_length(coalesce(new.data->'seating'->'blocked','[]'))); end if;
-  if (new.data->'seating'->'sections') is distinct from (old.data->'seating'->'sections') then b := b || '{"Seating map":"previous layout"}'; a := a || '{"Seating map":"new layout"}'; end if;
+  if (new.data->'seating') is distinct from (old.data->'seating') then
+    -- a layout edit can never delete a seat somebody holds a ticket for
+    if exists(select 1 from tickets t where t.event_id = new.id and t.status = 'valid' and t.seat is not null and not coalesce(new.data->'seating'->'meta', '{}') ? t.seat) then
+      raise exception 'Sold seats would disappear from the map. Move those customers first, or block the seats instead.'; end if;
+    if (new.data->'seating'->'sections') is distinct from (old.data->'seating'->'sections') or (new.data->'seating'->'levels') is distinct from (old.data->'seating'->'levels')
+       or (new.data->'seating'->'removed') is distinct from (old.data->'seating'->'removed') then b := b || '{"Seating map":"previous layout"}'; a := a || '{"Seating map":"new layout"}'; end if;
+    if (new.data->'seating'->'noSingles') is distinct from (old.data->'seating'->'noSingles') then b := b || jsonb_build_object('Single-seat gap rule', old.data->'seating'->'noSingles'); a := a || jsonb_build_object('Single-seat gap rule', new.data->'seating'->'noSingles'); end if;
+    -- per-seat price / area changes go into the seat history
+    insert into seat_log(box_office_id, event_id, seat, action, detail, by)
+      select new.box_office_id, new.id, m.k, 'price', 'Price level '
+        || coalesce((select x->>'name' from jsonb_array_elements(old.data->'ticketTypes') x where x->>'id' = old.data->'seating'->'index'->>m.k), 'not for sale') || ' → '
+        || coalesce((select x->>'name' from jsonb_array_elements(new.data->'ticketTypes') x where x->>'id' = new.data->'seating'->'index'->>m.k), 'not for sale'), me_email()
+      from (select key k from jsonb_each(coalesce(new.data->'seating'->'meta','{}')) where coalesce(old.data->'seating'->'meta','{}') ? key) m
+      where (old.data->'seating'->'index'->>m.k) is distinct from (new.data->'seating'->'index'->>m.k);
+    insert into seat_log(box_office_id, event_id, seat, action, detail, by)
+      select new.box_office_id, new.id, key, 'area', 'Seating area ' || (old.data->'seating'->'meta'->key->>0) || ' → ' || (value->>0), me_email()
+      from jsonb_each(coalesce(new.data->'seating'->'meta','{}')) where coalesce(old.data->'seating'->'meta','{}') ? key and (old.data->'seating'->'meta'->key->>0) is distinct from (value->>0);
+    if (new.data->'seating'->'index') is distinct from (old.data->'seating'->'index') then b := b || '{"Seat prices":""}'; a := a || '{"Seat prices":"changed"}'; end if;
+    if (new.data->'seating'->'areas') is distinct from (old.data->'seating'->'areas') then b := b || '{"Seating areas":""}'; a := a || '{"Seating areas":"changed"}'; end if;
+  end if;
   if (new.secrets->>'password' <> '') is distinct from (old.secrets->>'password' <> '') then b := b || jsonb_build_object('Password', old.secrets->>'password' <> ''); a := a || jsonb_build_object('Password', new.secrets->>'password' <> ''); end if;
   if a <> '{}' then perform log_action(new.box_office_id, 'event.updated', 'Updated “' || (new.data->>'name') || '”: ' || (select string_agg(x, ', ') from jsonb_object_keys(a) x), b, a, new.id); end if;
   new.updated_at := now(); return new;
@@ -244,13 +284,161 @@ create trigger orders_audit before update on orders for each row execute functio
 create or replace function rand_code(n int) returns text language sql volatile as
 $$ select string_agg(substr('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', 1 + floor(random()*32)::int, 1), '') from generate_series(1, n) $$;
 
-create or replace function availability(p_event uuid) returns jsonb language sql stable security definer set search_path = public as $$
+drop function if exists availability(uuid);
+-- seats: sold "slot|seat" keys; off: seats nobody else can pick right now (blocked / held / unavailable / in another buyer's checkout).
+create or replace function availability(p_event uuid, p_token text default null) returns jsonb language sql stable security definer set search_path = public as $$
   select jsonb_build_object(
     'tt',    coalesce((select jsonb_object_agg(k, c) from (select ticket_type_id k, count(*) c from tickets where event_id = p_event and status='valid' group by 1) a), '{}'),
     'slots', coalesce((select jsonb_object_agg(k, c) from (select slot_id k, count(*) c from tickets where event_id = p_event and status='valid' and slot_id is not null group by 1) a), '{}'),
     'seats', coalesce((select jsonb_agg(coalesce(slot_id,'') || '|' || seat) from tickets where event_id = p_event and status='valid' and seat is not null), '[]'),
+    'off',   coalesce((select jsonb_agg(slot_id || '|' || seat) from seat_status where event_id = p_event
+               and not (status = 'checkout' and (expires_at <= now() or token = p_token))), '[]'),
     'total', (select count(*) from tickets where event_id = p_event and status='valid'));
 $$;
+
+-- ── Seats (Stage 3) ────────────────────────────────────────────────────────────
+-- "Stalls centre · Row A · Seat 12" from the event's derived seat meta
+create or replace function seat_text(e events, p_seat text) returns text language sql stable as $$
+  select coalesce(concat_ws(' · ', nullif(e.data->'seating'->'meta'->p_seat->>0, ''), 'Row ' || nullif(e.data->'seating'->'meta'->p_seat->>1, ''),
+    'Seat ' || nullif(e.data->'seating'->'meta'->p_seat->>2, '')), p_seat) $$;
+-- What stops this seat being sold right now (null = nothing). Staff may sell a seat they're holding; a buyer may buy their own checkout hold.
+create or replace function seat_blocker(p_event uuid, p_slot text, p_seat text, p_token text, p_staff boolean) returns text language sql stable as $$
+  select status from seat_status where event_id = p_event and seat = p_seat and slot_id in (coalesce(p_slot,''), '')
+    and not (status = 'checkout' and (expires_at <= now() or token = p_token)) and not (p_staff and status = 'held')
+  order by case status when 'unavailable' then 4 when 'blocked' then 3 when 'held' then 2 else 1 end desc limit 1 $$;
+create or replace function seat_free(e events, p_slot text, p_seat text, p_token text) returns boolean language sql stable as $$
+  select coalesce(e.data->'seating'->'index', '{}') ? p_seat
+    and not exists(select 1 from tickets t where t.event_id = e.id and t.status = 'valid' and t.seat = p_seat and coalesce(t.slot_id,'') = coalesce(p_slot,''))
+    and seat_blocker(e.id, p_slot, p_seat, p_token, false) is null $$;
+-- Single-seat gap rule (mirrors singleGaps() in data.js): seats this selection would leave stranded alone in a row.
+create or replace function single_gaps(e events, p_slot text, p_seats text[], p_token text) returns text[] language plpgsql stable as $$
+declare r jsonb; ids text[]; n int; i int; bef boolean[]; aft boolean[]; bad text[] := '{}';
+begin
+  for r in select value from jsonb_each(coalesce(e.data->'seating'->'rows', '{}')) loop
+    select array_agg(x order by o) into ids from jsonb_array_elements_text(r) with ordinality as t(x, o);
+    if not (ids && p_seats) then continue; end if;
+    n := array_length(ids, 1); bef := '{}'; aft := '{}';
+    for i in 1 .. n loop
+      bef := bef || (ids[i] is not null and seat_free(e, p_slot, ids[i], p_token));
+      aft := aft || (bef[i] and not (ids[i] = any(p_seats)));
+    end loop;
+    for i in 1 .. n loop
+      if aft[i] and not coalesce(aft[i-1], false) and not coalesce(aft[i+1], false)
+         and not (bef[i] and not coalesce(bef[i-1], false) and not coalesce(bef[i+1], false)) then bad := bad || ids[i]; end if;
+    end loop;
+  end loop;
+  return bad;
+end $$;
+-- A buyer's 10-minute hold while they check out. p_token = a random id from their browser.
+create or replace function hold_seats(p_event uuid, p_slot text, p_seats text[], p_token text) returns jsonb language plpgsql security definer set search_path = public as $$
+declare e events%rowtype; s text; blk text; gaps text[]; exp timestamptz := now() + interval '10 minutes';
+begin
+  select * into e from events where id = p_event;
+  if not found or not event_live(e) then raise exception 'Event is not on sale'; end if;
+  if not coalesce((e.data->'seating'->>'enabled')::boolean, false) then return null; end if;
+  if coalesce(length(p_token), 0) not between 8 and 64 then raise exception 'bad token'; end if;
+  if coalesce(array_length(p_seats, 1), 0) > 10 then raise exception 'Maximum 10 seats per order'; end if;
+  perform pg_advisory_xact_lock(hashtext(e.id::text));
+  foreach s in array coalesce(p_seats, '{}') loop
+    if not seat_free(e, p_slot, s, p_token) then
+      blk := seat_blocker(e.id, p_slot, s, p_token, false);
+      raise exception '% %', seat_text(e, s), case when blk = 'checkout' then 'is being held by another buyer — try again in a few minutes' else 'is no longer available' end; end if;
+  end loop;
+  if coalesce((e.data->'seating'->>'noSingles')::boolean, false) then
+    gaps := single_gaps(e, p_slot, p_seats, p_token);
+    if array_length(gaps, 1) > 0 then raise exception 'Please don''t leave a single empty seat next to your selection (%). Move over one seat, or include it.', (select string_agg(seat_text(e, g), '; ') from unnest(gaps) g); end if;
+  end if;
+  delete from seat_status where event_id = e.id and status = 'checkout' and token = p_token;
+  insert into seat_status(box_office_id, event_id, slot_id, seat, status, by, expires_at, token)
+    select e.box_office_id, e.id, coalesce(p_slot,''), x, 'checkout', 'buyer', exp, p_token from unnest(coalesce(p_seats, '{}')) x;
+  return jsonb_build_object('expires', exp);
+end $$;
+create or replace function release_seats(p_event uuid, p_token text) returns void language sql security definer set search_path = public as $$
+  delete from seat_status where status = 'checkout' and token = p_token and (p_event is null or event_id = p_event) $$;
+-- Staff seat management, any number of seats at once. p_slot '' = every showtime.
+-- p_action: block | unblock | hold {note} | release | unavailable | available | price {ttId} | area {area} | move {to}
+create or replace function seat_action(p_event uuid, p_slot text, p_action text, p_seats text[], p jsonb default '{}') returns void language plpgsql security definer set search_path = public as $$
+declare e events%rowtype; st text; perm text; s text; sec jsonb; v text; d jsonb; t tickets%rowtype; o_ref text; cnt int; sl text := coalesce(p_slot, '');
+  kinds text[]; lbl text;
+begin
+  select * into e from events where id = p_event; if not found then raise exception 'Event not found'; end if;
+  perm := case p_action when 'block' then 'seating.block' when 'hold' then 'seating.block' when 'unblock' then 'seating.unblock' when 'release' then 'seating.unblock'
+    when 'unavailable' then 'seating.edit' when 'available' then 'seating.edit' when 'price' then 'seating.edit' when 'area' then 'seating.edit' when 'move' then 'seating.move' end;
+  if perm is null then raise exception 'Unknown seat action'; end if;
+  if not has_perm(e.box_office_id, perm, e.id) or (p_action = 'price' and not has_perm(e.box_office_id, 'tickets.pricing', e.id)) then
+    raise exception 'You don''t have permission to do that (%)', perm; end if;
+  select coalesce(array_agg(distinct x), '{}') into p_seats from unnest(p_seats) x where coalesce(e.data->'seating'->'meta', '{}') ? x;
+  cnt := coalesce(array_length(p_seats, 1), 0); if cnt = 0 then raise exception 'Select at least one seat'; end if;
+  perform pg_advisory_xact_lock(hashtext(e.id::text));
+  if p_action in ('block', 'hold', 'unavailable') then
+    st := case p_action when 'hold' then 'held' when 'block' then 'blocked' else 'unavailable' end;
+    lbl := case p_action when 'hold' then 'Held' when 'block' then 'Blocked' else 'Made unavailable' end;
+    delete from seat_status where event_id = e.id and slot_id = sl and seat = any(p_seats) and status <> 'checkout';
+    insert into seat_status(box_office_id, event_id, slot_id, seat, status, note, by) select e.box_office_id, e.id, sl, x, st, left(p->>'note', 200), me_email() from unnest(p_seats) x;
+    insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by)
+      select e.box_office_id, e.id, sl, x, st, concat_ws(' ', lbl, case when sl <> '' then 'for this showtime' when jsonb_array_length(coalesce(e.data->'timeSlots','[]')) > 0 then 'for every showtime' end,
+        '— ' || nullif(p->>'note', '')), me_email() from unnest(p_seats) x;
+  elsif p_action in ('unblock', 'release', 'available') then
+    kinds := case p_action when 'unblock' then array['blocked'] when 'release' then array['held','checkout'] else array['unavailable'] end;
+    with gone as (delete from seat_status where event_id = e.id and seat = any(p_seats) and status = any(kinds) and slot_id in (sl, '') returning seat)
+    insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by)
+      select distinct e.box_office_id, e.id, sl, seat, case p_action when 'release' then 'released' else p_action end,
+        case p_action when 'unblock' then 'Unblocked' when 'release' then 'Released' else 'Made available' end, me_email() from gone;
+  elsif p_action in ('price', 'area') then
+    d := e.data;
+    foreach s in array p_seats loop
+      select x into sec from jsonb_array_elements(d->'seating'->'sections') x where x->>'code' = split_part(s, '-', 1);
+      if p_action = 'price' then
+        v := nullif(p->>'ttId', '');
+        if v is not null and not exists(select 1 from jsonb_array_elements(d->'ticketTypes') x where x->>'id' = v) then raise exception 'Unknown price level'; end if;
+        d := jsonb_set(d, '{seating,prices}', case when v is null or v = sec->>'ticketTypeId' then coalesce(d->'seating'->'prices','{}') - s else coalesce(d->'seating'->'prices','{}') || jsonb_build_object(s, v) end);
+        v := coalesce(v, nullif(sec->>'ticketTypeId', ''));
+        d := jsonb_set(d, '{seating,index}', case when v is null then coalesce(d->'seating'->'index','{}') - s else coalesce(d->'seating'->'index','{}') || jsonb_build_object(s, v) end);
+      else
+        v := nullif(left(trim(coalesce(p->>'area', '')), 60), '');
+        d := jsonb_set(d, '{seating,areas}', case when v is null or v = coalesce(nullif(sec->>'area',''), sec->>'name') then coalesce(d->'seating'->'areas','{}') - s else coalesce(d->'seating'->'areas','{}') || jsonb_build_object(s, v) end);
+        d := jsonb_set(d, array['seating','meta',s,'0'], to_jsonb(coalesce(v, nullif(sec->>'area',''), sec->>'name', sec->>'code')));
+      end if;
+    end loop;
+    update events set data = d where id = e.id;   -- events_guard writes each seat's price / area change into seat_log
+  elsif p_action = 'move' then
+    s := p->>'to';
+    select * into t from tickets where event_id = e.id and status = 'valid' and seat = p_seats[1] and coalesce(slot_id,'') = sl;
+    if not found then raise exception 'That seat has no ticket to move'; end if;
+    if not coalesce(e.data->'seating'->'meta', '{}') ? s then raise exception 'Choose the new seat'; end if;
+    if exists(select 1 from tickets where event_id = e.id and status = 'valid' and seat = s and coalesce(slot_id,'') = sl) or seat_blocker(e.id, sl, s, null, true) is not null
+      then raise exception '% isn''t free', seat_text(e, s); end if;
+    if e.data->'seating'->'index'->>s is distinct from t.ticket_type_id then raise exception 'That seat is a different price level — changing price (upgrade / downgrade) comes with order editing in Stage 6'; end if;
+    update tickets set seat = s, area = e.data->'seating'->'meta'->s->>0, "row" = e.data->'seating'->'meta'->s->>1, seat_label = e.data->'seating'->'meta'->s->>2 where id = t.id;
+    update orders set data = jsonb_set(data, '{lines}', (select jsonb_agg(case when l->>'eventId' = e.id::text and (l->'seats') ? p_seats[1]
+        then jsonb_set(l, '{seats}', (select jsonb_agg(case when z = p_seats[1] then s else z end) from jsonb_array_elements_text(l->'seats') z)) else l end) from jsonb_array_elements(data->'lines') l))
+      where id = t.order_id returning ref into o_ref;
+    delete from seat_status where event_id = e.id and seat = s and status = 'held' and slot_id in (sl, '');
+    insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref) values
+      (e.box_office_id, e.id, sl, p_seats[1], 'moved', t.holder || ' moved to ' || seat_text(e, s) || ' — seat released', me_email(), o_ref),
+      (e.box_office_id, e.id, sl, s, 'moved', t.holder || ' moved here from ' || seat_text(e, p_seats[1]), me_email(), o_ref);
+  end if;
+  perform log_action(e.box_office_id, 'seats.' || p_action, format('%s %s seat%s — %s', initcap(p_action), cnt, case when cnt = 1 then '' else 's' end, e.data->>'name'), null, null, e.id);
+end $$;
+-- Master venue charts live on the box office; seating.edit manages them.
+create or replace function save_venues(p_bo uuid, p jsonb) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not has_perm(p_bo, 'seating.edit') then raise exception 'You don''t have permission to edit venue charts'; end if;
+  if jsonb_typeof(p) <> 'array' then raise exception 'bad venues'; end if;
+  update box_offices set venues = p where id = p_bo;
+  perform log_action(p_bo, 'venues.saved', 'Edited venue charts (' || jsonb_array_length(p) || ')');
+end $$;
+-- Cancelled / refunded tickets release their seats — on the seat's record.
+create or replace function tickets_seat_log() returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if old.status = 'valid' and new.status <> 'valid' and new.seat is not null then
+    insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref)
+      select new.box_office_id, new.event_id, coalesce(new.slot_id,''), new.seat, 'cancelled', 'Order ' || o.ref || ' ' || o.status || ' — seat released', me_email(), o.ref from orders o where o.id = new.order_id;
+  end if;
+  return new;
+end $$;
+drop trigger if exists tickets_seat_log on tickets;
+create trigger tickets_seat_log after update on tickets for each row execute function tickets_seat_log();
 
 create or replace function check_discount(p_event uuid, p_code text) returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare d jsonb; used int;
@@ -324,7 +512,7 @@ declare
   lines jsonb := '[]'; subtotal bigint := 0; discount bigint := 0; fee bigint := 0; tax bigint := 0; eligible bigint := 0;
   qty int; unit bigint; sold int; oid uuid; okey uuid; oref text; seat text; i int; donation bigint; ev_ids uuid[] := '{}';
   manual boolean := coalesce(p->>'payment','') = 'manual'; status text; total bigint; cur text;
-  bo box_offices%rowtype; plat jsonb; pfee bigint := 0; ntk int := 0;
+  bo box_offices%rowtype; plat jsonb; pfee bigint := 0; ntk int := 0; blk text; gaps text[]; all_seats text[]; evr events%rowtype; tok text := nullif(p->>'holdToken','');
 begin
   if coalesce(trim(p->'buyer'->>'name'),'') = '' then raise exception 'Name is required'; end if;
   if coalesce(p->'buyer'->>'email','') !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'A valid email is required'; end if;
@@ -368,10 +556,18 @@ begin
     if coalesce((ev.data->'seating'->>'enabled')::boolean, false) then
       if jsonb_array_length(coalesce(it->'seats','[]')) <> qty then raise exception 'Pick % seat(s)', qty; end if;
       for seat in select jsonb_array_elements_text(it->'seats') loop
-        if (ev.data->'seating'->'blocked') ? seat or not (coalesce(ev.data->'seating'->'index','{}') ? seat) then raise exception 'Seat % is unavailable', seat; end if;
-        if ev.data->'seating'->'index'->>seat <> tt->>'id' then raise exception 'Seat % is not a % seat', seat, tt->>'name'; end if;
-        if av->'seats' ? (coalesce(it->>'slotId','') || '|' || seat) then raise exception 'Seat % was just taken', seat; end if;
+        if not (coalesce(ev.data->'seating'->'index','{}') ? seat) then raise exception '% is unavailable', seat_text(ev, seat); end if;
+        if ev.data->'seating'->'index'->>seat <> tt->>'id' then raise exception '% isn''t a % seat', seat_text(ev, seat), tt->>'name'; end if;
+        if av->'seats' ? (coalesce(it->>'slotId','') || '|' || seat) then raise exception '% was just taken', seat_text(ev, seat); end if;
+        blk := seat_blocker(ev.id, coalesce(it->>'slotId',''), seat, tok, manual);   -- staff may sell a seat they're holding
+        if blk is not null then raise exception '% %', seat_text(ev, seat), case when blk = 'checkout' then 'is being held by another buyer — try again in a few minutes' else 'is unavailable' end; end if;
       end loop;
+      if coalesce((ev.data->'seating'->>'noSingles')::boolean, false) and not manual then
+        select coalesce(array_agg(x), '{}') into all_seats from jsonb_array_elements(p->'items') i, jsonb_array_elements_text(coalesce(i->'seats','[]')) x
+          where i->>'eventId' = ev.id::text and coalesce(i->>'slotId','') = coalesce(it->>'slotId','');
+        gaps := single_gaps(ev, coalesce(it->>'slotId',''), all_seats, tok);
+        if array_length(gaps, 1) > 0 then raise exception 'Please don''t leave a single empty seat next to your selection (%). Move over one seat, or include it.', (select string_agg(seat_text(ev, g), '; ') from unnest(gaps) g); end if;
+      end if;
     end if;
     unit := coalesce((tt->>'price')::bigint, 0);
     subtotal := subtotal + unit * qty; if unit > 0 then ntk := ntk + qty; end if;
@@ -424,12 +620,25 @@ begin
     returning id, access_key into oid, okey;
 
   for it in select * from jsonb_array_elements(lines) where value->>'kind' = 'ticket' loop
+    select * into evr from events where id = (it->>'eventId')::uuid;
     for i in 1 .. ((it->>'qty')::int * (it->>'admits')::int) loop
-      insert into tickets(box_office_id, order_id, event_id, ticket_type_id, slot_id, seat, code, holder)
-      values (bo.id, oid, (it->>'eventId')::uuid, it->>'ticketTypeId', nullif(it->>'slotId',''),
-              case when jsonb_array_length(it->'seats') >= i then it->'seats'->>(i-1) end, rand_code(10), p->'buyer'->>'name');
+      seat := case when jsonb_array_length(it->'seats') >= i then it->'seats'->>(i-1) end;
+      insert into tickets(box_office_id, order_id, event_id, ticket_type_id, slot_id, seat, area, "row", seat_label, comp, code, holder)
+      values (bo.id, oid, evr.id, it->>'ticketTypeId', nullif(it->>'slotId',''), seat,
+              evr.data->'seating'->'meta'->seat->>0, evr.data->'seating'->'meta'->seat->>1, evr.data->'seating'->'meta'->seat->>2,
+              coalesce((p->>'comp')::boolean, false), rand_code(10), p->'buyer'->>'name');
+      if seat is not null then
+        insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref, discount)
+        values (bo.id, evr.id, coalesce(it->>'slotId',''), seat, case when coalesce((p->>'comp')::boolean, false) then 'comp' else 'sold' end,
+          case when coalesce((p->>'comp')::boolean, false) then 'Complimentary ticket issued to ' else 'Sold to ' end || (p->'buyer'->>'name')
+            || case when disc is null then '' else ' · discount ' || (disc->>'code') end, coalesce(nullif(me_email(), ''), lower(trim(p->'buyer'->>'email'))), oref, disc->>'code');
+      end if;
     end loop;
+    -- seats sold out of a checkout hold, or a staff hold, leave the hold list
+    delete from seat_status where event_id = evr.id and slot_id in (coalesce(it->>'slotId',''), '') and (it->'seats') ? seat_status.seat
+      and (seat_status.status = 'checkout' or (manual and seat_status.status = 'held'));
   end loop;
+  if tok is not null then delete from seat_status x where x.status = 'checkout' and x.token = tok; end if;
   return jsonb_build_object('id', oid, 'key', okey, 'ref', oref);
 end $$;
 
@@ -471,7 +680,7 @@ begin
   res := jsonb_build_object('super', sup, 'bos', bos, 'me', me, 'bo', to_jsonb(b));
   if b.status <> 'active' and not (p_support and sup) then return res || jsonb_build_object('blocked', b.status); end if;
   if coalesce((b.settings->>'require2fa')::boolean, false) and coalesce(auth.jwt() ->> 'aal', '') <> 'aal2' and not (p_support and sup) then
-    return res || jsonb_build_object('needs2fa', true, 'events', '[]'::jsonb, 'orders', '[]'::jsonb, 'tickets', '[]'::jsonb, 'waitlist', '[]'::jsonb, 'team', jsonb_build_array(me), 'broadcasts', '[]'::jsonb, 'audit', '[]'::jsonb); end if;
+    return res || jsonb_build_object('needs2fa', true, 'events', '[]'::jsonb, 'orders', '[]'::jsonb, 'tickets', '[]'::jsonb, 'waitlist', '[]'::jsonb, 'team', jsonb_build_array(me), 'broadcasts', '[]'::jsonb, 'audit', '[]'::jsonb, 'seatStatus', '[]'::jsonb, 'seatLog', '[]'::jsonb); end if;
   select coalesce(array_agg(e.id), '{}') into evs from events e where e.box_office_id = b.id and (has_perm(b.id, 'events.view', e.id) or has_perm(b.id, 'door.scan', e.id));
   P_names := has_perm(b.id, 'customers.names'); P_emails := has_perm(b.id, 'customers.emails'); P_phones := has_perm(b.id, 'customers.phones'); P_money := has_perm(b.id, 'finance.totals');
   seeorders := has_perm(b.id, 'orders.view') or P_money or has_perm(b.id, 'finance.reports') or has_perm(b.id, 'comms.lists') or has_perm(b.id, 'customers.profiles');
@@ -485,7 +694,7 @@ begin
                || case when P_names then '{}'::jsonb else '{"name":"Guest"}'::jsonb end
                || case when P_emails then '{}'::jsonb else jsonb_build_object('email', regexp_replace(o.buyer_email, '^(.)[^@]*@(.)[^.]*(\..+)$', '\1•••@\2•••\3')) end
                || case when P_phones or coalesce(o.data->'buyer'->>'phone','') = '' then '{}'::jsonb else '{"phone":"•••"}'::jsonb end)))
-      ) from orders o where o.box_office_id = b.id and o.event_ids && evs), '[]') end,
+      from orders o where o.box_office_id = b.id and o.event_ids && evs), '[]') end,
     'tickets', coalesce((select jsonb_agg(to_jsonb(t) || case when P_names then '{}'::jsonb else '{"holder":"Guest"}'::jsonb end) from tickets t where t.event_id = any(evs)), '[]'),
     'waitlist', case when has_perm(b.id, 'orders.view') or has_perm(b.id, 'comms.lists') then coalesce((select jsonb_agg(to_jsonb(w)) from waitlist w where w.event_id = any(evs)), '[]') else '[]' end,
     'team', case when has_perm(b.id, 'admin.invite') or has_perm(b.id, 'admin.perms') or has_perm(b.id, 'admin.remove')
@@ -494,6 +703,10 @@ begin
     'broadcasts', coalesce((select jsonb_agg(to_jsonb(x)) from broadcasts x where x.event_id = any(evs) and (has_perm(b.id, 'comms.email') or has_perm(b.id, 'comms.notify'))), '[]'),
     'audit', coalesce((select jsonb_agg(to_jsonb(a) order by a.at desc) from (select * from audit_log a where a.box_office_id = b.id
         and (has_perm(b.id, 'admin.perms') or a.actor = em or (a.target is not null and has_perm(b.id, 'events.edit', a.target))) order by a.at desc limit 1500) a), '[]'),
+    'seatStatus', coalesce((select jsonb_agg(to_jsonb(x) - 'token') from seat_status x where x.event_id = any(evs)
+        and not (x.status = 'checkout' and x.expires_at <= now())), '[]'),
+    'seatLog', case when has_perm(b.id, 'seating.view') then coalesce((select jsonb_agg(to_jsonb(l) order by l.at desc) from (select * from seat_log l
+        where l.event_id = any(evs) order by l.at desc limit 8000) l), '[]') else '[]' end,
     'views', coalesce((select jsonb_object_agg(v.event_id, jsonb_build_object('total', v.total, 'unique', v.uniq, 'today', v.today, 'last10m', v.now10, 'bySrc', v.bysrc)) from (
         select event_id, count(*) total, count(distinct visitor) uniq, count(*) filter (where at >= date_trunc('day', now())) today,
           count(distinct visitor) filter (where at >= now() - interval '10 minutes') now10,
@@ -584,13 +797,14 @@ begin
   perform log_action(null, 'platform.deleted', 'Permanently deleted box office ' || b.name);
 end $$;
 
-grant execute on function availability(uuid), check_discount(uuid,text), unlock(uuid,text), join_waitlist(uuid,text,text,text),
+grant execute on function availability(uuid,text), hold_seats(uuid,text,text[],text), release_seats(uuid,text), check_discount(uuid,text), unlock(uuid,text), join_waitlist(uuid,text,text,text),
   get_order(uuid,uuid), lookup_order(text,text), place_order(jsonb), register_box_office(text,text,text,text),
   event_by_slug(text), track_view(uuid,text,text) to anon, authenticated;
-grant execute on function save_event_templates(uuid,jsonb), notify_waitlist(uuid,text) to authenticated;
+grant execute on function save_event_templates(uuid,jsonb), notify_waitlist(uuid,text), seat_action(uuid,text,text,text[],jsonb), save_venues(uuid,jsonb) to authenticated;
 grant execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), transfer_ownership(uuid,text), platform_overview(), platform_save(jsonb),
   create_box_office(text,text,text,text), set_box_office_status(uuid,text), delete_box_office(uuid) to authenticated;
-revoke execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), new_box_office(text,text,text,text,text,text), log_action(uuid,text,text,jsonb,jsonb) from anon, public;
+revoke execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), new_box_office(text,text,text,text,text,text), log_action(uuid,text,text,jsonb,jsonb,uuid),
+  seat_blocker(uuid,text,text,text,boolean), seat_free(events,text,text,text), single_gaps(events,text,text[],text) from anon, public;
 
 -- First platform owner. Create box offices from #/platform after signing in.
 insert into platform_admins(email) values ('moishsonn@gmail.com') on conflict do nothing;
