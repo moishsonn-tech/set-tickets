@@ -57,6 +57,20 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   with `scope` event|ticket, types in `Q_TYPES`, checked server-side by `checkAnswers()` / `check_answers()`; per-ticket answers land on
   `tickets.answers`. Event page sections + `event.page` (video, gallery, sponsors, blocks, hide{}, colours, checkoutNote). Customer accounts
   (`#/account`, optional): DEMO `st.customers` (PBKDF2), LIVE Supabase Auth email+password + `my_orders()` (confirmed email only).
+- **Orders & customers (Stage 6):** staff never write `orders` / `tickets` directly (no update policies; table writes revoked) — every
+  change is `DB.orderAction(id, action, p)` → DEMO `demoOrderAction()` / SQL `order_action()` (actions: change | cancel | refund | collect |
+  addAddon | removeAddon | customer | holder | note | message | resend | markPaid | cancelUnpaid | status). Nothing is overwritten: a seat /
+  type / showtime change sets the old ticket `status='replaced'` (`replaced_by`) and issues a new ticket + code (`changeOrderTickets()` /
+  `change_order_tickets()`, price via `changePrice()` / `change_price()`; net difference settled once: collect | due | waive, or refund | credit |
+  eventCredit | none). Refunds `refundPlan()` + `applyRefund()` append to `data.refunds` (per-ticket `tickets.refunded`); extra money to
+  `data.charges` / `extraPaid`; `data.due` = balance due; `orderMoney()` / `order_money()` = collected / refunded / credited / refundable.
+  Every change is a row in `orderLog` / `order_log` (+ audit). Refunds to the card: LIVE goes through the payments Edge Function
+  (`{action:'order'}` runs `order_action` as the caller, then `provider.refund` per 'processing' refund → `finish_refund()`). Credits = `credits`
+  table (code `CR-…`, email, optional event, expiry, `applied[]`; `creditState()` / `credit_state()`); used at checkout via `p.credit` (code or
+  'account') / `p.creditId` (staff) → `quote(..., {credit})` / `price_cart` `creditAvail` (set only by `place_order`, stripped from the payload).
+  Customers page `#/admin/customers[/<email>]`, notes `customer_notes`; order page `#/admin/orders/<id>`, manual order `#/admin/orders/new`.
+  Live activity: `DB.ping()` / `presence_ping()` → `event_presence`, summarised in `admin_load().live`; event tab "Live activity". Outbox has
+  one `confirmation` per order (partial unique index) plus resend / updated / refund / message rows.
 - **Money is integer cents everywhere.**
 - **Not yet wired:** the payments Edge Function is written but not deployed (no Supabase project yet; needs Stripe keys in
   Supabase secrets + pg_cron for `expire_orders()`); outbound email/SMS (confirmations are queued in `outbox`, not sent); Apple Wallet passes.
@@ -64,7 +78,10 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
 ## Run locally
 `cd frontend && python3 -m http.server 8765` → http://localhost:8765 (organizer side: /#/admin).
 Tests: copy `tests/*.html` into `frontend/`, open via the local server (headless Chrome `--dump-dom` works), then delete the copies.
-Stage 5's suite uses PBKDF2 (real CPU time), so run it in real time (poll its `#out`), not with `--virtual-time-budget`.
+Stage 5's and 6's suites use PBKDF2 (real CPU time), so run them in real time (poll their `#out` for `DONE`), not with `--virtual-time-budget`.
+Database rules for real: `bash tests/db-e2e.sh` applies `supabase/schema.sql` to a scratch Postgres (with `tests/supabase-stub.sql` standing in
+for Supabase's auth schema and roles) and runs `tests/db-e2e.sql` as buyers, staff, customers and the service role. A throwaway Postgres:
+`pip install pgserver` (bundles the binaries) — see the script header.
 
 ## Deploy
 Live at https://moishsonn-tech.github.io/set-tickets/ (public repo moishsonn-tech/set-tickets).

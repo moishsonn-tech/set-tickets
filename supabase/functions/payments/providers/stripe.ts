@@ -48,8 +48,9 @@ export default {
     if (ev.type === 'payment_intent.payment_failed') return { type: 'failed', orderId: o.metadata.order_id, ref: o.id, error: o.last_payment_error?.message || 'Payment failed' };
     return null;
   },
-  async refund({ ref, account, env }) {
-    return call(env, 'POST', 'refunds', { payment_intent: ref, refund_application_fee: true, reverse_transfer: undefined }, { account, idem: 'set-refund-' + ref });
+  // amount = cents to refund (all of it when left out); idem = one key per refund so a retry can never refund twice
+  async refund({ ref, account, env, amount, idem }) {
+    return call(env, 'POST', 'refunds', { payment_intent: ref, amount: amount || undefined, refund_application_fee: true }, { account, idem: idem || 'set-refund-' + ref });
   },
   async connect({ boxOffice, account, returnUrl, env }) {
     const acct = account?.account || (await call(env, 'POST', 'accounts', { type: 'express', metadata: { box_office_id: boxOffice.id }, business_profile: { name: boxOffice.name } })).id;

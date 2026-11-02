@@ -133,7 +133,30 @@ create table if not exists payment_accounts (box_office_id uuid primary key refe
   status text not null default 'pending' check (status in ('pending','connected','restricted')), test boolean not null default true, data jsonb not null default '{}', updated_at timestamptz not null default now());
 -- outgoing mail: ONE confirmation per order (unique), delivered by Stage 8's sender
 create table if not exists outbox (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id), order_id uuid references orders(id),
-  kind text not null, "to" text not null, status text not null default 'queued', at timestamptz not null default now(), unique (order_id, kind));
+  kind text not null, "to" text not null, status text not null default 'queued', at timestamptz not null default now());
+
+-- Stage 6: tickets are never edited in place. A seat / type / showtime change voids the ticket ('replaced', replaced_by → the new one);
+-- refunds per ticket are tracked; every order change is a row in order_log; credits; notes on customers; live presence on event pages.
+alter table tickets drop constraint if exists tickets_status_check;
+alter table tickets add constraint tickets_status_check check (status in ('valid','cancelled','replaced'));
+alter table tickets add column if not exists replaces uuid, add column if not exists replaced_by uuid, add column if not exists refunded bigint not null default 0,
+  add column if not exists cancelled_at timestamptz, add column if not exists changed_at timestamptz, add column if not exists issued_at timestamptz default now();
+create table if not exists order_log (id bigint generated always as identity primary key, at timestamptz not null default now(), box_office_id uuid not null references box_offices(id),
+  order_id uuid not null references orders(id), ref text, event_id uuid, kind text not null, summary text not null, by text, note text, data jsonb not null default '{}', before jsonb, after jsonb);
+create index if not exists order_log_order on order_log(order_id, at desc);
+create index if not exists order_log_bo on order_log(box_office_id, at desc);
+create table if not exists credits (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id), code text not null unique,
+  email text not null, name text, amount bigint not null check (amount > 0), event_id uuid references events(id), expires timestamptz, source_order uuid references orders(id), source_ref text,
+  note text, issued_by text, issued_at timestamptz not null default now(), revoked_at timestamptz, revoked_by text, revoke_note text, applied jsonb not null default '[]');
+create index if not exists credits_email on credits(box_office_id, email);
+create table if not exists customer_notes (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id), email text not null, body text not null, by text,
+  at timestamptz not null default now());
+create table if not exists event_presence (event_id uuid not null references events(id) on delete cascade, visitor text not null, at timestamptz not null default now(), cart int not null default 0,
+  carted_at timestamptz, converted_at timestamptz, primary key (event_id, visitor));
+-- outbox: one confirmation per order; resends, updated tickets, refunds and staff messages are extra rows
+alter table outbox add column if not exists subject text, add column if not exists body text, add column if not exists by text;
+alter table outbox drop constraint if exists outbox_order_id_kind_key;
+create unique index if not exists outbox_one_confirmation on outbox(order_id) where kind = 'confirmation';
 
 -- ── Who is asking ──────────────────────────────────────────────────────────────
 create or replace function me_email() returns text language sql stable as $$ select lower(coalesce(auth.jwt() ->> 'email', '')) $$;
@@ -189,9 +212,14 @@ create policy events_update on events for update using (has_perm(box_office_id, 
 create policy events_delete on events for delete using (has_perm(box_office_id, 'events.publish', id) and not exists(select 1 from orders o where id = any(o.event_ids)));
 
 create policy orders_read on orders for select using (has_perm(box_office_id, 'orders.view') and has_perm(box_office_id, 'customers.emails') and has_perm(box_office_id, 'customers.phones'));
-create policy orders_update on orders for update using (has_perm(box_office_id, 'orders.edit', event_ids[1]) or has_perm(box_office_id, 'orders.cancel', event_ids[1]) or has_perm(box_office_id, 'orders.refund', event_ids[1]));
 create policy tickets_read on tickets for select using (has_perm(box_office_id, 'door.attendees', event_id) or has_perm(box_office_id, 'orders.view', event_id));
-create policy tickets_update on tickets for update using (has_perm(box_office_id, 'orders.cancelTicket', event_id) or has_perm(box_office_id, 'orders.cancel', event_id));
+-- Stage 6: no update policies on orders or tickets — staff change them only through order_action() (permission-checked, logged)
+drop policy if exists orders_update on orders; drop policy if exists tickets_update on tickets;
+alter table order_log enable row level security; alter table credits enable row level security; alter table customer_notes enable row level security; alter table event_presence enable row level security;
+create policy order_log_team on order_log for select using (has_perm(box_office_id, 'orders.view', event_id));
+create policy credits_team on credits for select using (has_perm(box_office_id, 'orders.view') or has_perm(box_office_id, 'customers.profiles'));
+create policy customer_notes_team on customer_notes for select using (has_perm(box_office_id, 'customers.profiles'));
+-- event_presence has no policy: nobody reads it directly (admin_load summarises it)
 create policy waitlist_team on waitlist for select using (has_perm(box_office_id, 'orders.view', event_id) or has_perm(box_office_id, 'comms.lists', event_id));
 alter table event_views enable row level security;
 create policy views_team on event_views for select using (exists(select 1 from events e where e.id = event_id and has_perm(e.box_office_id, 'events.view', e.id)));
@@ -367,7 +395,7 @@ create or replace function availability(p_event uuid, p_token text default null)
     'total', (select count(*) from u),
     -- products and packages already sold (a package's products count against the product's stock)
     'ad', coalesce((select jsonb_object_agg(k, c) from (select k, sum(n) c from (
-        select l->>'addonId' k, (l->>'qty')::int n from orders o, jsonb_array_elements(o.data->'lines') l
+        select l->>'addonId' k, (l->>'qty')::int - coalesce((l->>'removed')::int, 0) n from orders o, jsonb_array_elements(o.data->'lines') l
           where p_event = any(o.event_ids) and order_counts(o) and l->>'kind' = 'addon' and l->>'eventId' = p_event::text
         union all
         select x->>'addonId', greatest(1, coalesce((x->>'qty')::int, 1)) * (l->>'qty')::int from orders o, jsonb_array_elements(o.data->'lines') l, jsonb_array_elements(coalesce(l->'addons','[]')) x
@@ -482,22 +510,18 @@ begin
       end if;
     end loop;
     update events set data = d where id = e.id;   -- events_guard writes each seat's price / area change into seat_log
-  elsif p_action = 'move' then
+  elsif p_action = 'move' then   -- same price level only; upgrades / downgrades go through the order (price difference)
     s := p->>'to';
     select * into t from tickets where event_id = e.id and status = 'valid' and seat = p_seats[1] and coalesce(slot_id,'') = sl;
     if not found then raise exception 'That seat has no ticket to move'; end if;
     if not coalesce(e.data->'seating'->'meta', '{}') ? s then raise exception 'Choose the new seat'; end if;
-    if exists(select 1 from tickets where event_id = e.id and status = 'valid' and seat = s and coalesce(slot_id,'') = sl) or seat_blocker(e.id, sl, s, null, true) is not null
-      then raise exception '% isn''t free', seat_text(e, s); end if;
-    if e.data->'seating'->'index'->>s is distinct from t.ticket_type_id then raise exception 'That seat is a different price level — changing price (upgrade / downgrade) comes with order editing in Stage 6'; end if;
-    update tickets set seat = s, area = e.data->'seating'->'meta'->s->>0, "row" = e.data->'seating'->'meta'->s->>1, seat_label = e.data->'seating'->'meta'->s->>2 where id = t.id;
-    update orders set data = jsonb_set(data, '{lines}', (select jsonb_agg(case when l->>'eventId' = e.id::text and (l->'seats') ? p_seats[1]
-        then jsonb_set(l, '{seats}', (select jsonb_agg(case when z = p_seats[1] then s else z end) from jsonb_array_elements_text(l->'seats') z)) else l end) from jsonb_array_elements(data->'lines') l))
-      where id = t.order_id returning ref into o_ref;
-    delete from seat_status where event_id = e.id and seat = s and status = 'held' and slot_id in (sl, '');
-    insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref) values
-      (e.box_office_id, e.id, sl, p_seats[1], 'moved', t.holder || ' moved to ' || seat_text(e, s) || ' — seat released', me_email(), o_ref),
-      (e.box_office_id, e.id, sl, s, 'moved', t.holder || ' moved here from ' || seat_text(e, p_seats[1]), me_email(), o_ref);
+    if e.data->'seating'->'index'->>s is distinct from t.ticket_type_id then raise exception 'That seat is a different price level — use Change seats on the order to upgrade or downgrade'; end if;
+    perform set_config('set.system', '1', true);
+    d := change_order_tickets(t.order_id, jsonb_build_object('changes', jsonb_build_array(jsonb_build_object('ticket', t.id, 'seat', s))), me_email(), true);
+    insert into order_log(box_office_id, order_id, ref, event_id, kind, summary, by, note, data) select o.box_office_id, o.id, o.ref, e.id, 'change',
+      'moved from ' || seat_text(e, p_seats[1]) || ' to ' || seat_text(e, s) || ' (seat inventory)', me_email(), coalesce(p->>'note',''), d from orders o where o.id = t.order_id;
+    perform queue_mail(o, 'updated', 'Your updated tickets', 'Your seat has changed. Your new ticket is attached — the old one no longer works.', me_email()) from orders o where o.id = t.order_id;
+    perform set_config('set.system', '', true);
   end if;
   perform log_action(e.box_office_id, 'seats.' || p_action, format('%s %s seat%s — %s', initcap(p_action), cnt, case when cnt = 1 then '' else 's' end, e.data->>'name'), null, null, e.id);
 end $$;
@@ -512,7 +536,7 @@ end $$;
 -- Cancelled / refunded tickets release their seats — on the seat's record.
 create or replace function tickets_seat_log() returns trigger language plpgsql security definer set search_path = public as $$
 begin
-  if old.status = 'valid' and new.status <> 'valid' and new.seat is not null then
+  if old.status = 'valid' and new.status <> 'valid' and new.seat is not null and coalesce(current_setting('set.system', true), '') <> '1' then   -- order_action logs its own
     insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref)
       select new.box_office_id, new.event_id, coalesce(new.slot_id,''), new.seat, 'cancelled', 'Order ' || o.ref || ' ' || o.status || ' — seat released', me_email(), o.ref from orders o where o.id = new.order_id;
   end if;
@@ -676,7 +700,7 @@ declare
   it jsonb; ad jsonb; ev events%rowtype; tt jsonb; b jsonb; slot jsonb; base jsonb; br jsonb; pr jsonb; r jsonb; adds jsonb;
   lines jsonb := '[]'; seen jsonb := '{}'; avs jsonb := '{}'; k text; adm int; sold int; inorder int; n int; i int; j int; per int;
   tts text[]; tf bigint[]; face bigint; unit bigint; uf bigint; ovr boolean; subtotal bigint; disc bigint; fdisc bigint; fee bigint; tax bigint; donation bigint; err text := '';
-  paidtk int; pfee bigint := 0; sfee bigint; pre bigint; pfx bigint := 0; proc bigint; pf jsonb := coalesce(st->'platform', '{}'); cd jsonb := coalesce(st->'card', '{}');
+  paidtk int; pfee bigint := 0; sfee bigint; pre bigint; pfx bigint := 0; proc bigint; cr bigint; pf jsonb := coalesce(st->'platform', '{}'); cd jsonb := coalesce(st->'card', '{}');
 begin
   for it in select * from jsonb_array_elements(coalesce(p->'items','[]')) loop
     select * into ev from events where id = (it->>'eventId')::uuid;
@@ -737,12 +761,13 @@ begin
   sfee := case when pf->>'payer' = 'buyer' then pfee else 0 end;
   tax := round((subtotal - disc + case when coalesce((st->>'taxOnFees')::boolean, false) then fee + sfee else 0 end) * coalesce((st->>'taxPct')::numeric, 0) / 100);
   pre := subtotal - disc + fee + sfee + tax + donation;
-  if p->>'payment' = 'card' and pre > 0 then pfx := round(pre * coalesce((cd->>'pct')::numeric, 0) / 100) + coalesce((cd->>'fixed')::bigint, 0); end if;
+  cr := least(greatest(0, coalesce((p->>'creditAvail')::bigint, 0)), pre);   -- Stage 6: a credit pays first (set by place_order, never by the buyer)
+  if p->>'payment' = 'card' and pre - cr > 0 then pfx := round((pre - cr) * coalesce((cd->>'pct')::numeric, 0) / 100) + coalesce((cd->>'fixed')::bigint, 0); end if;
   proc := case when coalesce((cd->>'pass')::boolean, false) then pfx else 0 end;
   return jsonb_build_object('lines', lines, 'subtotal', subtotal, 'discount', disc, 'feeDiscount', fdisc, 'fee', fee, 'serviceFee', sfee, 'tax', tax, 'donation', donation,
     'ticketsTotal', (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int), 0) from jsonb_array_elements(lines) l where l->>'kind' in ('ticket','bundle')),
     'addonsTotal', (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int), 0) from jsonb_array_elements(lines) l where l->>'kind' = 'addon'),
-    'processing', proc, 'processingFee', pfx, 'platformFee', pfee, 'total', pre + proc, 'promoErr', err,
+    'processing', proc, 'processingFee', pfx, 'platformFee', pfee, 'credit', cr, 'total', pre - cr + proc, 'promoErr', err,
     'faceValue', (select coalesce(sum(case when l->>'kind' = 'bundle' then (l->>'value')::bigint else (l->>'face')::bigint * (l->>'qty')::int end), 0) from jsonb_array_elements(lines) l),
     'currency', coalesce((select l->>'currency' from jsonb_array_elements(lines) l where l ? 'currency' limit 1), st->>'currency', 'USD'));
 end $$;
@@ -799,7 +824,7 @@ end $$;
 create or replace function unlock(p_event uuid, p_password text) returns jsonb language sql stable security definer set search_path = public as $$
   select jsonb_build_object(
     'event', coalesce(secrets->>'password','') <> '' and secrets->>'password' = p_password,
-    'ticketTypes', coalesce((select jsonb_agg(k) from jsonb_each_text(coalesce(secrets->'ticketPasswords','{}')) where value = p_password), '[]'))
+    'ticketTypes', coalesce((select jsonb_agg(key) from jsonb_each_text(coalesce(secrets->'ticketPasswords','{}')) where value = p_password), '[]'))
   from events e where id = p_event and event_live(e);
 $$;
 
@@ -841,11 +866,13 @@ end $$;
 
 -- what a buyer may see of their own order (Stage 5): never the platform's cut, the processor's cut or payment internals
 create or replace function buyer_order(o orders) returns jsonb language sql stable as $$
-  select (to_jsonb(o) - 'access_key' - 'attempt_key' - 'payment') || jsonb_build_object('data', o.data - 'platformFee' - 'processingFee',
+  select (to_jsonb(o) - 'access_key' - 'attempt_key' - 'payment') || jsonb_build_object('data', o.data - 'platformFee' - 'processingFee' || jsonb_build_object(
+      'refunds', coalesce((select jsonb_agg(jsonb_build_object('at', r->'at', 'amount', r->'amount', 'to', r->'to', 'credit', r->'credit', 'status', r->'status')) from jsonb_array_elements(o.data->'refunds') r), '[]'),
+      'charges', coalesce((select jsonb_agg(jsonb_build_object('at', c->'at', 'amount', c->'amount', 'method', c->'method', 'reason', c->'reason')) from jsonb_array_elements(o.data->'charges') c), '[]')),
     'paidWith', case when o.payment->>'last4' is not null then (o.payment->>'brand') || ' •••• ' || (o.payment->>'last4') else o.payment->>'brand' end,
     'failures', (select count(*) from jsonb_array_elements(coalesce(o.payment->'attempts','[]')) a where not coalesce((a->>'ok')::boolean, false))) $$;
 create or replace function get_order(p_id uuid, p_key uuid) returns jsonb language sql stable security definer set search_path = public as $$
-  select jsonb_build_object('order', buyer_order(o), 'tickets', coalesce((select jsonb_agg(to_jsonb(t)) from tickets t where t.order_id = o.id), '[]'))
+  select jsonb_build_object('order', buyer_order(o), 'tickets', coalesce((select jsonb_agg(to_jsonb(t)) from tickets t where t.order_id = o.id and t.status <> 'replaced'), '[]'))
   from orders o where o.id = p_id and o.access_key = p_key;
 $$;
 
@@ -861,9 +888,10 @@ declare
   st jsonb; it jsonb; ad jsonb; ev events%rowtype; tt jsonb; b jsonb; av jsonb; pend jsonb := '{}'; avs jsonb := '{}'; ev_ids uuid[] := '{}'; x text; k text; n int;
   manual boolean := coalesce(p->>'payment','') = 'manual'; is_comp boolean := coalesce((p->>'comp')::boolean, false); tok text := nullif(p->>'holdToken','');
   bo box_offices%rowtype; email text := lower(trim(coalesce(p->'buyer'->>'email',''))); seated boolean; tts text[]; pos jsonb; gaps text[]; all_seats text[]; with_t boolean;
-  f jsonb; err text; promo jsonb; promo_code text; tracking text; q jsonb; status text; total bigint; prev orders%rowtype;
+  f jsonb; err text; promo jsonb; promo_code text; tracking text; q jsonb; status text; total bigint; prev orders%rowtype; cr credits%rowtype; cap bigint;
   oid uuid; okey uuid; oref text; l jsonb; c int; u int; j int; adm int; per int; d bigint; w bigint[]; fs bigint[]; ps bigint[]; ds bigint[]; extras jsonb; by_ text;
 begin
+  p := p - 'creditAvail';   -- only this function decides how much credit applies
   if coalesce(trim(p->'buyer'->>'name'),'') = '' then raise exception 'Name is required'; end if;
   if email !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'A valid email is required'; end if;
   perform expire_orders();
@@ -987,6 +1015,23 @@ begin
   end if;
   q := price_cart(p, manual, pricing_settings(bo), promo);
   if promo is not null and q->>'promoErr' <> '' then raise exception '%', q->>'promoErr'; end if;
+  -- credit (Stage 6): a credit code, the signed-in customer's own account credit, or one a staff member picks on a manual order
+  if (coalesce(p->>'credit','') <> '' or coalesce(p->>'creditId','') <> '') and not is_comp then
+    if coalesce(p->>'creditId','') <> '' then
+      if not manual then raise exception 'not allowed'; end if;
+      select * into cr from credits cx where cx.id = (p->>'creditId')::uuid and cx.box_office_id = bo.id for update;
+    elsif p->>'credit' = 'account' then
+      if me_email() <> email or (select u.email_confirmed_at from auth.users u where u.id = auth.uid()) is null then raise exception 'Sign in with this email to use your account credit'; end if;
+      select * into cr from credits cx where cx.box_office_id = bo.id and cx.email = lower(trim(p->'buyer'->>'email')) and credit_problem(cx, ev_ids) = ''
+        order by (credit_state(cx)->>'remaining')::bigint desc limit 1 for update;
+      if not found then raise exception 'You have no credit that can be used on this order'; end if;
+    else select * into cr from credits cx where cx.box_office_id = bo.id and cx.code = upper(trim(p->>'credit')) for update; end if;
+    err := credit_problem(cr, ev_ids); if err <> '' then raise exception '%', err; end if;
+    cap := (credit_state(cr)->>'remaining')::bigint;
+    if cr.event_id is not null then cap := least(cap, (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int - coalesce((l->>'disc')::bigint, 0) + coalesce((l->>'fee')::bigint, 0) - coalesce((l->>'feeDisc')::bigint, 0)), 0)
+      from jsonb_array_elements(q->'lines') l where l->>'eventId' = cr.event_id::text)); end if;
+    q := price_cart(p || jsonb_build_object('creditAvail', cap), manual, pricing_settings(bo), promo);
+  end if;
   -- checkout questions: once per order (box office), once per event, once per ticket
   if not manual then
     err := check_answers(st, ev_ids, coalesce(p->'answers','{}'), coalesce(p->'ticketAnswers','{}'),
@@ -1012,13 +1057,16 @@ begin
   end if;
   status := case when total = 0 or manual then 'paid' when p->>'payment' = 'card' then 'awaiting_payment' else 'pending' end;
   loop oref := 'SET-' || rand_code(6); exit when not exists(select 1 from orders where ref = oref); end loop;
-  insert into orders(box_office_id, ref, status, buyer_email, event_ids, attempt_key, expires_at, payment, data) values (bo.id, oref, status, email, ev_ids, nullif(p->>'attempt',''),
-    case when status = 'awaiting_payment' then now() + interval '15 minutes' end,
-    case when status = 'awaiting_payment' then jsonb_build_object('provider', bo.gateway->>'provider', 'test', coalesce((bo.gateway->>'test')::boolean, true), 'attempts', '[]'::jsonb) end,
+  insert into orders(box_office_id, ref, status, buyer_email, event_ids, attempt_key, expires_at, paid_at, payment, data) values (bo.id, oref, status, email, ev_ids, nullif(p->>'attempt',''),
+    case when status = 'awaiting_payment' then now() + interval '15 minutes' end, case when status = 'paid' then now() end,
+    case when status = 'awaiting_payment' then jsonb_build_object('provider', bo.gateway->>'provider', 'test', coalesce((bo.gateway->>'test')::boolean, true), 'attempts', '[]'::jsonb)
+         when manual and total > 0 then jsonb_build_object('provider', 'manual', 'method', case when p->>'payMethod' in ('cash','terminal','check','transfer','other') then p->>'payMethod' else 'other' end,
+           'ref', left(coalesce(p->>'payRef',''), 80), 'by', me_email()) end,
     jsonb_build_object('buyer', p->'buyer', 'lines', q->'lines', 'subtotal', q->'subtotal', 'ticketsTotal', q->'ticketsTotal', 'addonsTotal', q->'addonsTotal', 'discount', q->'discount',
       'feeDiscount', q->'feeDiscount', 'fee', q->'fee', 'serviceFee', q->'serviceFee', 'tax', q->'tax', 'donation', q->'donation', 'processing', q->'processing', 'processingFee', q->'processingFee',
       'total', total, 'refunded', 0, 'faceValue', q->'faceValue', 'code', promo->>'code', 'promo', case when promo is null then null else jsonb_build_object('id', promo->>'id', 'code', promo_code) end,
-      'tracking', tracking, 'payment', case when total = 0 then 'free' else p->>'payment' end, 'answers', coalesce(p->'answers','{}'), 'ticketAnswers', coalesce(p->'ticketAnswers','{}'),
+      'tracking', tracking, 'payment', case when total = 0 then case when coalesce((q->>'credit')::bigint, 0) > 0 then 'credit' else 'free' end else p->>'payment' end,
+      'credit', case when coalesce((q->>'credit')::bigint, 0) > 0 then jsonb_build_object('id', cr.id, 'code', cr.code, 'amount', (q->>'credit')::bigint) end, 'answers', coalesce(p->'answers','{}'), 'ticketAnswers', coalesce(p->'ticketAnswers','{}'),
       'optIn', coalesce((p->>'optIn')::boolean, false), 'source', p->>'source', 'currency', q->'currency', 'platformFee', q->'platformFee') || case when is_comp then '{"comp":true}'::jsonb else '{}'::jsonb end)
     returning id, access_key into oid, okey;
   -- the order holds its seats itself now (paid → tickets; unpaid → reserved until paid or expired), so the buyer's seat holds go
@@ -1028,6 +1076,7 @@ begin
   end loop;
   if tok is not null then delete from seat_status y where y.status = 'checkout' and y.token = tok; end if;
   if status = 'paid' then perform issue_order_tickets(oid, coalesce(nullif(me_email(), ''), email)); end if;
+  if manual and coalesce((p->>'send')::boolean, true) = false then update outbox set status = 'not sent (staff choice)' where order_id = oid and kind = 'confirmation'; end if;
   return jsonb_build_object('id', oid, 'key', okey, 'ref', oref, 'status', status, 'total', total,
     'expires_at', (select expires_at from orders where id = oid));
 end $$;
@@ -1199,8 +1248,487 @@ begin
   if em = '' or coalesce((select email_confirmed_at from auth.users where id = auth.uid()), null) is null then raise exception 'Please sign in with a confirmed email'; end if;
   return jsonb_build_object(
     'orders', coalesce((select jsonb_agg(buyer_order(o) || jsonb_build_object('key', o.access_key) order by o.created_at desc) from orders o where o.buyer_email = em and o.status <> 'expired'), '[]'),
-    'tickets', coalesce((select jsonb_agg(to_jsonb(t)) from tickets t join orders o on o.id = t.order_id where o.buyer_email = em), '[]'));
+    'tickets', coalesce((select jsonb_agg(to_jsonb(t)) from tickets t join orders o on o.id = t.order_id where o.buyer_email = em and t.status <> 'replaced'), '[]'));
 end $$;
+
+-- ── Stage 6: orders & customers — mirrors the "Orders & customers (Stage 6)" section of data.js ─────────────
+-- Staff never write orders or tickets directly (no update policies): every change is order_action(), which checks the permission,
+-- appends to order_log (never overwrites), and voids + reissues tickets for seat / type / showtime changes.
+create or replace function order_money(o orders) returns jsonb language sql stable as $$
+  with v as (select (case when o.paid_at is not null or o.status in ('paid','refunded') then coalesce((o.data->>'total')::bigint, 0) else 0 end) + coalesce((o.data->>'extraPaid')::bigint, 0) col,
+      coalesce((o.data->>'refunded')::bigint, 0) ref, coalesce((o.data->>'credited')::bigint, 0) cre,
+      coalesce((o.data->>'fee')::bigint, 0) + coalesce((o.data->>'serviceFee')::bigint, 0) fees)
+  select jsonb_build_object('collected', col, 'refunded', ref, 'credited', cre, 'due', coalesce((o.data->>'due')::bigint, 0), 'refundable', greatest(0, col - ref - cre),
+    'fees', fees, 'feesLeft', greatest(0, fees - coalesce((o.data->>'refundedFees')::bigint, 0))) from v $$;
+create or replace function was_paid(o orders) returns boolean language sql stable as $$ select o.paid_at is not null or o.status in ('paid','refunded') $$;
+create or replace function money_txt(c bigint) returns text language sql immutable as $$ select '$' || to_char(coalesce(c, 0) / 100.0, 'FM999999990.00') $$;
+create or replace function order_log_add(o orders, p_kind text, p_summary text, p_by text, p_note text, p_data jsonb default '{}', p_before jsonb default null, p_after jsonb default null) returns void
+  language plpgsql security definer set search_path = public as $$
+begin
+  insert into order_log(box_office_id, order_id, ref, event_id, kind, summary, by, note, data, before, after)
+    values (o.box_office_id, o.id, o.ref, o.event_ids[1], p_kind, p_summary, p_by, left(coalesce(p_note, ''), 500), coalesce(p_data, '{}'), p_before, p_after);
+  perform log_action(o.box_office_id, 'order.' || p_kind, 'Order ' || o.ref || ': ' || p_summary, p_before, p_after, o.event_ids[1]);
+end $$;
+create or replace function queue_mail(o orders, p_kind text, p_subject text, p_body text, p_by text) returns uuid language sql security definer set search_path = public as $$
+  insert into outbox(box_office_id, order_id, kind, "to", subject, body, by) values (o.box_office_id, o.id, p_kind, o.buyer_email, left(p_subject, 200), left(p_body, 5000), p_by) returning id $$;
+-- credits: remaining = amount − what orders (still counting) and staff applied; revoked → 0
+create or replace function credit_state(c credits) returns jsonb language sql stable security definer set search_path = public as $$
+  with u as (select coalesce(sum((o.data->'credit'->>'amount')::bigint), 0) n from orders o where o.data->'credit'->>'id' = c.id::text
+      and not coalesce((o.data->'credit'->>'restored')::boolean, false) and (order_counts(o) or was_paid(o))),
+    a as (select coalesce(sum((x->>'amount')::bigint), 0) n from jsonb_array_elements(c.applied) x),
+    s as (select u.n + a.n used from u, a)
+  select jsonb_build_object('used', used, 'remaining', case when c.revoked_at is not null then 0 else greatest(0, c.amount - used) end,
+    'status', case when c.revoked_at is not null then 'revoked' when c.amount - used <= 0 then 'used' when c.expires is not null and c.expires <= now() then 'expired' else 'active' end,
+    'uses', coalesce((select jsonb_agg(jsonb_build_object('ref', o.ref, 'order_id', o.id, 'amount', (o.data->'credit'->>'amount')::bigint, 'events', to_jsonb(o.event_ids), 'at', o.created_at))
+       from orders o where o.data->'credit'->>'id' = c.id::text and not coalesce((o.data->'credit'->>'restored')::boolean, false) and (order_counts(o) or was_paid(o))), '[]') || c.applied) from s $$;
+create or replace function credit_problem(c credits, p_events uuid[]) returns text language sql stable security definer set search_path = public as $$
+  select case when c.id is null then 'That credit code is not valid' when credit_state(c)->>'status' = 'revoked' then 'That credit was cancelled'
+    when credit_state(c)->>'status' = 'expired' then 'That credit has expired' when credit_state(c)->>'status' = 'used' then 'That credit has been used up'
+    when c.event_id is not null and not (c.event_id = any(p_events)) then 'That credit is for a different event' else '' end $$;
+create or replace function issue_credit(p_bo uuid, p jsonb, p_order orders, p_by text) returns credits language plpgsql security definer set search_path = public as $$
+declare c credits%rowtype; cd text; em text := lower(trim(coalesce(p->>'email', p_order.buyer_email, ''))); amt bigint := greatest(0, round(coalesce(nullif(p->>'amount','')::numeric, 0)))::bigint;
+begin
+  if em !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'The credit needs the customer''s email'; end if;
+  if amt <= 0 then raise exception 'Enter a credit amount'; end if;
+  if nullif(p->>'eventId','') is not null and not exists(select 1 from events where id = (p->>'eventId')::uuid and box_office_id = p_bo) then raise exception 'Unknown event'; end if;
+  loop cd := 'CR-' || rand_code(8); exit when not exists(select 1 from credits where code = cd); end loop;
+  insert into credits(box_office_id, code, email, name, amount, event_id, expires, source_order, source_ref, note, issued_by)
+    values (p_bo, cd, em, left(coalesce(p->>'name', p_order.data->'buyer'->>'name', ''), 120), amt, nullif(p->>'eventId','')::uuid, nullif(p->>'expires','')::timestamptz,
+      p_order.id, p_order.ref, left(coalesce(p->>'note', ''), 300), p_by) returning * into c;
+  return c;
+end $$;
+-- how much a refund request comes to. mode: full | tickets (+ their booking-fee share when fees) | fees | percent | amount
+create or replace function refund_plan(o orders, p jsonb) returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare m jsonb := order_money(o); amt bigint := 0; fees bigint := 0; per jsonb := '{}'; n_all int; n_sel int; pct numeric; t tickets%rowtype;
+begin
+  select count(*) into n_all from tickets where order_id = o.id and status <> 'replaced';
+  if p->>'mode' = 'full' then
+    amt := (m->>'refundable')::bigint; fees := (m->>'feesLeft')::bigint;
+    for t in select * from tickets where order_id = o.id and status <> 'replaced' and coalesce(paid, 0) - refunded > 0 loop per := per || jsonb_build_object(t.id, t.paid - t.refunded); end loop;
+  elsif p->>'mode' = 'tickets' then
+    for t in select * from tickets where order_id = o.id and status <> 'replaced' and id::text in (select jsonb_array_elements_text(coalesce(p->'tickets','[]'))) loop
+      per := per || jsonb_build_object(t.id, greatest(0, coalesce(t.paid, 0) - t.refunded)); amt := amt + greatest(0, coalesce(t.paid, 0) - t.refunded);
+    end loop;
+    n_sel := (select count(*) from jsonb_object_keys(per)); if n_sel = 0 then raise exception 'Choose the tickets to refund'; end if;
+    if coalesce((p->>'fees')::boolean, false) then fees := least((m->>'feesLeft')::bigint, round((m->>'fees')::bigint * n_sel::numeric / greatest(1, n_all))::bigint); amt := amt + fees; end if;
+  elsif p->>'mode' = 'fees' then fees := (m->>'feesLeft')::bigint; amt := fees;
+  elsif p->>'mode' = 'percent' then
+    pct := nullif(p->>'pct','')::numeric; if pct is null or pct <= 0 or pct > 100 then raise exception 'Enter a percentage between 1 and 100'; end if;
+    amt := round((m->>'refundable')::bigint * pct / 100)::bigint;
+  elsif p->>'mode' = 'amount' then
+    amt := greatest(0, round(coalesce(nullif(p->>'amount','')::numeric, 0)))::bigint;
+    if amt > (m->>'refundable')::bigint then raise exception 'You can refund at most % on this order', money_txt((m->>'refundable')::bigint); end if;
+  else raise exception 'Choose how much to refund'; end if;
+  amt := least(amt, (m->>'refundable')::bigint);
+  if amt <= 0 then raise exception '%', case when (m->>'refundable')::bigint > 0 then 'Enter an amount to refund' else 'Nothing left to refund on this order' end; end if;
+  return jsonb_build_object('amount', amt, 'fees', least(fees, amt), 'per', per);
+end $$;
+-- record a refund on the order. to = original (the processor refunds the card: left 'processing' for the payments Edge Function) | cash | other
+-- | credit / eventCredit (a credit code instead of money)
+create or replace function apply_refund(p_order uuid, plan jsonb, p jsonb, p_by text) returns jsonb language plpgsql security definer set search_path = public as $$
+declare o orders%rowtype; d jsonb; r jsonb; c credits%rowtype; tov text := coalesce(nullif(p->>'to',''), 'original'); k text;
+begin
+  select * into o from orders where id = p_order for update; d := o.data;
+  if tov not in ('original','credit','eventCredit','cash','other') then raise exception 'Choose where the refund goes'; end if;
+  r := jsonb_build_object('id', gen_random_uuid(), 'at', now(), 'by', p_by, 'amount', (plan->>'amount')::bigint, 'fees', (plan->>'fees')::bigint, 'to', tov,
+    'note', left(coalesce(p->>'note', ''), 300), 'per', coalesce(plan->'per', '{}'), 'status', 'done', 'ref', null);
+  if tov in ('credit','eventCredit') then
+    if tov = 'eventCredit' and nullif(p->>'creditEvent','') is null then raise exception 'Choose the event the credit is for'; end if;
+    c := issue_credit(o.box_office_id, jsonb_build_object('amount', plan->'amount', 'eventId', case when tov = 'eventCredit' then p->>'creditEvent' end, 'expires', p->>'creditExpires',
+      'note', coalesce(nullif(p->>'note',''), 'Refunded as credit')), o, p_by);
+    r := r || jsonb_build_object('credit', c.code);
+    d := d || jsonb_build_object('credited', coalesce((d->>'credited')::bigint, 0) + (plan->>'amount')::bigint);
+  else
+    if tov = 'original' and o.payment->>'ref' is not null and coalesce(o.payment->>'provider','') not in ('', 'manual') then
+      r := r || jsonb_build_object('status', 'processing', 'provider', o.payment->>'provider', 'payment', o.payment->>'ref'); end if;
+    d := d || jsonb_build_object('refunded', coalesce((d->>'refunded')::bigint, 0) + (plan->>'amount')::bigint);
+  end if;
+  d := d || jsonb_build_object('refundedFees', coalesce((d->>'refundedFees')::bigint, 0) + (plan->>'fees')::bigint,
+    'refunds', coalesce(d->'refunds', '[]') || jsonb_build_array(r));
+  update orders set data = d where id = o.id;
+  for k in select jsonb_object_keys(coalesce(plan->'per','{}')) loop update tickets set refunded = refunded + (plan->'per'->>k)::bigint where id = k::uuid and order_id = o.id; end loop;
+  return r;
+end $$;
+create or replace function refund_text(r jsonb) returns text language sql immutable as $$
+  select money_txt((r->>'amount')::bigint) || case when r->>'to' in ('credit','eventCredit') then ' as credit ' || (r->>'credit') else ' to ' || case r->>'to' when 'original' then 'original payment method'
+    when 'cash' then 'cash' else 'other — recorded only' end end $$;
+-- every ticket voided and no products left → cancelled (refunded when everything collected went back)
+create or replace function settle_order_status(p_order uuid) returns void language plpgsql security definer set search_path = public as $$
+declare o orders%rowtype; m jsonb;
+begin
+  select * into o from orders where id = p_order;
+  if exists(select 1 from tickets where order_id = o.id and status = 'valid')
+     or exists(select 1 from jsonb_array_elements(o.data->'lines') l where l->>'kind' = 'addon' and (l->>'qty')::int - coalesce((l->>'removed')::int, 0) > 0) then return; end if;
+  m := order_money(o);
+  update orders set status = case when (m->>'collected')::bigint > 0 and (m->>'refunded')::bigint + (m->>'credited')::bigint >= (m->>'collected')::bigint then 'refunded' else 'cancelled' end where id = o.id;
+end $$;
+-- what a changed ticket costs (mirrors changePrice() in data.js)
+create or replace function change_price(e events, t tickets, tt jsonb, p_slot text, p_sold int, p_override text) returns jsonb language plpgsql stable as $$
+declare old_tt jsonb; same boolean; face bigint; paid bigint; ovr boolean := coalesce(p_override, '') <> '';
+begin
+  old_tt := (select x from jsonb_array_elements(e.data->'ticketTypes') x where x->>'id' = t.ticket_type_id);
+  same := tt->>'id' = t.ticket_type_id and list_price(tt, p_slot) = list_price(old_tt, t.slot_id);
+  face := case when same then t.face else (unit_price(tt, p_slot, p_sold, null)->>'price')::bigint end;
+  paid := case when t.comp then 0 when ovr then greatest(0, round(p_override::numeric))::bigint when same then t.paid else greatest(0, face - coalesce(t.discount, 0)) end;
+  return jsonb_build_object('face', face, 'newPaid', paid, 'diff', case when t.comp then 0 else paid - coalesce(t.paid, 0) end);
+end $$;
+-- Move / upgrade / downgrade / change type, section or showtime (mirrors changeOrderTickets() in data.js). The old ticket → 'replaced';
+-- a new ticket is issued. The net difference is settled once: collect | due | waive, or refund | credit | eventCredit | none.
+create or replace function change_order_tickets(p_order uuid, p jsonb, p_by text, p_inventory boolean default false) returns jsonb language plpgsql security definer set search_path = public as $$
+declare o orders%rowtype; c jsonb; t tickets%rowtype; e events%rowtype; tt jsonb; sl text; st text; seated boolean; ovr boolean; pr jsonb; plan jsonb := '[]'; x jsonb;
+  vac uuid[] := '{}'; chosen text[] := '{}'; k text; net bigint := 0; keep boolean; rows jsonb := '[]'; nt uuid; paid bigint; disc bigint; frm text; tov text; kind text;
+  m jsonb; out jsonb; r jsonb; ch jsonb; add int; cap int; used int;
+begin
+  select * into o from orders where id = p_order for update;
+  if o.status <> 'paid' then raise exception 'Only paid orders can be changed'; end if;
+  if jsonb_array_length(coalesce(p->'changes','[]')) = 0 then raise exception 'Choose at least one ticket to change'; end if;
+  vac := array(select (y->>'ticket')::uuid from jsonb_array_elements(p->'changes') y);
+  for c in select * from jsonb_array_elements(p->'changes') loop
+    select * into t from tickets where id = (c->>'ticket')::uuid and order_id = o.id;
+    if not found or t.status <> 'valid' then raise exception 'That ticket is no longer valid — reload the order'; end if;
+    select * into e from events where id = t.event_id; perform pg_advisory_xact_lock(hashtext(e.id::text));
+    seated := coalesce((e.data->'seating'->>'enabled')::boolean, false);
+    sl := case when c ? 'slotId' then nullif(c->>'slotId','') else t.slot_id end;
+    if jsonb_array_length(coalesce(e.data->'timeSlots','[]')) > 0 and not exists(select 1 from jsonb_array_elements(e.data->'timeSlots') s where s->>'id' = sl) then raise exception 'Choose a showtime'; end if;
+    st := case when seated then case when c ? 'seat' then nullif(c->>'seat','') else t.seat end end;
+    if seated and not coalesce(e.data->'seating'->'meta', '{}') ? coalesce(st, '') then raise exception 'Choose the new seat'; end if;
+    tt := (select y from jsonb_array_elements(e.data->'ticketTypes') y where y->>'id' = case when seated then e.data->'seating'->'index'->>st else coalesce(nullif(c->>'ticketTypeId',''), t.ticket_type_id) end);
+    if tt is null then raise exception '%', case when seated then seat_text(e, st) || ' is not for sale' else 'Unknown ticket type' end; end if;
+    ovr := coalesce(c->>'price', '') <> '';
+    if st is not distinct from t.seat and sl is not distinct from t.slot_id and tt->>'id' = t.ticket_type_id and not ovr then raise exception 'Ticket %: nothing to change', t.code; end if;
+    if st is not null then   -- free, or vacated by this same change; staff may use held seats
+      k := e.id || '|' || coalesce(sl, '') || '|' || st; if k = any(chosen) then raise exception '% is chosen twice', seat_text(e, st); end if; chosen := chosen || k;
+      if exists(select 1 from tickets y where y.event_id = e.id and y.status = 'valid' and y.seat = st and coalesce(y.slot_id,'') = coalesce(sl,'') and not (y.id = any(vac)))
+         or exists(select 1 from reserved_units(e.id) r2 where r2.seat = st and coalesce(r2.slot,'') = coalesce(sl,''))
+         or seat_blocker(e.id, coalesce(sl,''), st, null, true) is not null then raise exception '% isn''t free', seat_text(e, st); end if;
+    end if;
+    plan := plan || jsonb_build_array(jsonb_build_object('t', t.id, 'e', e.id, 'tt', tt, 'seat', st, 'slot', sl, 'ovr', ovr, 'price', c->>'price'));
+  end loop;
+  if exists(select 1 from jsonb_array_elements(plan) y where (y->>'ovr')::boolean) and not p_inventory and not has_perm(o.box_office_id, 'tickets.pricing', o.event_ids[1]) then
+    raise exception 'You don''t have permission to change ticket prices'; end if;
+  -- ticket-type stock and showtime capacity, net of what this change gives back
+  for e in select * from events where id in (select (y->>'e')::uuid from jsonb_array_elements(plan) y) loop
+    for tt in select * from jsonb_array_elements(e.data->'ticketTypes') loop
+      add := (select count(*) from jsonb_array_elements(plan) y where y->>'e' = e.id::text and y->'tt'->>'id' = tt->>'id')
+           - (select count(*) from jsonb_array_elements(plan) y join tickets z on z.id = (y->>'t')::uuid where y->>'e' = e.id::text and z.ticket_type_id = tt->>'id');
+      used := coalesce((availability(e.id)->'tt'->>(tt->>'id'))::int, 0);
+      if add > 0 and coalesce((tt->>'qty')::int, 0) > 0 and used + add > (tt->>'qty')::int then raise exception 'Only % % left', greatest(0, (tt->>'qty')::int - used), tt->>'name'; end if;
+    end loop;
+    for x in select * from jsonb_array_elements(coalesce(e.data->'timeSlots','[]')) loop
+      add := (select count(*) from jsonb_array_elements(plan) y where y->>'e' = e.id::text and y->>'slot' = x->>'id')
+           - (select count(*) from jsonb_array_elements(plan) y join tickets z on z.id = (y->>'t')::uuid where y->>'e' = e.id::text and z.slot_id = x->>'id');
+      cap := coalesce((x->>'capacity')::int, 0); used := coalesce((availability(e.id)->'slots'->>(x->>'id'))::int, 0);
+      if add > 0 and cap > 0 and used + add > cap then raise exception 'That showtime is full'; end if;
+    end loop;
+  end loop;
+  -- prices
+  for x in select * from jsonb_array_elements(plan) loop
+    select * into t from tickets where id = (x->>'t')::uuid; select * into e from events where id = (x->>'e')::uuid;
+    pr := change_price(e, t, x->'tt', x->>'slot', coalesce((availability(e.id)->'tt'->>(x->'tt'->>'id'))::int, 0), case when (x->>'ovr')::boolean then x->>'price' end);
+    net := net + (pr->>'diff')::bigint;
+    rows := rows || jsonb_build_array(x || pr);
+  end loop;
+  m := order_money(o);
+  if p_inventory and net <> 0 then raise exception 'That seat is a different price level — use Change seats on the order to upgrade or downgrade'; end if;
+  if net > 0 and coalesce(p->>'settle','') not in ('collect','due','waive') then raise exception 'Choose how to handle the % difference', money_txt(net); end if;
+  if net < 0 and coalesce(p->>'downgrade','') not in ('refund','credit','eventCredit','none') then raise exception 'Choose what to do with the % difference', money_txt(-net); end if;
+  if net > 0 and p->>'settle' = 'collect' then
+    if not has_perm(o.box_office_id, 'orders.edit', o.event_ids[1]) then raise exception 'You don''t have permission to take payments on orders'; end if;
+    if coalesce(p->>'method','') not in ('cash','terminal','check','transfer','other') then raise exception 'Choose how the difference was paid'; end if; end if;
+  if net < 0 and p->>'downgrade' <> 'none' then
+    if not has_perm(o.box_office_id, 'orders.refund', o.event_ids[1]) then raise exception 'You don''t have permission to issue refunds'; end if;
+    if -net > (m->>'refundable')::bigint then raise exception 'Only % can still be refunded on this order', money_txt((m->>'refundable')::bigint); end if; end if;
+  keep := (net > 0 and p->>'settle' = 'waive') or (net < 0 and p->>'downgrade' = 'none');
+  out := jsonb_build_object('net', net, 'tickets', '[]'::jsonb);
+  for x in select * from jsonb_array_elements(rows) loop
+    select * into t from tickets where id = (x->>'t')::uuid; select * into e from events where id = (x->>'e')::uuid;
+    paid := case when keep then t.paid else (x->>'newPaid')::bigint end;
+    disc := case when t.comp then 0 when (x->>'ovr')::boolean then greatest(0, (x->>'face')::bigint - paid) else coalesce(t.discount, 0) + case when keep and (x->>'diff')::bigint > 0 then (x->>'diff')::bigint else 0 end end;
+    insert into tickets(box_office_id, order_id, event_id, ticket_type_id, slot_id, seat, area, "row", seat_label, comp, face, paid, discount, promo, tracking, bundle, extras, price_override, answers, code, holder, status, checked_in_at, replaces)
+      values (t.box_office_id, t.order_id, e.id, x->'tt'->>'id', x->>'slot', x->>'seat', e.data->'seating'->'meta'->(x->>'seat')->>0, e.data->'seating'->'meta'->(x->>'seat')->>1, e.data->'seating'->'meta'->(x->>'seat')->>2,
+        t.comp, (x->>'face')::bigint, paid, disc, t.promo, t.tracking, t.bundle, t.extras, (x->>'ovr')::boolean or t.price_override, t.answers, rand_code(10), t.holder, 'valid', t.checked_in_at, t.id) returning id into nt;
+    update tickets set status = 'replaced', replaced_by = nt, changed_at = now() where id = t.id;
+    frm := coalesce(case when t.seat is not null then seat_text(e, t.seat) end, (select y->>'name' from jsonb_array_elements(e.data->'ticketTypes') y where y->>'id' = t.ticket_type_id));
+    tov := coalesce(case when x->>'seat' is not null then seat_text(e, x->>'seat') end, x->'tt'->>'name');
+    kind := case when (x->>'diff')::bigint > 0 then 'upgrade' when (x->>'diff')::bigint < 0 then 'downgrade' else 'move' end;
+    if t.seat is not null and (t.seat is distinct from x->>'seat' or t.slot_id is distinct from x->>'slot') then
+      insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref) values (e.box_office_id, e.id, coalesce(t.slot_id,''), t.seat, 'moved', t.holder || ' moved to ' || tov || ' — seat released', p_by, o.ref); end if;
+    if x->>'seat' is not null then
+      delete from seat_status where event_id = e.id and seat = x->>'seat' and status = 'held' and slot_id in (coalesce(x->>'slot',''), '');
+      if t.seat is distinct from x->>'seat' or t.slot_id is distinct from x->>'slot' then
+        insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref) values (e.box_office_id, e.id, coalesce(x->>'slot',''), x->>'seat', 'moved',
+          t.holder || ' moved here from ' || frm || case when kind <> 'move' then ' · ' || kind || ' ' || money_txt(abs((x->>'diff')::bigint)) else '' end, p_by, o.ref); end if;
+    end if;
+    out := jsonb_set(out, '{tickets}', (out->'tickets') || jsonb_build_array(jsonb_build_object('kind', kind, 'diff', (x->>'diff')::bigint,
+      'from', jsonb_build_object('ticket', t.code, 'type', (select y->>'name' from jsonb_array_elements(e.data->'ticketTypes') y where y->>'id' = t.ticket_type_id), 'seat', case when t.seat is not null then seat_text(e, t.seat) end, 'slot', t.slot_id, 'face', t.face, 'paid', t.paid),
+      'to', jsonb_build_object('ticket', (select code from tickets where id = nt), 'type', x->'tt'->>'name', 'seat', case when x->>'seat' is not null then seat_text(e, x->>'seat') end, 'slot', x->>'slot', 'face', (x->>'face')::bigint, 'paid', paid))));
+  end loop;
+  if net > 0 and p->>'settle' = 'collect' then
+    ch := jsonb_build_object('id', gen_random_uuid(), 'at', now(), 'by', p_by, 'amount', net, 'method', p->>'method', 'ref', left(coalesce(p->>'ref',''), 80), 'reason', 'Upgrade difference');
+    update orders set data = data || jsonb_build_object('charges', coalesce(data->'charges','[]') || jsonb_build_array(ch), 'extraPaid', coalesce((data->>'extraPaid')::bigint, 0) + net) where id = o.id;
+    out := out || jsonb_build_object('charge', ch);
+  elsif net > 0 and p->>'settle' = 'due' then
+    update orders set data = data || jsonb_build_object('due', coalesce((data->>'due')::bigint, 0) + net) where id = o.id; out := out || jsonb_build_object('due', net);
+  elsif net < 0 and p->>'downgrade' = 'refund' then
+    out := out || jsonb_build_object('refund', apply_refund(o.id, jsonb_build_object('amount', -net, 'fees', 0, 'per', '{}'::jsonb), jsonb_build_object('to', coalesce(nullif(p->>'to',''), 'original'), 'note', p->>'note'), p_by));
+  elsif net < 0 and p->>'downgrade' in ('credit','eventCredit') then
+    out := out || jsonb_build_object('refund', apply_refund(o.id, jsonb_build_object('amount', -net, 'fees', 0, 'per', '{}'::jsonb),
+      jsonb_build_object('to', p->>'downgrade', 'creditEvent', coalesce(nullif(p->>'creditEvent',''), o.event_ids[1]::text), 'creditExpires', p->>'creditExpires', 'note', p->>'note'), p_by));
+  end if;
+  return out || jsonb_build_object('settle', case when net > 0 then p->>'settle' when net < 0 then p->>'downgrade' end);
+end $$;
+create or replace function cancel_order_tickets(o orders, p jsonb, p_by text) returns text[] language plpgsql security definer set search_path = public as $$
+declare t tickets%rowtype; e events%rowtype; mode text := coalesce(nullif(p->>'seat',''), 'release'); all_ boolean := coalesce((p->>'all')::boolean, false); codes text[] := '{}'; sst text;
+begin
+  if mode not in ('release','hold','block') then raise exception 'Choose what happens to the seats'; end if;
+  if not all_ and jsonb_array_length(coalesce(p->'tickets','[]')) = 0 then raise exception 'Choose the tickets to cancel'; end if;
+  for t in select * from tickets where order_id = o.id and status = 'valid' and (all_ or id::text in (select jsonb_array_elements_text(coalesce(p->'tickets','[]')))) for update loop
+    update tickets set status = 'cancelled', cancelled_at = now() where id = t.id; codes := codes || t.code;
+    if t.seat is null then continue; end if;
+    select * into e from events where id = t.event_id;
+    if mode = 'release' then
+      insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref) values (o.box_office_id, e.id, coalesce(t.slot_id,''), t.seat, 'cancelled', 'Ticket ' || t.code || ' cancelled (order ' || o.ref || ') — seat released', p_by, o.ref);
+    else
+      sst := case mode when 'hold' then 'held' else 'blocked' end;
+      delete from seat_status where event_id = e.id and seat = t.seat and slot_id = coalesce(t.slot_id,'') and status <> 'checkout';
+      insert into seat_status(box_office_id, event_id, slot_id, seat, status, note, by) values (o.box_office_id, e.id, coalesce(t.slot_id,''), t.seat, sst, 'Kept from cancelled order ' || o.ref, p_by);
+      insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref) values (o.box_office_id, e.id, coalesce(t.slot_id,''), t.seat, sst, 'Ticket ' || t.code || ' cancelled (order ' || o.ref || ') — seat kept ' || sst, p_by, o.ref);
+    end if;
+  end loop;
+  if all_ then update orders set data = jsonb_set(data, '{lines}', (select jsonb_agg(case when l->>'kind' = 'addon' then l || jsonb_build_object('removed', (l->>'qty')::int) else l end order by n)
+    from jsonb_array_elements(data->'lines') with ordinality z(l, n))) where id = o.id; end if;
+  return codes;
+end $$;
+-- "Dinner × 2" strings on an event's valid tickets, from the order's product lines (after a product is added or removed)
+create or replace function refresh_extras(p_order uuid, p_event text) returns void language sql security definer set search_path = public as $$
+  update tickets set extras = (select coalesce(jsonb_agg((l->>'name') || ' × ' || ((l->>'qty')::int - coalesce((l->>'removed')::int, 0)) order by n), '[]')
+    from orders o, jsonb_array_elements(o.data->'lines') with ordinality z(l, n) where o.id = p_order and l->>'kind' = 'addon' and l->>'eventId' = p_event and (l->>'qty')::int - coalesce((l->>'removed')::int, 0) > 0)
+  where order_id = p_order and event_id::text = p_event and status = 'valid' $$;
+
+-- Every staff change to an order (Eli Step 6). Mirrors demoOrderAction() in data.js. → jsonb {status, refund?, ...}
+create or replace function order_action(p_order uuid, p_action text, p jsonb default '{}') returns jsonb language plpgsql security definer set search_path = public as $$
+declare o orders%rowtype; ev uuid; by_ text := me_email(); res jsonb := '{}'; plan jsonb; r jsonb; codes text[]; was text; all_ boolean; n_live int; amt bigint; l jsonb; e events%rowtype;
+  ad jsonb; qty int; sold int; unit bigint; txt text := ''; nm text; em text; ph text; bef jsonb; aft jsonb; body text; subj text; t tickets%rowtype; mid uuid; s text;
+  perm_ok boolean;
+begin
+  select * into o from orders where id = p_order for update;
+  if not found or not is_member(o.box_office_id) and not is_super() then raise exception 'Order not found'; end if;
+  ev := o.event_ids[1];
+  if p_action = 'status' then   -- the old one-click buttons
+    return order_action(p_order, case p->>'status' when 'paid' then 'markPaid' when 'refunded' then 'refund' when 'cancelled' then case when o.status in ('pending','awaiting_payment') then 'cancelUnpaid' else 'cancel' end else 'x' end,
+      case p->>'status' when 'refunded' then jsonb_build_object('mode', 'full', 'to', 'original', 'cancel', true) || (p - 'status') when 'cancelled' then jsonb_build_object('all', true, 'seat', 'release') || (p - 'status') else p - 'status' end);
+  end if;
+  perm_ok := case p_action when 'markPaid' then has_perm(o.box_office_id, 'orders.edit', ev) when 'cancelUnpaid' then has_perm(o.box_office_id, 'orders.cancel', ev)
+    when 'change' then has_perm(o.box_office_id, 'orders.seats', ev) when 'refund' then has_perm(o.box_office_id, 'orders.refund', ev)
+    when 'collect' then has_perm(o.box_office_id, 'orders.edit', ev) when 'addAddon' then has_perm(o.box_office_id, 'orders.edit', ev) when 'removeAddon' then has_perm(o.box_office_id, 'orders.edit', ev)
+    when 'customer' then has_perm(o.box_office_id, 'orders.customer', ev) when 'holder' then has_perm(o.box_office_id, 'orders.customer', ev)
+    when 'note' then has_perm(o.box_office_id, 'orders.edit', ev) when 'message' then has_perm(o.box_office_id, 'comms.email', ev) when 'resend' then has_perm(o.box_office_id, 'orders.resend', ev)
+    when 'cancel' then true else null end;
+  if perm_ok is null then raise exception 'Unknown order action'; end if;
+  if not perm_ok then raise exception 'You don''t have permission to do that'; end if;
+  perform set_config('set.system', '1', true);   -- this function checks and logs the change itself
+  if p_action = 'markPaid' then
+    if o.status not in ('pending','awaiting_payment') then raise exception 'This order is not waiting for payment'; end if;
+    was := o.status;
+    update orders set status = 'paid', paid_at = now(), payment = coalesce(payment, '{}') || jsonb_build_object('markedPaidBy', by_) ||
+      case when p->>'method' in ('cash','terminal','check','transfer','other') then jsonb_build_object('method', p->>'method') else '{}'::jsonb end where id = o.id;   -- orders_paid issues the tickets
+    perform order_log_add(o, 'paid', format('marked paid (%s → paid) — tickets issued', was), by_, p->>'note', '{}', jsonb_build_object('status', was), '{"status":"paid"}');
+  elsif p_action = 'cancelUnpaid' then
+    if o.status not in ('pending','awaiting_payment') then raise exception 'This order is not an unpaid reservation'; end if;
+    update orders set status = 'cancelled' where id = o.id;
+    for l in select v from jsonb_array_elements(o.data->'lines') v loop
+      for s in select jsonb_array_elements_text(coalesce(l->'seats','[]')) loop
+        insert into seat_log(box_office_id, event_id, slot_id, seat, action, detail, by, ref) values (o.box_office_id, (l->>'eventId')::uuid, coalesce(l->>'slotId',''), s, 'released', 'Reservation ' || o.ref || ' cancelled — seat released', by_, o.ref);
+      end loop;
+    end loop;
+    perform order_log_add(o, 'cancelled', 'unpaid reservation cancelled — seats released', by_, p->>'note', '{}', jsonb_build_object('status', o.status), '{"status":"cancelled"}');
+  elsif p_action = 'change' then
+    res := change_order_tickets(o.id, p, by_);
+    perform order_log_add(o, 'change', format('%s: %s%s', case when jsonb_array_length(res->'tickets') = 1 then 'changed 1 ticket' else 'changed ' || jsonb_array_length(res->'tickets') || ' tickets' end,
+      (select string_agg(coalesce(x->'from'->>'seat', x->'from'->>'type') || ' → ' || coalesce(x->'to'->>'seat', x->'to'->>'type'), '; ') from jsonb_array_elements(res->'tickets') x),
+      case when (res->>'net')::bigint > 0 then ' · upgrade ' || money_txt((res->>'net')::bigint) || ' — ' || case res->>'settle' when 'collect' then 'collected' when 'due' then 'added to the balance due' else 'no charge' end
+           when (res->>'net')::bigint < 0 then ' · downgrade ' || money_txt(-(res->>'net')::bigint) || ' — ' || case when res ? 'refund' then refund_text(res->'refund') else 'no refund' end else '' end), by_, p->>'note', res);
+    if coalesce((p->>'notify')::boolean, true) then perform queue_mail(o, 'updated', 'Your updated tickets', 'Your tickets have changed. Your new tickets are attached — the old ones no longer work.', by_); end if;
+  elsif p_action = 'cancel' then
+    if o.status <> 'paid' then raise exception 'Only paid orders can be changed'; end if;
+    select count(*) into n_live from tickets where order_id = o.id and status = 'valid';
+    all_ := coalesce((p->>'all')::boolean, false) or (n_live > 0 and n_live = (select count(*) from tickets where order_id = o.id and status = 'valid' and id::text in (select jsonb_array_elements_text(coalesce(p->'tickets','[]')))));
+    if not has_perm(o.box_office_id, case when all_ then 'orders.cancel' else 'orders.cancelTicket' end, ev) then raise exception 'You don''t have permission to do that'; end if;
+    if p->'refund' is not null and jsonb_typeof(p->'refund') = 'object' then
+      if not has_perm(o.box_office_id, 'orders.refund', ev) then raise exception 'You don''t have permission to issue refunds'; end if;
+      plan := refund_plan(o, (p->'refund') || jsonb_build_object('mode', coalesce(nullif(p->'refund'->>'mode',''), 'tickets'),
+        'tickets', case when all_ then (select jsonb_agg(id) from tickets where order_id = o.id and status = 'valid') else p->'tickets' end));
+    end if;
+    codes := cancel_order_tickets(o, p || jsonb_build_object('all', all_), by_);
+    if plan is not null then r := apply_refund(o.id, plan, (p->'refund') || jsonb_build_object('note', p->>'note'), by_); end if;
+    perform settle_order_status(o.id);
+    perform order_log_add(o, 'cancel', format('%s (%s) — %s%s', case when all_ then 'order cancelled' else 'cancelled ' || coalesce(array_length(codes, 1), 0) || ' ticket' || case when coalesce(array_length(codes, 1), 0) = 1 then '' else 's' end end,
+      coalesce(array_to_string(codes, ', '), 'products'), case coalesce(nullif(p->>'seat',''), 'release') when 'release' then 'release the seats for sale' when 'hold' then 'keep the seats held' else 'keep the seats blocked' end,
+      case when r is not null then ' · refunded ' || refund_text(r) else ' · no refund' end), by_, p->>'note', jsonb_build_object('tickets', to_jsonb(codes), 'seat', coalesce(p->>'seat','release'), 'refund', r), null,
+      jsonb_build_object('status', (select status from orders where id = o.id)));
+    if coalesce((p->>'notify')::boolean, true) then perform queue_mail(o, 'cancelled', case when all_ then 'Your order was cancelled' else 'Some of your tickets were cancelled' end,
+      case when r is not null then 'A refund of ' || money_txt((r->>'amount')::bigint) || ' has been issued.' else '' end, by_); end if;
+    res := jsonb_build_object('cancelled', coalesce(array_length(codes, 1), 0), 'refund', r);
+  elsif p_action = 'refund' then
+    if not was_paid(o) then raise exception 'Nothing has been paid on this order'; end if;
+    if coalesce((p->>'cancel')::boolean, false) and p->>'mode' in ('full','tickets') and not has_perm(o.box_office_id, case when p->>'mode' = 'full' then 'orders.cancel' else 'orders.cancelTicket' end, ev) then
+      raise exception 'You don''t have permission to do that'; end if;
+    plan := refund_plan(o, p); r := apply_refund(o.id, plan, p, by_);
+    if coalesce((p->>'cancel')::boolean, false) and o.status = 'paid' and p->>'mode' in ('full','tickets') then
+      codes := cancel_order_tickets(o, jsonb_build_object('all', p->>'mode' = 'full', 'tickets', case when p->>'mode' = 'tickets' then p->'tickets' else '[]'::jsonb end, 'seat', coalesce(p->>'seat','release')), by_);
+      perform settle_order_status(o.id); end if;
+    perform order_log_add(o, 'refund', 'refunded ' || refund_text(r) || case p->>'mode' when 'full' then ' (everything left)' when 'fees' then ' (booking fee)' when 'percent' then ' (' || (p->>'pct') || '%)'
+      when 'tickets' then ' (' || (select count(*) from jsonb_object_keys(plan->'per')) || ' ticket(s)' || case when (plan->>'fees')::bigint > 0 then ' + booking fee' else '' end || ')' else '' end
+      || case when coalesce(array_length(codes, 1), 0) > 0 then ' · ' || array_length(codes, 1) || ' ticket(s) cancelled' when coalesce((p->>'cancel')::boolean, false) then '' else ' · tickets kept' end,
+      by_, p->>'note', jsonb_build_object('refund', r, 'cancelled', to_jsonb(coalesce(codes, '{}'))), null, jsonb_build_object('status', (select status from orders where id = o.id)));
+    if coalesce((p->>'notify')::boolean, true) then perform queue_mail(o, 'refund', 'Your refund', 'We''ve issued a refund of ' || money_txt((r->>'amount')::bigint)
+      || case when r ? 'credit' then ' as credit — use code ' || (r->>'credit') || ' on your next order' else '' end || '.', by_); end if;
+    res := jsonb_build_object('refund', r);
+  elsif p_action = 'collect' then
+    amt := greatest(0, round(coalesce(nullif(p->>'amount','')::numeric, 0)))::bigint; if amt <= 0 then raise exception 'Enter the amount received'; end if;
+    if coalesce(p->>'method','') not in ('cash','terminal','check','transfer','other') then raise exception 'Choose how it was paid'; end if;
+    update orders set data = data || jsonb_build_object('charges', coalesce(data->'charges','[]') || jsonb_build_array(jsonb_build_object('id', gen_random_uuid(), 'at', now(), 'by', by_, 'amount', amt,
+        'method', p->>'method', 'ref', left(coalesce(p->>'ref',''), 80), 'reason', left(coalesce(nullif(p->>'reason',''), 'Payment received'), 120))),
+      'extraPaid', coalesce((data->>'extraPaid')::bigint, 0) + amt, 'due', greatest(0, coalesce((data->>'due')::bigint, 0) - amt)) where id = o.id;
+    perform order_log_add(o, 'payment', money_txt(amt) || ' received (' || (p->>'method') || ')' || case when coalesce(p->>'ref','') <> '' then ' · ref ' || (p->>'ref') else '' end, by_, p->>'note', jsonb_build_object('amount', amt, 'method', p->>'method'));
+  elsif p_action = 'addAddon' then
+    if o.status <> 'paid' then raise exception 'Only paid orders can be changed'; end if;
+    select * into e from events where id = coalesce(nullif(p->>'eventId','')::uuid, ev) and id = any(o.event_ids);
+    ad := (select y from jsonb_array_elements(coalesce(e.data->'addons','[]')) y where y->>'id' = p->>'addonId'); qty := floor(coalesce(nullif(p->>'qty','')::numeric, 0));
+    if ad is null then raise exception 'Choose a product'; end if; if qty < 1 then raise exception 'Enter a quantity'; end if;
+    perform pg_advisory_xact_lock(hashtext(e.id::text)); sold := coalesce((availability(e.id)->'ad'->>(ad->>'id'))::int, 0);
+    if coalesce((ad->>'qty')::int, 0) > 0 and sold + qty > (ad->>'qty')::int then raise exception 'Only % % left', greatest(0, (ad->>'qty')::int - sold), ad->>'name'; end if;
+    unit := greatest(0, round(coalesce((ad->>'price')::numeric, 0)))::bigint; amt := unit * qty;
+    if amt > 0 then
+      if p->>'settle' = 'collect' then
+        if coalesce(p->>'method','') not in ('cash','terminal','check','transfer','other') then raise exception 'Choose how it was paid'; end if;
+        update orders set data = data || jsonb_build_object('charges', coalesce(data->'charges','[]') || jsonb_build_array(jsonb_build_object('id', gen_random_uuid(), 'at', now(), 'by', by_, 'amount', amt, 'method', p->>'method',
+          'ref', left(coalesce(p->>'ref',''), 80), 'reason', 'Added ' || (ad->>'name'))), 'extraPaid', coalesce((data->>'extraPaid')::bigint, 0) + amt) where id = o.id;
+        txt := ' · ' || money_txt(amt) || ' collected';
+      elsif p->>'settle' = 'due' then update orders set data = data || jsonb_build_object('due', coalesce((data->>'due')::bigint, 0) + amt) where id = o.id; txt := ' · ' || money_txt(amt) || ' added to the balance due';
+      elsif p->>'settle' = 'waive' then txt := ' · no charge';
+      else raise exception 'Choose how the % is paid', money_txt(amt); end if;
+    end if;
+    update orders set data = jsonb_set(data, '{lines}', data->'lines' || jsonb_build_array(jsonb_build_object('kind', 'addon', 'eventId', e.id, 'eventName', e.data->>'name', 'addonId', ad->>'id', 'name', ad->>'name', 'qty', qty,
+      'unit', case when p->>'settle' = 'waive' then 0 else unit end, 'face', unit, 'unitFee', 0, 'fee', 0, 'added', now(), 'by', by_) || case when p->>'settle' = 'waive' then '{"waived":true}'::jsonb else '{}'::jsonb end)) where id = o.id;
+    perform refresh_extras(o.id, e.id::text);
+    perform order_log_add(o, 'addon', 'added ' || (ad->>'name') || ' × ' || qty || txt, by_, p->>'note', jsonb_build_object('addonId', ad->>'id', 'qty', qty));
+  elsif p_action = 'removeAddon' then
+    if o.status <> 'paid' then raise exception 'Only paid orders can be changed'; end if;
+    l := o.data->'lines'->((p->>'line')::int); qty := floor(coalesce(nullif(p->>'qty','')::numeric, 0));
+    if l is null or l->>'kind' <> 'addon' then raise exception 'Choose a product'; end if;
+    if qty < 1 or qty > (l->>'qty')::int - coalesce((l->>'removed')::int, 0) then raise exception 'Enter how many to remove'; end if;
+    amt := least((l->>'unit')::bigint * qty, (order_money(o)->>'refundable')::bigint);
+    if coalesce((p->>'refund')::boolean, false) and amt > 0 then
+      if not has_perm(o.box_office_id, 'orders.refund', ev) then raise exception 'You don''t have permission to issue refunds'; end if;
+      r := apply_refund(o.id, jsonb_build_object('amount', amt, 'fees', 0, 'per', '{}'::jsonb), p, by_); end if;
+    update orders set data = jsonb_set(data, array['lines', p->>'line', 'removed'], to_jsonb(coalesce((l->>'removed')::int, 0) + qty)) where id = o.id;
+    perform refresh_extras(o.id, l->>'eventId'); perform settle_order_status(o.id);
+    perform order_log_add(o, 'addon', 'removed ' || (l->>'name') || ' × ' || qty || case when r is not null then ' · refunded ' || refund_text(r) else ' · no refund' end, by_, p->>'note', jsonb_build_object('addonId', l->>'addonId', 'qty', qty, 'refund', r));
+  elsif p_action = 'customer' then
+    nm := trim(coalesce(p->>'name', o.data->'buyer'->>'name')); em := lower(trim(coalesce(p->>'email', o.buyer_email))); ph := trim(coalesce(p->>'phone', o.data->'buyer'->>'phone', ''));
+    if nm = '' then raise exception 'Name is required'; end if; if em !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'A valid email is required'; end if;
+    bef := jsonb_build_object('name', o.data->'buyer'->>'name', 'email', o.buyer_email, 'phone', coalesce(o.data->'buyer'->>'phone','')); aft := jsonb_build_object('name', nm, 'email', em, 'phone', ph);
+    if bef = aft then raise exception 'Nothing changed'; end if;
+    update orders set buyer_email = em, data = jsonb_set(data, '{buyer}', coalesce(data->'buyer','{}') || aft) where id = o.id;
+    perform order_log_add(o, 'customer', 'customer details changed: ' || (select string_agg(k2, ', ') from jsonb_object_keys(aft) k2 where aft->>k2 is distinct from bef->>k2), by_, p->>'note', '{}', bef, aft);
+  elsif p_action = 'holder' then
+    select * into t from tickets where id = nullif(p->>'ticket','')::uuid and order_id = o.id and status = 'valid'; if not found then raise exception 'That ticket is no longer valid'; end if;
+    nm := left(trim(coalesce(p->>'name','')), 120); if nm = '' then raise exception 'Enter the new name'; end if;
+    update tickets set holder = nm where id = t.id;
+    perform order_log_add(o, 'holder', format('ticket %s now in the name of %s (was %s)', t.code, nm, t.holder), by_, p->>'note', jsonb_build_object('ticket', t.code), jsonb_build_object('holder', t.holder), jsonb_build_object('holder', nm));
+  elsif p_action = 'note' then
+    body := trim(coalesce(p->>'body','')); if body = '' then raise exception 'Write a note'; end if;
+    perform order_log_add(o, 'note', left(body, 500), by_, '');
+  elsif p_action = 'message' then
+    subj := trim(coalesce(p->>'subject','')); body := trim(coalesce(p->>'body','')); if subj = '' or body = '' then raise exception 'Add a subject and a message'; end if;
+    mid := queue_mail(o, 'message', subj, body, by_);
+    perform order_log_add(o, 'message', format('message queued for %s: “%s”', o.buyer_email, left(subj, 80)), by_, '', jsonb_build_object('outbox', mid));
+  elsif p_action = 'resend' then
+    if p->>'kind' is distinct from 'confirmation' and not exists(select 1 from tickets where order_id = o.id and status = 'valid') then raise exception 'This order has no valid tickets'; end if;
+    mid := queue_mail(o, case when p->>'kind' = 'confirmation' then 'confirmation_copy' else 'tickets' end, case when p->>'kind' = 'confirmation' then 'Your order confirmation' else 'Your tickets' end, '', by_);
+    perform order_log_add(o, 'resend', case when p->>'kind' = 'confirmation' then 'confirmation email' else 'tickets' end || ' re-sent to ' || o.buyer_email, by_, '', jsonb_build_object('outbox', mid));
+  end if;
+  perform set_config('set.system', '', true);
+  return res || jsonb_build_object('status', (select status from orders where id = o.id));
+end $$;
+-- the payments Edge Function (service role) reports what the processor did with a 'processing' refund
+create or replace function finish_refund(p_order uuid, p_refund text, p jsonb) returns void language plpgsql security definer set search_path = public as $$
+declare o orders%rowtype; r jsonb; i int; k text;
+begin
+  select * into o from orders where id = p_order for update;
+  select n - 1, v into i, r from jsonb_array_elements(coalesce(o.data->'refunds','[]')) with ordinality z(v, n) where v->>'id' = p_refund;
+  if r is null or r->>'status' <> 'processing' then return; end if;
+  if coalesce((p->>'ok')::boolean, false) then
+    update orders set data = jsonb_set(data, array['refunds', i::text], r || jsonb_build_object('status', 'done', 'ref', p->>'ref')) where id = o.id;
+  else   -- the processor refused: the money did not go back, so it is still refundable
+    update orders set data = jsonb_set(data, array['refunds', i::text], r || jsonb_build_object('status', 'failed', 'error', left(coalesce(p->>'error',''), 300)))
+      || jsonb_build_object('refunded', greatest(0, coalesce((data->>'refunded')::bigint, 0) - (r->>'amount')::bigint), 'refundedFees', greatest(0, coalesce((data->>'refundedFees')::bigint, 0) - (r->>'fees')::bigint))
+      where id = o.id;
+    for k in select jsonb_object_keys(coalesce(r->'per','{}')) loop update tickets set refunded = greatest(0, refunded - (r->'per'->>k)::bigint) where id = k::uuid; end loop;
+    insert into order_log(box_office_id, order_id, ref, event_id, kind, summary, by, data) values (o.box_office_id, o.id, o.ref, o.event_ids[1], 'refund',
+      'card refund of ' || money_txt((r->>'amount')::bigint) || ' FAILED at the processor: ' || coalesce(p->>'error','') || ' — not refunded', 'system', jsonb_build_object('refund', r));
+  end if;
+end $$;
+-- Credits outside an order: issue (goodwill / future-event credit), revoke what's left, apply to an order's balance due
+create or replace function credit_action(p_bo uuid, p_action text, p jsonb) returns jsonb language plpgsql security definer set search_path = public as $$
+declare c credits%rowtype; o orders%rowtype; st jsonb; amt bigint; why text;
+begin
+  if not has_perm(p_bo, 'orders.refund') then raise exception 'You don''t have permission to manage credits'; end if;
+  if p_action = 'issue' then
+    if nullif(p->>'order','') is not null then select * into o from orders where id = (p->>'order')::uuid and box_office_id = p_bo; end if;
+    c := issue_credit(p_bo, p, o, me_email());
+    perform log_action(p_bo, 'credit.issued', format('Issued %s credit %s to %s', money_txt(c.amount), c.code, c.email), null, null, coalesce(c.event_id, o.event_ids[1]));
+    if o.id is not null then insert into order_log(box_office_id, order_id, ref, event_id, kind, summary, by, note, data) values (o.box_office_id, o.id, o.ref, o.event_ids[1], 'credit',
+      format('credit %s issued: %s', c.code, money_txt(c.amount)), me_email(), coalesce(p->>'note',''), jsonb_build_object('credit', c.code)); end if;
+    return to_jsonb(c);
+  end if;
+  select * into c from credits where id = nullif(p->>'id','')::uuid and box_office_id = p_bo for update; if not found then raise exception 'Credit not found'; end if;
+  st := credit_state(c);
+  if p_action = 'revoke' then
+    if c.revoked_at is not null then raise exception 'Already revoked'; end if;
+    update credits set revoked_at = now(), revoked_by = me_email(), revoke_note = left(coalesce(p->>'note',''), 300) where id = c.id returning * into c;
+    perform log_action(p_bo, 'credit.revoked', format('Revoked credit %s (%s unused)', c.code, money_txt((st->>'remaining')::bigint)));
+    return to_jsonb(c);
+  elsif p_action = 'apply' then
+    select * into o from orders where id = nullif(p->>'order','')::uuid and box_office_id = p_bo for update; if not found then raise exception 'Order not found'; end if;
+    why := credit_problem(c, o.event_ids); if why <> '' then raise exception '%', why; end if;
+    amt := least(coalesce(nullif(round(coalesce(nullif(p->>'amount','')::numeric, 0))::bigint, 0), (st->>'remaining')::bigint), (st->>'remaining')::bigint, coalesce((o.data->>'due')::bigint, 0));
+    if amt <= 0 then raise exception 'This order has no balance due'; end if;
+    update credits set applied = applied || jsonb_build_array(jsonb_build_object('order_id', o.id, 'ref', o.ref, 'amount', amt, 'events', to_jsonb(o.event_ids), 'at', now(), 'by', me_email())) where id = c.id returning * into c;
+    update orders set data = data || jsonb_build_object('due', coalesce((data->>'due')::bigint, 0) - amt, 'charges', coalesce(data->'charges','[]') || jsonb_build_array(jsonb_build_object('id', gen_random_uuid(), 'at', now(),
+      'by', me_email(), 'amount', amt, 'method', 'credit', 'ref', c.code, 'reason', 'Credit applied'))) where id = o.id;
+    insert into order_log(box_office_id, order_id, ref, event_id, kind, summary, by, data) values (o.box_office_id, o.id, o.ref, o.event_ids[1], 'payment', format('credit %s applied: %s', c.code, money_txt(amt)), me_email(), jsonb_build_object('credit', c.code, 'amount', amt));
+    perform log_action(p_bo, 'credit.applied', format('Applied %s of credit %s to order %s', money_txt(amt), c.code, o.ref), null, null, o.event_ids[1]);
+    return to_jsonb(c);
+  end if;
+  raise exception 'Unknown credit action';
+end $$;
+create or replace function customer_note(p_bo uuid, p_email text, p_body text) returns jsonb language plpgsql security definer set search_path = public as $$
+declare n customer_notes%rowtype;
+begin
+  if not has_perm(p_bo, 'customers.profiles') then raise exception 'You don''t have permission to do that'; end if;
+  if trim(coalesce(p_body,'')) = '' then raise exception 'Write a note'; end if;
+  insert into customer_notes(box_office_id, email, body, by) values (p_bo, lower(trim(p_email)), left(trim(p_body), 1000), me_email()) returning * into n;
+  return to_jsonb(n);
+end $$;
+-- buyers: what a typed credit code is worth (never whose it is) · the signed-in customer's own credits
+create or replace function check_credit(p_bo uuid, p_code text) returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('code', c.code, 'remaining', (credit_state(c)->>'remaining')::bigint, 'status', credit_state(c)->>'status', 'event_id', c.event_id, 'expires', c.expires)
+  from credits c where c.box_office_id = p_bo and c.code = upper(trim(p_code)) $$;
+create or replace function my_credits() returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare em text := me_email();
+begin
+  if em = '' or (select email_confirmed_at from auth.users where id = auth.uid()) is null then return '[]'; end if;
+  return coalesce((select jsonb_agg(jsonb_build_object('code', c.code, 'box_office_id', c.box_office_id, 'amount', c.amount, 'remaining', (credit_state(c)->>'remaining')::bigint,
+    'status', credit_state(c)->>'status', 'event_id', c.event_id, 'expires', c.expires, 'issued_at', c.issued_at)) from credits c where c.email = em), '[]');
+end $$;
+-- live activity: a visitor on an event page (cart = tickets of this event in their cart; converted = they just ordered)
+create or replace function presence_ping(p_event uuid, p_visitor text, p_cart int default 0, p_converted boolean default false) returns void language sql security definer set search_path = public as $$
+  insert into event_presence(event_id, visitor, at, cart, carted_at, converted_at)
+    select p_event, left(p_visitor, 64), now(), greatest(0, least(99, coalesce(p_cart, 0))), case when coalesce(p_cart, 0) > 0 then now() end, case when p_converted then now() end
+    where exists(select 1 from events e where e.id = p_event and event_live(e))
+  on conflict (event_id, visitor) do update set at = now(), cart = excluded.cart, carted_at = coalesce(event_presence.carted_at, excluded.carted_at), converted_at = coalesce(excluded.converted_at, event_presence.converted_at) $$;
 
 -- ── Promo + tracking code admin (Stage 4) ──
 create or replace function code_clash(p_bo uuid, p_codes text[], p_self text) returns void language plpgsql stable security definer set search_path = public as $$
@@ -1300,7 +1828,8 @@ begin
   res := jsonb_build_object('super', sup, 'bos', bos, 'me', me, 'bo', to_jsonb(b));
   if b.status <> 'active' and not (p_support and sup) then return res || jsonb_build_object('blocked', b.status); end if;
   if coalesce((b.settings->>'require2fa')::boolean, false) and coalesce(auth.jwt() ->> 'aal', '') <> 'aal2' and not (p_support and sup) then
-    return res || jsonb_build_object('needs2fa', true, 'events', '[]'::jsonb, 'orders', '[]'::jsonb, 'tickets', '[]'::jsonb, 'waitlist', '[]'::jsonb, 'team', jsonb_build_array(me), 'broadcasts', '[]'::jsonb, 'audit', '[]'::jsonb, 'seatStatus', '[]'::jsonb, 'seatLog', '[]'::jsonb, 'promos', '[]'::jsonb, 'tracking', '[]'::jsonb, 'outbox', '[]'::jsonb); end if;
+    return res || jsonb_build_object('needs2fa', true, 'events', '[]'::jsonb, 'orders', '[]'::jsonb, 'tickets', '[]'::jsonb, 'waitlist', '[]'::jsonb, 'team', jsonb_build_array(me), 'broadcasts', '[]'::jsonb, 'audit', '[]'::jsonb, 'seatStatus', '[]'::jsonb, 'seatLog', '[]'::jsonb, 'promos', '[]'::jsonb, 'tracking', '[]'::jsonb, 'outbox', '[]'::jsonb,
+      'orderLog', '[]'::jsonb, 'credits', '[]'::jsonb, 'custNotes', '[]'::jsonb, 'accounts', '[]'::jsonb, 'live', '{}'::jsonb); end if;
   select coalesce(array_agg(e.id), '{}') into evs from events e where e.box_office_id = b.id and (has_perm(b.id, 'events.view', e.id) or has_perm(b.id, 'door.scan', e.id));
   P_names := has_perm(b.id, 'customers.names'); P_emails := has_perm(b.id, 'customers.emails'); P_phones := has_perm(b.id, 'customers.phones'); P_money := has_perm(b.id, 'finance.totals');
   P_proc := has_perm(b.id, 'finance.processing'); P_fees := has_perm(b.id, 'finance.fees');
@@ -1338,6 +1867,18 @@ begin
         and not (x.status = 'checkout' and x.expires_at <= now())), '[]'),
     'seatLog', case when has_perm(b.id, 'seating.view') then coalesce((select jsonb_agg(to_jsonb(l) order by l.at desc) from (select * from seat_log l
         where l.event_id = any(evs) order by l.at desc limit 8000) l), '[]') else '[]' end,
+    -- Stage 6: every order's change history, credits, notes on customers, who has a customer account, live event activity
+    'orderLog', case when has_perm(b.id, 'orders.view') then coalesce((select jsonb_agg(to_jsonb(x) order by x.at desc) from (select * from order_log x where x.box_office_id = b.id and x.event_id = any(evs)
+        order by x.at desc limit 5000) x), '[]') else '[]' end,
+    'credits', case when has_perm(b.id, 'orders.view') or has_perm(b.id, 'customers.profiles') then coalesce((select jsonb_agg(to_jsonb(c) || credit_state(c)) from credits c where c.box_office_id = b.id), '[]') else '[]' end,
+    'custNotes', case when has_perm(b.id, 'customers.profiles') then coalesce((select jsonb_agg(to_jsonb(n) order by n.at desc) from customer_notes n where n.box_office_id = b.id), '[]') else '[]' end,
+    'accounts', case when has_perm(b.id, 'customers.profiles') then coalesce((select jsonb_agg(distinct u.email) from auth.users u where u.email_confirmed_at is not null
+        and exists(select 1 from orders o where o.box_office_id = b.id and o.buyer_email = lower(u.email))), '[]') else '[]' end,
+    'live', coalesce((select jsonb_object_agg(z.event_id, z.j) from (select p.event_id, jsonb_build_object('now', count(*) filter (where p.at > now() - interval '2 minutes'),
+        'carts', count(*) filter (where p.at > now() - interval '2 minutes' and p.cart > 0), 'cartTickets', coalesce(sum(p.cart) filter (where p.at > now() - interval '2 minutes'), 0),
+        'carted', count(*) filter (where p.carted_at is not null), 'converted', count(*) filter (where p.converted_at is not null),
+        'abandoned', count(*) filter (where p.carted_at is not null and p.converted_at is null and p.at < now() - interval '30 minutes')) j
+        from event_presence p where p.event_id = any(evs) group by p.event_id) z), '{}'),
     'views', coalesce((select jsonb_object_agg(v.event_id, jsonb_build_object('total', v.total, 'unique', v.uniq, 'today', v.today, 'last10m', v.now10, 'bySrc', v.bysrc, 'byRef', coalesce(v.byref, '{}'))) from (
         select event_id, count(*) total, count(distinct visitor) uniq, count(*) filter (where at >= date_trunc('day', now())) today,
           count(distinct visitor) filter (where at >= now() - interval '10 minutes') now10,
@@ -1431,19 +1972,26 @@ end $$;
 
 grant execute on function availability(uuid,text), hold_seats(uuid,text,text[],text), release_seats(uuid,text), check_code(uuid[],text), unlock(uuid,text), join_waitlist(uuid,text,text,text),
   get_order(uuid,uuid), lookup_order(text,text), place_order(jsonb), register_box_office(text,text,text,text), cancel_checkout(uuid,uuid),
-  event_by_slug(text), track_view(uuid,text,text,text) to anon, authenticated;
+  event_by_slug(text), track_view(uuid,text,text,text), check_credit(uuid,text), presence_ping(uuid,text,int,boolean) to anon, authenticated;
+grant execute on function order_action(uuid,text,jsonb), credit_action(uuid,text,jsonb), customer_note(uuid,text,text), my_credits() to authenticated;
+revoke insert, update, delete on orders, tickets, order_log, credits, customer_notes, event_presence from anon, authenticated;
 grant execute on function save_event_templates(uuid,jsonb), notify_waitlist(uuid,text), seat_action(uuid,text,text,text[],jsonb), save_venues(uuid,jsonb),
   save_promo(uuid,jsonb), delete_promo(uuid,text), save_tracking(uuid,jsonb), delete_tracking(uuid,text), my_orders(), disconnect_gateway(uuid), set_platform_fee(uuid,jsonb) to authenticated;
 grant execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), transfer_ownership(uuid,text), platform_overview(), platform_save(jsonb),
   create_box_office(text,text,text,text), set_box_office_status(uuid,text), delete_box_office(uuid) to authenticated;
-revoke execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), new_box_office(text,text,text,text,text,text), log_action(uuid,text,text,jsonb,jsonb,uuid),
+-- staff-only RPCs: not for anonymous callers (their explicit grant to authenticated above stays)
+revoke execute on function checkin(text,boolean,uuid), admin_load(uuid,boolean), order_action(uuid,text,jsonb), credit_action(uuid,text,jsonb), customer_note(uuid,text,text), my_credits() from anon, public;
+revoke execute on function new_box_office(text,text,text,text,text,text), log_action(uuid,text,text,jsonb,jsonb,uuid),
   seat_blocker(uuid,text,text,text,boolean), seat_free(events,text,text,text), single_gaps(events,text,text[],text),
   find_code(uuid,text), promo_usable(jsonb,text,text), tracking_usable(jsonb,uuid,uuid[]), apply_promo(jsonb,jsonb,bigint), price_cart(jsonb,boolean,jsonb,jsonb),
   order_check_tickets(events,jsonb,jsonb,jsonb,int,text[],boolean,text,jsonb), issue_ticket(uuid,uuid,text,jsonb,text,text,bigint,bigint,bigint,text,text,jsonb,jsonb,boolean,text,text,jsonb),
   code_clash(uuid,text[],text), issue_order_tickets(uuid,text), confirm_payment(uuid,jsonb), record_payment_attempt(uuid,jsonb), expire_orders(),
-  pricing_settings(box_offices), check_answers(jsonb,uuid[],jsonb,jsonb,jsonb), ticket_answers(orders,text,int), reserved_units(uuid), reserved_units_of(orders) from anon, authenticated, public;
+  pricing_settings(box_offices), check_answers(jsonb,uuid[],jsonb,jsonb,jsonb), ticket_answers(orders,text,int), reserved_units(uuid), reserved_units_of(orders),
+  order_log_add(orders,text,text,text,text,jsonb,jsonb,jsonb), queue_mail(orders,text,text,text,text), issue_credit(uuid,jsonb,orders,text), refund_plan(orders,jsonb), apply_refund(uuid,jsonb,jsonb,text),
+  settle_order_status(uuid), change_order_tickets(uuid,jsonb,text,boolean), cancel_order_tickets(orders,jsonb,text), refresh_extras(uuid,text), finish_refund(uuid,text,jsonb),
+  credit_state(credits), credit_problem(credits,uuid[]) from anon, authenticated, public;
 -- the payments Edge Function (service role) confirms payments, records failed attempts and expires stale checkouts
-grant execute on function confirm_payment(uuid,jsonb), record_payment_attempt(uuid,jsonb), expire_orders() to service_role;
+grant execute on function confirm_payment(uuid,jsonb), record_payment_attempt(uuid,jsonb), expire_orders(), finish_refund(uuid,text,jsonb) to service_role;
 -- pg_cron (enable it in Supabase → Database → Extensions): release unpaid card checkouts every minute
 -- select cron.schedule('set-expire-checkouts', '* * * * *', 'select expire_orders()');
 

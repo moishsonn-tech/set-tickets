@@ -1,10 +1,12 @@
 // @ts-nocheck — plain JavaScript (Deno runs it as TypeScript).
 /* SET payments Edge Function. Deploy:  supabase functions deploy payments --no-verify-jwt   (webhooks carry no Supabase login)
    Secrets:  supabase secrets set STRIPE_SECRET_KEY=… STRIPE_WEBHOOK_SECRET=… STRIPE_PUBLISHABLE_KEY=… APP_ORIGINS=https://your-site
-   SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided by Supabase. Nothing secret ever reaches the browser.
+   SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY are provided by Supabase. Nothing secret ever reaches the browser.
 
    POST {action:'intent', order, key}          buyer: start paying for an order (the order id + its secret key prove it's theirs)
    POST {action:'connect', bo, provider, return}  staff with admin.payments: connect the box office's own processor account
+   POST {action:'order', order, op, p}            staff: an order change that refunds the card (Stage 6). Runs order_action() AS the caller, so
+                                                  their permissions apply, then refunds each 'processing' refund at the processor (retries any stuck one)
    POST ?webhook=stripe                           the processor: payment succeeded / failed, account ready  → confirm_payment() issues tickets */
 import { PROVIDERS } from './providers/index.ts';
 
@@ -73,6 +75,23 @@ Deno.serve(async req => {
       await db('payment_accounts', { method: 'POST', prefer: 'resolution=merge-duplicates,return=minimal',
         body: { box_office_id: bo.id, provider: body.provider, account: r.account, status: 'pending', test: String(env.STRIPE_SECRET_KEY || '').startsWith('sk_test'), updated_at: new Date().toISOString() } });
       return json(req, { url: r.url });
+    }
+    if (body.action === 'order') {  // ── staff: change an order, then refund the card at the box office's processor ──
+      const r = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/order_action', { method: 'POST', body: JSON.stringify({ p_order: body.order, p_action: body.op, p: body.p || {} }),
+        headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: req.headers.get('authorization') || '', 'Content-Type': 'application/json' } });
+      const res = await r.json().catch(() => ({})); if (!r.ok) return json(req, { error: res?.message || 'Could not change the order' }, 400);
+      const order = await one(`orders?id=eq.${encodeURIComponent(body.order)}&select=*`), account = order && await one(`payment_accounts?box_office_id=eq.${order.box_office_id}&select=*`);
+      for (const rf of (order?.data?.refunds || []).filter(x => x.status === 'processing')) {
+        const p = PROVIDERS[rf.provider]; let out;
+        try {
+          if (!p || !account || account.provider !== rf.provider) throw new Error('The processor that took this payment is not connected');
+          const x = await p.refund({ ref: rf.payment, amount: rf.amount, account: account.account, idem: 'set-refund-' + rf.id, env });   // one refund id → never refunded twice
+          out = { ok: true, ref: x.id };
+        } catch (e) { out = { ok: false, error: String(e.message || e) }; }
+        await rpc('finish_refund', { p_order: order.id, p_refund: rf.id, p: out });
+        if (res.refund?.id === rf.id) res.refund = { ...res.refund, status: out.ok ? 'done' : 'failed', error: out.error || null };
+      }
+      return json(req, res);
     }
     return json(req, { error: 'Unknown action' }, 400);
   } catch (e) {

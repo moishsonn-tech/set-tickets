@@ -75,7 +75,7 @@ const S = {
   sc: { evId: '', tab: 'scan', last: null, q: '', filter: 'all', recent: [], sound: true, queue: [], err: '' },  // door scanner app
 };
 function loadCart() { try { return JSON.parse(localStorage.getItem('set_cart')) || { items: [], addons: [], donation: 0, unlock: {} }; } catch (e) { return { items: [], addons: [], donation: 0, unlock: {} }; } }
-function saveCart() { try { localStorage.setItem('set_cart', JSON.stringify(S.cart)); } catch (e) { } }
+function saveCart() { try { localStorage.setItem('set_cart', JSON.stringify(S.cart)); } catch (e) { } if (!S.loading) setTimeout(presencePing); }
 const cartCount = () => sum(S.cart.items, i => i.qty);
 const evById = id => S.events.find(e => e.id === id) || S.adm?.events.find(e => e.id === id);
 // The box office whose settings and branding apply to this page — buyers see the organizer's brand, not the platform's.
@@ -127,7 +127,7 @@ async function onRoute() {
   if (r.page === 'e' || r.page === 'embed') {
     let ev = S.events.find(e => e.slug === r.params[0]) || S.adm?.events.find(e => e.slug === r.params[0]);
     if (!ev && !S._fetched?.[r.params[0]]) { (S._fetched ||= {})[r.params[0]] = 1; DB.eventBySlug(r.params[0]).then(e => { if (e) { S.events.push(e); onRoute(); } }).catch(() => { }); }
-    if (ev && eventLive(ev) && !/preview=1/.test(location.hash) && S._viewed !== ev.id + location.hash) { S._viewed = ev.id + location.hash; DB.trackView(ev.id, sessionStorage.getItem('set_src'), sessionStorage.getItem('set_ref')); }
+    if (ev && eventLive(ev) && !/preview=1/.test(location.hash) && S._viewed !== ev.id + location.hash) { S._viewed = ev.id + location.hash; DB.trackView(ev.id, sessionStorage.getItem('set_src'), sessionStorage.getItem('set_ref')); DB.ping(ev.id, cartTicketsFor(ev.id)); }
     if (ev && S.sel?.eventId !== ev.id) S.sel = { eventId: ev.id, qty: {}, slotId: '', seats: [], addons: {}, bundles: {}, picks: {}, unlocked: { event: false, tts: [] }, pw: '' };
     if (ev) refreshAvail(ev.id);
   }
@@ -550,7 +550,17 @@ function Waitlist(ev, why) {
 }
 
 // ── Cart & checkout ───────────────────────────────────────────────────────────
-function cartQuote() { const bo = cartBo(); return quote(S.cart, S.events.concat(S.adm?.events || []), bo ? pricingSettings(bo, S.platform) : S.settings, S.co.disc, { avail: S.avail, method: S.co.payment }); }
+function cartQuote() {
+  const bo = cartBo(), evs = S.events.concat(S.adm?.events || []), set = bo ? pricingSettings(bo, S.platform) : S.settings, o = { avail: S.avail, method: S.co.payment };
+  const q = quote(S.cart, evs, set, S.co.disc, o), c = coCredit(); if (!c) return q;
+  return quote(S.cart, evs, set, S.co.disc, { ...o, credit: Math.min(c.remaining, c.event_id ? eventPortion(q, c.event_id) : Infinity) });
+}
+// the credit this checkout will use: a typed credit code, or (signed in) the account's best credit for these events
+function coCredit() {
+  const ids = cartEventIds(), ok = c => c && c.status === 'active' && c.remaining > 0 && (!c.event_id || ids.includes(c.event_id)) && (!cartBo() || !c.box_office_id || c.box_office_id === cartBo().id);
+  if (S.co.credit) return ok(S.co.credit) ? S.co.credit : null;
+  return S.co.useAcct && S.cust ? (S.myCredits || []).filter(ok).sort((a, b) => b.remaining - a.remaining)[0] || null : null;
+}
 const cartEventIds = () => [...new Set([...S.cart.items, ...S.cart.addons].map(i => i.eventId))];
 // smart add-ons: an offer shows when the cart matches its trigger (ticket type, seating area, price level, quantity) and the product isn't in it yet
 function upsellsFor(q) {
@@ -623,12 +633,22 @@ function Checkout() {
       ${co.disc ? `<div class="between small"><span class="chip ok">${esc(co.disc.code)}</span><a href="#" data-action="removeCode" class="small">Remove</a></div>${q.promoErr ? `<p class="small" style="color:var(--warn);margin-top:6px">${esc(q.promoErr)}</p>` : ''}`
         : ck.promo !== false ? `<div class="row"><input class="inp" data-bind="co.code" placeholder="Promo or referral code" value="${esc(co.code)}"><button class="btn btn-ghost" data-action="applyCode">Apply</button></div>` : ''}
       ${ref ? `<div class="between small" style="margin-top:8px"><span class="muted">Referral code <b class="tnum">${esc(ref)}</b></span><a href="#" data-action="removeRef" class="small">Remove</a></div>` : ''}
+      ${CreditBox()}
       ${Breakdown(q, co.disc?.code)}
       ${co.err ? `<div class="banner" style="background:var(--bad-bg);color:var(--bad);margin:12px 0 0">${esc(co.err)}</div>` : ''}
       <button class="btn btn-accent btn-lg btn-block" style="margin-top:16px" data-action="placeOrder" ${co.busy || (q.total && !co.payment) ? 'disabled' : ''}>${co.busy ? 'One moment…' : q.total ? (co.payment === 'offline' ? 'Reserve tickets' : 'Continue to payment') : 'Get free tickets'} <span class="arr">→</span></button>
       <p class="small muted" style="text-align:center;margin-top:10px">${ic('lock', 12)} ${q.total && co.payment === 'card' ? 'You\'ll see the exact total before you pay' : 'Secure checkout'} · tickets only after payment</p>
     </div></aside>
   </div></div>`;
+}
+// credit at checkout (Stage 6): signed-in customers get theirs offered automatically; guests type the credit code they were given
+function CreditBox() {
+  const co = S.co, mine = S.cust ? (S.myCredits || []).filter(c => c.status === 'active' && c.remaining > 0 && (!cartBo() || c.box_office_id === cartBo().id)) : [];
+  if (S.cust && !S.myCredits && !S._credReq) { S._credReq = 1; DB.myCredits().then(r => { S.myCredits = r; if (r.some(c => c.status === 'active')) S.co.useAcct = true; render(); }).catch(() => { }); }
+  if (co.credit) return `<div class="between small" style="margin-top:8px"><span class="chip ok">Credit ${esc(co.credit.code)} · ${money(co.credit.remaining)} left</span><a href="#" data-action="removeCredit" class="small">Remove</a></div>`;
+  return `${mine.length ? `<label class="check small" style="margin-top:8px"><input type="checkbox" data-bind="co.useAcct" ${co.useAcct ? 'checked' : ''}> <span>Use my credit (${money(mine.reduce((a, c) => Math.max(a, c.remaining), 0))} available)</span></label>` : ''}
+    ${co.creditOpen ? `<div class="row" style="margin-top:8px"><input class="inp" data-bind="co.creditCode" placeholder="Credit code, e.g. CR-…" value="${esc(co.creditCode || '')}"><button class="btn btn-ghost" data-action="applyCredit">Apply</button></div>`
+      : `<a href="#" class="small" style="display:inline-block;margin-top:8px" data-action="openCredit">Have a credit code?</a>`}`;
 }
 const ticketsPerEvent = q => q.lines.reduce((m, l) => (m[l.eventId] = (m[l.eventId] || 0) + lineUnits(l).length, m), {});
 // The money, every part on its own line (Eli's example: Tickets $300 · Booking fee $12 · Sales tax $8.50 · Discount −$30 · Total $290.50)
@@ -638,7 +658,7 @@ function Breakdown(q, code) {
     ${row('Tickets', q.ticketsTotal)}${row('Products & add-ons', q.addonsTotal)}
     ${row('Booking fee', (q.fee || 0) + (q.feeDiscount || 0))}${row('Service fee', q.serviceFee)}${row('Sales tax', q.tax)}
     ${q.discount + q.feeDiscount ? `<div class="sum-line" style="color:var(--ok)"><span>Discount${code ? ' · ' + esc(code) : ''}</span><span class="tnum">−${money(q.discount + q.feeDiscount, q.currency)}</span></div>` : ''}
-    ${row('Card processing', q.processing)}${row('Donation', q.donation)}${q.refunded ? row('Refunded', -q.refunded) : ''}
+    ${row('Card processing', q.processing)}${row('Donation', q.donation)}${q.credit ? `<div class="sum-line" style="color:var(--ok)"><span>Credit applied</span><span class="tnum">−${money(q.credit, q.currency)}</span></div>` : ''}${q.refunded ? row('Refunded', -q.refunded) : ''}
     <div class="sum-line total"><span>Total</span><span class="tnum">${money(q.total, q.currency)}</span></div></div>`;
 }
 // one checkout question. path is under S.co ("answers.<id>" or "tanswers.<id>.<ticket>")
@@ -728,7 +748,8 @@ async function payWith(card) {
 }
 function endPay() { S.co = { ...S.co, pay: null, busy: false, err: '', attempt: null, card: null }; try { localStorage.removeItem('set_pay'); } catch (e) { } render(); }
 async function checkoutDone(r) {
-  S.cart = { items: [], addons: [], donation: 0, unlock: {} }; saveCart();
+  cartEventIds().forEach(id => DB.ping(id, 0, true));   // live activity: this visitor's cart became an order
+  S.cart = { items: [], addons: [], donation: 0, unlock: {} }; saveCart(); S.co.credit = null; S.co.creditCode = ''; S.co.useAcct = false; S.myCredits = null; S._credReq = 0;
   S.co = { ...S.co, busy: false, disc: null, code: '', tracking: '', answers: {}, tanswers: {}, terms: false, pay: null, attempt: null, card: null, err: '' };
   try { localStorage.removeItem('set_pay'); } catch (e) { }
   S.avail = {}; _availReq.clear(); S.order = null;
@@ -806,7 +827,7 @@ function OrderPage() {
 function Account() {
   if (!S.cust) return AccountAuth();
   const w = S.wallet;
-  if (!w) { S.wallet = { loading: true }; DB.myOrders().then(r => { S.wallet = r; render(); }).catch(e => { S.wallet = { err: e.message }; render(); }); }
+  if (!w) { S.wallet = { loading: true }; Promise.all([DB.myOrders(), DB.myCredits().catch(() => [])]).then(([r, c]) => { S.wallet = { ...r, credits: c }; render(); }).catch(e => { S.wallet = { err: e.message }; render(); }); }
   if (!w || w.loading) return '<div class="container section"><p class="muted">Loading your tickets…</p></div>';
   const tab = S.ui.wtab || 'upcoming', now = Date.now() - 6 * 3600e3, evOf = id => evById(id) || { name: (w.orders.flatMap(o => o.data.lines).find(l => l.eventId === id) || {}).eventName || 'Event' };
   // one card per order + event, with its valid tickets
@@ -823,6 +844,7 @@ function Account() {
     <div class="between wrap"><div><h1 class="display" style="font-size:44px">My account</h1><p class="muted">${esc(S.cust.name || '')} · ${esc(S.cust.email)}</p></div><button class="btn btn-ghost btn-sm" data-action="custOut">Sign out</button></div>
     <div class="tabs" style="margin:20px 0">${tabs.map(([k, t]) => `<button class="${tab === k ? 'on' : ''}" data-action="custTab" data-v="${k}">${t}</button>`).join('')}</div>
     ${w.err ? `<div class="banner bad">${esc(w.err)}</div>` : ''}
+    ${(w.credits || []).filter(c => c.status === 'active').map(c => `<div class="banner info">You have <b>${money(c.remaining)}</b> credit${c.event_id ? ' for ' + esc(evById(c.event_id)?.name || 'an event') : ''} — it's applied automatically at checkout (code <code>${esc(c.code)}</code>${c.expires ? ', expires ' + esc(fmtDate(c.expires, { month: 'short', day: 'numeric', year: 'numeric' })) : ''}).</div>`).join('')}
     ${tab === 'upcoming' ? (up.map(card).join('') || '<div class="empty">No upcoming tickets. <a href="#/">Find an event</a>.</div>')
       : tab === 'past' ? (past.map(card).join('') || '<div class="empty">No past events yet.</div>')
       : tab === 'orders' ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Order</th><th>Placed</th><th>Events</th><th>Total</th><th>Status</th></tr></thead><tbody>
@@ -864,7 +886,7 @@ function FindTickets() {
 //  ORGANIZER BACK OFFICE
 // ══════════════════════════════════════════════════════════════════════════════
 const NAV = [
-  ['dashboard', 'Dashboard', 'home'], ['events', 'Events', 'cal', 'events.view'], ['venues', 'Venues', 'pin', 'seating.view'], ['orders', 'Orders', 'cart', 'orders.view'], ['promos', 'Promotions', 'tag', 'tickets.discounts|tickets.discountsEdit|tickets.tracking|finance.reports'], ['attendees', 'Door list', 'users', 'door.attendees'],
+  ['dashboard', 'Dashboard', 'home'], ['events', 'Events', 'cal', 'events.view'], ['venues', 'Venues', 'pin', 'seating.view'], ['orders', 'Orders', 'cart', 'orders.view'], ['customers', 'Customers', 'users', 'customers.profiles'], ['promos', 'Promotions', 'tag', 'tickets.discounts|tickets.discountsEdit|tickets.tracking|finance.reports'], ['attendees', 'Door list', 'users', 'door.attendees'],
   ['checkin', 'Scanner app', 'scan', 'door.scan'], ['reports', 'Reports', 'chart', 'finance.reports'], ['marketing', 'Marketing', 'mega', 'comms.email'],
   ['team', 'Team', 'team', 'admin.invite|admin.perms|admin.remove'], ['branding', 'Branding', 'brush', 'admin.settings'], ['settings', 'Settings', 'gear', 'admin.settings'], ['security', 'My security', 'lock'],
 ];
@@ -875,7 +897,7 @@ function AdminShell() {
   if (!S.adm) return `<div class="empty" style="padding-top:30vh">Loading…</div>`;
   if (!S.adm.bo) return S.adm.super ? (setTimeout(() => { location.hash = '#/platform'; }), '') : Gate('No box office yet', `${esc(S.user.email)} isn't on any box office team. Ask an owner to invite you.`);
   if (S.adm.blocked) return Gate(S.adm.bo.name + ' is ' + BO_STATUS[S.adm.blocked].toLowerCase(), S.adm.blocked === 'pending' ? 'The platform team is reviewing this box office. You\'ll get an email when it\'s approved.' : 'Event pages and checkout are offline and staff access is paused. Contact the platform team.');
-  const sub = S.route.sub, page = { dashboard: Dashboard, events: EventsList, event: EventEditor, venues: Venues, orders: Orders, promos: Promos, attendees: Attendees, checkin: CheckIn, reports: Reports, marketing: Marketing, team: Team, branding: Branding, settings: Settings, security: Security }[sub] || Dashboard;
+  const sub = S.route.sub, page = { dashboard: Dashboard, events: EventsList, event: EventEditor, venues: Venues, orders: Orders, customers: Customers, promos: Promos, attendees: Attendees, checkin: CheckIn, reports: Reports, marketing: Marketing, team: Team, branding: Branding, settings: Settings, security: Security }[sub] || Dashboard;
   const allowed = NAV.filter(navOk), navKey = sub === 'event' ? 'events' : sub, entry = NAV.find(n => n[0] === navKey);
   const body = S.adm.needs2fa && sub !== 'security' ? Gate2fa() : entry && !navOk(entry) ? `<div class="empty"><div class="display" style="font-size:28px">No access</div><p class="muted" style="margin-top:8px">You don't have permission to open ${esc(entry[1])}. Ask a box office admin.</p></div>` : page();
   return `<div class="admin">
@@ -994,13 +1016,13 @@ function NewEventModal() {
   modal('New event', `<div class="new-ev"><button class="item-card" data-action="blankEvent"><b>Blank event</b><span class="small muted">Start from scratch</span></button>
     ${list.map(t => `<button class="item-card" data-action="fromTemplate" data-v="${t.id}"><b>${esc(t.name)}</b><span class="small muted">${esc(t.event.ticketTypes.length)} ticket types${t.event.seating?.enabled ? ' · seating map' : ''}</span></button>`).join('')}</div>`);
 }
-const ETABS = [['overview', 'Overview'], ['details', 'Details'], ['tickets', 'Tickets & pricing'], ['products', 'Products & packages'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['inventory', 'Seat inventory'], ['checkout', 'Page & checkout'], ['discounts', 'Promo codes'],
+const ETABS = [['overview', 'Overview'], ['live', 'Live activity'], ['details', 'Details'], ['tickets', 'Tickets & pricing'], ['products', 'Products & packages'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['inventory', 'Seat inventory'], ['checkout', 'Page & checkout'], ['discounts', 'Promo codes'],
   ['emails', 'Emails'], ['waitlist', 'Waitlist'], ['team', 'Team'], ['history', 'History'], ['share', 'Share & embed']];
 function EventEditor() {
   const ev = S.draft; if (!ev) return '<p class="muted">Event not found.</p>';
   const tab = S.route.params[1] || 'overview', ro = !can('events.edit', ev.id), pub = can('events.publish', ev.id);
-  const body = { overview: EdOverview, details: EdDetails, tickets: EdTickets, products: EdProducts, schedule: EdSchedule, seating: EdSeating, inventory: EdInventory, checkout: EdCheckout, discounts: EdDiscounts, emails: EdEmails, waitlist: EdWaitlist, team: EdTeam, history: EdHistory, share: EdShare }[tab] || EdOverview;
-  const live = ['overview', 'team', 'history', 'waitlist', 'inventory', 'discounts'].includes(tab);  // these tabs act immediately, not through "Save changes"
+  const body = { overview: EdOverview, live: EdLive, details: EdDetails, tickets: EdTickets, products: EdProducts, schedule: EdSchedule, seating: EdSeating, inventory: EdInventory, checkout: EdCheckout, discounts: EdDiscounts, emails: EdEmails, waitlist: EdWaitlist, team: EdTeam, history: EdHistory, share: EdShare }[tab] || EdOverview;
+  const live = ['overview', 'live', 'team', 'history', 'waitlist', 'inventory', 'discounts'].includes(tab);  // these tabs act immediately, not through "Save changes"
   return `<a href="#/admin/events" class="small muted" style="text-decoration:none">← Events</a>
   ${head(esc(ev.name || 'Untitled event'), `${evChip(ev)} ${S.dirty ? '<span class="chip warn">Unsaved changes</span>' : ''}`,
     `<a class="btn btn-ghost" href="#/e/${esc(ev.slug)}?preview=1" target="_blank">Preview</a>
@@ -1703,50 +1725,415 @@ function EdShare(ev) {
 }
 
 // ── Orders ───────────────────────────────────────────────────────────────────
+// ── Orders (Stage 6): search, the full order page, ticket / seat changes, cancellations, refunds, credits, communication ──
+// Order search: every word must match somewhere — name, email, phone, order #, transaction id, ticket code, event, ticket type / area, row,
+// seat, promo, tracking or credit code. Field words narrow it: row:F seat:12 area:balcony type:premium ticket:7KQ2M9XHPA code:BINAH15
+const OSEARCH = { row: t => t.row, seat: t => t.seat_label || t.seat, area: t => t.area, ticket: t => t.code, type: t => evById(t.event_id)?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name };
 function filteredOrders() {
-  const q = S.ui.q.trim().toLowerCase();
-  return S.adm.orders.filter(o => (!S.ui.ev || o.event_ids.includes(S.ui.ev)) && (!S.ui.status || o.status === S.ui.status)
-    && (!q || [o.ref, o.data.buyer.name, o.buyer_email, o.data.buyer.phone].join(' ').toLowerCase().includes(q))).sort((a, b) => D(b.created_at) - D(a.created_at));
+  const words = S.ui.q.trim().toLowerCase().split(/\s+/).filter(Boolean), by = {};
+  if (words.length) S.adm.tickets.forEach(t => (by[t.order_id] ||= []).push(t));
+  return S.adm.orders.filter(o => {
+    if ((S.ui.ev && !o.event_ids.includes(S.ui.ev)) || (S.ui.status && o.status !== S.ui.status)) return false;
+    if (!words.length) return true;
+    const d = o.data, tks = by[o.id] || [];
+    const hay = [o.ref, d.buyer.name, o.buyer_email, d.buyer.phone, String(d.buyer.phone || '').replace(/\D/g, ''), o.payment?.ref, d.code, d.tracking, d.credit?.code, ...(d.refunds || []).map(r => [r.credit, r.ref].join(' ')),
+      ...(d.charges || []).map(c => c.ref), ...d.lines.map(l => l.eventName + ' ' + l.name),
+      ...tks.flatMap(t => [t.code, t.holder, t.area, t.row && 'row ' + t.row, t.seat_label, t.seat, OSEARCH.type(t), t.promo, t.tracking])].filter(Boolean).join(' · ').toLowerCase();
+    const field = words.map(w => w.match(/^(row|seat|area|ticket|type):(.+)$/)).filter(Boolean);   // ticket fields: all on the SAME ticket (row:F seat:12)
+    return words.every(w => {
+      const m = w.match(/^(row|seat|area|ticket|type|code):(.+)$/); if (!m) return hay.includes(w);
+      return m[1] !== 'code' || [d.code, d.tracking, d.credit?.code].some(x => String(x || '').toLowerCase() === m[2]);
+    }) && (!field.length || tks.some(t => field.every(m => { const v = String(OSEARCH[m[1]](t) || '').toLowerCase(); return ['area', 'type'].includes(m[1]) ? v.includes(m[2]) : v === m[2]; })));
+  }).sort((a, b) => D(b.created_at) - D(a.created_at));
 }
 const evOptions = (cur, all = 'All events') => `<option value="">${all}</option>${S.adm.events.slice().sort((a, b) => D(b.start) - D(a.start)).map(e => `<option value="${e.id}" ${cur === e.id ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}`;
 function Orders() {
+  if (S.route.params[0] === 'new') return ManualOrder();
+  if (S.route.params[0]) return OrderView(S.route.params[0]);
   const os = filteredOrders(), picked = Object.keys(S.ui.picked).filter(k => S.ui.picked[k]);
-  return head('Orders', `${os.length} orders · ${money(sum(os.filter(o => ['paid', 'pending'].includes(o.status)), o => o.data.total))}`,
+  return head('Orders', `${os.length} orders · ${money(sum(os.filter(o => ['paid', 'pending'].includes(o.status)), o => orderMoney(o).net || (o.status === 'pending' ? o.data.total : 0)))}`,
     `${can('customers.export') ? '<button class="btn btn-ghost" data-action="exportOrders">Export CSV</button>' : ''}${can('orders.edit') ? `<button class="btn btn-accent" data-action="manualOrder">${ic('plus', 15)} Manual order</button>` : ''}`) + `
-  <div class="toolbar"><input class="inp" data-input="q" placeholder="Search name, email, order #…" value="${esc(S.ui.q)}">
+  <div class="toolbar"><input class="inp" style="min-width:320px;flex:1" data-input="q" placeholder="Search name, email, phone, order #, ticket code, seat, row, promo or referral code…" value="${esc(S.ui.q)}">
     <select class="inp" data-input="ev">${evOptions(S.ui.ev)}</select>
     <select class="inp" data-input="status"><option value="">Any status</option>${Object.entries(ORDER_STATUS).map(([k, t]) => `<option value="${k}" ${S.ui.status === k ? 'selected' : ''}>${t}</option>`).join('')}</select>
     ${picked.length && can('orders.refund') ? `<button class="btn btn-danger btn-sm" data-action="bulkCancel">Cancel & refund ${picked.length} selected</button>` : ''}</div>
+  <p class="small muted" style="margin:-6px 0 12px">Narrow by ticket: <code>row:F</code> <code>seat:12</code> <code>area:balcony</code> <code>type:premium</code> <code>ticket:CODE</code> <code>code:BINAH15</code> — or paste a payment / transaction id.</p>
   <div class="tbl-wrap"><table class="tbl"><thead><tr><th style="width:30px"></th><th>Order</th><th>Buyer</th><th>Event</th><th>Tickets</th><th>Total</th><th>Status</th><th>Placed</th></tr></thead><tbody>
-  ${os.slice(0, 300).map(o => `<tr class="click" data-action="openOrder" data-id="${o.id}"><td data-stop="1"><input type="checkbox" data-action="pick" data-id="${o.id}" ${S.ui.picked[o.id] ? 'checked' : ''}></td>
+  ${os.slice(0, 300).map(o => { const m = orderMoney(o); return `<tr class="click" data-action="openOrder" data-id="${o.id}"><td data-stop="1"><input type="checkbox" data-action="pick" data-id="${o.id}" ${S.ui.picked[o.id] ? 'checked' : ''}></td>
     <td class="tnum"><b>${esc(o.ref)}</b></td><td>${esc(o.data.buyer.name)}<div class="small muted">${esc(o.buyer_email)}</div></td>
-    <td>${esc([...new Set(o.data.lines.map(l => l.eventName).filter(Boolean))].join(', '))}</td><td class="tnum">${sum(o.data.lines.filter(l => l.kind === 'ticket'), l => l.qty * l.admits)}</td>
-    <td class="tnum">${money(o.data.total, o.data.currency)}</td><td>${statusChip(o.status)}</td><td class="small muted">${esc(fmtDT(o.created_at))}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No orders match.</td></tr>'}
+    <td>${esc([...new Set(o.data.lines.map(l => l.eventName).filter(Boolean))].join(', '))}</td><td class="tnum">${S.adm.tickets.filter(t => t.order_id === o.id && t.status === 'valid').length || sum(o.data.lines.filter(l => l.kind === 'ticket'), l => l.qty * l.admits)}</td>
+    <td class="tnum">${money(o.data.total, o.data.currency)}${m.refunded || m.credited ? `<div class="small" style="color:var(--bad)">−${money(m.refunded + m.credited, o.data.currency)}</div>` : ''}${m.due ? `<div class="small" style="color:var(--warn)">${money(m.due, o.data.currency)} due</div>` : ''}</td><td>${statusChip(o.status)}</td><td class="small muted">${esc(fmtDT(o.created_at))}</td></tr>`; }).join('') || '<tr><td colspan="8" class="empty">No orders match.</td></tr>'}
   </tbody></table></div>`;
 }
-function OrderModal(id) {
-  const o = S.adm.orders.find(x => x.id === id); if (!o) return;
-  const d = o.data, tks = S.adm.tickets.filter(t => t.order_id === id), qs = [...(S.adm.bo.settings.questions || []), ...o.event_ids.flatMap(e => (evById(e)?.questions || []).filter(q => q.scope !== 'ticket'))];
-  const tqs = o.event_ids.flatMap(e => (evById(e)?.questions || []).filter(q => q.scope === 'ticket')), pay = o.payment, mail = (S.adm.outbox || []).find(m => m.order_id === o.id);
+const OrderModal = id => { location.hash = '#/admin/orders/' + id; };   // the order is a full page now
+const TK_CHIP = { valid: '', cancelled: '<span class="chip bad mini">cancelled</span>', replaced: '<span class="chip mini">replaced</span>' };
+const tkType = t => evById(t.event_id)?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name || 'Ticket';
+const tkWhere = t => { const ev = evById(t.event_id), slot = t.slot_id && ev?.timeSlots?.find(s => s.id === t.slot_id); return [t.seat ? seatName(ev, t.seat, true, t) : '', slot ? fmtDT(slot.start) : ''].filter(Boolean).join(' · ') || 'General admission'; };
+const LOG_ICON = { change: '⇄', cancel: '✕', refund: '↩', payment: '＋', addon: '＋', customer: '✎', holder: '✎', note: '✎', message: '✉', resend: '✉', paid: '✓', cancelled: '✕', credit: '★', placed: '•' };
+function orderTimeline(o) {
+  const rows = (S.adm.orderLog || []).filter(x => x.order_id === o.id).map(x => ({ at: x.at, kind: x.kind, text: x.summary, by: x.by, note: x.kind === 'note' ? '' : x.note }));
+  rows.push({ at: o.created_at, kind: 'placed', text: `order placed — ${o.data.payment === 'manual' ? 'staff order' : o.data.payment}${o.data.comp ? ' · complimentary' : ''}`, by: o.data.payment === 'manual' ? '' : o.buyer_email });
+  if (o.paid_at && o.paid_at !== o.created_at && !rows.some(r => r.kind === 'paid')) rows.push({ at: o.paid_at, kind: 'paid', text: 'payment confirmed — tickets issued', by: '' });
+  return rows.sort((a, b) => D(b.at) - D(a.at));
+}
+function OrderView(id) {
+  const o = S.adm.orders.find(x => x.id === id);
+  if (!o) return `<a href="#/admin/orders" class="small muted" style="text-decoration:none">← Orders</a><div class="empty">Order not found.</div>`;
+  if (S.ui.oid !== id) { S.ui.oid = id; S.ui.op = null; S.ui.osel = {}; }
+  const d = o.data, cur = d.currency, ev0 = o.event_ids[0], m = orderMoney(o), fin = can('finance.totals'), all = S.adm.tickets.filter(t => t.order_id === id);
+  const shown = S.ui.oAll ? all : all.filter(t => t.status !== 'replaced'), live = all.filter(t => t.status === 'valid'), sel = live.filter(t => S.ui.osel[t.id]), paid = o.status === 'paid';
+  const pay = o.payment, mails = (S.adm.outbox || []).filter(x => x.order_id === o.id).sort((a, b) => D(b.at) - D(a.at)), notes = (S.adm.orderLog || []).filter(x => x.order_id === o.id && x.kind === 'note');
+  const qs = [...(S.adm.bo.settings.questions || []), ...o.event_ids.flatMap(e => (evById(e)?.questions || []).filter(q => q.scope !== 'ticket'))];
   const ans = (q, v) => q.type === 'signature' && String(v || '').startsWith('data:image/png') ? `<img class="sig-img" src="${esc(v)}" alt="signature">` : esc(v === true ? (q.type === 'terms' || q.type === 'waiver' ? 'Accepted' : 'Yes') : v || '—');
-  modal(`Order ${esc(o.ref)}`, `<div class="between"><div><b style="font-size:16px">${esc(d.buyer.name)}</b><div class="muted small">${esc(o.buyer_email)}${d.buyer.phone ? ' · ' + esc(d.buyer.phone) : ''}</div></div>${statusChip(o.status)}</div>
-    <div class="small muted" style="margin-top:6px">${esc(fmtDT(o.created_at))} · ${esc(d.payment)}${d.source ? ' · source: ' + esc(d.source) : ''}${d.tracking ? ' · referral: ' + esc(d.tracking) : ''}${d.optIn ? ' · opted in to marketing' : ''}</div>
-    <div class="sep"></div>${d.lines.map(l => l.unit == null ? `<div class="sum-line"><span>${l.qty} × ${esc(l.name)}</span><span>—</span></div>` : SumLine(evById(l.eventId), l, d.currency)).join('')}
-    ${d.total == null ? '' : Breakdown({ ...d, ticketsTotal: d.ticketsTotal ?? d.subtotal }, d.code)}
-    ${d.platformFee != null || d.processingFee != null ? `<div class="small muted" style="margin-top:6px">Kept by others: ${d.platformFee != null ? `platform fee ${money(d.platformFee, d.currency)}` : ''}${d.processingFee != null ? ` · card processing ${money(d.processingFee, d.currency)}` : ''}</div>` : ''}
-    ${pay ? `<div class="sep"></div><div class="small"><b>Payment</b> · ${esc(GATEWAYS[pay.provider]?.name || pay.provider || '')}${pay.test ? ' (test)' : ''}${pay.ref ? ` · <code>${esc(pay.ref)}</code>` : ''}${pay.last4 ? ` · ${esc(pay.brand)} •••• ${esc(pay.last4)}` : pay.brand ? ' · ' + esc(pay.brand) : ''}${pay.markedPaidBy ? ' · marked paid by ' + esc(pay.markedPaidBy) : ''}${o.paid_at ? ' · ' + esc(fmtDT(o.paid_at)) : ''}</div>
-      ${(pay.attempts || []).filter(a => !a.ok).map(a => `<div class="small" style="color:var(--bad)">${esc(fmtDT(a.at))} · ${esc(a.brand || a.method || '')} ${a.last4 ? '•••• ' + esc(a.last4) : ''} — ${esc(a.error || 'failed')}</div>`).join('')}${pay.note ? `<div class="small" style="color:var(--warn)">${esc(pay.note)}</div>` : ''}` : ''}
-    ${o.status === 'awaiting_payment' ? `<div class="small muted" style="margin-top:6px">Card checkout in progress — seats held until ${esc(fmtTime(o.expires_at))}. No tickets until the payment is confirmed.</div>` : ''}
-    ${o.status === 'pending' ? `<div class="small muted" style="margin-top:6px">Pay-later reservation: no tickets yet. “Mark paid” issues them and sends the confirmation.</div>` : ''}
-    ${mail ? `<div class="small muted" style="margin-top:6px">Confirmation email ${esc(mail.status)} for ${esc(mail.to)} · ${esc(fmtDT(mail.at))}</div>` : ''}
-    ${qs.length ? `<div class="sep"></div>${qs.map(q => `<div class="small"><span class="muted">${esc(q.label)}:</span> ${ans(q, d.answers?.[q.id])}</div>`).join('')}` : ''}
-    <div class="sep"></div><div class="eyebrow" style="margin-bottom:8px">Tickets</div>
-    ${tks.map(t => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="tnum"><b>${esc(t.code)}</b> ${t.seat ? '· ' + esc(seatName(evById(t.event_id), t.seat, true, t)) : ''}${t.face != null ? `<span class="muted"> · ${esc(evById(t.event_id)?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name || '')} · face ${money(t.face, d.currency)} · paid ${money(t.paid, d.currency)}${t.discount ? ' · −' + money(t.discount, d.currency) + ' ' + esc(t.promo || '') : ''}${t.bundle ? ' · ' + esc(t.bundle.name) : ''}${t.comp ? ' · comp' : ''}${t.price_override ? ' · price override' : ''}</span>` : ''}${tqs.filter(q => t.answers?.[q.id] !== undefined).map(q => `<br><span class="muted">${esc(q.label)}:</span> ${ans(q, t.answers[q.id])}`).join('')}</span><span>${t.status !== 'valid' ? '<span class="chip bad">void</span>' : t.checked_in_at ? '<span class="chip ok">in ' + esc(fmtTime(t.checked_in_at)) + '</span>' : '<span class="chip">not in</span>'}</span></div>`).join('')}`,
+  const btn = (kind, label, perm, cls = 'btn-ghost', extra = '') => can(perm, ev0) ? `<button class="btn ${cls} btn-sm" data-action="opOpen" data-v="${kind}" ${extra}>${label}</button>` : '';
+  const prods = d.lines.map((l, i) => ({ l, i })).filter(x => x.l.kind === 'addon');
+  const cust = S.adm.accounts?.includes(o.buyer_email);
+  return `<a href="#/admin/orders" class="small muted" style="text-decoration:none">← Orders</a>
+  ${head(`Order ${esc(o.ref)}`, `${statusChip(o.status)} <span class="muted small">placed ${esc(fmtDT(o.created_at))}${d.source ? ' · source ' + esc(d.source) : ''}${d.tracking ? ' · referral ' + esc(d.tracking) : ''}</span>`,
     `<a class="btn btn-ghost btn-sm" target="_blank" href="#/order/${o.id}/${o.access_key || ''}">Buyer's page</a>
      <button class="btn btn-ghost btn-sm" data-action="emailPv" data-id="${o.id}">Confirmation email</button>
-     <button class="btn btn-ghost btn-sm" data-action="resend" data-id="${o.id}">Resend tickets</button>
-     ${can('orders.edit', o.event_ids[0]) && ['pending', 'awaiting_payment'].includes(o.status) ? `<button class="btn btn-dark btn-sm" data-action="orderStatus" data-id="${o.id}" data-v="paid">Mark paid & issue tickets</button>` : ''}
-     ${can(o.status === 'paid' ? 'orders.refund' : 'orders.cancel', o.event_ids[0]) && ['paid', 'pending'].includes(o.status) ? `<button class="btn btn-danger btn-sm" data-action="orderStatus" data-id="${o.id}" data-v="${o.status === 'paid' ? 'refunded' : 'cancelled'}">${o.status === 'paid' ? 'Refund & cancel' : 'Cancel'}</button>` : ''}`);
+     ${live.length && can('orders.resend', ev0) ? `<button class="btn btn-ghost btn-sm" data-action="opGo" data-v="resend" data-k="tickets">Resend tickets</button>` : ''}
+     ${btn('message', 'Message customer', 'comms.email')}
+     ${['pending', 'awaiting_payment'].includes(o.status) ? btn('markPaid', 'Mark paid & issue tickets', 'orders.edit', 'btn-dark') + btn('cancelUnpaid', 'Cancel reservation', 'orders.cancel', 'btn-danger') : ''}`)}
+  ${S.ui.op ? OpPanel(o, sel, live) : ''}
+  <div class="ord-grid"><div class="stack">
+    <div class="card" style="padding:0"><div class="between wrap" style="padding:16px 20px 8px;gap:8px"><h3>Tickets <span class="muted small">${live.length} valid${all.length > live.length ? ` · ${all.length - live.length} cancelled / replaced` : ''}</span></h3>
+      <div class="row wrap">${all.some(t => t.status === 'replaced') ? `<label class="check small"><input type="checkbox" data-action="oAll" ${S.ui.oAll ? 'checked' : ''}> <span>Show replaced tickets</span></label>` : ''}
+        ${paid && live.length ? `${btn('change', sel.length ? `Change ${sel.length} selected` : 'Change seats / tickets', 'orders.seats', 'btn-dark', sel.length ? '' : 'data-all="1"')}${btn('cancel', sel.length ? `Cancel ${sel.length} selected` : 'Cancel tickets', sel.length && sel.length < live.length ? 'orders.cancelTicket' : 'orders.cancel', 'btn-ghost', sel.length ? '' : 'data-all="1"')}` : ''}</div></div>
+      <div class="tbl-wrap" style="border:0;box-shadow:none;border-radius:0"><table class="tbl"><thead><tr><th style="width:30px">${paid && live.length ? `<input type="checkbox" data-action="oSelAll" ${sel.length === live.length && live.length ? 'checked' : ''} aria-label="Select all">` : ''}</th><th>Ticket</th><th>Type / area</th><th>Seat / showtime</th><th>Holder</th>${fin ? '<th>Face</th><th>Paid</th>' : ''}<th>Status</th></tr></thead><tbody>
+      ${shown.map(t => `<tr class="${t.status !== 'valid' ? 'dimrow' : ''}"><td>${t.status === 'valid' && paid ? `<input type="checkbox" data-action="oSel" data-id="${t.id}" ${S.ui.osel[t.id] ? 'checked' : ''}>` : ''}</td>
+        <td class="tnum"><b>${esc(t.code)}</b>${t.replaces ? `<div class="small muted">replaces ${esc(all.find(x => x.id === t.replaces)?.code || '')}</div>` : ''}${t.status === 'replaced' ? `<div class="small muted">→ ${esc(all.find(x => x.id === t.replaced_by)?.code || '')}</div>` : ''}</td>
+        <td>${esc(tkType(t))}${t.area && t.area !== tkType(t) ? `<div class="small muted">${esc(t.area)}</div>` : ''}${t.comp ? ' <span class="chip info mini">comp</span>' : ''}${t.bundle ? ` <span class="chip mini">${esc(t.bundle.name)}</span>` : ''}${t.price_override ? ' <span class="chip warn mini">price override</span>' : ''}</td>
+        <td class="small">${esc(tkWhere(t))}</td>
+        <td class="small">${esc(t.holder || '')}${t.status === 'valid' && can('orders.customer', ev0) ? ` <a href="#" class="small" data-action="opOpen" data-v="holder" data-id="${t.id}">rename</a>` : ''}</td>
+        ${fin ? `<td class="tnum small">${money(t.face, cur)}</td><td class="tnum small">${money(t.paid, cur)}${t.discount ? `<div class="muted">−${money(t.discount, cur)} ${esc(t.promo || '')}</div>` : ''}${t.refunded ? `<div style="color:var(--bad)">refunded ${money(t.refunded, cur)}</div>` : ''}</td>` : ''}
+        <td>${t.status !== 'valid' ? TK_CHIP[t.status] : t.checked_in_at ? `<span class="chip ok mini">in ${esc(fmtTime(t.checked_in_at))}</span>` : '<span class="chip mini">not in</span>'}</td></tr>`).join('') || `<tr><td colspan="8" class="muted small" style="padding:14px 20px">${o.status === 'pending' || o.status === 'awaiting_payment' ? 'No tickets yet — they are issued once the payment is confirmed.' : 'No tickets.'}</td></tr>`}
+      </tbody></table></div></div>
+    <div class="card"><div class="between"><h3>Products & add-ons</h3>${paid ? btn('addAddon', 'Add product', 'orders.edit') : ''}</div>
+      ${prods.map(({ l, i }) => { const left = l.qty - (l.removed || 0); return `<div class="between small line"><span>${l.qty} × ${esc(l.name)} <span class="muted">· ${esc(l.eventName || '')}${l.added ? ' · added ' + esc(fmtDT(l.added)) : ''}${l.waived ? ' · no charge' : ''}${l.removed ? ` · ${l.removed} removed` : ''}</span></span>
+        <span class="row">${fin ? `<span class="tnum">${money(l.unit * left, cur)}</span>` : ''}${paid && left > 0 && can('orders.edit', ev0) ? `<a href="#" class="small" data-action="opOpen" data-v="removeAddon" data-id="${i}">remove</a>` : ''}</span></div>`; }).join('') || '<p class="small muted" style="margin-top:6px">No products on this order.</p>'}</div>
+    <div class="card"><h3>History</h3><p class="small muted" style="margin:2px 0 10px">Every change, in order — nothing is overwritten.</p>
+      <div class="tl">${orderTimeline(o).map(r => `<div class="tl-row"><span class="tl-i">${LOG_ICON[r.kind] || '•'}</span><div><div class="small">${esc(r.text.charAt(0).toUpperCase() + r.text.slice(1))}</div>
+        <div class="small muted">${esc(fmtDT(r.at))}${r.by ? ' · ' + esc(r.by) : ''}${r.note ? ' · “' + esc(r.note) + '”' : ''}</div></div></div>`).join('')}</div></div>
+  </div><div class="stack">
+    <div class="card"><div class="between"><h3>Customer</h3>${btn('customer', 'Edit', 'orders.customer')}</div>
+      <div style="margin-top:6px"><b>${esc(d.buyer.name)}</b><div class="small muted">${esc(o.buyer_email)}${d.buyer.phone ? ' · ' + esc(d.buyer.phone) : ''}</div>${d.buyer.address ? `<div class="small muted">${esc(d.buyer.address)}</div>` : ''}</div>
+      <div class="small muted" style="margin-top:6px">${cust ? '<span class="chip ok mini">has an account</span>' : 'Guest checkout'}${d.optIn ? ' · opted in to marketing' : ''}</div>
+      ${can('customers.profiles') ? `<a class="small" href="#/admin/customers/${encodeURIComponent(o.buyer_email)}">Customer profile →</a>` : ''}</div>
+    ${d.total == null ? '' : `<div class="card"><div class="between"><h3>Money</h3><div class="row">${wasPaid(o) ? btn('refund', 'Refund', 'orders.refund', 'btn-ghost') : ''}${btn('collect', 'Record payment', 'orders.edit')}</div></div>
+      ${d.lines.map(l => l.unit == null ? '' : SumLine(evById(l.eventId), l, cur)).join('')}
+      ${Breakdown({ ...d, ticketsTotal: d.ticketsTotal ?? d.subtotal, refunded: 0 }, d.code)}
+      ${(d.charges || []).map(c => `<div class="sum-line small"><span class="muted">${esc(c.reason || 'Payment')} · ${esc(PAY_METHODS[c.method] || (c.method === 'credit' ? 'credit ' + c.ref : c.method))} · ${esc(fmtDT(c.at))}</span><span class="tnum">+${money(c.amount, cur)}</span></div>`).join('')}
+      ${(d.refunds || []).map(r => `<div class="sum-line small" style="color:var(--bad)"><span>Refund ${r.status === 'processing' ? '<span class="chip warn mini">processing</span>' : r.status === 'failed' ? '<span class="chip bad mini">failed</span>' : ''} · ${esc(r.credit ? 'credit ' + r.credit : REFUND_TO[r.to])} · ${esc(fmtDT(r.at))}${r.ref ? ` · <code>${esc(r.ref)}</code>` : ''}</span><span class="tnum">−${money(r.amount, cur)}</span></div>`).join('')}
+      <div class="sep"></div>
+      <div class="sum-line"><span class="muted">Collected</span><span class="tnum">${money(m.collected, cur)}</span></div>
+      ${m.refunded ? `<div class="sum-line"><span class="muted">Refunded</span><span class="tnum">−${money(m.refunded, cur)}</span></div>` : ''}${m.credited ? `<div class="sum-line"><span class="muted">Given back as credit</span><span class="tnum">−${money(m.credited, cur)}</span></div>` : ''}
+      <div class="sum-line total"><span>Net</span><span class="tnum">${money(m.collected - m.refunded - m.credited, cur)}</span></div>
+      ${m.due ? `<div class="banner warn" style="margin:10px 0 0">Balance due: <b>${money(m.due, cur)}</b>${btn('collect', 'Record payment', 'orders.edit', 'btn-dark')}</div>` : ''}
+      ${d.platformFee != null || d.processingFee != null ? `<div class="small muted" style="margin-top:6px">Kept by others: ${d.platformFee != null ? `platform fee ${money(d.platformFee, cur)}` : ''}${d.processingFee != null ? ` · card processing ${money(d.processingFee, cur)}` : ''}</div>` : ''}</div>`}
+    ${pay ? `<div class="card"><h3>Payment</h3><div class="small" style="margin-top:6px">${esc(GATEWAYS[pay.provider]?.name || pay.provider || d.payment || '')}${pay.test ? ' (test)' : ''}${pay.ref ? ` · transaction <code>${esc(pay.ref)}</code>` : ''}${pay.last4 ? ` · ${esc(pay.brand)} •••• ${esc(pay.last4)}` : pay.brand ? ' · ' + esc(pay.brand) : ''}${pay.markedPaidBy ? ' · marked paid by ' + esc(pay.markedPaidBy) : ''}${o.paid_at ? ' · ' + esc(fmtDT(o.paid_at)) : ''}</div>
+      ${(pay.attempts || []).filter(a => !a.ok).map(a => `<div class="small" style="color:var(--bad)">${esc(fmtDT(a.at))} · ${esc(a.brand || a.method || '')} ${a.last4 ? '•••• ' + esc(a.last4) : ''} — ${esc(a.error || 'failed')}</div>`).join('')}${pay.note ? `<div class="small" style="color:var(--warn)">${esc(pay.note)}</div>` : ''}
+      ${o.status === 'awaiting_payment' ? `<div class="small muted" style="margin-top:6px">Card checkout in progress — seats held until ${esc(fmtTime(o.expires_at))}. No tickets until the payment is confirmed.</div>` : ''}
+      ${o.status === 'pending' ? `<div class="small muted" style="margin-top:6px">Pay-later reservation: no tickets yet. “Mark paid” issues them and sends the confirmation.</div>` : ''}</div>` : ''}
+    ${d.credit ? `<div class="card"><h3>Credit used</h3><div class="small" style="margin-top:6px"><code>${esc(d.credit.code)}</code> · ${money(d.credit.amount, cur)}${d.credit.restored ? ' · returned to the credit' : ''}</div></div>` : ''}
+    ${qs.length ? `<div class="card"><h3>Checkout answers</h3>${qs.map(q => `<div class="small" style="margin-top:6px"><span class="muted">${esc(q.label)}:</span> ${ans(q, d.answers?.[q.id])}</div>`).join('')}</div>` : ''}
+    <div class="card"><h3>Internal notes</h3><p class="small muted" style="margin:2px 0 8px">Only your team sees these.</p>
+      ${notes.map(n => `<div class="note-row"><div class="small">${esc(n.summary)}</div><div class="small muted">${esc(n.by)} · ${esc(fmtDT(n.at))}</div></div>`).join('')}
+      ${can('orders.edit', ev0) ? `<textarea class="inp" rows="2" data-input="onote" placeholder="Add a note…">${esc(S.ui.onote || '')}</textarea><button class="btn btn-ghost btn-sm" style="margin-top:6px" data-action="opGo" data-v="note">Add note</button>` : ''}</div>
+    <div class="card"><h3>Communications</h3><p class="small muted" style="margin:2px 0 8px">Every email to this customer about this order${DB.live ? '' : ' (queued — sending switches on in Stage 8)'}.</p>
+      ${mails.map(x => `<div class="between small line"><span><b>${esc({ confirmation: 'Order confirmation', confirmation_copy: 'Confirmation (resent)', tickets: 'Tickets resent', updated: 'Updated tickets', cancelled: 'Cancellation', refund: 'Refund', message: x.subject || 'Message' }[x.kind] || x.kind)}</b>${x.kind === 'message' && x.body ? `<div class="muted">${esc(x.body.slice(0, 120))}</div>` : ''}</span><span class="muted" style="text-align:right">${esc(x.status)} · ${esc(fmtDT(x.at))}${x.by ? `<div>${esc(x.by)}</div>` : ''}</span></div>`).join('') || '<p class="small muted">Nothing sent yet.</p>'}</div>
+  </div></div>`;
+}
+// The action panel at the top of the order page. S.ui.op = {kind, ...fields}; everything re-renders as you choose.
+const opRow = (label, inner) => `<div class="field"><label class="fl">${label}</label>${inner}</div>`;
+const opSel = (path, opts, cur) => `<select class="inp" data-bind="ui.op.${path}">${Object.entries(opts).map(([k, t]) => `<option value="${k}" ${cur === k ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
+const opMoney = (key, val, ph = '') => `<input class="inp" type="number" min="0" step="0.01" data-input="op.${key}" data-rr="1" value="${esc(val ?? '')}" placeholder="${esc(ph)}">`;
+const opText = (key, val, ph = '', rr = '') => `<input class="inp" data-input="op.${key}" ${rr ? 'data-rr="1"' : ''} value="${esc(val ?? '')}" placeholder="${esc(ph)}">`;
+const opDollars = v => v === undefined || v === null || String(v).trim() === '' ? null : Math.round(parseFloat(v) * 100);
+const refundToOpts = o => ({ original: o.payment?.ref ? `Original payment (${o.payment.last4 ? o.payment.brand + ' •••• ' + o.payment.last4 : GATEWAYS[o.payment.provider]?.name || 'card'})` : 'Original payment method', credit: REFUND_TO.credit, eventCredit: REFUND_TO.eventCredit, cash: REFUND_TO.cash, other: REFUND_TO.other });
+const futureEvents = () => S.adm.events.filter(e => e.status !== 'cancelled' && !e.archived && D(e.end || e.start) > Date.now());
+const creditOpts = (op, prefix = '') => `<div class="grid2">${opRow('Credit for', `<select class="inp" data-bind="ui.op.${prefix}creditEvent">${futureEvents().map(e => `<option value="${e.id}" ${(op[prefix + 'creditEvent'] || op._ev) === e.id ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select>`)}
+  ${opRow('Expires (optional)', `<input class="inp" type="date" data-bind="ui.op.${prefix}creditExpires" value="${esc(op[prefix + 'creditExpires'] || '')}">`)}</div>`;
+// the change panel: what each selected ticket becomes, the price difference, and how it's settled
+function changeRows(o, op, live) {
+  const now = new Date();
+  return (op.tickets || []).map(id => {
+    const t = live.find(x => x.id === id); if (!t) return null;
+    const ev = evById(t.event_id), c = op.map[id] || {}, slot = c.slotId !== undefined ? c.slotId || null : t.slot_id || null, seated = !!ev.seating?.enabled;
+    const seat = seated ? c.seat || t.seat : null, ttId = seated ? ev.seating.index?.[seat] : c.ticketTypeId || t.ticket_type_id, tt = ev.ticketTypes.find(x => x.id === ttId);
+    const sold = availabilityFrom(S.adm.tickets, ev.id, [], '', S.adm.orders).tt[ttId] || 0;
+    const pr = tt ? changePrice(ev, t, tt, slot, sold, now, c.price) : null;
+    const changed = tt && (seat !== t.seat || slot !== (t.slot_id || null) || tt.id !== t.ticket_type_id || (c.price !== undefined && c.price !== null && c.price !== ''));
+    return { t, ev, c, slot, seat, tt, pr, changed, seated };
+  }).filter(Boolean);
+}
+function OpPanel(o, sel, live) {
+  const op = S.ui.op, cur = o.data.currency, m = orderMoney(o), close = `<button class="btn btn-ghost" data-action="opClose">Close</button>`;
+  const go = (label, cls = 'btn-accent', dis = false) => `<button class="btn ${cls}" data-action="opGo" data-v="${op.kind}" ${dis ? 'disabled' : ''}>${label}</button>`;
+  const note = `${opRow('Reason / note (kept in the history)', `<input class="inp" data-input="op.note" value="${esc(op.note || '')}" placeholder="e.g. customer asked at the box office">`)}`;
+  const tell = `<label class="check"><input type="checkbox" data-bind="ui.op.notify" ${op.notify !== false ? 'checked' : ''}> <span>Email the customer${op.kind === 'change' ? ' their updated tickets' : ''}</span></label>`;
+  let title = '', body = '', foot = '';
+  if (op.kind === 'change') {
+    const rows = changeRows(o, op, live), net = rows.reduce((a, r) => a + (r.changed && r.pr ? r.pr.diff : 0), 0), cur0 = rows.find(r => r.t.id === op.cur) || rows.find(r => r.seated && !r.c.seat) || rows[0];
+    const curEv = cur0?.ev, slot = cur0?.slot;
+    let map = '';
+    if (cur0?.seated) {   // pick the new seat on the map: sold, blocked, unavailable and other buyers' checkouts are greyed out; held seats can be used by staff
+      const vac = new Set(rows.filter(r => r.ev === curEv && (r.t.slot_id || null) === slot).map(r => r.t.seat)), av = availabilityFrom(S.adm.tickets, curEv.id, S.adm.seatStatus.filter(r => r.status !== 'held'), '', S.adm.orders);
+      const off = new Set([...offSeats(av, slot)].filter(s => !vac.has(s)));
+      rows.filter(r => r.ev === curEv && r.slot === slot && r.c.seat && r !== cur0).forEach(r => off.add(r.c.seat));
+      const lvs = levelsOf(curEv.seating), lv = lvs.some(l => l.id === op.level) ? op.level : (layoutOf(curEv.seating).byId.get(cur0.seat)?.level ?? lvs[0].id);
+      map = `<div class="op-map"><div class="small" style="margin-bottom:6px">Choose the new seat for <b>${esc(cur0.t.code)}</b> (now ${esc(seatName(curEv, cur0.t.seat, true, cur0.t))}) — tap a seat.</div>
+        ${lvs.length > 1 ? `<div class="tabs sm-levels">${lvs.map(l => `<button type="button" class="${lv === l.id ? 'on' : ''}" data-action="opLevel" data-v="${esc(l.id)}">${esc(l.name)}</button>`).join('')}</div>` : ''}
+        <div class="sm-scroll">${SeatCanvas(curEv, { off, mine: [cur0.c.seat || cur0.t.seat], level: lv })}</div>
+        <div class="legend">${curEv.ticketTypes.filter(t => Object.values(curEv.seating.index || {}).includes(t.id)).map(t => `<span><i style="background:${tierColor(curEv, t.id)}"></i>${esc(t.name)} ${money(t.price, curEv.currency)}</span>`).join('')}<span><i style="background:#d7d4cb"></i>Taken / unavailable</span></div></div>`;
+    }
+    title = `Change ${rows.length} ticket${rows.length === 1 ? '' : 's'}`;
+    body = `<div class="tbl-wrap" style="box-shadow:none"><table class="tbl"><thead><tr><th>Ticket</th><th>Now</th><th>Change to</th>${can('tickets.pricing', o.event_ids[0]) ? '<th>Price override</th>' : ''}<th>Old</th><th>New</th><th>Difference</th></tr></thead><tbody>
+      ${rows.map(r => `<tr class="${r === cur0 && r.seated ? 'op-cur' : ''}"><td class="tnum"><b>${esc(r.t.code)}</b></td><td class="small">${esc(tkType(r.t))}<div class="muted">${esc(tkWhere(r.t))}</div></td>
+        <td class="small">${r.seated ? `<a href="#" data-action="opCur" data-id="${r.t.id}">${r.c.seat ? esc(seatName(r.ev, r.c.seat, true)) + ` · ${esc(r.tt?.name || 'not for sale')}` : 'pick a seat ↓'}</a>`
+          : `<select class="inp inp-sm" data-bind="ui.op.map.${r.t.id}.ticketTypeId">${r.ev.ticketTypes.map(x => `<option value="${x.id}" ${(r.c.ticketTypeId || r.t.ticket_type_id) === x.id ? 'selected' : ''}>${esc(x.name)} — ${money(listPrice(x, r.slot), cur)}</option>`).join('')}</select>`}
+          ${(r.ev.timeSlots || []).length ? `<select class="inp inp-sm" style="margin-top:4px" data-bind="ui.op.map.${r.t.id}.slotId">${r.ev.timeSlots.map(s => `<option value="${s.id}" ${r.slot === s.id ? 'selected' : ''}>${esc(fmtDT(s.start))}</option>`).join('')}</select>` : ''}</td>
+        ${can('tickets.pricing', o.event_ids[0]) ? `<td><input class="inp inp-sm" style="width:90px" type="number" min="0" step="0.01" data-action-change="opPrice" data-id="${r.t.id}" value="${r.c.price != null && r.c.price !== '' ? (r.c.price / 100).toFixed(2) : ''}" placeholder="auto"></td>` : ''}
+        <td class="tnum small">${money(r.t.paid, cur)}</td><td class="tnum small">${r.changed && r.pr ? money(r.pr.newPaid, cur) : '—'}</td>
+        <td class="tnum small">${r.changed && r.pr ? (r.pr.diff > 0 ? `<b style="color:var(--warn)">+${money(r.pr.diff, cur)}</b>` : r.pr.diff < 0 ? `<b style="color:var(--ok)">−${money(-r.pr.diff, cur)}</b>` : '$0') : '—'}</td></tr>`).join('')}</tbody></table></div>
+      ${map}
+      <div class="op-sum">${net > 0 ? `Amount due: <b>${money(net, cur)}</b>` : net < 0 ? `Difference to give back: <b>${money(-net, cur)}</b>` : 'No price difference.'}</div>
+      ${net > 0 ? `<div class="grid2">${opRow('Upgrade difference', opSel('settle', UPGRADE_SETTLE, op.settle))}${op.settle === 'collect' ? opRow('Paid by', opSel('method', PAY_METHODS, op.method)) : ''}</div>` : ''}
+      ${net < 0 ? `<div class="grid2">${opRow('Downgrade difference', opSel('downgrade', DOWNGRADE_SETTLE, op.downgrade))}${op.downgrade === 'refund' ? opRow('Refund to', opSel('to', { original: refundToOpts(o).original, cash: 'Cash', other: REFUND_TO.other }, op.to)) : ''}</div>${op.downgrade === 'eventCredit' ? creditOpts(op) : ''}` : ''}
+      ${note}${tell}`;
+    S.ui.op._net = net; S.ui.op._ready = rows.every(r => r.changed && r.tt);
+    foot = go(net > 0 ? `Change & ${op.settle === 'collect' ? 'collect ' + money(net, cur) : op.settle === 'due' ? 'add ' + money(net, cur) + ' due' : 'waive ' + money(net, cur)}` : net < 0 ? `Change & ${{ refund: 'refund', credit: 'credit', eventCredit: 'credit', none: 'keep' }[op.downgrade]} ${money(-net, cur)}` : 'Change tickets', 'btn-accent', !S.ui.op._ready);
+  } else if (op.kind === 'cancel') {
+    const ids = op.all ? live.map(t => t.id) : op.tickets || [], refund = op.refundMode && op.refundMode !== 'none';
+    let plan = null, err = ''; if (refund) try { plan = refundPlan(o, S.adm.tickets, { mode: op.refundMode === 'full' ? 'full' : 'tickets', tickets: ids, fees: op.refundMode === 'ticketsFees' }); } catch (e) { err = e.message; }
+    title = op.all ? 'Cancel the whole order' : `Cancel ${ids.length} ticket${ids.length === 1 ? '' : 's'}`;
+    body = `<p class="small muted" style="margin-bottom:10px">${ids.map(id => esc(live.find(t => t.id === id)?.code || '')).join(', ')}${op.all && o.data.lines.some(l => l.kind === 'addon') ? ' · and every product on the order' : ''}</p>
+      <div class="grid2">${opRow('Seats', opSel('seat', SEAT_AFTER_CANCEL, op.seat || 'release'))}${can('orders.refund', o.event_ids[0]) && wasPaid(o) ? opRow('Refund', opSel('refundMode', { none: 'Cancel without refund', tickets: 'Refund the ticket price', ticketsFees: 'Refund ticket price + booking fee', ...(op.all ? { full: 'Refund everything left on the order' } : {}) }, op.refundMode || 'none')) : ''}</div>
+      ${refund ? `<div class="grid2">${opRow('Refund to', opSel('to', refundToOpts(o), op.to || 'original'))}</div>${op.to === 'eventCredit' ? creditOpts(op) : ''}<div class="op-sum">${err ? `<span style="color:var(--bad)">${esc(err)}</span>` : `Refund: <b>${money(plan.amount, cur)}</b>`}</div>` : ''}
+      ${note}${tell}`;
+    foot = go(refund && plan ? `Cancel & refund ${money(plan.amount, cur)}` : 'Cancel tickets', 'btn-danger', refund && !plan);
+  } else if (op.kind === 'refund') {
+    let plan = null, err = '';
+    try { plan = refundPlan(o, S.adm.tickets, { mode: op.mode, tickets: Object.keys(S.ui.osel).filter(k => S.ui.osel[k]), fees: op.fees, pct: op.pct, amount: opDollars(op.amount) }); } catch (e) { err = e.message; }
+    title = 'Refund';
+    body = `<p class="small muted" style="margin-bottom:10px">${money(m.refundable, cur)} can still be refunded${m.refunded || m.credited ? ` (${money(m.refunded + m.credited, cur)} already given back)` : ''}.</p>
+      <div class="grid2">${opRow('How much', opSel('mode', { full: 'Full refund (everything left)', tickets: 'Selected tickets — ticket price', fees: 'Booking fee only', percent: 'A percentage', amount: 'A specific amount' }, op.mode))}
+        ${op.mode === 'percent' ? opRow('Percent', `<input class="inp" type="number" min="1" max="100" data-input="op.pct" data-rr="1" value="${esc(op.pct || '')}" placeholder="e.g. 50">`) : op.mode === 'amount' ? opRow('Amount ($)', opMoney('amount', op.amount, '0.00')) : op.mode === 'tickets' ? opRow('Booking fee', `<label class="check"><input type="checkbox" data-bind="ui.op.fees" ${op.fees ? 'checked' : ''}> <span>Refund their booking fee too</span></label>`) : ''}</div>
+      ${op.mode === 'tickets' ? `<p class="small muted">Tick the tickets in the list below. ${Object.keys(S.ui.osel).filter(k => S.ui.osel[k]).length} selected.</p>` : ''}
+      <div class="grid2">${opRow('Refund to', opSel('to', refundToOpts(o), op.to || 'original'))}
+        ${['full', 'tickets'].includes(op.mode) && o.status === 'paid' ? opRow('Tickets', `<label class="check"><input type="checkbox" data-bind="ui.op.cancel" ${op.cancel ? 'checked' : ''}> <span>Also cancel ${op.mode === 'full' ? 'all tickets' : 'the refunded tickets'}</span></label><div class="small muted">Leave unticked to refund without cancelling.</div>`) : ''}</div>
+      ${op.cancel && ['full', 'tickets'].includes(op.mode) ? `<div class="grid2">${opRow('Seats', opSel('seat', SEAT_AFTER_CANCEL, op.seat || 'release'))}</div>` : ''}
+      ${op.to === 'eventCredit' ? creditOpts(op) : ''}
+      <div class="op-sum">${err ? `<span style="color:var(--bad)">${esc(err)}</span>` : `Refund: <b>${money(plan.amount, cur)}</b>${plan.fees ? ` <span class="muted small">(incl. ${money(plan.fees, cur)} booking fee)</span>` : ''} ${['credit', 'eventCredit'].includes(op.to) ? '— issued as a credit code' : op.to === 'original' && o.payment?.ref ? '— back to the card' : ''}`}</div>
+      ${note}${tell}`;
+    foot = go(plan ? `Refund ${money(plan.amount, cur)}` : 'Refund', 'btn-danger', !plan);
+  } else if (op.kind === 'collect') {
+    title = 'Record a payment';
+    body = `<div class="grid2">${opRow('Amount ($)', opMoney('amount', op.amount, m.due ? (m.due / 100).toFixed(2) : '0.00'))}${opRow('Paid by', opSel('method', PAY_METHODS, op.method))}</div>
+      <div class="grid2">${opRow('Reference (optional)', opText('ref', op.ref, 'receipt / check no.'))}${opRow('For', opText('reason', op.reason, m.due ? 'Balance due' : 'Payment received'))}</div>
+      ${m.due && (S.adm.credits || []).some(c => c.email === o.buyer_email && c.status === 'active') && can('orders.refund') ? `<p class="small">This customer has credit — <a href="#/admin/customers/${encodeURIComponent(o.buyer_email)}">apply it from their profile</a>.</p>` : ''}${note}`;
+    foot = go('Record payment');
+  } else if (op.kind === 'addAddon') {
+    const ev = evById(op.eventId || o.event_ids[0]), ad = (ev?.addons || []).find(a => a.id === op.addonId) || ev?.addons?.[0], qty = Math.max(1, +op.qty || 1);
+    title = 'Add a product';
+    body = `${o.event_ids.length > 1 ? opRow('Event', `<select class="inp" data-bind="ui.op.eventId">${o.event_ids.map(id => `<option value="${id}" ${ev?.id === id ? 'selected' : ''}>${esc(evById(id)?.name || '')}</option>`).join('')}</select>`) : ''}
+      ${(ev?.addons || []).length ? `<div class="grid2">${opRow('Product', `<select class="inp" data-bind="ui.op.addonId">${ev.addons.map(a => `<option value="${a.id}" ${ad?.id === a.id ? 'selected' : ''}>${esc(a.name)} — ${money(a.price, cur)}</option>`).join('')}</select>`)}${opRow('Quantity', `<input class="inp" type="number" min="1" data-input="op.qty" data-rr="1" value="${esc(op.qty || 1)}">`)}</div>
+      <div class="grid2">${opRow(`Charge ${money(cents(ad?.price) * qty, cur)}`, opSel('settle', UPGRADE_SETTLE, op.settle))}${op.settle === 'collect' ? opRow('Paid by', opSel('method', PAY_METHODS, op.method)) : ''}</div>${note}` : '<p class="small muted">This event has no products.</p>'}`;
+    foot = (ev?.addons || []).length ? go('Add product') : '';
+  } else if (op.kind === 'removeAddon') {
+    const l = o.data.lines[+op.line], left = l ? l.qty - (l.removed || 0) : 0, qty = Math.min(left, Math.max(1, +op.qty || left));
+    title = 'Remove a product';
+    body = l ? `<p class="small" style="margin-bottom:10px">${l.qty} × ${esc(l.name)}${l.removed ? ` (${l.removed} already removed)` : ''}</p>
+      <div class="grid2">${opRow('How many', `<input class="inp" type="number" min="1" max="${left}" data-input="op.qty" data-rr="1" value="${esc(qty)}">`)}${can('orders.refund', o.event_ids[0]) && wasPaid(o) && l.unit ? opRow('Refund', opSel('refund', { '': 'No refund', original: 'Refund to the original payment', credit: 'Refund as account credit', cash: 'Refund in cash' }, op.refund || '')) : ''}</div>
+      ${op.refund ? `<div class="op-sum">Refund: <b>${money(Math.min(l.unit * qty, m.refundable), cur)}</b></div>` : ''}${note}` : '';
+    foot = go('Remove', 'btn-danger');
+  } else if (op.kind === 'customer') {
+    title = 'Edit customer details';
+    body = `<div class="grid2">${opRow('Name', opText('name', op.name))}${opRow('Email', opText('email', op.email))}</div><div class="grid2">${opRow('Phone', opText('phone', op.phone))}</div>
+      <p class="small muted">The change is kept in the order history with the old details.</p>${note}`;
+    foot = go('Save details');
+  } else if (op.kind === 'holder') {
+    const t = live.find(x => x.id === op.ticket);
+    title = `Ticket ${esc(t?.code || '')} — holder`;
+    body = `${opRow('Name on the ticket', opText('name', op.name, 'New guest name'))}<p class="small muted">Use this when a ticket is passed to someone else. The ticket code stays the same.</p>${note}`;
+    foot = go('Save');
+  } else if (op.kind === 'message') {
+    title = `Message ${esc(o.data.buyer.name)}`;
+    body = `${opRow('Subject', opText('subject', op.subject, 'About your order ' + o.ref))}${opRow('Message', `<textarea class="inp" rows="4" data-input="op.body">${esc(op.body || '')}</textarea>`)}<p class="small muted">Sent to ${esc(o.buyer_email)} and kept on the order.</p>`;
+    foot = go('Send message');
+  } else if (op.kind === 'markPaid') {
+    title = 'Mark paid & issue tickets';
+    body = `${opRow('Paid by', opSel('method', PAY_METHODS, op.method))}<p class="small muted">The tickets are issued now and the confirmation email is queued.</p>${note}`;
+    foot = go('Mark paid', 'btn-dark');
+  } else if (op.kind === 'cancelUnpaid') {
+    title = 'Cancel this reservation'; body = `<p class="small">Nothing was paid, so there's nothing to refund. The seats and stock go back on sale.</p>${note}`; foot = go('Cancel reservation', 'btn-danger');
+  }
+  return `<div class="card op-card"><div class="between"><h3>${title}</h3><button class="icon-btn" data-action="opClose" aria-label="Close">${ic('x', 14)}</button></div><div class="stack" style="margin-top:12px">${body}</div><div class="row wrap" style="margin-top:14px;justify-content:flex-end">${close}${foot}</div></div>`;
+}
+// the server call for the open panel
+function opPayload(o) {
+  const op = S.ui.op, sel = Object.keys(S.ui.osel).filter(k => S.ui.osel[k]), note = op.note || '', notify = op.notify !== false;
+  switch (op.kind) {
+    case 'change': return { changes: op.tickets.map(id => ({ ticket: id, ...op.map[id] })), settle: op.settle, method: op.method, downgrade: op.downgrade, to: op.to, creditEvent: op.creditEvent || op._ev, creditExpires: op.creditExpires ? new Date(op.creditExpires + 'T23:59').toISOString() : null, note, notify };
+    case 'cancel': { const r = op.refundMode && op.refundMode !== 'none'; return { all: !!op.all, tickets: op.all ? [] : op.tickets, seat: op.seat || 'release', note, notify,
+      refund: r ? { mode: op.refundMode === 'full' ? 'full' : 'tickets', fees: op.refundMode === 'ticketsFees', to: op.to || 'original', creditEvent: op.creditEvent || op._ev, creditExpires: op.creditExpires ? new Date(op.creditExpires + 'T23:59').toISOString() : null } : null }; }
+    case 'refund': return { mode: op.mode, tickets: sel, fees: !!op.fees, pct: op.pct, amount: opDollars(op.amount), to: op.to || 'original', cancel: !!op.cancel, seat: op.seat || 'release', creditEvent: op.creditEvent || op._ev, creditExpires: op.creditExpires ? new Date(op.creditExpires + 'T23:59').toISOString() : null, note, notify };
+    case 'collect': return { amount: opDollars(op.amount) ?? orderMoney(o).due, method: op.method, ref: op.ref, reason: op.reason || (orderMoney(o).due ? 'Balance due' : 'Payment received'), note };
+    case 'addAddon': { const ev = evById(op.eventId || o.event_ids[0]); return { eventId: ev?.id, addonId: op.addonId || ev?.addons?.[0]?.id, qty: Math.max(1, +op.qty || 1), settle: op.settle, method: op.method, note }; }
+    case 'removeAddon': { const l = o.data.lines[+op.line]; return { line: +op.line, qty: Math.min(l.qty - (l.removed || 0), Math.max(1, +op.qty || l.qty - (l.removed || 0))), refund: !!op.refund, to: op.refund || 'original', note }; }
+    case 'customer': return { name: op.name, email: op.email, phone: op.phone, note };
+    case 'holder': return { ticket: op.ticket, name: op.name, note };
+    case 'message': return { subject: op.subject || 'About your order ' + o.ref, body: op.body };
+    case 'markPaid': return { method: op.method, note };
+    default: return { note };
+  }
+}
+const OP_DONE = { change: 'Tickets changed — new tickets issued', cancel: 'Cancelled', refund: 'Refund issued', collect: 'Payment recorded', addAddon: 'Product added', removeAddon: 'Product removed', customer: 'Customer details saved',
+  holder: 'Holder changed', message: 'Message queued', markPaid: 'Marked paid — tickets issued', cancelUnpaid: 'Reservation cancelled', note: 'Note added', resend: 'Tickets re-sent' };
+
+// ── Customers (Stage 6 §7): one record per email across all of this box office's orders ──
+function customerIndex() {
+  const by = {};
+  for (const o of S.adm.orders) { if (o.status === 'expired') continue; const c = by[o.buyer_email] ||= { email: o.buyer_email, name: o.data.buyer.name, phone: o.data.buyer.phone || '', orders: [], last: o.created_at };
+    c.orders.push(o); if (D(o.created_at) >= D(c.last)) { c.last = o.created_at; c.name = o.data.buyer.name; c.phone = o.data.buyer.phone || c.phone; } }
+  for (const cr of S.adm.credits || []) by[cr.email] ||= { email: cr.email, name: cr.name, phone: '', orders: [], last: cr.issued_at };
+  return Object.values(by).map(c => { const ids = new Set(c.orders.map(o => o.id)), tks = S.adm.tickets.filter(t => ids.has(t.order_id) && t.status !== 'replaced');
+    return { ...c, tickets: tks, spent: sum(c.orders, o => orderMoney(o).net), refunds: sum(c.orders, o => orderMoney(o).refunded + orderMoney(o).credited), credit: sum((S.adm.credits || []).filter(x => x.email === c.email && x.status === 'active'), x => x.remaining), account: (S.adm.accounts || []).includes(c.email) }; });
+}
+function Customers() {
+  if (S.route.params[0]) return CustomerView(S.route.params[0]);
+  const q = String(S.ui.cq || '').trim().toLowerCase(), all = customerIndex(), list = all.filter(c => !q || [c.name, c.email, c.phone].join(' ').toLowerCase().includes(q)).sort((a, b) => D(b.last) - D(a.last));
+  return head('Customers', `${all.length} customers · ${all.filter(c => c.account).length} with an account`, can('customers.export') ? '<button class="btn btn-ghost" data-action="exportCustomers">Export CSV</button>' : '') + `
+  <div class="toolbar"><input class="inp" style="flex:1" data-input="cq" data-rr="1" placeholder="Search name, email or phone…" value="${esc(S.ui.cq || '')}"></div>
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Customer</th><th>Orders</th><th>Tickets</th><th>Spent</th><th>Refunds</th><th>Credit</th><th>Account</th><th>Last order</th></tr></thead><tbody>
+  ${list.slice(0, 400).map(c => `<tr class="click" data-action="go" data-v="#/admin/customers/${encodeURIComponent(c.email)}"><td><b>${esc(c.name)}</b><div class="small muted">${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''}</div></td>
+    <td class="tnum">${c.orders.length}</td><td class="tnum">${c.tickets.filter(t => t.status === 'valid').length}</td><td class="tnum">${money(c.spent)}</td><td class="tnum">${c.refunds ? money(c.refunds) : '—'}</td><td class="tnum">${c.credit ? `<span class="chip ok mini">${money(c.credit)}</span>` : '—'}</td>
+    <td>${c.account ? '<span class="chip ok mini">yes</span>' : '<span class="muted small">guest</span>'}</td><td class="small muted">${esc(fmtDT(c.last))}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No customers match.</td></tr>'}</tbody></table></div>`;
+}
+function CustomerView(email) {
+  const c = customerIndex().find(x => x.email === email);
+  if (!c) return `<a href="#/admin/customers" class="small muted" style="text-decoration:none">← Customers</a><div class="empty">Customer not found.</div>`;
+  const now = Date.now(), valid = c.tickets.filter(t => t.status === 'valid'), when = t => D(evById(t.event_id)?.timeSlots?.find(s => s.id === t.slot_id)?.start || evById(t.event_id)?.start);
+  const upcoming = valid.filter(t => when(t) >= now).sort((a, b) => when(a) - when(b)), past = c.tickets.filter(t => when(t) < now || t.status !== 'valid');
+  const credits = (S.adm.credits || []).filter(x => x.email === email), notes = (S.adm.custNotes || []).filter(n => n.email === email);
+  const codes = [...new Set(c.orders.map(o => o.data.code).filter(Boolean))], refs = [...new Set(c.orders.map(o => o.data.tracking).filter(Boolean))];
+  const prods = {}; c.orders.forEach(o => o.data.lines.filter(l => l.kind === 'addon').forEach(l => { prods[l.name] = (prods[l.name] || 0) + l.qty - (l.removed || 0); }));
+  const comps = c.tickets.filter(t => t.comp && t.status === 'valid').length, tkRow = t => `<div class="between small line"><span><b>${esc(evById(t.event_id)?.name || '')}</b> · ${esc(tkType(t))}<div class="muted">${esc(tkWhere(t))} · ${esc(t.code)}</div></span>
+    <span>${TK_CHIP[t.status] || (t.checked_in_at ? '<span class="chip ok mini">checked in</span>' : '')} <a href="#/admin/orders/${t.order_id}" class="small">order</a></span></div>`;
+  const kpi = (l, v, d = '') => `<div class="kpi"><div class="eyebrow">${l}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`;
+  const cu = S.ui.cust?.email === email ? S.ui.cust : (S.ui.cust = { email, amount: '', eventId: '', expires: '', note: '' });
+  return `<a href="#/admin/customers" class="small muted" style="text-decoration:none">← Customers</a>
+  ${head(esc(c.name), `${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''} · ${c.account ? '<span class="chip ok mini">customer account</span>' : '<span class="chip mini">guest — no account</span>'}`)}
+  <div class="kpis">${kpi('Total spent', money(c.spent), `${c.orders.length} order${c.orders.length === 1 ? '' : 's'}`)}${kpi('Tickets', valid.length, `${upcoming.length} upcoming · ${comps} comp`)}${kpi('Refunds', money(c.refunds))}${kpi('Credit balance', money(c.credit), `${credits.length} credit${credits.length === 1 ? '' : 's'}`)}</div>
+  <div class="ord-grid"><div class="stack">
+    <div class="card"><h3>Upcoming events & current tickets</h3>${upcoming.map(tkRow).join('') || '<p class="small muted" style="margin-top:6px">No upcoming tickets.</p>'}</div>
+    <div class="card" style="padding:0"><div style="padding:16px 20px 6px"><h3>Order history</h3></div><table class="tbl"><thead><tr><th>Order</th><th>Event</th><th>Status</th><th>Total</th><th>Refunded</th><th>Placed</th></tr></thead><tbody>
+      ${c.orders.slice().sort((a, b) => D(b.created_at) - D(a.created_at)).map(o => { const m = orderMoney(o); return `<tr class="click" data-action="openOrder" data-id="${o.id}"><td class="tnum"><b>${esc(o.ref)}</b></td><td class="small">${esc([...new Set(o.data.lines.map(l => l.eventName))].join(', '))}</td><td>${statusChip(o.status)}</td><td class="tnum">${money(o.data.total, o.data.currency)}</td><td class="tnum">${m.refunded + m.credited ? money(m.refunded + m.credited) : '—'}</td><td class="small muted">${esc(fmtDT(o.created_at))}</td></tr>`; }).join('') || '<tr><td colspan="6" class="muted">No orders.</td></tr>'}</tbody></table></div>
+    <div class="card"><h3>Past & cancelled tickets</h3>${past.slice(0, 60).map(tkRow).join('') || '<p class="small muted" style="margin-top:6px">None.</p>'}</div>
+  </div><div class="stack">
+    <div class="card"><h3>Credits</h3>${credits.map(x => `<div class="line"><div class="between small"><span><code>${esc(x.code)}</code> · ${money(x.amount)}${x.event_id ? ' · for ' + esc(evById(x.event_id)?.name || 'an event') : ' · any event'}</span><span class="chip mini ${x.status === 'active' ? 'ok' : x.status === 'revoked' ? 'bad' : ''}">${esc(x.status)}</span></div>
+        <div class="small muted">${money(x.remaining)} left · ${money(x.used)} used${x.uses.length ? ' on ' + x.uses.map(u => esc(u.ref)).join(', ') : ''} · issued ${esc(fmtDT(x.issued_at))} by ${esc(x.issued_by || '')}${x.source_ref ? ' from ' + esc(x.source_ref) : ''}${x.expires ? ' · expires ' + esc(fmtDate(x.expires, { month: 'short', day: 'numeric', year: 'numeric' })) : ''}${x.revoked_at ? ' · revoked by ' + esc(x.revoked_by) : ''}</div>
+        ${x.status === 'active' && can('orders.refund') ? `<div class="row" style="margin-top:4px">${c.orders.some(o => o.data.due) ? `<button class="btn btn-ghost btn-sm" data-action="creditApply" data-id="${x.id}">Apply to balance due</button>` : ''}<button class="btn btn-ghost btn-sm" data-action="creditRevoke" data-id="${x.id}">Revoke</button></div>` : ''}</div>`).join('') || '<p class="small muted" style="margin-top:6px">No credits.</p>'}
+      ${can('orders.refund') ? `<div class="sep"></div><div class="fl">Issue credit</div><div class="grid2"><input class="inp" type="number" min="0" step="0.01" data-input="cust.amount" value="${esc(cu.amount)}" placeholder="Amount $">
+        <select class="inp" data-input="cust.eventId"><option value="">Any event</option>${futureEvents().map(e => `<option value="${e.id}" ${cu.eventId === e.id ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select></div>
+        <div class="grid2" style="margin-top:8px"><input class="inp" type="date" data-input="cust.expires" value="${esc(cu.expires)}" title="Expires (optional)"><input class="inp" data-input="cust.note" value="${esc(cu.note)}" placeholder="Reason"></div>
+        <button class="btn btn-dark btn-sm" style="margin-top:8px" data-action="creditIssue">Issue credit</button>` : ''}</div>
+    <div class="card"><h3>Internal notes</h3>${notes.map(n => `<div class="note-row"><div class="small">${esc(n.body)}</div><div class="small muted">${esc(n.by)} · ${esc(fmtDT(n.at))}</div></div>`).join('') || '<p class="small muted" style="margin:6px 0">No notes yet.</p>'}
+      <textarea class="inp" rows="2" data-input="cnote" placeholder="Add a note about this customer…">${esc(S.ui.cnote || '')}</textarea><button class="btn btn-ghost btn-sm" style="margin-top:6px" data-action="custNote" data-v="${esc(email)}">Add note</button></div>
+    <div class="card"><h3>Codes & products</h3>
+      <div class="small" style="margin-top:6px"><span class="muted">Promo codes used:</span> ${codes.map(x => `<span class="chip mini">${esc(x)}</span>`).join(' ') || '—'}</div>
+      <div class="small" style="margin-top:6px"><span class="muted">Referral / tracking codes:</span> ${refs.map(x => `<span class="chip mini">${esc(x)}</span>`).join(' ') || '—'}</div>
+      <div class="small" style="margin-top:6px"><span class="muted">Products bought:</span> ${Object.entries(prods).filter(([, n]) => n > 0).map(([k, n]) => `${esc(k)} × ${n}`).join(', ') || '—'}</div>
+      <div class="small" style="margin-top:6px"><span class="muted">Complimentary tickets:</span> ${comps || '—'}</div></div>
+  </div></div>`;
+}
+
+// ── Live event activity (Stage 6 §9): people on the page now, carts, seats tied up in checkout vs sold, conversion, sources ──
+function liveData(ev) {
+  const now = Date.now(), L = S.adm.live?.[ev.id] || { now: 0, carts: 0, cartTickets: 0, carted: 0, converted: 0, abandoned: 0 }, v = S.adm.views?.[ev.id] || { total: 0, unique: 0, today: 0, last10m: 0, bySrc: {} };
+  const os = S.adm.orders.filter(o => o.event_ids.includes(ev.id)), checkouts = os.filter(o => o.status === 'awaiting_payment' && D(o.expires_at) > now);
+  const holds = (S.adm.seatStatus || []).filter(r => r.event_id === ev.id && r.status === 'checkout' && D(r.expires_at) > now).length;
+  const inCheckout = sum(checkouts, o => sum(o.data.lines.filter(l => l.eventId === ev.id), l => lineUnits(l).filter(u => u.seat).length));
+  const sold = S.adm.tickets.filter(t => t.event_id === ev.id && t.status === 'valid').length, done = os.filter(o => wasPaid(o) || o.status === 'pending');
+  const started = os.filter(o => o.data.payment !== 'manual' && D(o.created_at) >= now - 30 * 864e5), completed = started.filter(o => wasPaid(o) || o.status === 'pending');
+  const sales = {}; done.forEach(o => { const k = o.data.tracking ? 'ref: ' + o.data.tracking : o.data.source || 'direct'; (sales[k] ||= { orders: 0, rev: 0 }).orders++; sales[k].rev += sum(o.data.lines.filter(l => l.eventId === ev.id), l => l.unit * l.qty - (l.disc || 0)); });
+  return { L, v, checkouts, holds, inCheckout, sold, started, completed, sales, last10: done.filter(o => D(o.paid_at || o.created_at) >= now - 6e5).length, today: done.filter(o => D(o.paid_at || o.created_at) >= new Date().setHours(0, 0, 0, 0)).length,
+    feed: os.filter(o => o.status !== 'expired').sort((a, b) => D(b.created_at) - D(a.created_at)).slice(0, 10) };
+}
+function EdLive(ev) {
+  const x = liveData(ev), L = x.L, pct = (a, b) => b ? Math.round(a / b * 100) + '%' : '—', fin = can('finance.totals');
+  const kpi = (l, val, d = '', dark) => `<div class="kpi ${dark ? 'dark' : ''}"><div class="eyebrow">${l}</div><div class="v">${val}</div>${d ? `<div class="d" ${dark ? 'style="color:var(--mut)"' : ''}>${d}</div>` : ''}</div>`;
+  const tied = x.holds + x.inCheckout, cap = Math.max(1, x.sold + tied);
+  return `<div class="between" style="margin:4px 0 12px"><div class="eyebrow dash">Live right now</div><span class="small muted"><span class="live-dot"></span> updates every 15 seconds · ${esc(fmtTime(new Date().toISOString()))}</span></div>
+  <div class="kpis">${kpi('Viewing now', L.now, 'people on the event page', true)}${kpi('Active carts', L.carts, `${L.cartTickets} ticket${L.cartTickets === 1 ? '' : 's'} in carts`)}${kpi('Seats held in checkout', tied, `${x.checkouts.length} checkout${x.checkouts.length === 1 ? '' : 's'} paying now`)}${kpi('Orders · last 10 min', x.last10, `${x.today} today`)}</div>
+  <div class="kpis">${kpi('Views today', x.v.today.toLocaleString(), `${x.v.total.toLocaleString()} total · ${x.v.unique.toLocaleString()} unique visitors`)}${kpi('Cart abandonment', L.abandoned, `${pct(L.abandoned, L.abandoned + L.converted)} of carts`)}${kpi('Checkout conversion', pct(x.completed.length, x.started.length), `${x.completed.length} of ${x.started.length} checkouts · 30 days`)}${kpi('Visitor → order', pct(L.converted, x.v.unique), `${L.converted} visitors ordered`)}</div>
+  <div class="card" style="margin-bottom:16px"><h3>Seats: tied up in checkout vs sold</h3><div class="stackbar" style="margin-top:10px"><i class="s-sold" style="width:${x.sold / cap * 100}%"></i><i class="s-tied" style="width:${tied / cap * 100}%"></i></div>
+    <div class="legend" style="margin-top:8px"><span><i style="background:var(--ink)"></i>Sold / issued ${x.sold}</span><span><i style="background:#e8a33d"></i>In checkout right now ${tied}${x.holds ? ` (${x.holds} held while choosing, ${x.inCheckout} paying)` : ''}</span></div></div>
+  <div class="cols"><div class="card"><h3>Live sales</h3>${x.feed.map(o => `<div class="between small line click" data-action="openOrder" data-id="${o.id}"><span><b>${esc(o.data.buyer.name)}</b> · ${sum(o.data.lines.filter(l => l.eventId === ev.id), l => lineUnits(l).length)} ticket(s)<div class="muted">${esc(ago(o.created_at))}${o.data.tracking ? ' · ref ' + esc(o.data.tracking) : o.data.source ? ' · ' + esc(o.data.source) : ''}</div></span><span>${statusChip(o.status)}</span></div>`).join('') || '<p class="small muted">No orders yet.</p>'}</div>
+    <div class="stack"><div class="card"><h3>Traffic sources</h3>${Object.entries(x.v.bySrc || {}).sort((a, b) => b[1] - a[1]).map(([k, n]) => `<div class="between small line"><span>${esc(k)}</span><b class="tnum">${n}</b></div>`).join('') || '<p class="small muted">No views yet.</p>'}</div>
+      <div class="card"><h3>Sales by source</h3>${Object.entries(x.sales).sort((a, b) => b[1].orders - a[1].orders).map(([k, s]) => `<div class="between small line"><span>${esc(k)}</span><span class="tnum">${s.orders} order${s.orders === 1 ? '' : 's'}${fin ? ' · ' + money(s.rev) : ''}</span></div>`).join('') || '<p class="small muted">No sales yet.</p>'}</div></div></div>`;
+}
+// seats staff can't use right now: sold / reserved, blocked, unavailable, in a buyer's checkout (held seats are fine for staff)
+const staffOff = (ev, slot) => offSeats(availabilityFrom(S.adm.tickets, ev.id, S.adm.seatStatus.filter(r => r.status !== 'held'), '', S.adm.orders), slot);
+function adminPickSeat(seat) {
+  if (S.ui.op?.kind === 'change') {
+    const o = S.adm.orders.find(x => x.id === S.ui.oid), rows = changeRows(o, S.ui.op, S.adm.tickets.filter(t => t.order_id === o.id && t.status === 'valid'));
+    const cur = rows.find(r => r.t.id === S.ui.op.cur) || rows.find(r => r.seated && !r.c.seat) || rows[0]; if (!cur) return;
+    S.ui.op.map[cur.t.id] = { ...(S.ui.op.map[cur.t.id] || {}), seat };
+    const next = rows.find(r => r.seated && r !== cur && !S.ui.op.map[r.t.id]?.seat); S.ui.op.cur = next ? next.t.id : cur.t.id;
+    return render();
+  }
+  if (S.ui.mo && S.route.params[0] === 'new') { const a = S.ui.mo.seats, i = a.indexOf(seat); if (i >= 0) a.splice(i, 1); else a.push(seat); render(); }
+}
+function adminPickGa(code) {   // a standing area on a seated map: take its next free spot
+  const o = S.ui.op?.kind === 'change' && S.adm.orders.find(x => x.id === S.ui.oid);
+  const row = o && changeRows(o, S.ui.op, S.adm.tickets.filter(t => t.order_id === o.id && t.status === 'valid')).find(r => r.t.id === S.ui.op.cur || r.seated);
+  const ev = row ? row.ev : evById(S.ui.mo?.ev); if (!ev) return;
+  const slot = row ? row.slot : ev.timeSlots?.length ? S.ui.mo.slot || ev.timeSlots[0].id : null, off = staffOff(ev, slot), taken = new Set(row ? Object.values(S.ui.op.map).map(x => x.seat) : S.ui.mo.seats);
+  const spot = layoutOf(ev.seating).secs.find(g => g.sec.code === code)?.local.find(p => p.tt && !off.has(p.id) && !taken.has(p.id));
+  if (!spot) return toast('No free spots left there', true);
+  adminPickSeat(spot.id);
+}
+// ── Manual / admin orders (Stage 6 §6): exact seats, comps, price override, promo code, products, offline payment + method, send now or not ──
+function ManualOrder() {
+  const m = S.ui.mo ||= { ev: S.adm.events.filter(e => e.status === 'published')[0]?.id || S.adm.events[0]?.id, tt: '', qty: 1, slot: '', seats: [], adds: {}, name: '', email: '', phone: '', pay: 'cash', ref: '', send: true, code: '', price: '', comp: false, credit: '' };
+  const ev = evById(m.ev), seated = !!ev?.seating?.enabled, slot = ev?.timeSlots?.length ? m.slot || ev.timeSlots[0].id : null;
+  const tt = ev && (ev.ticketTypes.find(t => t.id === m.tt) || ev.ticketTypes[0]), cur = ev?.currency;
+  let map = '', q = null, err = '';
+  if (ev && seated) {
+    const off = staffOff(ev, slot), lvs = levelsOf(ev.seating), lv = lvs.some(l => l.id === m.level) ? m.level : lvs[0].id;
+    map = `<div class="card"><div class="between"><h3>Seats</h3><span class="small muted">${m.seats.length} selected — tap seats to add or remove · held seats can be sold by staff</span></div>
+      ${lvs.length > 1 ? `<div class="tabs sm-levels">${lvs.map(l => `<button type="button" class="${lv === l.id ? 'on' : ''}" data-action="moLevel" data-v="${esc(l.id)}">${esc(l.name)}</button>`).join('')}</div>` : ''}
+      <div class="sm-scroll">${SeatCanvas(ev, { off, mine: m.seats, level: lv })}</div>
+      <div class="legend">${ev.ticketTypes.filter(t => Object.values(ev.seating.index || {}).includes(t.id)).map(t => `<span><i style="background:${tierColor(ev, t.id)}"></i>${esc(t.name)} ${money(t.price, cur)}</span>`).join('')}</div></div>`;
+  }
+  const items = ev ? seated ? [...new Set(m.seats.map(s => ev.seating.index[s]))].map(id => ({ eventId: ev.id, ticketTypeId: id, qty: m.seats.filter(s => ev.seating.index[s] === id).length, slotId: slot, seats: m.seats.filter(s => ev.seating.index[s] === id) }))
+    : tt ? [{ eventId: ev.id, ticketTypeId: tt.id, qty: Math.max(1, +m.qty || 1), slotId: slot }] : [] : [];
+  const price = !m.comp && String(m.price ?? '').trim() !== '' ? Math.round(parseFloat(m.price) * 100) : undefined;
+  if (price !== undefined) items.forEach(i => { i.price = price; });
+  const addons = Object.entries(m.adds || {}).filter(([, n]) => +n > 0).map(([id, n]) => ({ eventId: ev.id, addonId: id, qty: +n }));
+  if (ev && (items.length || addons.length)) try { q = quote({ items, addons }, S.adm.events, pricingSettings(S.adm.bo, S.platform), null, { manual: true, avail: { [ev.id]: availabilityFrom(S.adm.tickets, ev.id, [], '', S.adm.orders) } }); } catch (e) { err = e.message; }
+  const credits = (S.adm.credits || []).filter(c => c.email === String(m.email || '').trim().toLowerCase() && c.status === 'active' && (!c.event_id || c.event_id === ev?.id));
+  S.ui.moItems = { items, addons };
+  return `<a href="#/admin/orders" class="small muted" style="text-decoration:none">← Orders</a>${head('New manual order', 'Phone sales, box-office sales and complimentary tickets')}
+  <div class="ord-grid"><div class="stack">
+    <div class="card"><div class="grid2">${opRow('Event', `<select class="inp" data-input="mo.ev" data-rr="1">${evOptions(m.ev, 'Choose…')}</select>`)}
+      ${ev?.timeSlots?.length ? opRow('Showtime', `<select class="inp" data-input="mo.slot" data-rr="1">${ev.timeSlots.map(s => `<option value="${s.id}" ${slot === s.id ? 'selected' : ''}>${esc(fmtDT(s.start))}</option>`).join('')}</select>`) : ''}</div>
+      ${ev && !seated ? `<div class="grid2">${opRow('Ticket type', `<select class="inp" data-input="mo.tt" data-rr="1">${ev.ticketTypes.map(t => `<option value="${t.id}" ${tt?.id === t.id ? 'selected' : ''}>${esc(t.name)} — ${money(t.price, cur)}${t.adminOnly ? ' (box office only)' : ''}</option>`).join('')}</select>`)}${opRow('Quantity', `<input class="inp" type="number" min="1" data-input="mo.qty" data-rr="1" value="${esc(m.qty)}">`)}</div>` : ''}
+      ${(ev?.addons || []).length ? `<div class="fl" style="margin-top:6px">Products & add-ons</div>${ev.addons.map(a => `<div class="between small line"><span>${esc(a.name)} · ${money(a.price, cur)}</span><input class="inp inp-sm" style="width:80px" type="number" min="0" data-action-change="moAdd" data-id="${a.id}" value="${esc(m.adds?.[a.id] || '')}" placeholder="0"></div>`).join('')}` : ''}</div>
+    ${map}
+  </div><div class="stack">
+    <div class="card"><h3>Customer</h3><div class="field"><label class="fl">Name</label><input class="inp" data-input="mo.name" value="${esc(m.name)}"></div>
+      <div class="grid2"><div class="field"><label class="fl">Email</label><input class="inp" data-input="mo.email" data-rr="1" value="${esc(m.email)}"></div><div class="field"><label class="fl">Phone</label><input class="inp" data-input="mo.phone" value="${esc(m.phone)}"></div></div></div>
+    <div class="card"><h3>Price & payment</h3>
+      ${ev && can('tickets.comps', ev.id) ? `<label class="check"><input type="checkbox" data-bind="ui.mo.comp" ${m.comp ? 'checked' : ''}> <span>Complimentary — free, keeps the real ticket type and face value</span></label>` : ''}
+      ${!m.comp && ev && can('tickets.pricing', ev.id) ? opRow('Price override (each ticket)', `<input class="inp" type="number" min="0" step="0.01" data-input="mo.price" data-rr="1" value="${esc(m.price ?? '')}" placeholder="Normal price">`) : ''}
+      ${!m.comp ? `<div class="grid2">${opRow('Promo code', `<input class="inp" data-input="mo.code" value="${esc(m.code)}" placeholder="optional">`)}${credits.length ? opRow('Use credit', `<select class="inp" data-input="mo.credit" data-rr="1"><option value="">No</option>${credits.map(c => `<option value="${c.id}" ${m.credit === c.id ? 'selected' : ''}>${esc(c.code)} · ${money(c.remaining)} left</option>`).join('')}</select>`) : ''}</div>
+        <div class="grid2">${opRow('Paid by', `<select class="inp" data-input="mo.pay" data-rr="1">${Object.entries(PAY_METHODS).map(([k, t]) => `<option value="${k}" ${m.pay === k ? 'selected' : ''}>${t}</option>`).join('')}</select>`)}${opRow('Payment reference', `<input class="inp" data-input="mo.ref" value="${esc(m.ref)}" placeholder="receipt / check no.">`)}</div>` : ''}
+      ${q ? Breakdown(m.comp ? { ...q, ticketsTotal: 0, addonsTotal: 0, fee: 0, feeDiscount: 0, serviceFee: 0, tax: 0, discount: 0, total: 0 } : q, '') : `<p class="small muted">${esc(err || (seated ? 'Pick seats on the map.' : 'Choose tickets.'))}</p>`}
+      <label class="check" style="margin-top:10px"><input type="checkbox" data-bind="ui.mo.send" ${m.send !== false ? 'checked' : ''}> <span>Send the tickets to the customer now</span></label>
+      <button class="btn btn-accent btn-block" style="margin-top:12px" data-action="saveManual" ${q ? '' : 'disabled'}>Create order</button></div>
+  </div></div>`;
 }
 // The order confirmation: ONE email per order with every ticket and its Area / Row / Seat, plus one PDF of all tickets.
 function OrderEmail(o, tks) {
@@ -1762,19 +2149,6 @@ function OrderEmail(o, tks) {
     <div class="em-btn">View &amp; download your tickets</div>
     <p class="small muted">📎 tickets-${esc(o.ref)}.pdf — ${valid.length} page${valid.length === 1 ? '' : 's'}, one ticket per page with its QR code</p>
     <div class="em-tot"><span>Order total</span><b>${money(d.total, d.currency)}</b></div></div>`;
-}
-function ManualOrderModal() {
-  const m = S.ui.mo || (S.ui.mo = { ev: S.adm.events[0]?.id, tt: '', qty: 1, slot: '', name: '', email: '', status: 'paid' });
-  const ev = S.adm.events.find(e => e.id === m.ev);
-  modal('Manual order', `<p class="small muted" style="margin-bottom:14px">Comp tickets, phone sales or box-office cash. Seats are assigned automatically for seated events.</p>
-    <div class="field"><label class="fl">Event</label><select class="inp" data-input="mo.ev" data-rerender="1">${evOptions(m.ev, 'Choose…')}</select></div>
-    ${ev ? `<div class="grid2"><div class="field"><label class="fl">Ticket type</label><select class="inp" data-input="mo.tt">${ev.ticketTypes.map(t => `<option value="${t.id}" ${m.tt === t.id ? 'selected' : ''}>${esc(t.name)} — ${money(t.price)}</option>`).join('')}</select></div>
-      <div class="field"><label class="fl">Quantity</label><input class="inp" type="number" min="1" data-input="mo.qty" value="${esc(m.qty)}"></div></div>
-      ${ev.timeSlots?.length ? `<div class="field"><label class="fl">Time slot</label><select class="inp" data-input="mo.slot">${ev.timeSlots.map(s => `<option value="${s.id}" ${m.slot === s.id ? 'selected' : ''}>${esc(fmtDT(s.start))}</option>`).join('')}</select></div>` : ''}` : ''}
-    <div class="grid2"><div class="field"><label class="fl">Buyer name</label><input class="inp" data-input="mo.name" value="${esc(m.name)}"></div><div class="field"><label class="fl">Buyer email</label><input class="inp" data-input="mo.email" value="${esc(m.email)}"></div></div>
-    ${ev && can('tickets.pricing', ev.id) && !m.comp ? `<div class="field"><label class="fl">Price override (each)</label><input class="inp" type="number" min="0" step="0.01" data-input="mo.price" value="${esc(m.price ?? '')}" placeholder="Normal price"><div class="small muted" style="margin-top:4px">Leave blank to charge the normal price. The ticket keeps its real type and face value; reports show the override.</div></div>` : ''}
-    ${ev && can('tickets.comps', ev.id) ? `<label class="check"><input type="checkbox" data-action="moComp" ${m.comp ? 'checked' : ''}> <span>Complimentary — issue free, keep the real ticket type and its face value for reporting</span></label>` : ''}`,
-    `<button class="btn btn-ghost" data-action="closeModal">Cancel</button><button class="btn btn-accent" data-action="saveManual">Create order</button>`);
 }
 function Attendees() {
   const evId = S.ui.attEv || S.adm.events.filter(e => e.status === 'published').sort((a, b) => D(a.start) - D(b.start)).find(e => D(e.start) > Date.now())?.id || S.adm.events[0]?.id;
@@ -2374,9 +2748,9 @@ const A = {
     q[id] = Math.max(0, Math.min(n, +el.dataset.max || 99)); render(); },
   addon: el => { const a = S.sel.addons; a[el.dataset.id] = Math.max(0, Math.min((a[el.dataset.id] || 0) + +el.dataset.d, +el.dataset.max || 99)); render(); },
   bqty: el => { const b = S.sel.bundles ||= {}; b[el.dataset.id] = Math.max(0, Math.min((b[el.dataset.id] || 0) + +el.dataset.d, +el.dataset.max || 10)); render(); },
-  pickSeat: el => { const s = el.dataset.v, a = S.sel.seats; const i = a.indexOf(s); if (i >= 0) a.splice(i, 1); else if (a.length < 10) a.push(s); else toast('Maximum 10 seats per order'); render(); },
+  pickSeat: el => { if (S.route.page === 'admin') return adminPickSeat(el.dataset.v); const s = el.dataset.v, a = S.sel.seats; const i = a.indexOf(s); if (i >= 0) a.splice(i, 1); else if (a.length < 10) a.push(s); else toast('Maximum 10 seats per order'); render(); },
   unlock: async () => { const ev = evById(S.sel.eventId); try { const r = await DB.unlock(ev.id, S.sel.pw); if (r?.event || r?.ticketTypes?.length) { S.sel.unlocked = { event: S.sel.unlocked.event || r.event, tts: [...S.sel.unlocked.tts, ...(r.ticketTypes || [])] }; S.cart.unlock[ev.id] = S.sel.pw; saveCart(); toast('Unlocked'); } else toast('That code isn\'t valid', true); render(); } catch (e) { toast(e.message, true); } },
-  pickGa: el => { const ev = evById(S.sel.eventId), off = offSeats(S.avail[ev.id], S.sel.slotId), a = S.sel.seats;
+  pickGa: el => { if (S.route.page === 'admin') return adminPickGa(el.dataset.v); const ev = evById(S.sel.eventId), off = offSeats(S.avail[ev.id], S.sel.slotId), a = S.sel.seats;
     const spot = layoutOf(ev.seating).seats.find(p => p.sec.code === el.dataset.v && !off.has(p.id) && !a.includes(p.id));
     if (!spot) return toast('That area is sold out', true); if (a.length >= 10) return toast('Maximum 10 seats per order'); a.push(spot.id); render(); },
   bLevel: el => { S.ui.bLevel = el.dataset.v; if (S.ui.pvOpen && document.querySelector('.modal .sm-buy')) A.smPreview(); else render(); },
@@ -2410,6 +2784,10 @@ const A = {
     toast(r?.error || 'That code isn\'t valid', true);
   },
   removeCode: () => { S.co.disc = null; S.co.code = ''; render(); },
+  openCredit: () => { S.co.creditOpen = true; render(); },
+  applyCredit: async () => { const bo = cartBo(); try { const c = await DB.checkCredit(bo?.id, S.co.creditCode); const why = !c ? 'That credit code is not valid' : c.status !== 'active' ? 'That credit is ' + c.status : c.event_id && !cartEventIds().includes(c.event_id) ? 'That credit is for a different event' : '';
+    if (why) return toast(why, true); S.co.credit = { ...c, box_office_id: bo?.id }; S.co.useAcct = false; render(); } catch (e) { toast(e.message, true); } },
+  removeCredit: () => { S.co.credit = null; S.co.creditCode = ''; render(); },
   removeRef: () => { S.co.tracking = ''; sessionStorage.removeItem('set_ref'); render(); },
   addUpsell: el => { const a = S.cart.addons.find(x => x.eventId === el.dataset.id && x.addonId === el.dataset.v);
     if (a) a.qty += +el.dataset.q || 1; else S.cart.addons.push({ eventId: el.dataset.id, addonId: el.dataset.v, qty: +el.dataset.q || 1 }); saveCart(); toast('Added to your order'); render(); },
@@ -2427,7 +2805,8 @@ const A = {
       const r = await DB.placeOrder({ buyer: { name: co.name.trim(), email: co.email.trim(), phone: String(co.phone || '').trim(), ...(co.address ? { address: co.address.trim() } : {}) },
         items: S.cart.items, addons: S.cart.addons, code: co.disc?.code || '', tracking: co.tracking || sessionStorage.getItem('set_ref') || '',
         donation: S.cart.donation || 0, payment: q.total === 0 ? 'free' : co.payment, answers: co.answers, ticketAnswers: tAnswers(), optIn: co.optIn,
-        source: sessionStorage.getItem('set_src') || null, unlock: S.cart.unlock, holdToken: DB.holdToken(), attempt: co.attempt });
+        source: sessionStorage.getItem('set_src') || null, unlock: S.cart.unlock, holdToken: DB.holdToken(), attempt: co.attempt,
+        credit: q.credit ? co.credit?.code || 'account' : '' });
       if (r.status === 'awaiting_payment') return startPay(r);
       checkoutDone(r);
     } catch (e) { co.busy = false; co.err = e.message; render(); }
@@ -2568,7 +2947,6 @@ const A = {
     else m.events = (m.events === 'all' ? S.adm.events.map(e => e.id) : m.events).filter(x => x !== id);
     try { await DB.saveMember(m); await reloadAdmin(); toast('Access updated'); render(); } catch (e) { toast(e.message, true); }
   },
-  moComp: el => { S.ui.mo.comp = el.checked; ManualOrderModal(); },
   genMode: el => { S.ui.gen.mode = el.dataset.v; render(); },
   genDay: el => { const d = S.ui.gen.days, v = +el.dataset.v, i = d.indexOf(v); if (i >= 0) d.splice(i, 1); else d.push(v); render(); },
   saveEvent: async () => {
@@ -2754,27 +3132,60 @@ const A = {
     try { const row = await DB.addBroadcast({ event_id: S.draft.id, subject: b.subject, body: b.body, recipients: +el.dataset.n, created_by: S.user.email }); S.adm.broadcasts.push(row); S.ui.bc = { subject: '', body: '' };
       toast('Queued for ' + el.dataset.n + ' buyers — sending is off until email is connected'); render(); } catch (e) { toast(e.message, true); } },
   exportWL: el => { download('waitlist.csv', csv([['Name', 'Email', 'Phone', 'Joined', 'Notified'], ...S.adm.waitlist.filter(w => w.event_id === el.dataset.id).map(w => [w.name, w.email, w.phone || '', w.created_at, w.notified_at || ''])])); DB.log('export.waitlist', 'Exported the waitlist'); },
-  openOrder: el => OrderModal(el.dataset.id),
+  openOrder: el => { location.hash = '#/admin/orders/' + el.dataset.id; },
+  oSel: el => { S.ui.osel[el.dataset.id] = el.checked; render(); },
+  oSelAll: el => { const o = S.adm.orders.find(x => x.id === S.ui.oid); S.ui.osel = {}; if (el.checked) S.adm.tickets.filter(t => t.order_id === o.id && t.status === 'valid').forEach(t => { S.ui.osel[t.id] = true; }); render(); },
+  oAll: el => { S.ui.oAll = el.checked; render(); },
+  opOpen: el => {
+    const o = S.adm.orders.find(x => x.id === S.ui.oid); if (!o) return;
+    const live = S.adm.tickets.filter(t => t.order_id === o.id && t.status === 'valid'), sel = live.filter(t => S.ui.osel[t.id]).map(t => t.id), k = el.dataset.v, all = el.dataset.all === '1';
+    const fut = futureEvents(), m = orderMoney(o), base = { kind: k, notify: true, note: '', _ev: (fut.find(e => o.event_ids.includes(e.id)) || fut[0])?.id };
+    S.ui.op = k === 'change' ? { ...base, tickets: all || !sel.length ? live.map(t => t.id) : sel, map: {}, settle: 'collect', method: 'cash', downgrade: 'refund', to: 'original' }
+      : k === 'cancel' ? { ...base, all: all || sel.length === live.length, tickets: all ? live.map(t => t.id) : sel, seat: 'release', refundMode: can('orders.refund', o.event_ids[0]) && wasPaid(o) ? 'tickets' : 'none', to: 'original' }
+      : k === 'refund' ? { ...base, mode: sel.length ? 'tickets' : 'full', to: 'original', cancel: false, seat: 'release' }
+      : k === 'holder' ? { ...base, ticket: el.dataset.id, name: live.find(t => t.id === el.dataset.id)?.holder || '' }
+      : k === 'customer' ? { ...base, name: o.data.buyer.name, email: o.buyer_email, phone: o.data.buyer.phone || '' }
+      : k === 'removeAddon' ? { ...base, line: +el.dataset.id, refund: '' }
+      : k === 'addAddon' ? { ...base, eventId: o.event_ids[0], qty: 1, settle: 'collect', method: 'cash' }
+      : k === 'collect' ? { ...base, amount: m.due ? (m.due / 100).toFixed(2) : '', method: 'cash' }
+      : k === 'markPaid' ? { ...base, method: 'cash' } : { ...base };
+    render(); window.scrollTo({ top: 0, behavior: 'smooth' });
+  },
+  opClose: () => { S.ui.op = null; render(); },
+  opCur: el => { S.ui.op.cur = el.dataset.id; render(); },
+  opLevel: el => { S.ui.op.level = el.dataset.v; render(); },
+  opGo: async el => {
+    const o = S.adm.orders.find(x => x.id === S.ui.oid); if (!o) return;
+    const k = el.dataset.v, p = k === 'note' ? { body: S.ui.onote } : k === 'resend' ? { kind: el.dataset.k || 'tickets' } : opPayload(o);
+    if (k === 'change' && !S.ui.op?._ready) return toast('Choose what each ticket changes to', true);
+    el.disabled = true;
+    try { const r = await DB.orderAction(o.id, k, p); S.ui.op = null; S.ui.osel = {}; if (k === 'note') S.ui.onote = ''; await reloadAdmin();
+      toast(OP_DONE[k] + (r?.refund?.status === 'processing' ? ' — the card refund is processing' : '')); render(); } catch (e) { el.disabled = false; toast(e.message, true); }
+  },
+  creditIssue: async () => { const c = S.ui.cust; try { const r = await DB.creditAction('issue', { email: c.email, name: customerIndex().find(x => x.email === c.email)?.name, amount: opDollars(c.amount), eventId: c.eventId || null, expires: c.expires ? new Date(c.expires + 'T23:59').toISOString() : null, note: c.note });
+    S.ui.cust = null; await reloadAdmin(); toast('Credit ' + r.code + ' issued'); render(); } catch (e) { toast(e.message, true); } },
+  creditRevoke: async el => { if (!confirmIn('Revoke what is left of this credit? It can\'t be used after this.')) return; try { await DB.creditAction('revoke', { id: el.dataset.id }); await reloadAdmin(); toast('Credit revoked'); render(); } catch (e) { toast(e.message, true); } },
+  creditApply: async el => { const c = (S.adm.credits || []).find(x => x.id === el.dataset.id), o = S.adm.orders.filter(x => x.buyer_email === c?.email && x.data.due > 0 && (!c.event_id || x.event_ids.includes(c.event_id)))[0];
+    if (!o) return toast('No order with a balance due that this credit can pay', true);
+    try { await DB.creditAction('apply', { id: c.id, order: o.id }); await reloadAdmin(); toast('Credit applied to ' + o.ref); render(); } catch (e) { toast(e.message, true); } },
+  custNote: async el => { try { await DB.customerNote(el.dataset.v, S.ui.cnote); S.ui.cnote = ''; await reloadAdmin(); toast('Note added'); render(); } catch (e) { toast(e.message, true); } },
+  exportCustomers: () => { download('customers.csv', csv([['Name', 'Email', 'Phone', 'Orders', 'Tickets', 'Spent', 'Refunds', 'Credit', 'Account', 'Last order'], ...customerIndex().map(c => [c.name, c.email, c.phone, c.orders.length, c.tickets.filter(t => t.status === 'valid').length, c.spent / 100, c.refunds / 100, c.credit / 100, c.account ? 'yes' : '', c.last])])); DB.log('export.customers', 'Exported the customer list'); },
   emailPv: el => { const o = S.adm.orders.find(x => x.id === el.dataset.id); modal('Confirmation email · ' + esc(o.ref), `<p class="small muted" style="margin-bottom:12px">One email per order — every ticket together, with the PDF tickets attached. (Sending switches on with email delivery in Stage 8; this is exactly what it will contain.)</p>${OrderEmail(o, S.adm.tickets.filter(t => t.order_id === o.id))}`); },
   pick: el => { S.ui.picked[el.dataset.id] = el.checked; render(); },
-  orderStatus: async el => { if (['cancelled', 'refunded'].includes(el.dataset.v) && !confirmIn('Cancel this order and void its tickets?' + (el.dataset.v === 'refunded' ? ' Refund the card in Stripe.' : ''))) return;
+  orderStatus: async el => { if (['cancelled', 'refunded'].includes(el.dataset.v) && !confirmIn('Cancel this order and void its tickets?' + (el.dataset.v === 'refunded' ? ' Everything left is refunded to the original payment.' : ''))) return;
     try { await DB.setOrderStatus(el.dataset.id, el.dataset.v); await reloadAdmin(); toast('Order ' + el.dataset.v); OrderModal(el.dataset.id); render(); } catch (e) { toast(e.message, true); } },
   bulkCancel: async () => { const ids = Object.keys(S.ui.picked).filter(k => S.ui.picked[k]); if (!confirmIn(`Cancel ${ids.length} orders and void their tickets?`)) return;
     for (const id of ids) { const o = S.adm.orders.find(x => x.id === id); if (o && ['paid', 'pending'].includes(o.status)) await DB.setOrderStatus(id, o.status === 'paid' ? 'refunded' : 'cancelled'); }
     S.ui.picked = {}; await reloadAdmin(); toast(ids.length + ' orders cancelled'); render(); },
-  resend: () => toast(DB.live ? 'Email delivery is not connected yet.' : 'Demo mode: email sending is off.'),
-  manualOrder: () => { S.ui.mo = null; ManualOrderModal(); },
+  manualOrder: () => { S.ui.mo = null; location.hash = '#/admin/orders/new'; },
+  moLevel: el => { S.ui.mo.level = el.dataset.v; render(); },
   saveManual: async () => {
-    const m = S.ui.mo, ev = S.adm.events.find(e => e.id === m.ev); if (!ev) return;
-    const tt = m.tt || ev.ticketTypes[0].id, qty = Math.max(1, +m.qty || 1), slot = ev.timeSlots?.length ? (m.slot || ev.timeSlots[0].id) : null;
-    let seats = [];
-    if (ev.seating?.enabled) { const off = offSeats(availabilityFrom(S.adm.tickets, ev.id, S.adm.seatStatus), slot);
-      seats = Object.keys(ev.seating.index || {}).filter(id => ev.seating.index[id] === tt && !off.has(id)).slice(0, qty);
-      if (seats.length < qty) return toast('Not enough free seats in that tier', true); }
-    const price = !m.comp && m.price !== undefined && String(m.price).trim() !== '' ? Math.round(parseFloat(m.price) * 100) : undefined;
-    if (price !== undefined && !(price >= 0)) return toast('Enter a valid price', true);
-    try { await DB.placeOrder({ buyer: { name: m.name, email: m.email, phone: '' }, items: [{ eventId: ev.id, ticketTypeId: tt, qty, slotId: slot, seats, ...(price !== undefined ? { price } : {}) }], addons: [], payment: 'manual', comp: !!m.comp, source: 'box office' }, true);
-      closeModal(); await reloadAdmin(); toast('Order created'); render(); } catch (e) { toast(e.message, true); }
+    const m = S.ui.mo, ev = evById(m.ev), { items, addons } = S.ui.moItems || {}; if (!ev) return;
+    if (!items?.length && !addons?.length) return toast(ev.seating?.enabled ? 'Pick seats on the map' : 'Choose tickets', true);
+    if (items.some(i => i.price !== undefined && !(i.price >= 0))) return toast('Enter a valid price', true);
+    try { const r = await DB.placeOrder({ buyer: { name: m.name, email: m.email, phone: m.phone || '' }, items, addons, payment: 'manual', comp: !!m.comp, code: m.comp ? '' : m.code, creditId: m.comp ? '' : m.credit || '',
+        payMethod: m.pay, payRef: m.ref, send: m.send !== false, source: 'box office' }, true);
+      S.ui.mo = null; await reloadAdmin(); toast('Order created'); location.hash = '#/admin/orders/' + r.id; } catch (e) { toast(e.message, true); }
   },
   exportOrders: () => download('orders.csv', csv([['Order', 'Placed', 'Status', 'Name', 'Email', 'Phone', 'Events', 'Tickets & packages', 'Products', 'Face value', 'Subtotal', 'Discount', 'Fee discount', 'Code', 'Tracking code', 'Fees', 'Tax', 'Donation', 'Total', 'Payment', 'Source', 'Marketing opt-in'],
     ...filteredOrders().map(o => { const d = o.data, m = v => v == null ? '' : v / 100; return [o.ref, o.created_at, o.status, d.buyer.name, o.buyer_email, d.buyer.phone, [...new Set(d.lines.map(l => l.eventName))].join('; '), d.lines.filter(l => l.kind !== 'addon').map(l => l.qty + 'x ' + l.name).join('; '),
@@ -2817,6 +3228,8 @@ const CHANGE = {
   bPick: el => { const p = (S.sel.picks ||= {})[el.dataset.id] ||= []; p[+el.dataset.i] = el.value; render(); },
   ttAccess: el => { const t = S.draft.ticketTypes[+el.dataset.i]; t.hidden = el.value === 'code'; t.adminOnly = el.value === 'admin'; dirty(); render(); },
   switchBo: async el => { try { S.ui.support = null; S.ui.set = S.ui.brand = S.ui.pe = null; await reloadAdmin(el.value); location.hash = '#/admin/dashboard'; setContext(); render(); } catch (e) { toast(e.message, true); } },
+  opPrice: el => { const m = S.ui.op.map[el.dataset.id] ||= {}; m.price = el.value === '' ? '' : Math.round(parseFloat(el.value) * 100); render(); },
+  moAdd: el => { (S.ui.mo.adds ||= {})[el.dataset.id] = Math.max(0, parseInt(el.value, 10) || 0); render(); },
   applyTpl: el => { const t = S.adm.bo.templates.find(x => x.id === el.value); if (!t) return; S.ui.pe.obj.perms = [...t.perms]; S.ui.pe.obj.template = t.id; S.ui.pe.dirty = true; render(); },
 };
 
@@ -2857,7 +3270,7 @@ document.addEventListener('input', e => {
     else if (k === 'findRef' || k === 'findEmail') (S.ui.find ||= {})[k === 'findRef' ? 'ref' : 'email'] = v;
     else if (k === 'loginEmail') S.ui.login.email = v; else if (k === 'loginCode') S.ui.login.code = v; else if (k === 'loginTotp') S.ui.login.totp = v;
     else if (k === 'sc.q') { S.sc.q = v; return render(); }
-    else if (k.includes('.')) { const [a, b] = k.split('.'); (S.ui[a] ||= {})[b] = v; if (a === 'mo' && el.dataset.rerender) ManualOrderModal(); if (el.dataset.rr || (a === 'inv' && b === 'template')) render(); return; }
+    else if (k.includes('.')) { const [a, b] = k.split('.'); (S.ui[a] ||= {})[b] = v; if (a === 'mo' && b === 'ev') Object.assign(S.ui.mo, { seats: [], adds: {}, tt: '', slot: '', credit: '', level: '' }); if (a === 'mo' && b === 'slot') S.ui.mo.seats = []; if (el.dataset.rr || (a === 'inv' && b === 'template')) render(); return; }
     else S.ui[k] = v;
     if (['homeq', 'homeWhen', 'q', 'ev', 'status', 'attEv', 'repEv'].includes(k)) render();
   }
@@ -2951,6 +3364,21 @@ async function boot() {
   } catch (e) { console.error(e); toast('Could not load events: ' + e.message, true); }
   S.sc.queue = loadQueue(); try { S.sc.evId = localStorage.getItem('set_scan_ev') || ''; } catch (e) { }
   S.loading = false; loadPixels(); onRoute(); flushQueue();
+  setInterval(heartbeat, 15000);
+}
+// every 15s: buyers on an event page / in checkout tell the box office they're here (live activity); staff watching live numbers get fresh ones
+let _beat = 0;
+function heartbeat() {
+  const r = S.route; _beat++;
+  if (document.hidden) return;
+  if (['e', 'cart'].includes(r.page) && _beat % 2 === 0) presencePing();
+  if (r.page === 'admin' && S.adm && !S.dirty && !$('#modal').innerHTML && !S.ui.op && ((r.sub === 'event' && r.params[1] === 'live') || r.sub === 'dashboard'))
+    reloadAdmin().then(() => { const a = document.activeElement; if (!a || !['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName)) render(); }).catch(() => { });
+}
+const cartTicketsFor = id => S.cart.items.filter(i => i.eventId === id).reduce((a, i) => a + (+i.qty || 0), 0);
+function presencePing() {
+  const ids = new Set(S.route.page === 'e' && S.sel?.eventId ? [S.sel.eventId] : []); cartEventIds().forEach(id => ids.add(id));
+  ids.forEach(id => DB.ping(id, cartTicketsFor(id)));
 }
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
 boot();

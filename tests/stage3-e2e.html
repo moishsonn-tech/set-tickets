@@ -39,10 +39,10 @@ const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({bu
   const run=freeRun('winter-orchestra-gala',3); ok(!!run,'found a free row start '+run);
   // gap rule: taking seats 2+3 would strand seat 1 at the row end
   ok(/single empty seat/.test(String(await throwsP(`DB.holdSeats('${g.id}','',${JSON.stringify(run.slice(1,3))})`))),'single-seat gap rule refuses stranding seat '+run[0]);
-  const mine=run.slice(0,2);
+  const mine=run.slice(0,2), inCo0=count(states('winter-orchestra-gala'),'checkout');   // (the sample data has other buyers mid-checkout)
   const h=await E(`DB.holdSeats('${g.id}','',${JSON.stringify(mine)})`);
   ok(h && new Date(h.expires)-Date.now()>9*6e4,'checkout hold for 10 minutes');
-  ok(count(states('winter-orchestra-gala'),'checkout')===2,'held seats show as “in checkout” in the back office');
+  ok(count(states('winter-orchestra-gala'),'checkout')===inCo0+2,'held seats show as “in checkout” in the back office');
   const myTok=E('DB.holdToken()'); W().localStorage.setItem('set_hold','other-buyer');
   ok(/held by another buyer/.test(String(await throwsP(`DB.holdSeats('${g.id}','',${JSON.stringify(mine)})`))),'another buyer cannot hold the same seats');
   ok(/held by another buyer/.test(String(await throwsP(order('winter-orchestra-gala',mine,",holdToken:'other-buyer'")))),'another buyer cannot buy seats in someone\'s checkout');
@@ -99,8 +99,9 @@ const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({bu
   const t0=E(`Demo.st.tickets.find(t=>t.event_id==='${g.id}'&&t.status==='valid'&&t.ticket_type_id==='${stalls}'&&t.seat)`);
   const dest=[...states('winter-orchestra-gala').values()].find(x=>x.state==='available'&&x.p.tt===stalls&&x.p.id!==t0.seat).p.id;
   await E(`DB.seatAction('${g.id}','','move',['${t0.seat}'],{to:'${dest}'})`);
-  const t1=E(`Demo.st.tickets.find(t=>t.id==='${t0.id}')`);
-  ok(t1.seat===dest && t1.row===ev('winter-orchestra-gala').seating.meta[dest][1] && E(`Demo.st.seatLog.filter(r=>r.action==='moved').length`)===2,'move a customer: ticket, row/seat and both seats\' history updated');
+  // Stage 6: a move never edits the ticket — the old one is 'replaced' and a new ticket (new code) is issued for the new seat
+  const t1=E(`Demo.st.tickets.find(t=>t.replaces==='${t0.id}')`), moved0=E(`Demo.st.seatLog.filter(r=>r.action==='moved'&&['${t0.seat}','${dest}'].includes(r.seat)).length`);
+  ok(t1 && t1.seat===dest && t1.row===ev('winter-orchestra-gala').seating.meta[dest][1] && E(`Demo.st.tickets.find(t=>t.id==='${t0.id}').status`)==='replaced' && moved0===2,'move a customer: new ticket on the new seat, row/seat and both seats\' history updated');
   const premSeat=[...states('winter-orchestra-gala').values()].find(x=>x.state==='available'&&x.p.tt===prem).p.id;
   ok(/different price level/.test(String(await throwsP(`DB.seatAction('${g.id}','','move',['${dest}'],{to:'${premSeat}'})`))),'moving to a different price level is refused (upgrades are Stage 6)');
   // cancel → released
@@ -135,7 +136,7 @@ const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({bu
   E(`S.ui.invSel=['CEN-E7']`); E('render()'); await sleep(40);
   ok(has('Seat history') && has('Artist family'),'single seat shows its status, note and history');
   // email + ticket PDF layout
-  const o=E(`S.adm.orders.find(o=>o.data.lines.some(l=>l.seats&&l.seats.length===2)&&o.status==='paid')`);
+  const o=E(`S.adm.orders.find(o=>o.data.lines.some(l=>l.seats&&l.seats.length===2)&&o.status==='paid'&&S.adm.tickets.filter(t=>t.order_id===o.id&&t.status==='valid').length===2)`);
   E(`A.emailPv({dataset:{id:'${o.id}'}})`); await sleep(40);
   ok(W().document.querySelectorAll('.email-pv .em-ev tbody tr').length===2 && W().document.querySelector('.email-pv').textContent.includes('one ticket per page'),'one confirmation email per order, listing every ticket with area/row/seat');
   E('closeModal()');

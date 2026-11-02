@@ -1,0 +1,248 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Stage 6 — orders, ticket / seat changes, cancellations, refunds, credits, manual orders, customer records, change history, live activity,
+// customer communication (Eli's Step 6). Run from the local server: /stage6-e2e.html (real time — it signs a customer in). The database side
+// of the same rules is checked for real on Postgres by tests/db-e2e.sh.
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow; const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=6000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t);
+const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));
+let lastErr=''; async function throwsP(code){ try{ await E(code); lastErr='(no error)'; return false }catch(e){ lastErr=e.message; return e.message||true } }
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const tt=(slug,name)=>ev(slug).ticketTypes.find(t=>t.name===name);
+const free=(slug,ttName,n)=>E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='${slug}'),t=e.ticketTypes.find(t=>t.name==='${ttName}');return [...seatStates(e,{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt===t.id).map(x=>x.p.id).slice(0,${n})})()`);
+const order=id=>E(`Demo.st.orders.find(o=>o.id==='${id}')`), tickets=id=>E(`Demo.st.tickets.filter(t=>t.order_id==='${id}')`), live=id=>tickets(id).filter(t=>t.status==='valid');
+const act=(id,a,p)=>E(`DB.orderAction('${id}','${a}',${JSON.stringify(p||{})})`);
+const lastLog=id=>E(`Demo.st.orderLog.find(x=>x.order_id==='${id}')`);
+const buy=(p,team)=>E(`DB.placeOrder(${JSON.stringify({buyer:{name:'Sam Seat',email:'sam6@test.co',phone:'(212) 555-0142'},addons:[],payment:'manual',...p})}${team===false?'':',true'})`);
+const view=async hash=>{ W().location.hash=hash; await sleep(60); E('render()'); await sleep(40); };
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.noSingles=false;Demo.save()`);
+  const g=ev('winter-orchestra-gala'), neon=ev('neon-nights-live'), food=ev('city-food-festival'), jazz=ev('spring-jazz-brunch');
+  const stalls=tt('winter-orchestra-gala','Stalls'), prem=tt('winter-orchestra-gala','Premium'), circle=tt('winter-orchestra-gala','Circle');
+  ok(E(`Demo.st.orderLog.length`)>=3 && E(`Demo.st.tickets.some(t=>t.status==='replaced')`) && E(`(Demo.st.credits||[]).length`)>=2,'sample data has changed orders, a replaced ticket and credits');
+  await as('moishsonn@gmail.com');
+
+  // ── §6 manual / admin order: exact seats, products, offline payment method, send now ──
+  const s2=free('winter-orchestra-gala','Stalls',2), park=g.addons[1];
+  const r1=await buy({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:2,seats:s2}],addons:[{eventId:g.id,addonId:park.id,qty:1}],payMethod:'cash',payRef:'R-1001'});
+  const o1=order(r1.id);
+  ok(o1.status==='paid' && live(r1.id).map(t=>t.seat).sort().join()===s2.slice().sort().join(),'manual order: exact seats chosen');
+  ok(o1.payment.provider==='manual' && o1.payment.method==='cash' && o1.payment.ref==='R-1001','manual order: offline payment and its method recorded');
+  ok(o1.data.lines.some(l=>l.kind==='addon') && live(r1.id).every(t=>t.extras.some(x=>x.includes(park.name))),'manual order: products added, shown on the tickets');
+  ok(E(`Demo.st.outbox.find(m=>m.order_id==='${r1.id}'&&m.kind==='confirmation').status`)==='queued','manual order: tickets sent immediately');
+  const r1b=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:1}],send:false,payMethod:'check'});
+  ok(E(`Demo.st.outbox.find(m=>m.order_id==='${r1b.id}'&&m.kind==='confirmation').status`).startsWith('not sent'),'manual order: staff can choose not to send yet');
+  const r1c=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:1,price:1234}],payMethod:'cash'});
+  ok(tickets(r1c.id)[0].paid===1234 && tickets(r1c.id)[0].price_override,'manual order: price override');
+  const rcomp=await buy({items:[{eventId:g.id,ticketTypeId:prem.id,qty:1,seats:free('winter-orchestra-gala','Premium',1)}],comp:true});
+  ok(tickets(rcomp.id)[0].comp && tickets(rcomp.id)[0].face===10000 && order(rcomp.id).data.total===0,'manual order: complimentary ticket keeps its type and face value');
+  E(`Demo.st.promos.find(p=>p.code==='WELCOME10').maxUses=0;Demo.save()`);
+  const rp=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:2}],code:'WELCOME10',payMethod:'terminal'});
+  ok(order(rp.id).data.discount>0 && order(rp.id).data.code==='WELCOME10','manual order: discount code applied');
+  // manual order page: seat map picking
+  E(`S.ui.mo=null`); await reloadAndView('#/admin/orders/new'); async function reloadAndView(h){ await E('reloadAdmin()'); await view(h); }
+  E(`S.ui.mo.ev='${g.id}'`); E('render()'); const pick=free('winter-orchestra-gala','Stalls',1)[0];
+  E(`adminPickSeat('${pick}')`); ok(E('S.ui.mo.seats').includes(pick) && has('Create order') && W().document.querySelector('.sm circle.mine'),'manual order page: pick exact seats on the map');
+  E(`adminPickSeat('${pick}')`); ok(!E('S.ui.mo.seats').includes(pick),'manual order page: tap again to remove a seat');
+
+  // ── §1 search ──
+  await E('reloadAdmin()'); W().location.hash='#/admin/orders'; await sleep(40);
+  const q=s=>{ E(`S.ui.q=${JSON.stringify(s)};S.ui.ev='';S.ui.status=''`); return E('filteredOrders().map(o=>o.id)'); };
+  const t0=live(r1.id)[0], payOrder=E(`Demo.st.orders.find(o=>o.payment&&o.payment.ref&&o.payment.ref.startsWith('pi_'))`);
+  ok(q('Sam Seat').includes(r1.id) && q('sam6@test.co').includes(r1.id),'search by customer name and email');
+  ok(q('2125550142').includes(r1.id) && q('555-0142').includes(r1.id),'search by phone (with or without punctuation)');
+  ok(q(o1.ref).includes(r1.id) && q(t0.code).includes(r1.id),'search by order number and ticket code');
+  ok(q(payOrder.payment.ref)[0]===payOrder.id,'search by transaction / payment id');
+  ok(q('winter orchestra').includes(r1.id) && q('stalls').includes(r1.id),'search by event and ticket type');
+  ok(JSON.stringify(q(`row:${t0.row} seat:${t0.seat_label}`))===JSON.stringify(E(`filteredOrders().filter(o=>Demo.st.tickets.some(t=>t.order_id===o.id&&t.row==='${t0.row}'&&t.seat_label==='${t0.seat_label}')).map(o=>o.id)`)) && q(`row:${t0.row} seat:${t0.seat_label}`).includes(r1.id),'search by row + seat');
+  ok(q(`area:${t0.area.split(' ')[0].toLowerCase()}`).includes(r1.id),'search by seating area');
+  ok(q('code:welcome10').includes(rp.id) && !q('code:welcome10').includes(r1.id),'search by promo code');
+  const trk=E(`Demo.st.orders.find(o=>o.data.tracking)`); ok(q('code:'+trk.data.tracking.toLowerCase()).includes(trk.id),'search by tracking / referral code');
+  E(`S.ui.q=''`);
+  await view('#/admin/orders/'+r1.id);
+  ok(has('Order '+o1.ref.toUpperCase()) || has(o1.ref),'order page opens');
+  ok(['Tickets','Products & add-ons','History','Money','Payment','Internal notes','Communications','Customer'].every(has) && has('R-1001') && has('Booking fee') || has('Total'),'order page: tickets, products, money, fees, payment, notes, history, communications');
+
+  // ── §2 seat / ticket changes ──
+  // move one ticket to another Stalls seat — no price difference; old ticket replaced, new ticket issued
+  const [ta,tb]=live(r1.id), dest=free('winter-orchestra-gala','Stalls',1)[0];
+  const ch1=await act(r1.id,'change',{changes:[{ticket:ta.id,seat:dest}],note:'aisle please'});
+  const na=E(`Demo.st.tickets.find(t=>t.replaces==='${ta.id}')`);
+  ok(ch1.net===0 && na.seat===dest && na.code!==ta.code && E(`Demo.st.tickets.find(t=>t.id==='${ta.id}').status`)==='replaced','move to another seat: old ticket replaced, a new ticket with a new code');
+  ok(live(r1.id).find(t=>t.id===tb.id).seat===tb.seat,'change one ticket without touching the rest of the order');
+  // upgrade Stalls ($65) → Premium ($100): $35 due — Eli's example
+  const pseat=free('winter-orchestra-gala','Premium',1)[0];
+  ok(/difference/.test(String(await throwsP(`DB.orderAction('${r1.id}','change',{changes:[{ticket:'${na.id}',seat:'${pseat}'}]})`))),'upgrade asks how to handle the difference');
+  const up=await act(r1.id,'change',{changes:[{ticket:na.id,seat:pseat}],settle:'collect',method:'terminal'});
+  ok(up.net===3500,'upgrade $65 → $100: amount due $35 (calculated automatically) — got '+up.net);
+  ok(order(r1.id).data.extraPaid===3500 && order(r1.id).data.charges.at(-1).method==='terminal','the $35 collected is recorded with its method');
+  const np=E(`Demo.st.tickets.find(t=>t.order_id==='${r1.id}'&&t.seat==='${pseat}'&&t.status==='valid')`);
+  ok(np.ticket_type_id===prem.id && np.paid===10000 && np.area===g.seating.meta[pseat][0],'the new ticket is Premium, $100 paid, in its new area');
+  // downgrade options: refund / account credit / future-event credit / no refund
+  const sback=free('winter-orchestra-gala','Stalls',1)[0];
+  const dn=await act(r1.id,'change',{changes:[{ticket:np.id,seat:sback}],downgrade:'refund',to:'original'});
+  ok(dn.net===-3500 && dn.refund.amount===3500 && order(r1.id).data.refunded===3500,'downgrade: refund the difference');
+  const r2=await buy({items:[{eventId:g.id,ticketTypeId:prem.id,qty:3,seats:free('winter-orchestra-gala','Premium',3)}],payMethod:'cash'});
+  const [p1,p2,p3]=live(r2.id), cs=free('winter-orchestra-gala','Stalls',3);
+  const dc=await act(r2.id,'change',{changes:[{ticket:p1.id,seat:cs[0]}],downgrade:'credit'});
+  ok(dc.refund.credit.startsWith('CR-') && order(r2.id).data.credited===3500,'downgrade: issue account credit');
+  const de=await act(r2.id,'change',{changes:[{ticket:p2.id,seat:cs[1]}],downgrade:'eventCredit',creditEvent:jazz.id});
+  ok(E(`Demo.st.credits.find(c=>c.code==='${de.refund.credit}').event_id`)===jazz.id,'downgrade: future-event credit for a chosen event');
+  const dz=await act(r2.id,'change',{changes:[{ticket:p3.id,seat:cs[2]}],downgrade:'none'});
+  ok(dz.net===-3500 && !dz.refund && E(`Demo.st.tickets.find(t=>t.replaces==='${p3.id}').paid`)===10000,'downgrade: no refund (what was paid stays on the ticket)');
+  // change several tickets together; change type on a general-admission event; change showtime
+  const r3=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:2}],payMethod:'cash'});
+  const other=neon.ticketTypes.find(t=>t.id!==neon.ticketTypes[0].id&&+t.price>0);
+  const mt=await act(r3.id,'change',{changes:live(r3.id).map(t=>({ticket:t.id,ticketTypeId:other.id})),settle:'due',downgrade:'none'});
+  ok(live(r3.id).length===2 && live(r3.id).every(t=>t.ticket_type_id===other.id),'change ticket type, several tickets together');
+  ok(mt.net===2*(other.price-neon.ticketTypes[0].price) && (mt.net<=0 || order(r3.id).data.due===mt.net),'price difference for a type change is calculated ('+mt.net+')');
+  const r5=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:1}],payMethod:'cash'});
+  ok(/nothing to change/.test(String(await throwsP(`DB.orderAction('${r5.id}','change',{changes:[{ticket:'${live(r5.id)[0].id}'}]})`))),'a change that changes nothing is refused');
+  const takenSeat=live(r2.id)[0].seat;
+  ok(/isn't free/.test(String(await throwsP(`DB.orderAction('${r1.id}','change',{changes:[{ticket:'${live(r1.id)[0].id}',seat:'${takenSeat}'}],settle:'waive',downgrade:'none'})`))),'cannot move onto a seat someone else holds');
+  // showtime change on an event with showtimes (temporarily give the gala two showtimes in this box office)
+  const jt=jazz.ticketTypes[0], rj=await buy({items:[{eventId:jazz.id,ticketTypeId:jt.id,qty:1,...(jazz.timeSlots?.length?{slotId:jazz.timeSlots[0].id}:{})}],payMethod:'cash'});
+  if (jazz.timeSlots?.length>1) { await act(rj.id,'change',{changes:[{ticket:live(rj.id)[0].id,slotId:jazz.timeSlots[1].id}],settle:'waive',downgrade:'none'}); ok(live(rj.id)[0].slot_id===jazz.timeSlots[1].id,'change showtime'); }
+  else { E(`(()=>{const e=Demo.st.events.find(x=>x.slug==='neon-nights-live');e.timeSlots=[{id:'s1',start:e.start,capacity:0},{id:'s2',start:new Date(Date.parse(e.start)+864e5).toISOString(),capacity:0}];Demo.save()})()`);
+    const rs=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:1,slotId:'s1'}],payMethod:'cash'});
+    await act(rs.id,'change',{changes:[{ticket:live(rs.id)[0].id,slotId:'s2'}],settle:'waive',downgrade:'none'});
+    ok(live(rs.id)[0].slot_id==='s2' && lastLog(rs.id).kind==='change','change showtime / occurrence');
+    E(`(()=>{const e=Demo.st.events.find(x=>x.slug==='neon-nights-live');e.timeSlots=[];Demo.save()})()`); }
+  // the change panel on the order page: pick a seat, see the difference
+  await E('reloadAdmin()'); await view('#/admin/orders/'+r5.id); await view('#/admin/orders/'+r2.id);
+  E(`S.ui.osel={'${live(r2.id)[0].id}':true}`); E(`A.opOpen({dataset:{v:'change'}})`); await sleep(40);
+  const pp=free('winter-orchestra-gala','Premium',1)[0]; E(`adminPickSeat('${pp}')`); await sleep(40);
+  ok(has('Amount due: $35') && W().document.querySelector('.op-card .sm'),'order screen: pick the new seat on the map, see “Amount due: $35”');
+  E(`S.ui.op.settle='due'`); E('render()'); await E(`A.opGo(document.querySelector('.op-card [data-action="opGo"]'))`); await sleep(60);
+  ok(order(r2.id).data.due===3500 && has('Balance due'),'order screen: apply the change; balance due shows');
+
+  // ── §3 cancellations ──
+  const r6=await buy({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:3,seats:free('winter-orchestra-gala','Stalls',3)}],payMethod:'cash'});
+  const [c1,c2,c3]=live(r6.id);
+  await act(r6.id,'cancel',{tickets:[c1.id],seat:'release'});
+  ok(live(r6.id).length===2 && E(`seatStates(Demo.st.events.find(e=>e.slug==='winter-orchestra-gala'),{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).get('${c1.seat}').state`)==='available','cancel one ticket, seat released straight back to inventory');
+  await act(r6.id,'cancel',{tickets:[c2.id],seat:'hold'});
+  ok(E(`Demo.st.seatStatus.some(r=>r.seat==='${c2.seat}'&&r.status==='held')`),'cancel and keep the seat held');
+  await act(r6.id,'cancel',{tickets:[c3.id],seat:'block'});
+  ok(E(`Demo.st.seatStatus.some(r=>r.seat==='${c3.seat}'&&r.status==='blocked')` ) && order(r6.id).status==='cancelled' && !order(r6.id).data.refunded,'cancel and keep blocked; last ticket → order cancelled, without refund');
+  const r7=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:3}],payMethod:'cash'});
+  await act(r7.id,'cancel',{tickets:live(r7.id).slice(0,2).map(t=>t.id),seat:'release',refund:{mode:'tickets',to:'cash'}});
+  ok(live(r7.id).length===1 && order(r7.id).data.refunded===2*neon.ticketTypes[0].price,'cancel selected tickets with a refund of their price');
+  await act(r7.id,'cancel',{all:true});
+  ok(order(r7.id).status==='cancelled' && live(r7.id).length===0,'cancel the full order');
+
+  // ── §4 refunds ──
+  const r8=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:4}],payMethod:'cash'}); const d8=order(r8.id).data, fee1=(d8.fee+d8.serviceFee)/4;
+  const rf1=await act(r8.id,'refund',{mode:'tickets',tickets:[live(r8.id)[0].id],fees:false,to:'original'});
+  ok(rf1.refund.amount===neon.ticketTypes[0].price && live(r8.id).length===4,'refund ticket price only — booking fee kept, ticket NOT cancelled (refund without cancelling)');
+  const rf2=await act(r8.id,'refund',{mode:'tickets',tickets:[live(r8.id)[1].id],fees:true,to:'original',cancel:true});
+  ok(rf2.refund.amount===neon.ticketTypes[0].price+Math.round(fee1) && live(r8.id).length===3,'refund a ticket with its booking fee, and cancel it');
+  const rf3=await act(r8.id,'refund',{mode:'fees',to:'other'}); ok(rf3.refund.fees===rf3.refund.amount && rf3.refund.amount>0,'refund the booking fee');
+  const rf4=await act(r8.id,'refund',{mode:'amount',amount:500,to:'cash'}); ok(rf4.refund.amount===500 && rf4.refund.to==='cash','refund a specific dollar amount');
+  const left=E(`orderMoney(Demo.st.orders.find(o=>o.id==='${r8.id}')).refundable`), rf5=await act(r8.id,'refund',{mode:'percent',pct:50,to:'original'});
+  ok(rf5.refund.amount===Math.round(left/2),'percentage refund (50% of what is left)');
+  ok(/at most/.test(String(await throwsP(`DB.orderAction('${r8.id}','refund',{mode:'amount',amount:99999999})`))),'cannot refund more than was collected');
+  const rf6=await act(r8.id,'refund',{mode:'full',to:'original',cancel:true});
+  ok(order(r8.id).status==='refunded' && E(`orderMoney(Demo.st.orders.find(o=>o.id==='${r8.id}')).refundable`)===0,'full refund of what is left → order refunded');
+  const cardOrder=E(`Demo.st.orders.find(o=>o.status==='paid'&&o.payment&&o.payment.ref&&o.payment.provider==='demo'&&o.box_office_id===S.adm.bo.id&&!(Demo.st.orderLog||[]).some(x=>x.order_id===o.id))`);
+  const rfc=await act(cardOrder.id,'refund',{mode:'full',to:'original'});
+  ok(rfc.refund.provider==='demo' && /^re_demo_/.test(rfc.refund.ref) && rfc.refund.status==='done','refund to the original card goes through the processor');
+  ok(order(cardOrder.id).status==='paid' && live(cardOrder.id).length>0,'a full refund can be made without cancelling the tickets when chosen');
+
+  // ── §5 credit ──
+  const r9=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:2}],payMethod:'cash',...{buyer:{name:'Cara Credit',email:'cara@test.co'}}});
+  const full=await act(r9.id,'refund',{mode:'full',to:'credit',cancel:true}); const cr=E(`Demo.st.credits.find(c=>c.code==='${full.refund.credit}')`);
+  ok(cr.amount===order(r9.id).data.total && cr.email==='cara@test.co' && cr.source_ref===order(r9.id).ref && cr.issued_by==='moishsonn@gmail.com','full credit: tracks original order, amount, who issued it');
+  const goodwill=await E(`DB.creditAction('issue',{email:'cara@test.co',amount:1000,eventId:'${jazz.id}',expires:new Date(Date.now()+864e5*30).toISOString(),note:'goodwill'})`);
+  ok(goodwill.amount===1000 && goodwill.event_id===jazz.id && goodwill.expires,'specific amount, restricted to one future event, with an expiry');
+  ok(/different event/.test(String(await throwsP(`DB.placeOrder({buyer:{name:'Cara',email:'cara@test.co'},items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:1}],addons:[],payment:'offline',credit:'${goodwill.code}'})`))),'event-restricted credit cannot be used on another event');
+  const exp=await E(`DB.creditAction('issue',{email:'cara@test.co',amount:500,expires:new Date(Date.now()-1000).toISOString()})`);
+  ok(/expired/.test(String(await throwsP(`DB.placeOrder({buyer:{name:'Cara',email:'cara@test.co'},items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:1}],addons:[],payment:'offline',credit:'${exp.code}'})`))),'expired credit cannot be used');
+  // guest uses a credit code at checkout (box office wide)
+  E(`S.cart={items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:1}],addons:[],donation:0,unlock:{}};saveCart()`);
+  await E('A.signOut()'); W().location.hash='#/cart'; await until(()=>has('Checkout')); E(`A.openCredit()`); E(`S.co.creditCode='${cr.code}'`); await E('A.applyCredit()'); await sleep(40);
+  const cq=E('cartQuote()'); ok(cq.credit>0 && has('Credit applied'),'guest: credit code applied at checkout, shown in the breakdown');
+  Object.assign(E('S.co'),{name:'Cara Credit',email:'cara@test.co',terms:true,payment:'offline'}); await E('A.placeOrder()'); await until(()=>/#\/order\//.test(W().location.hash));
+  const used=E(`Demo.st.orders.slice(-1)[0]`); ok(used.data.credit.code===cr.code && used.data.credit.amount===cq.credit,'the order records which credit paid how much');
+  ok(E(`creditState(Demo.st.credits.find(c=>c.code==='${cr.code}'),Demo.st.orders).remaining`)===cr.amount-cq.credit,'remaining balance goes down');
+  // signed-in customer: their credit is offered automatically
+  W().location.hash='#/account'; await until(()=>W().document.querySelector('[data-input="authEmail"],[data-bind]'));
+  await E(`DB.custSignIn('maya@example.com','tickets123')`); await E('loadCustomer()');
+  E(`S.myCredits=null;S._credReq=0;S.cart={items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:1}],addons:[],donation:0,unlock:{}};saveCart()`);
+  W().location.hash='#/cart'; await until(()=>E('S.myCredits')); await sleep(60); E('render()');
+  ok(E('S.co.useAcct')===true && E('cartQuote()').credit===Math.min(2500,E('cartQuote()').total+E('cartQuote()').credit) && has('Use my credit'),'signed-in customer: account credit applied automatically');
+  W().location.hash='#/account'; E('S.wallet=null'); await until(()=>has('applied automatically'));
+  ok(has('$25') && has('applied automatically at checkout'),'customer account shows the credit balance');
+  await E('DB.custSignOut()'); E('S.cust=null');
+  await as('moishsonn@gmail.com');
+  // manual admin application + revocation
+  const r10=await buy({items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:1}],payMethod:'cash',buyer:{name:'Cara Credit',email:'cara@test.co'}});
+  await act(r10.id,'addAddon',{eventId:neon.id,addonId:(neon.addons||[])[0]?.id,qty:1,settle:'due'}).catch(()=>{});
+  if (!(order(r10.id).data.due>0)) { E(`Demo.st.orders.find(o=>o.id==='${r10.id}').data.due=1500;Demo.save()`); }
+  const bc=E(`Demo.st.credits.find(c=>c.code==='${cr.code}')`); await E(`DB.creditAction('apply',{id:'${bc.id}',order:'${r10.id}'})`);
+  ok(order(r10.id).data.charges.some(c=>c.method==='credit') && E(`creditState(Demo.st.credits.find(c=>c.code==='${cr.code}'),Demo.st.orders).uses`).some(u=>u.manual&&u.ref===order(r10.id).ref),'staff apply a credit to a balance due (manual application)');
+  await E(`DB.creditAction('revoke',{id:'${bc.id}'})`); const rv=E(`Demo.st.credits.find(c=>c.code==='${cr.code}')`);
+  ok(rv.revoked_by==='moishsonn@gmail.com' && E(`creditState(Demo.st.credits.find(c=>c.code==='${cr.code}'),Demo.st.orders).remaining`)===0,'staff revoke a credit (who and when kept)');
+  await E('reloadAdmin()'); const cs6=E(`S.adm.credits.find(c=>c.code==='${cr.code}')`);
+  ok(cs6.used>0 && cs6.uses.length>=2 && cs6.uses.some(u=>u.events.includes(neon.id)) && cs6.status==='revoked','credit tracking: issued, used, remaining, where used, revoked');
+
+  // ── §7 customer records ──
+  await view('#/admin/customers'); ok(has('Customers') && has('Cara Credit'),'customer list');
+  await view('#/admin/customers/'+encodeURIComponent('cara@test.co'));
+  ok(['Total spent','Upcoming events','Order history','Refunds','Credits','Internal notes','Promo codes used','Products bought','Complimentary tickets','guest'].every(has),'customer profile: tickets, events, orders, spent, refunds, credits, comps, codes, products, notes, account status');
+  E(`S.ui.cnote='Calls ahead before shows'`); await E(`A.custNote({dataset:{v:'cara@test.co'}})`); await sleep(40); ok(has('Calls ahead before shows'),'internal note on a customer');
+  await view('#/admin/customers/'+encodeURIComponent('maya@example.com')); ok(has('customer account'),'shows when a customer has an account');
+
+  // ── §8 complete change history ──
+  const hist=E(`Demo.st.orderLog.filter(x=>x.order_id==='${r1.id}')`), upRow=hist.find(x=>x.kind==='change'&&x.data.net===3500);
+  ok(upRow && upRow.data.tickets[0].from.paid===6500 && upRow.data.tickets[0].to.paid===10000 && upRow.data.tickets[0].from.seat && upRow.data.tickets[0].to.seat && upRow.data.charge.amount===3500 && upRow.by==='moishsonn@gmail.com' && upRow.at,'history: original + new ticket, seat, price, difference, payment collected, who, when');
+  ok(hist.some(x=>x.kind==='change'&&x.data.refund&&x.data.refund.amount===3500) && hist.some(x=>x.note==='aisle please'),'history: refunds issued and reasons are kept');
+  ok(E(`Demo.st.tickets.filter(t=>t.order_id==='${r1.id}'&&t.status==='replaced').length`)>=3,'never overwritten: every replaced ticket is still on file');
+  await view('#/admin/orders/'+r1.id); ok(has('Upgrade $35.00') || has('upgrade $35.00'),'order page timeline shows the upgrade');
+
+  // ── §10 communication ──
+  await E(`DB.orderAction('${r1.id}','resend',{kind:'tickets'})`); await E(`DB.orderAction('${r1.id}','resend',{kind:'confirmation'})`);
+  await E(`DB.orderAction('${r1.id}','message',{subject:'Parking update',body:'Use the north entrance.'})`); await E(`DB.orderAction('${r1.id}','note',{body:'VIP — artist friend'})`);
+  const mails=E(`Demo.st.outbox.filter(m=>m.order_id==='${r1.id}').map(m=>m.kind)`);
+  ok(['tickets','confirmation_copy','message','updated'].every(k=>mails.includes(k)),'resend tickets, resend confirmation, custom message, updated tickets after changes — all on record');
+  await E('reloadAdmin()'); await view('#/admin/orders/'+r1.id);
+  ok(has('Parking update') && has('Updated tickets') && has('VIP — artist friend'),'order page lists previous communications and internal notes');
+  // customer + holder edits keep the before / after
+  await act(r1.id,'customer',{phone:'(212) 555-0199'}); ok(lastLog(r1.id).before.phone==='(212) 555-0142' && order(r1.id).data.buyer.phone==='(212) 555-0199','customer details change keeps the old details');
+  await act(r1.id,'holder',{ticket:live(r1.id)[0].id,name:'Guest Two'}); ok(live(r1.id)[0].holder==='Guest Two','put a ticket in someone else’s name');
+  // products on an existing order
+  const before=E(`availabilityFrom(Demo.st.tickets,'${g.id}',[],'',Demo.st.orders).ad['${park.id}']||0`);
+  await act(r1.id,'addAddon',{eventId:g.id,addonId:park.id,qty:2,settle:'collect',method:'cash'});
+  ok(E(`availabilityFrom(Demo.st.tickets,'${g.id}',[],'',Demo.st.orders).ad['${park.id}']`)===before+2 && live(r1.id).every(t=>t.extras.some(x=>x.includes(park.name+' × 2'))),'add a product to an order (stock + tickets updated)');
+  const li=order(r1.id).data.lines.findIndex(l=>l.kind==='addon'&&l.added); await act(r1.id,'removeAddon',{line:li,qty:2,refund:true,to:'cash'});
+  ok(E(`availabilityFrom(Demo.st.tickets,'${g.id}',[],'',Demo.st.orders).ad['${park.id}']`)===before,'remove a product with a refund (stock back)');
+
+  // ── §9 live activity ──
+  E(`DB.ping('${g.id}',4)`); E(`DB.ping('${g.id}',0,true)`);
+  E(`(()=>{const e=Demo.st.events.find(x=>x.slug==='winter-orchestra-gala');Demo.st.seatStatus.push({id:'h1',box_office_id:e.box_office_id,event_id:e.id,slot_id:'',seat:'${free('winter-orchestra-gala','Circle',1)[0]}',status:'checkout',token:'tk',expires_at:new Date(Date.now()+5e5).toISOString(),at:new Date().toISOString()});Demo.save()})()`);
+  await E('reloadAdmin()'); const lv=E(`S.adm.live['${g.id}']`);
+  ok(lv.now>=1 && lv.converted>=1 && 'abandoned' in lv && 'cartTickets' in lv,'live presence: viewing now, carts, converted, abandoned');
+  await view(`#/admin/event/${g.id}/live`);
+  ok(['Viewing now','Active carts','Seats held in checkout','Orders · last 10 min','Views today','Cart abandonment','Checkout conversion','Live sales','Traffic sources','Sales by source','tied up in checkout vs sold'].every(has),'Live activity tab: views, viewers, carts, held seats, checkouts, abandonment, conversion, live sales, sources');
+  ok(E(`liveData(S.adm.events.find(e=>e.id==='${g.id}')).holds`)>=1,'seats temporarily held during checkout counted separately from sold');
+
+  // ── security: permissions on every order change ──
+  await as('manager@skyline.example');
+  ok(/permission/.test(String(await throwsP(`DB.orderAction('${r2.id}','change',{changes:[{ticket:'${live(r2.id)[0].id}',seat:'${free('winter-orchestra-gala','Stalls',1)[0]}'}],settle:'waive',downgrade:'none'})`))),'event manager without “Change seats” cannot change tickets');
+  ok(/permission/.test(String(await throwsP(`DB.orderAction('${r2.id}','refund',{mode:'full'})`))),'… nor refund');
+  ok(/permission/.test(String(await throwsP(`DB.creditAction('issue',{email:'x@test.co',amount:100})`))),'… nor issue credit');
+  await as('support@skyline.example');
+  const rs1=await act(r2.id,'refund',{mode:'amount',amount:100,to:'cash'}); ok(rs1.refund.amount===100,'customer service (has “Issue refunds”) can refund');
+  ok(/permission/.test(String(await throwsP(`DB.orderAction('${r2.id}','change',{changes:[{ticket:'${live(r2.id)[0].id}',price:1}],settle:'waive',downgrade:'none'})`))),'price overrides on a change need “Change pricing”');
+  await E('A.signOut()'); E(`DB._actor=null`);
+  ok(!!(await throwsP(`DB.orderAction('${r2.id}','note',{body:'x'})`)),'signed out: no order changes at all');
+  ok(E(`Demo.st.orders.filter(o=>o.status==='paid').every(o=>Demo.st.outbox.filter(m=>m.order_id===o.id&&m.kind==='confirmation').length<=1)`),'still exactly one order confirmation per order');
+  log('DONE');
+}catch(e){log('ERROR '+e.message+'\n'+e.stack)}})();
+</script></body></html>

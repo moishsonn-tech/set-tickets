@@ -195,7 +195,8 @@ const Q=(cart,code)=>E(`quote(${JSON.stringify(cart)},Demo.st.events,{...DEFAULT
   // ── §10 every ticket's reporting fields ──
   const fresh=E(`Demo.st.tickets.filter(t=>t.status==='valid')`);
   ok(fresh.every(t=>['face','paid','discount','promo','tracking','bundle','extras','comp'].every(k=>k in t)),`all ${fresh.length} tickets carry face, paid, discount, promo, tracking, bundle, products, comp`);
-  const bad=E(`Demo.st.orders.filter(o=>!o.data.comp&&o.status==='paid').filter(o=>{const t=Demo.st.tickets.filter(x=>x.order_id===o.id).reduce((s,x)=>s+x.paid,0);const ad=o.data.lines.filter(l=>l.kind==='addon').reduce((s,l)=>s+l.unit*l.qty-(l.disc||0),0);const bad=o.data.lines.filter(l=>l.kind==='bundle').reduce((s,l)=>s+l.addons.reduce((a,x)=>a+0,0),0);return Math.abs(t+ad-(o.data.subtotal-o.data.discount))>0 && !o.data.lines.some(l=>l.kind==='bundle'&&l.addons.length)}).length`);
+  // (orders changed after purchase — Stage 6 upgrades, refunds, replaced tickets — are checked by the Stage 6 suite)
+  const bad=E(`Demo.st.orders.filter(o=>!o.data.comp&&o.status==='paid'&&!(Demo.st.orderLog||[]).some(x=>x.order_id===o.id)).filter(o=>{const t=Demo.st.tickets.filter(x=>x.order_id===o.id).reduce((s,x)=>s+x.paid,0);const ad=o.data.lines.filter(l=>l.kind==='addon').reduce((s,l)=>s+l.unit*l.qty-(l.disc||0),0);const bad=o.data.lines.filter(l=>l.kind==='bundle').reduce((s,l)=>s+l.addons.reduce((a,x)=>a+0,0),0);return Math.abs(t+ad-(o.data.subtotal-o.data.discount))>0 && !o.data.lines.some(l=>l.kind==='bundle'&&l.addons.length)}).length`);
   ok(bad===0,'collected per ticket + products = order subtotal − discount, for every order without packaged products');
   W().location.hash='#/admin/reports'; await until(()=>W().document.querySelector('[data-action="exportTickets"]'));
   ok(true,'ticket detail CSV export available on Reports');
