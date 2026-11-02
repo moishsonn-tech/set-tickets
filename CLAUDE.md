@@ -33,7 +33,16 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   through `remapSeatKeys()`. Blocks, staff holds, "unavailable" and buyers' 10-minute checkout holds are `seat_status` rows (never in
   the event) — `seatStates()` merges them with tickets; staff change them via `seatAction()` / `seat_action()`. Every seat change is in
   `seat_log`. Master venue charts are `box_offices.venues`; `venueToEvent()` copies one into an event (tiers matched to ticket types by name).
-- **Money is integer cents everywhere.** `quote()` in data.js is the one pricing function on the client.
+- **Pricing & promotions (Stage 4):** `quote()` in data.js is the one pricing engine (display everywhere, authoritative in DEMO); SQL
+  `price_cart()` / `apply_promo()` mirror it line for line — change both. Ticket price = showtime price (`slotPrices`) or base, replaced by the
+  first active `phases` entry (dates + `upTo` sold), then a lower `breaks` quantity price; a phase ending mid-order splits the line. Staff
+  override = item `price` on manual orders (`tickets.pricing`); price edits on save also need `tickets.pricing` (`priceSig` / `price_sig`).
+  Packages = `event.bundles` (parts of allowed ticket types + products, one price, own stock); products = `event.addons` (stock, per-order
+  max, sale window, standalone, ticket-type / seat-area rules); checkout offers = `event.upsells`. Promo codes + tracking codes are
+  box-office wide (`promos`, `tracking_codes`; one code namespace incl. bulk unique `codes`) — `findCode()` / `find_code()`. Promo discounts
+  are per unit (`line.discs`), so every ticket stores `face`, `paid`, `discount`, `promo`, `tracking`, `bundle`, `extras`, `comp`,
+  `price_override`. Tracking links are `?ref=CODE` (views keep the ref). Promotions page = `#/admin/promos`.
+- **Money is integer cents everywhere.**
 - **Not yet wired:** Stripe card payments (needs a Supabase Edge Function + webhook), outbound email/SMS
   (confirmations, reminders, broadcasts are recorded but not sent), Apple Wallet passes.
 

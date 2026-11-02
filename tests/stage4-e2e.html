@@ -1,0 +1,254 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Stage 4 — ticket types, pricing rules, promo codes, products, bundles, upsells, tracking codes (Eli's Step 4). Run from the local server: /stage4-e2e.html
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow; const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=6000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t);
+const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+let lastErr=''; async function throwsP(code){ try{ await E(code); lastErr='(no error)'; return false }catch(e){ lastErr=e.message; return e.message||true } }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const tt=(slug,name)=>ev(slug).ticketTypes.find(t=>t.name===name);
+const promo=code=>E(`Demo.st.promos.find(p=>p.code==='${code}')`);
+const setPromo=(code,patch)=>E(`Object.assign(Demo.st.promos.find(p=>p.code==='${code}'),${JSON.stringify(patch)});Demo.save()`);
+const free=(slug,ttName,n)=>E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='${slug}'),t=e.ticketTypes.find(t=>t.name==='${ttName}');return [...seatStates(e,{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt===t.id).map(x=>x.p.id).slice(0,${n})})()`);
+const buyer=(n='Test Buyer',e='buyer4@test.co')=>({name:n,email:e});
+const place=(p,team)=>`DB.placeOrder(${JSON.stringify({buyer:buyer(),addons:[],payment:'card',...p})}${team?',true':''})`;
+const order=id=>E(`Demo.st.orders.find(o=>o.id==='${id}')`), tickets=id=>E(`Demo.st.tickets.filter(t=>t.order_id==='${id}')`);
+const Q=(cart,code)=>E(`quote(${JSON.stringify(cart)},Demo.st.events,{...DEFAULT_SETTINGS,...Demo.st.boxOffices.find(b=>b.id===Demo.st.events.find(e=>e.id==='${cart.items[0]?.eventId||cart.addons[0].eventId}').box_office_id).settings},${code?`publicPromo(Demo.st.promos.find(p=>p.code==='${code}'),'${code}')`:'null'},{avail:Object.fromEntries(Demo.st.events.map(e=>[e.id,availabilityFrom(Demo.st.tickets,e.id,[],'',Demo.st.orders)]))})`);
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.noSingles=false;Demo.save()`);  // the gap rule is Stage 3's; keep seat picks simple here
+  const g=ev('winter-orchestra-gala'), neon=ev('neon-nights-live'), food=ev('city-food-festival'), kids=ev('kids-science-show');
+  const prem=tt('winter-orchestra-gala','Premium'), stalls=tt('winter-orchestra-gala','Stalls'), circle=tt('winter-orchestra-gala','Circle');
+
+  // ── §1 ticket types ──
+  W().location.hash='#/e/neon-nights-live'; await until(()=>W().document.querySelector('.tt'));
+  ok([...W().document.querySelectorAll('.tt-group')].map(x=>x.textContent).join('|')==='Groups','ticket groups show as headings (hidden VIP group stays hidden)');
+  ok(!has('Artist guest list'),'box-office-only ticket type is not shown to buyers');
+  const guest=tt('neon-nights-live','Artist guest list');
+  ok(/box office only/.test(String(await throwsP(place({items:[{eventId:neon.id,ticketTypeId:guest.id,qty:1}]})))),'box-office-only type refused online');
+  ok(W().document.querySelectorAll('.tt.bundle').length===1 && has('Ticket + parking') && has('save $5'),'packages listed with their saving');
+  ok(has('Tour T-shirt'),'standalone product listed');
+
+  // ── §2 pricing rules ──
+  let q=Q({items:[{eventId:g.id,ticketTypeId:circle.id,qty:2,seats:free('winter-orchestra-gala','Circle',2)}],addons:[]});
+  ok(q.lines[0].unit===3900 && q.lines[0].phase==='Early bird' && q.subtotal===7800,'early-bird phase prices Circle at $39 (base $45)');
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').ticketTypes.find(t=>t.name==='Circle').phases[0].from=new Date(Date.now()+864e5).toISOString()`);
+  q=Q({items:[{eventId:g.id,ticketTypeId:circle.id,qty:1,seats:free('winter-orchestra-gala','Circle',1)}],addons:[]});
+  ok(q.lines[0].unit===4500 && !q.lines[0].phase,'a scheduled phase that has not started leaves the base price');
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').ticketTypes.find(t=>t.name==='Circle').phases[0].from=''`);
+  const ga=tt('neon-nights-live','General admission'), gaSold=E(`availabilityFrom(Demo.st.tickets,'${neon.id}').tt['${ga.id}']||0`);
+  E(`Demo.st.events.find(e=>e.slug==='neon-nights-live').ticketTypes[0].phases=[{label:'First wave',price:2500,from:'',until:'',upTo:${gaSold+1}}];Demo.save()`);
+  q=Q({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:3}],addons:[]});
+  ok(q.lines.length===2 && q.lines[0].qty===1 && q.lines[0].unit===2500 && q.lines[1].qty===2 && q.lines[1].unit===3500,'price rises after N sold — split inside one order: 1×$25 + 2×$35');
+  const rU=await E(place({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:3}]}));
+  ok(order(rU.id).data.subtotal===9500 && tickets(rU.id).map(t=>t.face).sort().join()==='2500,3500,3500','the order and its tickets keep each phase price');
+  ok(Q({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1}],addons:[]}).lines[0].unit===3500,'next buyer pays the new price');
+  q=Q({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:6,seats:free('winter-orchestra-gala','Stalls',6)}],addons:[]});
+  ok(q.lines[0].unit===5500 && q.lines[0].face===5500 && Q({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:5,seats:free('winter-orchestra-gala','Stalls',5)}],addons:[]}).lines[0].unit===6500,'group / quantity price: 6+ Stalls at $55, 5 at $65');
+  const pass=tt('city-food-festival','Tasting pass');
+  ok(Q({items:[{eventId:food.id,ticketTypeId:pass.id,qty:1,slotId:food.timeSlots[1].id}],addons:[]}).lines[0].unit===5900 && Q({items:[{eventId:food.id,ticketTypeId:pass.id,qty:1,slotId:food.timeSlots[0].id}],addons:[]}).lines[0].unit===4900,'different price per showtime ($59 evening, $49 midday)');
+  ok(E(`seatInfo(Demo.st.events.find(e=>e.slug==='winter-orchestra-gala'),'CEN-B5').area`)==='Premium centre' && prem.price===10000 && stalls.price===6500,'different prices by seating area (Premium centre $100 vs Stalls $65)');
+
+  // admin manual price override
+  await as('moishsonn@gmail.com');
+  const ov=await E(place({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:2,price:1234}],payment:'manual'},true));
+  const ovt=tickets(ov.id); ok(ovt.length===2 && ovt.every(t=>t.paid===1234 && t.face===3500 && t.price_override && t.ticket_type_id===ga.id) && order(ov.id).data.subtotal===2468,'manual price override: charged $12.34, face value + real type kept');
+  await as('support@skyline.example');
+  ok(/permission to change ticket prices/.test(String(await throwsP(place({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1,price:100}],payment:'manual'},true)))),'override needs the “Change pricing” permission');
+  ok(/not allowed/.test(String(await throwsP(place({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1,price:100}]})))),'buyers can never send a price');
+
+  // ── §3 promo codes: Eli's BINAH15 example ──
+  const b=JSON.parse(JSON.stringify(promo('BINAH15'))); ok(b.amount===15 && b.prices.join()==='10000' && b.maxTickets===4 && b.maxUses===100 && new Date(b.expires).getDay()===0 && new Date(b.expires).getHours()===10,'BINAH15 seeded: 15%, $100 seats only, max 4 per order, 100 uses, expires Sunday 10:00 AM');
+  const p5=free('winter-orchestra-gala','Premium',5), s2=free('winter-orchestra-gala','Stalls',2);
+  q=Q({items:[{eventId:g.id,ticketTypeId:prem.id,qty:5,seats:p5},{eventId:g.id,ticketTypeId:stalls.id,qty:2,seats:s2}],addons:[]},'BINAH15');
+  ok(q.discount===4*1500 && q.lines.find(l=>l.ticketTypeId===stalls.id).disc===undefined && q.lines[0].discs.filter(d=>d>0).length===4,'BINAH15 on 5 Premium + 2 Stalls: 15% off exactly 4 Premium, Stalls untouched ($60 off)');
+  ok(/doesn't apply/.test(Q({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:2,seats:s2}],addons:[]},'BINAH15').promoErr),'BINAH15 on Stalls only: “doesn\'t apply”');
+  const rb=await E(place({items:[{eventId:g.id,ticketTypeId:prem.id,qty:2,seats:p5.slice(0,2)}],code:'binah15'}));
+  const ob=order(rb.id), tb=tickets(rb.id);
+  ok(ob.data.discount===3000 && ob.data.code==='BINAH15' && ob.data.promo.id===b.id && tb.every(t=>t.face===10000 && t.paid===8500 && t.discount===1500 && t.promo==='BINAH15'),'order: each $100 ticket keeps face $100, paid $85, discount $15 + code');
+  setPromo('BINAH15',{expires:new Date(Date.now()-6e4).toISOString()});
+  ok(/expired/.test(String(await throwsP(place({items:[{eventId:g.id,ticketTypeId:prem.id,qty:1,seats:p5.slice(2,3)}],code:'BINAH15'})))),'expired code refused');
+  setPromo('BINAH15',{expires:b.expires,maxUses:E(`Demo.st.orders.filter(o=>o.data.promo?.id==='${b.id}'&&['paid','pending'].includes(o.status)).length`)});
+  ok(/fully used/.test(String(await throwsP(place({items:[{eventId:g.id,ticketTypeId:prem.id,qty:1,seats:p5.slice(2,3)}],code:'BINAH15'})))),'max total uses enforced');
+  setPromo('BINAH15',{maxUses:100,startsAt:new Date(Date.now()+864e5).toISOString()});
+  ok(/isn't active yet/.test(String(await throwsP(place({items:[{eventId:g.id,ticketTypeId:prem.id,qty:1,seats:p5.slice(2,3)}],code:'BINAH15'})))),'start date enforced');
+  setPromo('BINAH15',{startsAt:''});
+  // per customer / fixed off order / event targeting
+  const w1=await E(`DB.placeOrder({buyer:{name:'W',email:'welcome@test.co'},items:[{eventId:'${neon.id}',ticketTypeId:'${ga.id}',qty:2}],addons:[],payment:'card',code:'WELCOME10'})`);
+  ok(order(w1.id).data.discount===1000 && tickets(w1.id).reduce((t,x)=>t+x.discount,0)===1000,'fixed $10 off the order, shared across the tickets');
+  ok(/already used/.test(String(await throwsP(`DB.placeOrder({buyer:{name:'W',email:'WELCOME@test.co'},items:[{eventId:'${neon.id}',ticketTypeId:'${ga.id}',qty:1}],addons:[],payment:'card',code:'WELCOME10'})`))),'max uses per customer enforced (same email)');
+  ok(/doesn't apply/.test(String(await throwsP(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:s2.slice(0,1)}],code:'WELCOME10'})))),'event-specific code refused on another event');
+  ok(/not valid/.test(String(await throwsP(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:s2.slice(0,1)}],code:'FAMILY5'})))),'another box office\'s code is not valid here');
+  // booking-fee discount + minimum quantity
+  ok(/at least 4 tickets/.test(Q({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:2}],addons:[]},'NOFEES').promoErr),'minimum ticket quantity enforced');
+  q=Q({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:4}],addons:[]},'NOFEES');
+  ok(q.discount===0 && q.feeDiscount>0 && q.fee===0 && q.total===q.subtotal+q.tax,'NOFEES: discounts the booking fee only (fee → $0, ticket price untouched)');
+  setPromo('NOFEES',{maxQty:3}); ok(/up to 3 tickets/.test(Q({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:4}],addons:[]},'NOFEES').promoErr),'maximum ticket quantity enforced'); setPromo('NOFEES',{maxQty:0});
+  setPromo('NOFEES',{on:'both',type:'pct',amount:50}); q=Q({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:4}],addons:[]},'NOFEES');
+  ok(q.discount===7000 && q.feeDiscount>0,'“both”: 50% off ticket price and booking fee'); setPromo('NOFEES',{on:'fee',amount:100});
+  // bulk unique single-use codes, 100% off, max 2 tickets
+  const press=promo('PRESS').codes[0], s4=free('winter-orchestra-gala','Stalls',5);
+  const rp=await E(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:3,seats:s4.slice(0,3)}],code:press.toLowerCase()}));
+  ok(order(rp.id).data.code===press && order(rp.id).data.discount===2*6500 && tickets(rp.id).filter(t=>t.paid===0).length===2,'bulk unique code: 100% off, max 2 discounted tickets per order');
+  ok(/already been used/.test(String(await throwsP(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:s4.slice(3,4)}],code:press})))),'a unique code works once');
+  ok(!!(await E(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:s4.slice(3,4)}],code:promo('PRESS').codes[1]}))),'the next unique code still works');
+  // product-only promo with minimum purchase
+  const park=g.addons.find(a=>a.name==='Parking pass');
+  ok(/minimum purchase/.test(Q({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:s4.slice(4,5)}],addons:[{eventId:g.id,addonId:park.id,qty:1}]},'PARKFREE').promoErr),'minimum purchase amount enforced');
+  q=Q({items:[{eventId:g.id,ticketTypeId:prem.id,qty:2,seats:p5.slice(2,4)}],addons:[{eventId:g.id,addonId:park.id,qty:2}]},'PARKFREE');
+  ok(q.discount===2500 && q.lines.find(l=>l.kind==='addon').disc===2500,'product-specific code: one free parking pass (max 1 discounted item)');
+  // fixed off each, ticket-type specific (Harbor's kids show)
+  const adult=tt('kids-science-show','Adult'), child=tt('kids-science-show','Child (2–12)');
+  q=Q({items:[{eventId:kids.id,ticketTypeId:adult.id,qty:2,slotId:kids.timeSlots[2].id},{eventId:kids.id,ticketTypeId:child.id,qty:3,slotId:kids.timeSlots[2].id}],addons:[]},'FAMILY5');
+  ok(q.discount===1500,'ticket-type code: $5 off each child ticket only');
+  // showtime / bundle targeting via the admin API
+  await as('moishsonn@gmail.com');
+  await E(`DB.savePromo({...newPromo(),code:'LATESHOW',type:'pct',amount:20,eventIds:['${neon.id}'],bundleIds:['${neon.bundles[0].id}'],scope:['bundles']})`);
+  q=Q({items:[{eventId:neon.id,bundleId:neon.bundles[0].id,qty:1},{eventId:neon.id,ticketTypeId:ga.id,qty:1}],addons:[]},'LATESHOW');
+  ok(q.discount===900 && q.lines.find(l=>l.kind==='bundle').disc===900,'bundle-specific code: 20% off the package only');
+  ok(/already in use/.test(String(await throwsP(`DB.savePromo({...newPromo(),code:'ALEX'})`))),'codes are unique across promo and tracking codes');
+  const pub=await E(`DB.checkCode(['${g.id}'],'BINAH15')`); if(pub.error) log('  checkCode: '+pub.error); ok(pub.kind==='promo' && pub.prices && pub.maxUses===undefined && pub.codes===undefined && pub.perCustomer===undefined,'buyers only see a code\'s targeting, never its limits or the other unique codes');
+
+  // ── §4 promo reporting ──
+  W().location.hash='#/admin/promos'; await until(()=>W().document.querySelector('.tbl tr.click'));
+  const st=E(`promoStats(S.adm.promos.find(p=>p.code==='BINAH15'))`);
+  ok(st.orders>=1 && st.tickets>=2 && st.discounted>=3000 && st.original>=20000 && st.customers.some(c=>c.email==='buyer4@test.co') && st.where.some(([k])=>k.includes('Premium centre')),'promo report: uses, orders, tickets, original value, discounted, customers, where used ('+st.where.map(w=>w[0]).join('; ')+')');
+  await until(()=>has('Revenue with codes'));
+  ok(has('BINAH15') && has('Discounted') && has('Revenue with codes'),'Promotions page lists every code with its numbers');
+  W().location.hash='#/admin/promos/code/'+b.id; await until(()=>W().document.querySelector('.kv-grid'));
+  ok(has('Where it was used') && has('Customers') && has('Original value') && W().document.querySelectorAll('.targets').length>=5,'code editor: targeting + report side by side');
+
+  // ── §5 products ──
+  const tee=neon.addons.find(a=>a.name==='Tour T-shirt'), npark=neon.addons.find(a=>a.name==='Parking');
+  const rt=await E(place({items:[],addons:[{eventId:neon.id,addonId:tee.id,qty:2}]}));
+  ok(order(rt.id).data.total>0 && !tickets(rt.id).length && order(rt.id).event_ids[0]===neon.id,'standalone product order (no ticket)');
+  ok(/only be bought with a ticket/.test(String(await throwsP(place({items:[],addons:[{eventId:neon.id,addonId:npark.id,qty:1}]})))),'non-standalone product needs a ticket');
+  const meet=g.addons.find(a=>a.name==='Meet the soloists');
+  ok(/only available with/.test(String(await throwsP(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:free('winter-orchestra-gala','Stalls',1)}],addons:[{eventId:g.id,addonId:meet.id,qty:1}]})))),'section-specific product refused with a Stalls seat');
+  const rm=await E(place({items:[{eventId:g.id,ticketTypeId:prem.id,qty:1,seats:free('winter-orchestra-gala','Premium',1)}],addons:[{eventId:g.id,addonId:meet.id,qty:1}]}));
+  ok(!!rm.id && tickets(rm.id)[0].extras.some(x=>x.includes('Meet the soloists')),'…allowed with a Premium centre seat; the ticket records its add-on');
+  ok(/Maximum 2/.test(String(await throwsP(place({items:[{eventId:g.id,ticketTypeId:prem.id,qty:1,seats:free('winter-orchestra-gala','Premium',1)}],addons:[{eventId:g.id,addonId:meet.id,qty:3}]})))),'per-order product limit');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='neon-nights-live'),a=e.addons.find(a=>a.name==='Parking');a.qty=availabilityFrom(Demo.st.tickets,e.id,[],'',Demo.st.orders).ad[a.id]||0;Demo.save()})()`);
+  ok(/0 Parking left/.test(String(await throwsP(place({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1}],addons:[{eventId:neon.id,addonId:npark.id,qty:1}]})))),'product inventory enforced');
+  ok(/0 Parking left/.test(String(await throwsP(place({items:[{eventId:neon.id,bundleId:neon.bundles[0].id,qty:1}]})))),'…including parking inside a package');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='neon-nights-live');e.addons.find(a=>a.name==='Parking').qty=0;e.addons.find(a=>a.name==='Tour T-shirt').salesEnd=new Date(Date.now()-1000).toISOString();Demo.save()})()`);
+  ok(/not on sale/.test(String(await throwsP(place({items:[],addons:[{eventId:neon.id,addonId:tee.id,qty:1}]})))),'product off-sale date');
+
+  // ── §6 bundles ──
+  const nb=neon.bundles[0], before=E(`availabilityFrom(Demo.st.tickets,'${neon.id}',[],'',Demo.st.orders)`);
+  const rn=await E(place({items:[{eventId:neon.id,bundleId:nb.id,qty:2}]}));
+  const on=order(rn.id), tn=tickets(rn.id), after=E(`availabilityFrom(Demo.st.tickets,'${neon.id}',[],'',Demo.st.orders)`);
+  ok(on.data.lines[0].kind==='bundle' && on.data.subtotal===9000 && on.data.lines[0].value===10000,'package: one combined price ($45 × 2), worth $50 each separately');
+  ok(tn.length===2 && tn.every(t=>t.ticket_type_id===ga.id && t.bundle?.name==='Ticket + parking' && t.face===3500 && t.extras.some(x=>x.includes('Parking'))),'each package ticket keeps its real ticket type, face value and bundle info');
+  ok(tn[0].paid===3150 && tn.reduce((s,t)=>s+t.paid,0)===6300,'package price shared by normal value: ticket $31.50 + parking $13.50 = $45');
+  ok(after.bd[nb.id]===(before.bd[nb.id]||0)+2 && after.ad[npark.id]===(before.ad[npark.id]||0)+2 && after.tt[ga.id]===(before.tt[ga.id]||0)+2,'separate package inventory; its tickets and parking count against their own stock');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='neon-nights-live');e.bundles[0].qty=availabilityFrom(Demo.st.tickets,e.id,[],'',Demo.st.orders).bd[e.bundles[0].id];Demo.save()})()`);
+  ok(/0 Ticket \+ parking left/.test(String(await throwsP(place({items:[{eventId:neon.id,bundleId:nb.id,qty:1}]})))),'package inventory enforced');
+  const fam=kids.bundles[0], rf=await E(place({items:[{eventId:kids.id,bundleId:fam.id,qty:1,slotId:kids.timeSlots[3].id}]}));
+  const tf=tickets(rf.id); ok(tf.length===4 && tf.filter(t=>t.ticket_type_id===adult.id).length===2 && tf.filter(t=>t.ticket_type_id===child.id).length===2 && tf.reduce((s,t)=>s+t.paid,0)===order(rf.id).data.subtotal,'family package: 2 adult + 2 child tickets, paid shares add up to the package price');
+  const dn=g.bundles.find(x=>x.name==='Date night'), dseats=free('winter-orchestra-gala','Stalls',2);
+  const rd=await E(place({items:[{eventId:g.id,bundleId:dn.id,qty:1,seats:dseats}]}));
+  ok(tickets(rd.id).length===2 && tickets(rd.id).every(t=>t.seat && t.area && t.bundle?.name==='Date night'),'seated package: seats picked on the map, area/row/seat kept');
+  ok(/can't include/.test(String(await throwsP(place({items:[{eventId:g.id,bundleId:dn.id,qty:1,seats:free('winter-orchestra-gala','Premium',2)}]})))),'only qualifying ticket types can go in a package');
+
+  // ── §7 conditional upsells (checkout) ──
+  W().location.hash='#/'; await sleep(60);
+  E(`S.cart={items:[{eventId:'${g.id}',ticketTypeId:'${prem.id}',qty:1,seats:${JSON.stringify(free('winter-orchestra-gala','Premium',1))}}],addons:[],donation:0,unlock:{}};S.co.disc=null`);
+  let ups=E('upsellsFor(cartQuote())').map(x=>x.ad.name);
+  ok(ups.includes('Pre-show dinner') && ups.includes('Meet the soloists') && !ups.includes('Parking pass'),'VIP (Premium) → dinner + meet & greet offered: '+ups.join(', '));
+  E(`S.cart.items=[{eventId:'${g.id}',ticketTypeId:'${stalls.id}',qty:2,seats:${JSON.stringify(free('winter-orchestra-gala','Stalls',2))}}]`);
+  ups=E('upsellsFor(cartQuote())').map(x=>x.ad.name); ok(ups.join()==='Parking pass','2 Stalls tickets → parking offered');
+  E(`S.cart.items[0].qty=1;S.cart.items[0].seats=S.cart.items[0].seats.slice(0,1)`); ok(E('upsellsFor(cartQuote()).length')===0,'1 Stalls ticket → nothing (min quantity 2)');
+  E(`S.cart.items[0].qty=2;S.cart.items[0].seats=${JSON.stringify(free('winter-orchestra-gala','Stalls',2))};saveCart()`);
+  W().location.hash='#/cart'; await until(()=>W().document.querySelector('.upsell'));
+  W().document.querySelector('[data-action="addUpsell"]').dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(60);
+  ok(E('S.cart.addons.length')===1 && !W().document.querySelector('.upsell') && has('Parking pass'),'checkout offer adds the product and disappears');
+
+  // ── §8 tracking codes ──
+  W().sessionStorage.clear(); W().location.hash='#/e/neon-nights-live?ref=alex'; await until(()=>W().document.querySelector('.tt'));
+  ok(E(`Demo.st.views['${neon.id}'].hits.slice(-1)[0][3]`)==='ALEX','a ?ref= link view is counted for its tracking code');
+  E(`S.cart={items:[{eventId:'${neon.id}',ticketTypeId:'${ga.id}',qty:2,seats:[]}],addons:[],donation:0,unlock:{}};saveCart()`);
+  W().location.hash='#/cart'; await until(()=>W().document.querySelector('[data-action="placeOrder"]'));
+  ok(has('Referral code') && has('ALEX'),'checkout shows the referral code');
+  E(`S.co.name='Ref Buyer';S.co.email='ref@test.co';S.co.terms=true`); await E('A.placeOrder()'); await until(()=>W().location.hash.startsWith('#/order/')); await until(()=>E('S.order&&S.order.order&&S.order.tickets'));
+  const ro=E('S.order.order'); ok(ro.data.tracking==='ALEX' && E('S.order.tickets').every(t=>t.tracking==='ALEX'),'order and tickets carry the tracking code');
+  ok(!(await E(place({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1}],tracking:'HOTELPARTNER'}).replace('DB.placeOrder(','(async p=>{const r=await DB.placeOrder(p);return Demo.st.orders.find(o=>o.id===r.id).data.tracking})('))),'event-restricted tracking code is not credited on other events');
+  E(`Demo.st.tracking.find(t=>t.code==='RADIO101').expires=new Date(Date.now()-1000).toISOString();Demo.save()`);
+  ok(!(await E(place({items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1}],tracking:'RADIO101'}).replace('DB.placeOrder(','(async p=>{const r=await DB.placeOrder(p);return Demo.st.orders.find(o=>o.id===r.id).data.tracking})('))),'expired tracking code is ignored (sale still goes through)');
+  const typed=await E(`DB.checkCode(['${neon.id}'],'alex')`); ok(typed.kind==='tracking' && typed.code==='ALEX','tracking code typed in the code box is recognised');
+  await as('moishsonn@gmail.com'); W().location.hash='#/admin/promos/tracking'; await until(()=>W().document.querySelector('.tbl tr.click'));
+  const ts=E(`trackStats(S.adm.tracking.find(t=>t.code==='ALEX'))`);
+  ok(ts.views>0 && ts.orders>=1 && ts.tickets>=2 && ts.revenue>0 && ts.conv>0 && ts.uses===ts.orders,`tracking report: ${ts.views} views, ${ts.orders} orders, ${ts.tickets} tickets, conversion ${(ts.conv*100).toFixed(1)}%`);
+  await E(`DB.saveTracking({id:'tr_new',code:'SPONSOR1',name:'Acme Sponsor',kind:'Sponsor',active:true,eventIds:['${g.id}'],startsAt:'',expires:'',maxUses:1})`);
+  await E(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:free('winter-orchestra-gala','Stalls',1)}],tracking:'SPONSOR1'}));
+  ok(!(await E(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:free('winter-orchestra-gala','Stalls',1)}],tracking:'SPONSOR1'}).replace('DB.placeOrder(','(async p=>{const r=await DB.placeOrder(p);return Demo.st.orders.find(o=>o.id===r.id).data.tracking})('))),'tracking usage limit');
+
+  // ── §9 comps keep the real type ──
+  const rc=await E(place({items:[{eventId:g.id,ticketTypeId:prem.id,qty:1,seats:free('winter-orchestra-gala','Premium',1)}],payment:'manual',comp:true},true));
+  const tc=tickets(rc.id)[0]; ok(tc.ticket_type_id===prem.id && tc.face===10000 && tc.paid===0 && tc.comp && order(rc.id).data.faceValue===10000,'comp: ticket type Premium, face $100, collected $0, issued as complimentary');
+
+  // ── §10 every ticket's reporting fields ──
+  const fresh=E(`Demo.st.tickets.filter(t=>t.status==='valid')`);
+  ok(fresh.every(t=>['face','paid','discount','promo','tracking','bundle','extras','comp'].every(k=>k in t)),`all ${fresh.length} tickets carry face, paid, discount, promo, tracking, bundle, products, comp`);
+  const bad=E(`Demo.st.orders.filter(o=>!o.data.comp&&['paid','pending'].includes(o.status)).filter(o=>{const t=Demo.st.tickets.filter(x=>x.order_id===o.id).reduce((s,x)=>s+x.paid,0);const ad=o.data.lines.filter(l=>l.kind==='addon').reduce((s,l)=>s+l.unit*l.qty-(l.disc||0),0);const bad=o.data.lines.filter(l=>l.kind==='bundle').reduce((s,l)=>s+l.addons.reduce((a,x)=>a+0,0),0);return Math.abs(t+ad-(o.data.subtotal-o.data.discount))>0 && !o.data.lines.some(l=>l.kind==='bundle'&&l.addons.length)}).length`);
+  ok(bad===0,'collected per ticket + products = order subtotal − discount, for every order without packaged products');
+  W().location.hash='#/admin/reports'; await until(()=>W().document.querySelector('[data-action="exportTickets"]'));
+  ok(true,'ticket detail CSV export available on Reports');
+  E(`S.ui.repEv='${g.id}'`); E('render()'); await sleep(60); ok(has('In packages') && has('Collected') && has('Premium + dinner (package)'),'reports: by ticket type from tickets (face, discounts, collected, comps, packages) + products');
+
+  // ── buyer UI: packages from the ticket panel (general admission + seated) ──
+  W().location.hash='#/'; await sleep(60); E(`S.cart={items:[],addons:[],donation:0,unlock:{}};saveCart()`);
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='kids-science-show');e.bundles[0].parts[1].ticketTypeIds.push(e.ticketTypes[0].id);Demo.save()})()`); await E('refreshPublic()');
+  W().location.hash='#/e/kids-science-show'; await until(()=>W().document.querySelector('[data-action="pickSlot"]:not([disabled])'));
+  W().document.querySelector('[data-action="pickSlot"]:not([disabled])').dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(40);
+  W().document.querySelector('[data-action="bqty"][data-d="1"]').dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(40);
+  ok(W().document.querySelectorAll('.tt.bundle select').length===1,'a package part that allows several ticket types lets the buyer choose');
+  await E('A.addToCart()'); await until(()=>W().document.querySelector('[data-action="placeOrder"]'));
+  ok(has('1 × Family package') && has('2 × Adult') && has('2 × Child'),'checkout shows the package and what is inside');
+  E(`S.co.name='Pack Buyer';S.co.email='pack@test.co';S.co.terms=true`); await E('A.placeOrder()'); await until(()=>E('S.order&&S.order.tickets&&S.order.tickets.length'));
+  ok(E('S.order.tickets.length')===4 && E('S.order.tickets.every(t=>t.bundle&&t.bundle.name===\'Family package\')') && W().document.querySelectorAll('.e-ticket').length===4 && has('Family package'),'package order → 4 e-tickets labelled with the package');
+  W().location.hash='#/e/winter-orchestra-gala'; await until(()=>W().document.querySelector('.st[data-action]'));
+  E(`S.sel.seats=${JSON.stringify(free('winter-orchestra-gala','Premium',1).concat(free('winter-orchestra-gala','Stalls',1)))};render()`);
+  W().document.querySelector('[data-action="bqty"][data-d="1"]').dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(40);
+  ok(has('Uses 1 of the seats you pick'),'seated package uses a seat picked on the map');
+  W().document.querySelectorAll('[data-action="bqty"][data-d="1"]')[0].dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(40);
+  ok(has('Pick 2 seats on the map for 2 × Premium + dinner') && W().document.querySelector('[data-action="addToCart"]').disabled,'two packages need two Premium seats — the panel says so');
+  W().document.querySelector('[data-action="bqty"][data-d="-1"]').dispatchEvent(new MouseEvent('click',{bubbles:true})); await sleep(40);
+  await E('A.addToCart()'); await until(()=>W().location.hash.startsWith('#/cart'));
+  ok(E('S.cart.items.length')===2 && E('S.cart.items.some(i=>i.bundleId&&i.seats.length===1)') && E('S.cart.items.some(i=>!i.bundleId&&i.seats.length===1)'),'cart: the package took the Premium seat, the Stalls seat is a normal ticket');
+  E(`S.cart={items:[],addons:[],donation:0,unlock:{}};saveCart()`); await E(`DB.releaseSeats('${g.id}')`);
+  // promo editor through the UI
+  await as('moishsonn@gmail.com'); W().location.hash='#/admin/promos'; await until(()=>W().document.querySelector('[data-action="newPromo"]'));
+  W().document.querySelector('[data-action="newPromo"]').dispatchEvent(new MouseEvent('click',{bubbles:true})); await until(()=>W().document.querySelector('[data-action="savePromo"]'));
+  E(`S.draft.code='uitest20';S.draft.amount=20`); W().document.querySelector(`[data-action="togList"][data-path="eventIds"][data-v="${neon.id}"]`).click(); await sleep(40);
+  await E('A.genCodes()'); await E('A.savePromo()'); await until(()=>E('S.adm.promos.some(p=>p.code===\'UITEST20\')'));
+  ok(E(`Demo.st.promos.find(p=>p.code==='UITEST20').eventIds.join()`)===neon.id && E(`Demo.st.promos.find(p=>p.code==='UITEST20').codes.length`)===25 && E("Demo.st.audit.some(a=>a.kind==='promo.created')"),'create a code in the editor: targeting + 25 unique codes saved, logged');
+
+  // ── admin screens + permissions ──
+  W().location.hash=`#/admin/event/${g.id}/tickets`; await until(()=>W().document.querySelector('details.rules'));
+  ok(W().document.querySelectorAll('details.rules[open]').length>=2 && has('Price phase') && has('Group / quantity price'),'Tickets & pricing tab: price phases + quantity prices');
+  W().location.hash=`#/admin/event/${g.id}/products`; await until(()=>has('Checkout offers'));
+  ok(W().document.querySelectorAll('.item-card').length===4+2+3 && has('saves $10'),'Products & packages tab: 4 products, 2 packages (with savings), 3 offers');
+  W().location.hash=`#/admin/event/${g.id}/discounts`; await until(()=>has('Promo codes that apply'));
+  ok(has('BINAH15') && has('EARLYBIRD') && !has('WELCOME10'),'event Promo codes tab lists only codes valid for the event');
+  // price edits need tickets.pricing
+  E(`(()=>{const m=Demo.st.members.find(m=>m.email==='manager@skyline.example');m.perms=m.perms.filter(p=>p!=='tickets.pricing');Demo.save()})()`);
+  await as('manager@skyline.example'); W().location.hash=`#/admin/event/${g.id}/tickets`; await until(()=>E('S.draft&&S.draft.id')===g.id);
+  E('S.draft.ticketTypes[0].price=9900;S.dirty=true'); await E('A.saveEvent()'); await sleep(60);
+  ok(E(`Demo.st.events.find(e=>e.id==='${g.id}').ticketTypes[0].price`)===10000,'changing a price without “Change pricing” is refused');
+  E(`S.draft=JSON.parse(JSON.stringify(S.adm.events.find(e=>e.id==='${g.id}')));S.draft.ticketTypes[0].desc='Best seats';S.dirty=true`); await E('A.saveEvent()'); await sleep(60);
+  ok(E(`Demo.st.events.find(e=>e.id==='${g.id}').ticketTypes[0].desc`)==='Best seats','…other ticket edits still save');
+  ok(E('S.adm.promos.length')>0 && E('S.adm.tracking.length')>0,'event manager sees promo + tracking codes');
+  await as('door@example.com'); ok(E('S.adm.promos.length')===0 && E('S.adm.tracking.length')===0 && !W().document.querySelector('a[href="#/admin/promos"]'),'door staff see no codes and no Promotions page');
+  await as('finance@skyline.example'); ok(/permission/.test(String(await throwsP(`DB.savePromo({...newPromo(),code:'FINTEST'})`))),'finance can read code reports but not create codes');
+  ok(E('S.adm.promos.length')>0 && E('S.adm.tickets.some(t=>t.face>0)'),'finance sees promo reports and ticket money');
+  E(`(()=>{const m=Demo.st.members.find(m=>m.email==='support@skyline.example');m.perms=m.perms.filter(p=>p!=='finance.totals');Demo.save()})()`);
+  await as('support@skyline.example'); ok(E('S.adm.tickets.every(t=>t.face==null&&t.paid==null)') && E('S.adm.orders.every(o=>o.data.faceValue==null)'),'without “sales totals” ticket money is hidden');
+  log('DONE');
+}catch(e){log('ERROR '+e.message+'\n'+e.stack)}})();
+</script></body></html>
