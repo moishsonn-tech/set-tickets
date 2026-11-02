@@ -3,7 +3,7 @@
    SET data layer. One interface (DB.*), two backends:
    - LIVE: Supabase (config.js filled in) — pricing/inventory enforced by place_order() in SQL.
    - DEMO: this browser's localStorage, seeded with sample events — the same rules run here in JS.
-   Event shape everywhere: {id, slug, status, ...publicData, secrets?:{password, ticketPasswords, discounts}}
+   Event shape everywhere: {id, slug, status, ...publicData, secrets?:{password, ticketPasswords}}  (promo codes live box-office wide: promos)
    Money is integer cents.
    ════════════════════════════════════════════════════════════════════════════ */
 const CFG = window.SET_CONFIG || {};
@@ -24,7 +24,7 @@ const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const PERMS = [
   ['events', 'Events', [['view', 'View events', 'v'], ['edit', 'Edit events'], ['create', 'Create events'], ['publish', 'Publish / unpublish'], ['settings', 'Edit event settings']]],
   ['seating', 'Seating', [['view', 'View seating chart', 'v'], ['edit', 'Edit seating chart'], ['block', 'Block seats'], ['unblock', 'Unblock seats'], ['move', 'Move customers between seats'], ['assign', 'Change seat assignments']]],
-  ['tickets', 'Tickets & pricing', [['view', 'View ticket types', 'v'], ['create', 'Create ticket types'], ['edit', 'Edit ticket types'], ['pricing', 'Change pricing'], ['comps', 'Create complimentary tickets'], ['discounts', 'Create discount codes'], ['discountsEdit', 'Edit discount codes']]],
+  ['tickets', 'Tickets & pricing', [['view', 'View ticket types', 'v'], ['create', 'Create ticket types'], ['edit', 'Edit ticket types'], ['pricing', 'Change pricing'], ['comps', 'Create complimentary tickets'], ['discounts', 'Create discount codes'], ['discountsEdit', 'Edit discount codes'], ['tracking', 'Manage tracking codes']]],
   ['orders', 'Orders', [['view', 'View orders', 'v'], ['edit', 'Edit orders'], ['cancel', 'Cancel orders'], ['cancelTicket', 'Cancel individual tickets'], ['resend', 'Resend tickets'], ['customer', 'Change customer information'], ['seats', 'Change seats'], ['refund', 'Issue refunds'], ['override', 'Override normal order restrictions']]],
   ['customers', 'Customer data', [['names', 'View customer names', 'v'], ['emails', 'View email addresses', 'v'], ['phones', 'View phone numbers', 'v'], ['profiles', 'View full customer profiles', 'v'], ['export', 'Export customer information']]],
   ['finance', 'Sales & finance', [['totals', 'View ticket sales totals', 'v'], ['reports', 'View financial reports', 'v'], ['fees', 'View fees', 'v'], ['processing', 'View payment processing information', 'v'], ['payouts', 'View payouts', 'v'], ['export', 'Export financial reports']]],
@@ -41,7 +41,7 @@ const DEFAULT_TEMPLATES = [
   { id: 'door_staff', name: 'Door staff', perms: ['events.view', 'seating.view', 'customers.names', 'door.scan', 'door.checkin', 'door.undo', 'door.override', 'door.attendees'] },
   { id: 'scanner', name: 'Scanner staff', perms: ['events.view', 'door.scan', 'door.checkin'] },
   { id: 'finance', name: 'Finance', perms: ['events.view', 'tickets.view', 'orders.view', 'customers.names', ...groupPerms('finance')] },
-  { id: 'marketing', name: 'Marketing', perms: ['events.view', 'tickets.view', 'tickets.discounts', 'tickets.discountsEdit', 'customers.names', 'customers.emails', 'customers.export', 'finance.totals', ...groupPerms('comms')] },
+  { id: 'marketing', name: 'Marketing', perms: ['events.view', 'tickets.view', 'tickets.discounts', 'tickets.discountsEdit', 'tickets.tracking', 'customers.names', 'customers.emails', 'customers.export', 'finance.totals', ...groupPerms('comms')] },
 ];
 // member = {email, perms:[], events:'all'|[eventId], owner?, support?}; eventId optional (checks event scope too)
 const hasPerm = (m, key, eventId) => !!m && (m.owner || m.support || (m.perms || []).includes(key)) && (!eventId || m.owner || m.support || m.events === 'all' || (m.events || []).includes(eventId));
@@ -69,38 +69,156 @@ const DEFAULT_SETTINGS = {
   contactEmail: '', reminderHours: 24, require2fa: false,
 };
 
-/* ── Pricing: the one quote function (display everywhere; authoritative in DEMO mode). ── */
-function quote(cart, events, settings, discount) {
-  const lines = [], byEv = id => events.find(e => e.id === id);
-  let subtotal = 0, fee = 0, eligible = 0;
-  for (const it of cart.items) {
-    const ev = byEv(it.eventId); if (!ev) continue;
-    const tt = (ev.ticketTypes || []).find(t => t.id === it.ticketTypeId); if (!tt) continue;
-    const unit = +tt.price || 0;
-    subtotal += unit * it.qty;
-    if (unit > 0 && settings.feeMode === 'buyer') fee += it.qty * (Math.round(unit * (+settings.feePct || 0) / 100) + (+settings.feeFixed || 0));
-    if (discount && (!discount.ticketTypeIds?.length || discount.ticketTypeIds.includes(tt.id))) eligible += unit * it.qty;
+/* ── Pricing (Stage 4): the one pricing engine — display everywhere, authoritative in DEMO; SQL price_cart() mirrors it line for line.
+   A ticket's price = its showtime price (slotPrices) or base price, replaced by the active price phase (early bird, a scheduled change,
+   or "the first N sold"), then by a quantity break when that is lower. Staff may override the price on a manual order (tickets.pricing).
+   Lines: ticket {face = normal price, unit = charged before the promo code} · bundle {one combined price, tts = a ticket type per ticket}
+   · addon. A promo code adds per-unit discounts (discs / feeDiscs) so every ticket can carry its own discount. ── */
+const cents = v => Math.max(0, Math.round(+v || 0));
+const inWindow = (from, until, now) => (!from || new Date(from) <= now) && (!until || new Date(until) > now);
+// split a whole number of cents over weights, exactly (no cent lost to rounding)
+function spread(total, weights) {
+  const w = weights.map(x => Math.max(0, +x || 0)), W = w.reduce((a, b) => a + b, 0) || 0, n = w.length;
+  if (!n) return [];
+  const out = w.map(x => W ? Math.floor(total * x / W) : Math.floor(total / n)); let left = total - out.reduce((a, b) => a + b, 0);
+  for (let i = 0; left > 0; i = (i + 1) % n) if (W === 0 || w[i] > 0) { out[i]++; left--; }
+  return out;
+}
+const listPrice = (tt, slotId) => tt ? cents(slotId && tt.slotPrices?.[slotId] !== undefined && tt.slotPrices[slotId] !== '' && tt.slotPrices[slotId] !== null ? tt.slotPrices[slotId] : tt.price) : 0;
+// the price phase selling right now (sold = tickets of this type already sold)
+const activePhase = (tt, sold, now) => (tt.phases || []).find(p => inWindow(p.from, p.until, now) && !(+p.upTo > 0 && sold >= +p.upTo)) || null;
+// price of each of n units, given how many are already sold and how many of this type the order holds (for quantity breaks)
+function ttPrices(tt, slotId, sold, n, inOrder, now) {
+  const br = (tt.breaks || []).filter(b => +b.min > 1 && inOrder >= +b.min).sort((a, b) => +b.min - +a.min)[0], adm = +tt.admits || 1;
+  return Array.from({ length: n }, (_, k) => {
+    const ph = activePhase(tt, sold + k * adm, now); let price = ph ? cents(ph.price) : listPrice(tt, slotId), label = ph ? ph.label || 'Special price' : '';
+    if (br && cents(br.price) < price) { price = cents(br.price); label = `${br.min}+ price`; }
+    return { price, label };
+  });
+}
+// one bundle = parts [{ticketTypeIds, qty}] + addons [{addonId, qty}]; positions = the allowed ticket types for each ticket in ONE bundle
+const bundlePositions = b => (b?.parts || []).flatMap(p => Array.from({ length: Math.max(0, +p.qty || 0) }, () => p.ticketTypeIds || []));
+// the ticket type of every ticket in a bundle line: seated → each seat's price level; general admission → the buyer's pick (default the first allowed)
+function bundleTicketTypes(ev, b, it) {
+  const pos = bundlePositions(b), n = pos.length, seated = ev.seating?.enabled;
+  return Array.from({ length: (+it.qty || 0) * n }, (_, i) => seated ? ev.seating.index?.[(it.seats || [])[i]] || '' : (it.picks || [])[i % n] || pos[i % n][0] || '');
+}
+// promo targeting: [] = any. scope = which kinds of thing it discounts.
+const anyOf = (list, v) => !(list || []).length || list.map(String).includes(String(v));
+function quote(cart, events, settings, promo, o = {}) {
+  const now = o.now || new Date(), byEv = id => events.find(e => e.id === id), lines = [], seen = {};
+  const feeOf = (unit, tickets) => unit > 0 && settings.feeMode === 'buyer' ? Math.round(unit * (+settings.feePct || 0) / 100) + tickets * (+settings.feeFixed || 0) : 0;
+  for (const it of cart.items || []) {
+    const ev = byEv(it.eventId); if (!ev || !(+it.qty >= 1)) continue;
     const slot = it.slotId ? (ev.timeSlots || []).find(s => s.id === it.slotId) : null;
-    lines.push({ kind: 'ticket', eventId: ev.id, eventName: ev.name, ticketTypeId: tt.id, name: tt.name, slotId: it.slotId || null,
-      slotStart: slot?.start || null, seats: it.seats || [], qty: it.qty, unit, admits: +tt.admits || 1, currency: ev.currency || settings.currency });
+    const base = { eventId: ev.id, eventName: ev.name, slotId: it.slotId || null, slotStart: slot?.start || null, currency: ev.currency || settings.currency };
+    if (it.bundleId) {
+      const b = (ev.bundles || []).find(x => x.id === it.bundleId); if (!b) continue;
+      const tts = bundleTicketTypes(ev, b, it), tfaces = tts.map(id => listPrice(ev.ticketTypes.find(t => t.id === id), it.slotId));
+      const adds = (b.addons || []).map(a => { const ad = (ev.addons || []).find(x => x.id === a.addonId); return ad ? { addonId: ad.id, name: ad.name, qty: Math.max(1, +a.qty || 1), face: cents(ad.price) } : null; }).filter(Boolean);
+      const unit = cents(b.price), per = bundlePositions(b).length, uf = feeOf(unit, Math.max(1, per));
+      lines.push({ kind: 'bundle', ...base, bundleId: b.id, name: b.name, qty: +it.qty, unit, face: unit, perCopy: per, tts, tfaces, addons: adds,
+        value: tfaces.reduce((a, x) => a + x, 0) + +it.qty * adds.reduce((a, x) => a + x.face * x.qty, 0), seats: it.seats || [], admits: 1, unitFee: uf, fee: +it.qty * uf });
+      continue;
+    }
+    const tt = (ev.ticketTypes || []).find(t => t.id === it.ticketTypeId); if (!tt) continue;
+    const k = ev.id + '|' + tt.id, adm = +tt.admits || 1, sold = (o.avail?.[ev.id]?.tt?.[tt.id] || 0) + (seen[k] || 0);
+    const inOrder = (cart.items || []).filter(x => x.eventId === ev.id && x.ticketTypeId === tt.id && !x.bundleId).reduce((a, x) => a + (+x.qty || 0), 0);
+    const prices = ttPrices(tt, it.slotId, sold, +it.qty, inOrder, now); seen[k] = (seen[k] || 0) + +it.qty * adm;
+    const ovr = !!o.manual && it.price !== undefined && it.price !== null && it.price !== '';
+    for (let i = 0; i < prices.length;) {  // a phase can end inside one order: one line per run of equal prices
+      let j = i; while (j < prices.length && prices[j].price === prices[i].price && prices[j].label === prices[i].label) j++;
+      const face = prices[i].price, unit = ovr ? cents(it.price) : face, uf = feeOf(unit, 1);
+      lines.push({ kind: 'ticket', ...base, ticketTypeId: tt.id, name: tt.name, seats: (it.seats || []).slice(i * adm, j * adm), qty: j - i, unit, face,
+        ...(prices[i].label ? { phase: prices[i].label } : {}), ...(ovr ? { override: true } : {}), admits: adm, unitFee: uf, fee: (j - i) * uf });
+      i = j;
+    }
   }
   for (const a of cart.addons || []) {
-    const ev = byEv(a.eventId); const ad = (ev?.addons || []).find(x => x.id === a.addonId);
-    if (!ad || a.qty < 1) continue;
-    subtotal += (+ad.price || 0) * a.qty;
-    lines.push({ kind: 'addon', eventId: ev.id, addonId: ad.id, name: ad.name, qty: a.qty, unit: +ad.price || 0 });
+    const ev = byEv(a.eventId), ad = (ev?.addons || []).find(x => x.id === a.addonId);
+    if (!ad || !(+a.qty >= 1)) continue;
+    lines.push({ kind: 'addon', eventId: ev.id, eventName: ev.name, addonId: ad.id, name: ad.name, qty: +a.qty, unit: cents(ad.price), face: cents(ad.price), unitFee: 0, fee: 0 });
   }
-  const disc = !discount ? 0 : discount.type === 'pct' ? Math.round(eligible * discount.amount / 100) : Math.min(+discount.amount, eligible);
-  const tax = Math.round((subtotal - disc) * (+settings.taxPct || 0) / 100);
+  const subtotal = lines.reduce((a, l) => a + l.unit * l.qty, 0), promoErr = promo ? applyPromo(lines, promo, events, subtotal) : '';
+  const disc = lines.reduce((a, l) => a + (l.disc || 0), 0), feeDisc = lines.reduce((a, l) => a + (l.feeDisc || 0), 0);
+  const fee = lines.reduce((a, l) => a + l.fee, 0) - feeDisc, tax = Math.round((subtotal - disc) * (+settings.taxPct || 0) / 100);
   const donation = Math.max(0, Math.round(+cart.donation || 0));
-  return { lines, subtotal, discount: disc, fee, tax, donation, total: subtotal - disc + fee + tax + donation,
-    currency: lines.find(l => l.currency)?.currency || settings.currency };
+  return { lines, subtotal, discount: disc, feeDiscount: feeDisc, fee, tax, donation, total: subtotal - disc + fee + tax + donation, promoErr,
+    faceValue: lines.reduce((a, l) => a + (l.kind === 'bundle' ? l.value : l.face * l.qty), 0), currency: lines.find(l => l.currency)?.currency || settings.currency };
+}
+// Promo code conditions + per-unit discounts. Returns '' or why the code can't be used on this cart.
+// type: pct | fixed (off each discounted item) | order (off the order, shared out) · on: tickets (the price) | fee (booking fee) | both
+function applyPromo(lines, p, events, subtotal) {
+  const scope = p.scope?.length ? p.scope : ['tickets', 'bundles'], units = [];
+  const tickets = lines.reduce((a, l) => a + (l.kind === 'ticket' ? l.qty * l.admits : l.kind === 'bundle' ? l.qty * l.perCopy : 0), 0);
+  if (+p.minQty > 0 && tickets < +p.minQty) return `Code ${p.code} needs at least ${p.minQty} tickets in the order`;
+  if (+p.maxQty > 0 && tickets > +p.maxQty) return `Code ${p.code} is only for orders of up to ${p.maxQty} tickets`;
+  if (+p.minSpend > 0 && subtotal < +p.minSpend) return `Code ${p.code} needs a minimum purchase of $${(+p.minSpend / 100).toFixed(2)}`;
+  for (const l of lines) {
+    if (!anyOf(p.eventIds, l.eventId)) continue;
+    if (l.kind !== 'addon' && (p.slotIds || []).length && !(p.slotIds || []).includes(l.slotId)) continue;
+    const ev = events.find(e => e.id === l.eventId);
+    for (let u = 0; u < l.qty; u++) {
+      if (l.kind === 'ticket') {
+        const area = l.seats[u * l.admits] ? ev?.seating?.meta?.[l.seats[u * l.admits]]?.[0] || '' : '';
+        if (!scope.includes('tickets') || !anyOf(p.ticketTypeIds, l.ticketTypeId) || !anyOf(p.prices, l.unit) || !anyOf(p.areas, area)) continue;
+      } else if (l.kind === 'bundle') { if (!scope.includes('bundles') || !anyOf(p.bundleIds, l.bundleId)) continue; }
+      else if (!scope.includes('addons') || !anyOf(p.addonIds, l.addonId)) continue;
+      units.push({ l, u, price: l.unit, fee: l.unitFee || 0, tickets: l.kind === 'ticket' ? 1 : l.kind === 'bundle' ? l.perCopy : 0 });
+    }
+  }
+  if (!units.length) return `Code ${p.code} doesn't apply to anything in your cart`;
+  units.sort((a, b) => b.price - a.price);  // the most expensive items get the discount first
+  let n = 0, nt = 0;
+  const take = units.filter(x => { if ((+p.maxItems > 0 && n >= +p.maxItems) || (x.tickets && +p.maxTickets > 0 && nt + x.tickets > +p.maxTickets)) return false; n++; nt += x.tickets; return true; });
+  if (!take.length) return `Code ${p.code} doesn't apply to anything in your cart`;
+  const on = p.on || 'tickets', amt = +p.amount || 0;
+  if (p.type === 'order') {
+    const D = Math.min(cents(amt), on === 'fee' ? 0 : take.reduce((a, x) => a + x.price, 0)), ds = spread(D, take.map(x => x.price));
+    const F = on === 'tickets' ? 0 : Math.min(cents(amt) - D, take.reduce((a, x) => a + x.fee, 0)), fs = spread(F, take.map(x => x.fee));
+    take.forEach((x, i) => { x.d = ds[i]; x.fd = fs[i]; });
+  } else for (const x of take) {
+    if (p.type === 'pct') { const r = Math.min(100, Math.max(0, amt)); x.d = on === 'fee' ? 0 : Math.round(x.price * r / 100); x.fd = on === 'tickets' ? 0 : Math.round(x.fee * r / 100); }
+    else { const a = cents(amt); x.d = on === 'fee' ? 0 : Math.min(a, x.price); x.fd = on === 'fee' ? Math.min(a, x.fee) : on === 'both' ? Math.min(a - x.d, x.fee) : 0; }
+  }
+  for (const x of take) {
+    const l = x.l; l.discs ||= Array(l.qty).fill(0); l.feeDiscs ||= Array(l.qty).fill(0);
+    l.discs[x.u] += x.d; l.feeDiscs[x.u] += x.fd; l.disc = (l.disc || 0) + x.d; l.feeDisc = (l.feeDisc || 0) + x.fd;
+  }
+  return '';
+}
+// usage limits that need order history (checked when the order is placed; the client can't see other people's orders)
+function promoUsable(p, code, orders, email, now = new Date()) {
+  if (!p || p.active === false) return 'That code is not valid';
+  if (p.startsAt && new Date(p.startsAt) > now) return `Code ${p.code} isn't active yet`;
+  if (p.expires && new Date(p.expires) <= now) return `Code ${p.code} has expired`;
+  const used = orders.filter(o => ['paid', 'pending'].includes(o.status) && o.data.promo?.id === p.id);
+  if (+p.maxUses > 0 && used.length >= +p.maxUses) return `Code ${p.code} has been fully used`;
+  if ((p.codes || []).includes(String(code).toUpperCase()) && used.some(o => String(o.data.code).toUpperCase() === String(code).toUpperCase())) return `Code ${String(code).toUpperCase()} has already been used`;
+  if (email && +p.perCustomer > 0 && used.filter(o => o.buyer_email === email.toLowerCase()).length >= +p.perCustomer) return `You've already used code ${p.code}`;
+  return '';
+}
+const trackingUsable = (t, eventIds, orders, now = new Date()) => !!t && t.active !== false && inWindow(t.startsAt, t.expires, now)
+  && (!(t.eventIds || []).length || eventIds.some(id => t.eventIds.includes(id)))
+  && !(+t.maxUses > 0 && orders.filter(o => o.box_office_id === t.box_office_id && ['paid', 'pending'].includes(o.status) && o.data.tracking === t.code).length >= +t.maxUses);
+// what a buyer's browser may know about a promo: the targeting it needs to show the discount, never the limits or the other unique codes
+const publicPromo = (p, code) => { const { codes, note, maxUses, perCustomer, created_at, created_by, box_office_id, ...pub } = p; return { ...pub, code: String(code).trim().toUpperCase() }; };
+// products a buyer can add right now, given what's in their selection (ticket types + seat areas)
+function addonOpen(ad, now = new Date()) { return inWindow(ad.salesStart, ad.salesEnd, now) && !ad.hidden; }
+function addonAllowed(ev, ad, tts, areas) {
+  return (!(ad.ticketTypeIds || []).length || ad.ticketTypeIds.some(id => tts.includes(id))) && (!(ad.areas || []).length || ad.areas.some(a => areas.includes(a)));
 }
 
 /* availability from a ticket list (DEMO) — same shape as the SQL availability() */
 // seats: sold "slot|seat" keys; off: seats nobody else can buy right now (blocked, held, unavailable, in someone else's checkout).
-function availabilityFrom(tickets, eventId, statuses = [], token = '') {
-  const a = { tt: {}, slots: {}, seats: [], total: 0, off: [] };
+// ad / bd: products and bundles already sold (from live orders; bundle products count against the product's stock)
+function availabilityFrom(tickets, eventId, statuses = [], token = '', orders = []) {
+  const a = { tt: {}, slots: {}, seats: [], total: 0, off: [], ad: {}, bd: {} };
+  for (const o of orders) if (['paid', 'pending'].includes(o.status)) for (const l of o.data.lines || []) {
+    if (l.eventId !== eventId) continue;
+    if (l.kind === 'addon') a.ad[l.addonId] = (a.ad[l.addonId] || 0) + l.qty;
+    if (l.kind === 'bundle') { a.bd[l.bundleId] = (a.bd[l.bundleId] || 0) + l.qty; for (const x of l.addons || []) a.ad[x.addonId] = (a.ad[x.addonId] || 0) + x.qty * l.qty; }
+  }
   for (const t of tickets) {
     if (t.event_id !== eventId || t.status !== 'valid') continue;
     a.total++; a.tt[t.ticket_type_id] = (a.tt[t.ticket_type_id] || 0) + 1;
@@ -184,10 +302,14 @@ function cloneEventStructure(src) {
   if (ev.seating?.prices) ev.seating.prices = Object.fromEntries(Object.entries(ev.seating.prices).map(([k, v]) => [k, ttMap[v] || '']));
   if (ev.seating?.index) ev.seating.index = Object.fromEntries(Object.entries(ev.seating.index).map(([k, v]) => [k, ttMap[v] || '']));
   const sec = ev.secrets || {};
-  ev.secrets = { password: sec.password || '', ticketPasswords: Object.fromEntries(Object.entries(sec.ticketPasswords || {}).map(([k, v]) => [ttMap[k], v])),
-    discounts: (sec.discounts || []).map(d => ({ ...d, id: shortId('dc_'), ticketTypeIds: (d.ticketTypeIds || []).map(i => ttMap[i]) })) };
-  ev.timeSlots = (ev.timeSlots || []).map(x => ({ ...x, id: shortId('ts_') }));
-  ev.addons = (ev.addons || []).map(a => ({ ...a, id: shortId('ad_') })); ev.questions = (ev.questions || []).map(q => ({ ...q, id: shortId('q_') }));
+  ev.secrets = { password: sec.password || '', ticketPasswords: Object.fromEntries(Object.entries(sec.ticketPasswords || {}).map(([k, v]) => [ttMap[k], v])) };
+  const slMap = {}, adMap = {}, tts = ids => (ids || []).map(i => ttMap[i]).filter(Boolean);
+  ev.timeSlots = (ev.timeSlots || []).map(x => { const n = shortId('ts_'); slMap[x.id] = n; return { ...x, id: n }; });
+  ev.ticketTypes.forEach(t => { if (t.slotPrices) t.slotPrices = Object.fromEntries(Object.entries(t.slotPrices).filter(([k]) => slMap[k]).map(([k, v]) => [slMap[k], v])); });
+  ev.addons = (ev.addons || []).map(a => { const n = shortId('ad_'); adMap[a.id] = n; return { ...a, id: n, ticketTypeIds: tts(a.ticketTypeIds) }; });
+  ev.bundles = (ev.bundles || []).map(b => ({ ...b, id: shortId('bd_'), parts: (b.parts || []).map(x => ({ ...x, ticketTypeIds: tts(x.ticketTypeIds) })), addons: (b.addons || []).filter(x => adMap[x.addonId]).map(x => ({ ...x, addonId: adMap[x.addonId] })) }));
+  ev.upsells = (ev.upsells || []).filter(u => adMap[u.addonId]).map(u => ({ ...u, id: shortId('up_'), addonId: adMap[u.addonId], ticketTypeIds: tts(u.ticketTypeIds) }));
+  ev.questions = (ev.questions || []).map(q => ({ ...q, id: shortId('q_') }));
   delete ev.archived; delete ev.publishAt; delete ev.salesStart; delete ev.salesEnd; delete ev.salesPaused; delete ev.hasPassword;
   return Object.assign(ev, { id: uid(), status: 'draft', created_at: nowIso() });
 }
@@ -195,7 +317,7 @@ function cloneEventStructure(src) {
 function eventToTemplate(ev, name) {
   const e = cloneEventStructure(ev), st = new Date(ev.start), mins = ev.end ? Math.round((new Date(ev.end) - st) / 6e4) : 180;
   for (const k of ['id', 'slug', 'status', 'created_at', 'start', 'end', 'box_office_id', 'image']) delete e[k];
-  e.timeSlots = []; e.secrets.discounts = []; e.secrets.password = '';
+  e.timeSlots = []; e.secrets.password = ''; e.ticketTypes.forEach(t => delete t.slotPrices);
   return { id: shortId('etpl_'), name: name || ev.name, created_at: nowIso(), at: [st.getHours(), st.getMinutes()], minutes: mins, event: e };
 }
 function eventFromTemplate(tpl, dayIso) {
@@ -379,7 +501,7 @@ function singleGaps(ev, isFree, chosen) {
 }
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v7';
+const DEMO_KEY = 'set_demo_v8';
 const Demo = {
   st: null,
   load() {
@@ -393,13 +515,20 @@ const Demo = {
   reset() { localStorage.removeItem(DEMO_KEY); return this.load(); },
 };
 
-function findDiscount(ev, code, orders) {
-  const d = (ev.secrets?.discounts || []).find(x => x.code.toUpperCase() === String(code).trim().toUpperCase());
-  if (!d) return null;
-  if (d.expires && new Date(d.expires) < new Date()) return null;
-  const used = orders.filter(o => ['paid', 'pending'].includes(o.status) && o.event_ids.includes(ev.id) && (o.data.code || '').toUpperCase() === d.code.toUpperCase()).length;
-  if (+d.limit > 0 && used >= +d.limit) return null;
-  const { limit, ...pub } = d; return pub;
+// A typed code is a promo code (or one of its bulk unique codes) or a tracking code — one namespace per box office.
+function findCode(st, boId, code) {
+  const c = String(code || '').trim().toUpperCase(); if (!c) return null;
+  const promo = (st.promos || []).find(p => p.box_office_id === boId && (String(p.code).toUpperCase() === c || (p.codes || []).includes(c)));
+  if (promo) return { promo };
+  const tracking = (st.tracking || []).find(t => t.box_office_id === boId && String(t.code).toUpperCase() === c);
+  return tracking ? { tracking } : null;
+}
+// codes are unique per box office across promo codes, their bulk unique codes and tracking codes
+function codeClash(st, code, extra, selfId) {
+  const all = [code, ...extra];
+  if (all.some(c => !/^[A-Z0-9][A-Z0-9_-]{2,31}$/.test(c))) throw new Error('Codes are 3–32 letters, numbers, - or _');
+  if (new Set(all).size !== all.length) throw new Error('The same code appears twice');
+  for (const c of all) { const f = findCode(st, DB._bo, c); if (f && (f.promo || f.tracking).id !== selfId) throw new Error(`Code ${c} is already in use`); }
 }
 
 // "Stalls centre · Row A · Seat 12" from the saved ticket meta (data layer has no layout renderer)
@@ -422,99 +551,172 @@ function logSeatEdits(prev, row) {
 }
 const gapMsg = (ev, gaps) => `Please don't leave a single empty seat next to your selection (${gaps.map(g => seatText(ev, g)).join('; ')}). Move over one seat, or include it.`;
 function demoPlaceOrder(p, asTeam) {
-  const st = Demo.st, manual = p.payment === 'manual';
+  const st = Demo.st, manual = p.payment === 'manual', now = new Date();
   if (manual && !asTeam) throw new Error('not allowed');
   if (!String(p.buyer?.name || '').trim()) throw new Error('Name is required');
   if (!EMAIL_RE.test(p.buyer?.email || '')) throw new Error('A valid email is required');
-  let disc = null, bo = null;
-  const pending = { tt: {}, slots: {}, seats: [], total: {} };
-  for (const it of p.items) {
-    const ev = st.events.find(e => e.id === it.eventId && (e.status === 'published' || manual));
+  const items = p.items || [], addons = (p.addons || []).filter(a => +a.qty >= 1);
+  if (!items.length && !addons.length) throw new Error('Your cart is empty');
+  let bo = null;
+  const pending = { tt: {}, slots: {}, seats: [], total: {}, bd: {}, ad: {} }, evIds = [], avs = {}, mine = {};  // mine: ticket types + seat areas in this order, per event
+  const evOf = id => {
+    const ev = st.events.find(e => e.id === id && (e.status === 'published' || manual));
     if (!ev) throw new Error('Event is not on sale');
     const b = st.boxOffices.find(x => x.id === ev.box_office_id);
     if (!b || (b.status !== 'active' && !manual)) throw new Error('This box office is not selling tickets right now');
     if (bo && bo !== b) throw new Error('One order can only hold one organizer\'s events');
     bo = b;
-    if (asTeam && !hasPerm(asTeam, 'orders.edit', ev.id)) throw new Error('You don\'t have permission to create orders for ' + ev.name);
-    const tt = ev.ticketTypes.find(t => t.id === it.ticketTypeId); if (!tt) throw new Error('Unknown ticket type');
-    const pw = p.unlock?.[ev.id] || '', sec = ev.secrets || {}, now = new Date();
-    if (!(it.qty >= 1)) throw new Error('Bad quantity');
-    if (!manual) {
-      normEvent(ev);
-      if (!eventLive(ev)) throw new Error('Event is not on sale');
-      if (ev.salesStart && new Date(ev.salesStart) > now) throw new Error('Tickets go on sale ' + new Date(ev.salesStart).toLocaleString());
-      if (sec.password && pw !== sec.password) throw new Error('This event needs a password');
-      if (sec.ticketPasswords?.[tt.id] && pw !== sec.ticketPasswords[tt.id]) throw new Error(tt.name + ' is locked');
-      if (tt.salesStart && new Date(tt.salesStart) > now) throw new Error(tt.name + ' is not on sale yet');
-      if (tt.salesEnd && new Date(tt.salesEnd) < now) throw new Error(tt.name + ' sales have ended');
-      if (ev.salesEnd && new Date(ev.salesEnd) < now) throw new Error('Sales have ended');
-      if (it.qty < (+tt.min || 1)) throw new Error(`Minimum ${tt.min} for ${tt.name}`);
-      if (+tt.max > 0 && it.qty > +tt.max) throw new Error(`Maximum ${tt.max} for ${tt.name}`);
+    if (!evIds.includes(ev.id)) {
+      evIds.push(ev.id); avs[ev.id] = availabilityFrom(st.tickets, ev.id, [], '', st.orders); mine[ev.id] = { tts: [], areas: [] };
+      if (!manual) {
+        normEvent(ev);
+        if (!eventLive(ev)) throw new Error('Event is not on sale');
+        if (ev.salesStart && new Date(ev.salesStart) > now) throw new Error('Tickets go on sale ' + new Date(ev.salesStart).toLocaleString());
+        if (ev.salesEnd && new Date(ev.salesEnd) < now) throw new Error('Sales have ended');
+        if (ev.secrets?.password && (p.unlock?.[ev.id] || '') !== ev.secrets.password) throw new Error('This event needs a password');
+      }
     }
-    const av = availabilityFrom(st.tickets, ev.id), adm = it.qty * (+tt.admits || 1);
-    const k = ev.id + tt.id; pending.tt[k] = (pending.tt[k] || 0) + adm; pending.total[ev.id] = (pending.total[ev.id] || 0) + adm;
+    return ev;
+  };
+  // inventory, capacity, showtime and seat checks for n tickets of one type (a bundle checks each of its ticket types)
+  const checkTickets = (ev, it, tt, n, seats) => {
+    if (!tt) throw new Error('Unknown ticket type');
+    const av = avs[ev.id], adm = n * (+tt.admits || 1), k = ev.id + tt.id;
+    pending.tt[k] = (pending.tt[k] || 0) + adm; pending.total[ev.id] = (pending.total[ev.id] || 0) + adm;
     if (+tt.qty > 0 && (av.tt[tt.id] || 0) + pending.tt[k] > +tt.qty) throw new Error(`Only ${Math.max(+tt.qty - (av.tt[tt.id] || 0), 0)} ${tt.name} left`);
     if (+ev.capacity > 0 && av.total + pending.total[ev.id] > +ev.capacity) throw new Error('Event is sold out');
     if (ev.timeSlots?.length) {
       const slot = ev.timeSlots.find(s => s.id === it.slotId); if (!slot) throw new Error('Pick a time slot');
       if (!manual && (slot.hidden || slot.unavailable || slot.soldOut)) throw new Error('That showtime is not available');
-      const sk = ev.id + slot.id; pending.slots[sk] = (pending.slots[sk] || 0) + it.qty;
+      const sk = ev.id + slot.id; pending.slots[sk] = (pending.slots[sk] || 0) + n;
       if (+slot.capacity > 0 && (av.slots[slot.id] || 0) + pending.slots[sk] > +slot.capacity) throw new Error('That time slot is full');
     }
-    if (ev.seating?.enabled) {
-      if ((it.seats || []).length !== it.qty) throw new Error(`Pick ${it.qty} seat(s)`);
-      const act = activeStatuses(st.seatStatus, ev.id, it.slotId || '');
-      for (const s of it.seats) {
-        const key = (it.slotId || '') + '|' + s, h = act.get(s);
-        if (!ev.seating.index?.[s]) throw new Error(`${seatText(ev, s)} is unavailable`);
-        if (ev.seating.index[s] !== tt.id) throw new Error(`${seatText(ev, s)} isn't a ${tt.name} seat`);
-        if (av.seats.includes(key) || pending.seats.includes(ev.id + key)) throw new Error(`${seatText(ev, s)} was just taken`);
-        // staff may sell a seat they're holding; nobody sells a blocked/unavailable seat or one in another buyer's checkout
-        if (h && !(h.status === 'checkout' && p.holdToken && h.token === p.holdToken) && !(manual && h.status === 'held'))
-          throw new Error(h.status === 'checkout' ? `${seatText(ev, s)} is being held by another buyer — try again in a few minutes` : `${seatText(ev, s)} is unavailable`);
-        pending.seats.push(ev.id + key);
-      }
-      if (ev.seating.noSingles && !manual) {
-        const mine = it.seats.concat(pending.seats.filter(k => k.startsWith(ev.id + (it.slotId || '') + '|')).map(k => k.split('|')[1]));
-        const taken = new Set(av.seats.filter(k => k.startsWith((it.slotId || '') + '|')).map(k => k.split('|')[1]));
-        const gaps = singleGaps(ev, id => !!ev.seating.index[id] && !taken.has(id) && !(act.get(id) && !(act.get(id).status === 'checkout' && act.get(id).token === p.holdToken)), [...new Set(mine)]);
-        if (gaps.length) throw new Error(gapMsg(ev, gaps));
-      }
+    mine[ev.id].tts.push(tt.id);
+    if (!ev.seating?.enabled) return;
+    if (seats.length !== n) throw new Error(`Pick ${n} seat(s)`);
+    const act = activeStatuses(st.seatStatus, ev.id, it.slotId || '');
+    for (const s of seats) {
+      const key = (it.slotId || '') + '|' + s, h = act.get(s);
+      if (!ev.seating.index?.[s]) throw new Error(`${seatText(ev, s)} is unavailable`);
+      if (ev.seating.index[s] !== tt.id) throw new Error(`${seatText(ev, s)} isn't a ${tt.name} seat`);
+      if (av.seats.includes(key) || pending.seats.includes(ev.id + key)) throw new Error(`${seatText(ev, s)} was just taken`);
+      // staff may sell a seat they're holding; nobody sells a blocked/unavailable seat or one in another buyer's checkout
+      if (h && !(h.status === 'checkout' && p.holdToken && h.token === p.holdToken) && !(manual && h.status === 'held'))
+        throw new Error(h.status === 'checkout' ? `${seatText(ev, s)} is being held by another buyer — try again in a few minutes` : `${seatText(ev, s)} is unavailable`);
+      pending.seats.push(ev.id + key); mine[ev.id].areas.push(ev.seating.meta?.[s]?.[0] || '');
     }
-    if (p.code && !disc) disc = findDiscount(ev, p.code, st.orders);
+  };
+  for (const it of items) {
+    const ev = evOf(it.eventId), sec = ev.secrets || {}, pw = p.unlock?.[ev.id] || '';
+    if (asTeam && !hasPerm(asTeam, 'orders.edit', ev.id)) throw new Error('You don\'t have permission to create orders for ' + ev.name);
+    if (!(+it.qty >= 1)) throw new Error('Bad quantity');
+    if (it.price !== undefined && it.price !== null && it.price !== '') {  // manual price override
+      if (!manual) throw new Error('not allowed');
+      if (!hasPerm(asTeam, 'tickets.pricing', ev.id)) throw new Error('You don\'t have permission to change ticket prices');
+    }
+    if (it.bundleId) {
+      const b = (ev.bundles || []).find(x => x.id === it.bundleId); if (!b) throw new Error('Unknown bundle');
+      if (!manual) {
+        if (b.hidden || !inWindow(b.salesStart, b.salesEnd, now)) throw new Error(b.name + ' is not on sale right now');
+        if (+b.max > 0 && +it.qty > +b.max) throw new Error(`Maximum ${b.max} × ${b.name} per order`);
+      }
+      const av = avs[ev.id]; pending.bd[b.id] = (pending.bd[b.id] || 0) + +it.qty;
+      if (+b.qty > 0 && (av.bd[b.id] || 0) + pending.bd[b.id] > +b.qty) throw new Error(`Only ${Math.max(0, +b.qty - (av.bd[b.id] || 0))} ${b.name} left`);
+      const pos = bundlePositions(b), tts = bundleTicketTypes(ev, b, it);
+      if (ev.seating?.enabled && (it.seats || []).length !== tts.length) throw new Error(`Pick ${tts.length} seat(s) for ${b.name}`);
+      tts.forEach((id, i) => { if (!pos[i % pos.length].includes(id)) throw new Error(`${b.name} can't include ${ev.seating?.enabled ? seatText(ev, it.seats[i]) : 'that ticket type'}`); });
+      for (const id of new Set(tts)) checkTickets(ev, it, ev.ticketTypes.find(t => t.id === id), tts.filter(x => x === id).length, (it.seats || []).filter((_, i) => tts[i] === id));
+      for (const x of b.addons || []) { const k = ev.id + '|' + x.addonId; pending.ad[k] = (pending.ad[k] || 0) + Math.max(1, +x.qty || 1) * +it.qty; }
+    } else {
+      const tt = ev.ticketTypes.find(t => t.id === it.ticketTypeId); if (!tt) throw new Error('Unknown ticket type');
+      if (!manual) {
+        if (tt.adminOnly) throw new Error(tt.name + ' is sold by the box office only');
+        if (sec.ticketPasswords?.[tt.id] && pw !== sec.ticketPasswords[tt.id]) throw new Error(tt.name + ' is locked');
+        if (tt.salesStart && new Date(tt.salesStart) > now) throw new Error(tt.name + ' is not on sale yet');
+        if (tt.salesEnd && new Date(tt.salesEnd) < now) throw new Error(tt.name + ' sales have ended');
+        if (+it.qty < (+tt.min || 1)) throw new Error(`Minimum ${tt.min} for ${tt.name}`);
+        if (+tt.max > 0 && +it.qty > +tt.max) throw new Error(`Maximum ${tt.max} for ${tt.name}`);
+      }
+      checkTickets(ev, it, tt, +it.qty, it.seats || []);
+    }
+    if (ev.seating?.enabled && ev.seating.noSingles && !manual) {
+      const av = avs[ev.id], act = activeStatuses(st.seatStatus, ev.id, it.slotId || '');
+      const all = pending.seats.filter(k => k.startsWith(ev.id + (it.slotId || '') + '|')).map(k => k.split('|')[1]);
+      const taken = new Set(av.seats.filter(k => k.startsWith((it.slotId || '') + '|')).map(k => k.split('|')[1]));
+      const gaps = singleGaps(ev, id => !!ev.seating.index[id] && !taken.has(id) && !(act.get(id) && !(act.get(id).status === 'checkout' && act.get(id).token === p.holdToken)), [...new Set(all)]);
+      if (gaps.length) throw new Error(gapMsg(ev, gaps));
+    }
   }
-  for (const a of p.addons || []) if (!p.items.some(i => i.eventId === a.eventId)) throw new Error('Unknown add-on');
-  if (!p.items.length) throw new Error('Your cart is empty');
-  if (p.code && !disc) throw new Error('That discount code is not valid');
-  const q = quote({ items: p.items, addons: p.addons, donation: p.donation }, st.events, bo.settings, disc);
-  const plat = st.platform, nTk = q.lines.filter(l => l.kind === 'ticket' && l.unit > 0).reduce((t, l) => t + l.qty, 0);
+  // products: on sale, sold with the right tickets / seats unless standalone, per-order limit, stock (bundled products count too)
+  for (const a of addons) {
+    const withTickets = items.some(i => i.eventId === a.eventId), ev = evOf(a.eventId), ad = (ev.addons || []).find(x => x.id === a.addonId);
+    if (!ad) throw new Error('Unknown add-on');
+    if (!manual) {
+      if (!addonOpen(ad, now)) throw new Error(ad.name + ' is not on sale right now');
+      if (!ad.standalone && !withTickets) throw new Error(ad.name + ' can only be bought with a ticket');
+      if (withTickets && !addonAllowed(ev, ad, mine[ev.id].tts, mine[ev.id].areas)) throw new Error(`${ad.name} is only available with ${[...(ad.ticketTypeIds || []).map(id => ev.ticketTypes.find(t => t.id === id)?.name), ...(ad.areas || [])].filter(Boolean).join(' / ')} tickets`);
+      if (!withTickets && ((ad.ticketTypeIds || []).length || (ad.areas || []).length)) throw new Error(ad.name + ' can only be bought with a ticket');
+      if (+ad.max > 0 && +a.qty > +ad.max) throw new Error(`Maximum ${ad.max} × ${ad.name} per order`);
+    }
+    const k = ev.id + '|' + ad.id; pending.ad[k] = (pending.ad[k] || 0) + +a.qty;
+  }
+  for (const [k, n] of Object.entries(pending.ad)) {
+    const [evId, id] = k.split('|'), ev = st.events.find(e => e.id === evId), ad = (ev.addons || []).find(x => x.id === id), sold = avs[evId].ad[id] || 0;
+    if (!ad) throw new Error('Unknown add-on');
+    if (+ad.qty > 0 && sold + n > +ad.qty) throw new Error(`Only ${Math.max(0, +ad.qty - sold)} ${ad.name} left`);
+  }
+  // promo / tracking code — one box office, one code namespace
+  const email = p.buyer.email.trim().toLowerCase();
+  let promo = null, tracking = null;
+  if (p.code && !p.comp) {
+    const f = findCode(st, bo.id, p.code);
+    if (f?.promo) { const e = promoUsable(f.promo, p.code, st.orders, email, now); if (e) throw new Error(e); promo = publicPromo(f.promo, p.code); }
+    else if (f?.tracking && trackingUsable(f.tracking, evIds, st.orders, now)) tracking = f.tracking.code;
+    else throw new Error('That code is not valid');
+  }
+  if (!tracking && p.tracking) { const f = findCode(st, bo.id, p.tracking); if (f?.tracking && trackingUsable(f.tracking, evIds, st.orders, now)) tracking = f.tracking.code; }  // a stale link never blocks a sale
+  const q = quote({ items, addons, donation: p.donation }, st.events, { ...DEFAULT_SETTINGS, ...bo.settings }, promo, { avail: avs, manual, now });
+  if (promo && q.promoErr) throw new Error(q.promoErr);
+  const plat = st.platform, nTk = q.lines.filter(l => l.kind === 'ticket' && l.unit > 0).reduce((t, l) => t + l.qty, 0) + q.lines.filter(l => l.kind === 'bundle' && l.unit > 0).reduce((t, l) => t + l.qty * l.perCopy, 0);
   const platformFee = q.subtotal - q.discount > 0 ? Math.round((q.subtotal - q.discount) * (+plat.feePct || 0) / 100) + nTk * (+plat.feeFixed || 0) : 0;
   if (q.total > 0 && !manual && !['offline', 'card'].includes(p.payment)) throw new Error('Choose a payment method');
   if (p.comp) {  // complimentary: keeps the real ticket type and face value, collects $0
     if (!manual) throw new Error('not allowed');
-    for (const it of p.items) if (!hasPerm(asTeam, 'tickets.comps', it.eventId)) throw new Error('You don\'t have permission to issue complimentary tickets');
-    q.lines.forEach(l => { l.face = l.unit; l.unit = 0; l.comp = true; }); q.faceValue = q.subtotal;
-    Object.assign(q, { subtotal: 0, discount: 0, fee: 0, tax: 0, donation: 0, total: 0 });
+    for (const id of evIds) if (!hasPerm(asTeam, 'tickets.comps', id)) throw new Error('You don\'t have permission to issue complimentary tickets');
+    q.lines.forEach(l => Object.assign(l, { unit: 0, fee: 0, unitFee: 0, comp: true }));
+    Object.assign(q, { subtotal: 0, discount: 0, feeDiscount: 0, fee: 0, tax: 0, donation: 0, total: 0 });
   }
   const status = (q.total === 0 || manual || p.payment === 'card') ? 'paid' : 'pending';
   let ref; do { ref = 'SET-' + randCode(6); } while (st.orders.some(o => o.ref === ref));
-  const order = { id: uid(), box_office_id: bo.id, ref, access_key: uid(), status, buyer_email: p.buyer.email.trim().toLowerCase(),
-    event_ids: [...new Set(p.items.map(i => i.eventId))], created_at: new Date().toISOString(),
-    data: { buyer: p.buyer, lines: q.lines, subtotal: q.subtotal, discount: q.discount, fee: q.fee, tax: q.tax, donation: q.donation,
-      total: q.total, code: disc?.code || null, payment: q.total === 0 ? 'free' : p.payment, answers: p.answers || {}, optIn: !!p.optIn,
-      source: p.source || null, currency: q.currency, platformFee: p.comp ? 0 : platformFee, ...(p.comp ? { comp: true, faceValue: q.faceValue } : {}) } };
+  const order = { id: uid(), box_office_id: bo.id, ref, access_key: uid(), status, buyer_email: email, event_ids: evIds, created_at: new Date().toISOString(),
+    data: { buyer: p.buyer, lines: q.lines, subtotal: q.subtotal, discount: q.discount, feeDiscount: q.feeDiscount, fee: q.fee, tax: q.tax, donation: q.donation,
+      total: q.total, faceValue: q.faceValue, code: promo?.code || null, promo: promo ? { id: promo.id, code: findCode(st, bo.id, promo.code).promo.code } : null, tracking,
+      payment: q.total === 0 ? 'free' : p.payment, answers: p.answers || {}, optIn: !!p.optIn, source: p.source || null, currency: q.currency,
+      platformFee: p.comp ? 0 : platformFee, ...(p.comp ? { comp: true } : {}) } };
   st.orders.push(order);
   const by = asTeam?.email || DB._actor || order.buyer_email;
-  for (const l of q.lines.filter(l => l.kind === 'ticket')) {
-    const ev = st.events.find(e => e.id === l.eventId);
-    for (let i = 0; i < l.qty * l.admits; i++) {
-      const seat = l.seats[i] || null, inf = seat ? seatInfo(ev, seat) : null;
-      st.tickets.push({ id: uid(), box_office_id: bo.id, order_id: order.id, event_id: l.eventId, ticket_type_id: l.ticketTypeId, slot_id: l.slotId || null,
-        seat, ...(inf ? { area: inf.area, row: inf.row, seat_label: inf.seat } : {}), ...(p.comp ? { comp: true } : {}), code: randCode(10), holder: p.buyer.name, status: 'valid', checked_in_at: null });
-      if (seat) seatLog(ev, l.slotId, seat, p.comp ? 'comp' : 'sold', `${p.comp ? 'Complimentary ticket issued' : 'Sold'} to ${p.buyer.name}${disc ? ` · discount ${disc.code}` : ''} · ${money_(l.unit || l.face || 0)}`, { ref, by, discount: disc?.code });
+  // Every ticket keeps: real ticket type, face value, amount collected, its discount + code, comp, tracking code, products and bundle.
+  const extras = evId => q.lines.filter(l => l.eventId === evId && l.kind === 'addon').map(l => `${l.name} × ${l.qty}`);
+  const issue = (l, ttId, seat, face, paid, discount, more = {}) => {
+    const ev = st.events.find(e => e.id === l.eventId), inf = seat ? seatInfo(ev, seat) : null;
+    st.tickets.push({ id: uid(), box_office_id: bo.id, order_id: order.id, event_id: l.eventId, ticket_type_id: ttId, slot_id: l.slotId || null,
+      seat, ...(inf ? { area: inf.area, row: inf.row, seat_label: inf.seat } : {}), comp: !!p.comp, face, paid, discount, promo: discount > 0 ? promo.code : null, tracking,
+      bundle: null, extras: extras(l.eventId), price_override: !!l.override, ...more, code: randCode(10), holder: p.buyer.name, status: 'valid', checked_in_at: null });
+    if (seat) seatLog(ev, l.slotId, seat, p.comp ? 'comp' : 'sold', `${p.comp ? 'Complimentary ticket issued' : 'Sold'} to ${p.buyer.name}${discount > 0 ? ` · discount ${promo.code}` : ''}${more.bundle ? ` · ${more.bundle.name}` : ''} · ${money_(p.comp ? face : paid)}`, { ref, by, discount: discount > 0 ? promo.code : null });
+  };
+  for (const l of q.lines) {
+    if (l.kind === 'ticket') for (let u = 0; u < l.qty; u++) {
+      const d = l.discs?.[u] || 0, fs = spread(l.face, Array(l.admits).fill(1)), ps = spread(l.unit - d, Array(l.admits).fill(1)), ds = spread(d, Array(l.admits).fill(1));
+      for (let j = 0; j < l.admits; j++) issue(l, l.ticketTypeId, l.seats[u * l.admits + j] || null, fs[j], ps[j], ds[j]);
+    }
+    if (l.kind === 'bundle') for (let c = 0; c < l.qty; c++) {  // the bundle price is shared over its tickets and products by their normal prices
+      const n = l.perCopy, tf = l.tfaces.slice(c * n, c * n + n), w = [...tf, ...l.addons.map(a => a.face * a.qty)], d = l.discs?.[c] || 0;
+      const ps = spread(l.unit - d, w), ds = spread(d, w);
+      for (let j = 0; j < n; j++) issue(l, l.tts[c * n + j], l.seats[c * n + j] || null, tf[j], ps[j], ds[j],
+        { bundle: { id: l.bundleId, name: l.name, n: c + 1 }, extras: [...extras(l.eventId), ...l.addons.map(a => `${a.name} × ${a.qty} (in ${l.name})`)] });
     }
     // seats sold out of a checkout hold or a staff hold leave the hold list
-    if (l.seats.length) st.seatStatus = (st.seatStatus || []).filter(r => !(r.event_id === l.eventId && l.seats.includes(r.seat) && [l.slotId || '', ''].includes(r.slot_id || '') && (r.status === 'checkout' || (manual && r.status === 'held'))));
+    if (l.seats?.length) st.seatStatus = (st.seatStatus || []).filter(r => !(r.event_id === l.eventId && l.seats.includes(r.seat) && [l.slotId || '', ''].includes(r.slot_id || '') && (r.status === 'checkout' || (manual && r.status === 'held'))));
   }
   if (p.holdToken) st.seatStatus = (st.seatStatus || []).filter(r => !(r.status === 'checkout' && r.token === p.holdToken));
   Demo.save();
@@ -531,9 +733,11 @@ const nowIso = () => new Date().toISOString();
 // page views → {total, unique, today, last10m, bySrc}; hits = [[ms, visitor, src]]
 function viewStats(v) {
   const hits = v?.hits || [], day0 = new Date().setHours(0, 0, 0, 0), bySrc = {};
-  hits.forEach(h => { const k = h[2] || 'direct'; bySrc[k] = (bySrc[k] || 0) + 1; });
-  return { total: hits.length, unique: new Set(hits.map(h => h[1])).size, today: hits.filter(h => h[0] >= day0).length, last10m: new Set(hits.filter(h => h[0] >= Date.now() - 6e5).map(h => h[1])).size, bySrc };
+  const byRef = {}; hits.forEach(h => { const k = h[2] || 'direct'; bySrc[k] = (bySrc[k] || 0) + 1; if (h[3]) { const r = byRef[h[3]] ||= { views: 0, v: new Set() }; r.views++; r.v.add(h[1]); } });
+  return { total: hits.length, unique: new Set(hits.map(h => h[1])).size, today: hits.filter(h => h[0] >= day0).length, last10m: new Set(hits.filter(h => h[0] >= Date.now() - 6e5).map(h => h[1])).size, bySrc,
+    byRef: Object.fromEntries(Object.entries(byRef).map(([k, r]) => [k, { views: r.views, unique: r.v.size }])) };
 }
+const MONEY_KEYS = ['subtotal', 'discount', 'feeDiscount', 'fee', 'tax', 'donation', 'total', 'faceValue', 'platformFee'], LINE_MONEY = ['face', 'value', 'tfaces', 'discs', 'feeDiscs', 'disc', 'feeDisc', 'fee', 'unitFee'];
 const maskEmail = e => String(e || '').replace(/^(.)[^@]*@(.)[^.]*(\..+)$/, '$1•••@$2•••$3');
 
 /* ── DEMO "server": every organizer write passes need(), the same checks the SQL policies make in LIVE. ── */
@@ -565,6 +769,7 @@ function startDemoSession(email) {
 const EVENT_TRACKED = [['name', 'Name'], ['status', 'Status'], ['archived', 'Archived'], ['start', 'Start'], ['end', 'End'], ['allDay', 'All day'], ['venue', 'Venue'], ['address', 'Address'],
   ['online', 'Online'], ['capacity', 'Capacity'], ['visibility', 'Visibility'], ['publishAt', 'Scheduled publish'], ['salesStart', 'Sales open'], ['salesEnd', 'Sales close'],
   ['waitlistMode', 'Waitlist'], ['currency', 'Currency'], ['contact', 'Event contact'], ['policies', 'Policies']];
+const priceSig = e => JSON.stringify([(e.ticketTypes || []).map(t => [t.id, +t.price || 0, t.phases || [], t.breaks || [], t.slotPrices || {}]), (e.addons || []).map(a => [a.id, +a.price || 0]), (e.bundles || []).map(b => [b.id, +b.price || 0])]);
 const showtimeSig = s => [s.start, s.capacity, s.hidden ? 'hidden' : '', s.unavailable ? 'unavailable' : '', s.soldOut ? 'sold out' : ''].filter(x => x !== '').join(' · ');
 function eventDiff(a, b) {
   const out = [], j = v => JSON.stringify(v ?? '');
@@ -576,8 +781,12 @@ function eventDiff(a, b) {
     if (!x || !y) { out.push(['Ticket type · ' + n, x ? 'existed' : '', y ? 'added' : 'removed']); continue; }
     if (x.price !== y.price) out.push(['Price · ' + n, x.price, y.price]);
     if (+x.qty !== +y.qty) out.push(['Quantity · ' + n, x.qty, y.qty]);
-    for (const k of ['name', 'hidden', 'salesStart', 'salesEnd', 'min', 'max']) if (j(x[k]) !== j(y[k])) out.push([`Ticket setting · ${n} · ${k}`, x[k] ?? '', y[k] ?? '']);
+    for (const k of ['name', 'hidden', 'adminOnly', 'group', 'salesStart', 'salesEnd', 'min', 'max']) if (j(x[k]) !== j(y[k])) out.push([`Ticket setting · ${n} · ${k}`, x[k] ?? '', y[k] ?? '']);
+    for (const [k, l] of [['phases', 'price phases'], ['breaks', 'quantity pricing'], ['slotPrices', 'showtime prices']]) if (j(x[k] || null) !== j(y[k] || null)) out.push([`Pricing rule · ${n} · ${l}`, 'previous', 'changed']);
   }
+  const named = (l, k) => (l || []).map(x => x.name + (k ? ' ' + money_(x[k]) : '')).join(', ');
+  for (const [k, l] of [['addons', 'Products'], ['bundles', 'Bundles'], ['upsells', 'Upsells']]) if (j(a?.[k] || []) !== j(b?.[k] || []))
+    out.push([l, k === 'upsells' ? (a?.[k] || []).length + ' offers' : named(a?.[k], 'price'), k === 'upsells' ? (b?.[k] || []).length + ' offers' : named(b?.[k], 'price')]);
   const sa = Object.fromEntries((a?.timeSlots || []).map(s => [s.id, showtimeSig(s)])), sb = Object.fromEntries((b?.timeSlots || []).map(s => [s.id, showtimeSig(s)]));
   for (const id of new Set([...Object.keys(sa), ...Object.keys(sb)])) if (sa[id] !== sb[id]) out.push(['Showtime', sa[id] || '(new)', sb[id] || '(removed)']);
   const sa2 = a?.seating || {}, sb2 = b?.seating || {}, changedKeys = (x, y) => [...new Set([...Object.keys(x || {}), ...Object.keys(y || {})])].filter(k => (x || {})[k] !== (y || {})[k]).length;
@@ -690,7 +899,7 @@ const DB = {
     const m = me || memberFor(st, email, bo.id);
     if (bo.status !== 'active' && !m.support) return { super: isSuper, bos, bo: publicBo(bo), me: m, blocked: bo.status };
     if (bo.settings?.require2fa && !m.support && !st.mfa?.[email])  // nothing leaves the "server" until 2FA is set up
-      return { super: isSuper, bos, me: m, needs2fa: true, bo: publicBo(bo), events: [], orders: [], tickets: [], waitlist: [], team: [m], broadcasts: [], audit: [], seatStatus: [], seatLog: [] };
+      return { super: isSuper, bos, me: m, needs2fa: true, bo: publicBo(bo), events: [], orders: [], tickets: [], waitlist: [], team: [m], broadcasts: [], audit: [], seatStatus: [], seatLog: [], promos: [], tracking: [] };
     const P = k => hasPerm(m, k);
     const events = st.events.filter(e => e.box_office_id === bo.id && (m.owner || m.support || m.events === 'all' || (m.events || []).includes(e.id)));
     const evIds = new Set(events.map(e => e.id));
@@ -702,7 +911,10 @@ const DB = {
     if (!P('customers.names')) { orders.forEach(o => o.data.buyer.name = 'Guest'); tickets.forEach(t => t.holder = 'Guest'); }
     if (!P('customers.emails')) orders.forEach(o => { o.buyer_email = maskEmail(o.buyer_email); o.data.buyer.email = o.buyer_email; });
     if (!P('customers.phones')) orders.forEach(o => { if (o.data.buyer.phone) o.data.buyer.phone = '•••'; });
-    if (!P('finance.totals')) orders.forEach(o => { for (const k of ['subtotal', 'discount', 'fee', 'tax', 'donation', 'total', 'platformFee']) o.data[k] = null; o.data.lines.forEach(l => l.unit = null); });
+    if (!P('finance.totals')) {
+      orders.forEach(o => { for (const k of MONEY_KEYS) o.data[k] = null; o.data.lines.forEach(l => { for (const k of LINE_MONEY) delete l[k]; l.unit = null; }); });
+      tickets.forEach(t => { t.face = t.paid = t.discount = null; });
+    }
     const full = clone({ ...bo, templates: bo.templates?.length ? bo.templates : DEFAULT_TEMPLATES });
     return { super: isSuper, bos, me: m, bo: { ...full, branding: { ...DEFAULT_BRANDING, ...full.branding }, settings: { ...DEFAULT_SETTINGS, ...full.settings, name: bo.name } },
       events: clone(events), orders, tickets,
@@ -712,7 +924,9 @@ const DB = {
       audit: clone(st.audit.filter(a => a.box_office_id === bo.id && (P('admin.perms') || a.actor === email || (a.target && hasPerm(m, 'events.edit', a.target)))).slice(0, 1500)),
       views: Object.fromEntries([...evIds].map(id => [id, viewStats(st.views?.[id])])),
       seatStatus: clone((st.seatStatus || []).filter(r => evIds.has(r.event_id))).map(({ token, ...r }) => r),  // buyers' hold tokens never leave the server
-      seatLog: P('seating.view') ? clone((st.seatLog || []).filter(r => evIds.has(r.event_id)).slice(0, 8000)) : [] };
+      seatLog: P('seating.view') ? clone((st.seatLog || []).filter(r => evIds.has(r.event_id)).slice(0, 8000)) : [],
+      promos: P('tickets.discounts') || P('tickets.discountsEdit') || P('finance.reports') ? clone((st.promos || []).filter(x => x.box_office_id === bo.id)) : [],
+      tracking: P('tickets.tracking') || P('finance.reports') ? clone((st.tracking || []).filter(x => x.box_office_id === bo.id)) : [] };
   },
   async stillAllowed() { if (LIVE) return true; try { need(); return true; } catch (e) { return !e.revoked; } },
   async saveEvent(ev) {
@@ -720,6 +934,7 @@ const DB = {
       const st = Demo.st, i = st.events.findIndex(e => e.id === ev.id), prev = i >= 0 ? st.events[i] : null;
       need(prev ? 'events.edit' : 'events.create', prev ? ev.id : null);
       if (prev && prev.status !== ev.status) need('events.publish', ev.id);
+      if (prev && priceSig(prev) !== priceSig(ev)) need('tickets.pricing', ev.id);  // prices, price rules, product and bundle prices
       if (prev && prev.box_office_id !== DB._bo) throw new Error('not allowed');
       const row = clone({ ...ev, box_office_id: DB._bo }), diff = eventDiff(prev, row);
       if (prev && row.seating?.enabled) {  // a layout edit can never delete a seat somebody holds a ticket for
@@ -835,10 +1050,11 @@ const DB = {
     if (!LIVE) { const st = Demo.fresh(), act = new Set(st.boxOffices.filter(b => b.status === 'active').map(b => b.id)); const e = st.events.find(x => x.slug === slug); return e && act.has(e.box_office_id) && eventLive(normEvent(e)) ? publicEvent(e) : null; }
     const r = await must(sb.rpc('event_by_slug', { p_slug: slug })); return r ? normEvent(rowToEvent(r)) : null;
   },
-  async trackView(eventId, src) {
+  async trackView(eventId, src, ref) {  // ref = tracking code from a ?ref= link
     let vid = ''; try { vid = localStorage.getItem('set_vid') || uid(); localStorage.setItem('set_vid', vid); } catch (e) { vid = uid(); }
-    if (!LIVE) { const st = Demo.st, v = ((st.views ||= {})[eventId] ||= { hits: [] }); v.hits.push([Date.now(), vid.slice(0, 8), src || '']); if (v.hits.length > 20000) v.hits.splice(0, 5000); Demo.save(); return; }
-    sb.rpc('track_view', { p_event: eventId, p_visitor: vid, p_src: src || null }).then(() => { }, () => { });
+    ref = String(ref || '').trim().toUpperCase().slice(0, 40);
+    if (!LIVE) { const st = Demo.st, v = ((st.views ||= {})[eventId] ||= { hits: [] }); v.hits.push([Date.now(), vid.slice(0, 8), src || '', ...(ref ? [ref] : [])]); if (v.hits.length > 20000) v.hits.splice(0, 5000); Demo.save(); return; }
+    sb.rpc('track_view', { p_event: eventId, p_visitor: vid, p_src: src || null, p_ref: ref || null }).then(() => { }, () => { });
   },
   async saveEventTemplates(list) {
     if (!LIVE) { need('events.create'); const bo = Demo.st.boxOffices.find(b => b.id === DB._bo); bo.eventTemplates = clone(list); audit('event.templates', 'Edited event templates'); Demo.save(); return; }
@@ -902,7 +1118,7 @@ const DB = {
   },
   // ── buyer-facing ──
   async availability(eventId) {
-    if (!LIVE) { const st = Demo.fresh(); return availabilityFrom(st.tickets, eventId, st.seatStatus, this.holdToken()); }
+    if (!LIVE) { const st = Demo.fresh(); return availabilityFrom(st.tickets, eventId, st.seatStatus, this.holdToken(), st.orders); }
     return must(sb.rpc('availability', { p_event: eventId, p_token: this.holdToken() }));
   },
   // This browser's checkout-hold id: seats picked here are held for HOLD_MINUTES while the buyer checks out.
@@ -971,14 +1187,53 @@ const DB = {
     Demo.save();
   },
   // Master venue charts: a library on the box office. Attaching one to an event copies it, so later edits never touch other events.
+  // ── Promo + tracking codes (Stage 4): box-office wide, targeted by event / showtime / ticket type / area / price / product / bundle ──
+  async savePromo(pr) {
+    if (LIVE) return must(sb.rpc('save_promo', { p_bo: DB._bo, p: pr }));
+    const st = Demo.st, list = st.promos ||= [], i = list.findIndex(x => x.id === pr.id && x.box_office_id === DB._bo);
+    need(i >= 0 ? 'tickets.discountsEdit' : 'tickets.discounts');
+    const row = clone({ ...pr, box_office_id: DB._bo, code: String(pr.code || '').trim().toUpperCase(), codes: [...new Set((pr.codes || []).map(c => String(c).trim().toUpperCase()).filter(Boolean))] });
+    codeClash(st, row.code, row.codes, row.id);
+    if (!['pct', 'fixed', 'order'].includes(row.type)) throw new Error('Choose a discount type');
+    if (row.type === 'pct' && !(+row.amount > 0 && +row.amount <= 100)) throw new Error('Percent must be between 1 and 100');
+    if (row.type !== 'pct' && !(+row.amount > 0)) throw new Error('Enter the discount amount');
+    if (i >= 0) { row.created_at = list[i].created_at; row.created_by = list[i].created_by; list[i] = row; } else { row.created_at = nowIso(); row.created_by = DB._actor; list.push(row); }
+    audit(i >= 0 ? 'promo.updated' : 'promo.created', `${i >= 0 ? 'Updated' : 'Created'} promo code ${row.code}${row.codes.length ? ` (+${row.codes.length} unique codes)` : ''}`); Demo.save(); return clone(row);
+  },
+  async deletePromo(id) {
+    if (LIVE) return must(sb.rpc('delete_promo', { p_bo: DB._bo, p_id: id }));
+    const st = Demo.st, pr = (st.promos || []).find(x => x.id === id && x.box_office_id === DB._bo); need('tickets.discountsEdit'); if (!pr) return;
+    if (st.orders.some(o => o.data.promo?.id === id)) throw new Error('This code has been used — switch it off instead, so its report is kept');
+    st.promos = st.promos.filter(x => x !== pr); audit('promo.deleted', 'Deleted promo code ' + pr.code); Demo.save();
+  },
+  async saveTracking(t) {
+    if (LIVE) return must(sb.rpc('save_tracking', { p_bo: DB._bo, p: t }));
+    const st = Demo.st, list = st.tracking ||= [], i = list.findIndex(x => x.id === t.id && x.box_office_id === DB._bo); need('tickets.tracking');
+    const row = clone({ ...t, box_office_id: DB._bo, code: String(t.code || '').trim().toUpperCase() }); codeClash(st, row.code, [], row.id);
+    if (!String(row.name || '').trim()) throw new Error('Who or what is this code for?');
+    if (i >= 0) { row.created_at = list[i].created_at; list[i] = row; } else { row.created_at = nowIso(); list.push(row); }
+    audit(i >= 0 ? 'tracking.updated' : 'tracking.created', `${i >= 0 ? 'Updated' : 'Created'} tracking code ${row.code} (${row.name})`); Demo.save(); return clone(row);
+  },
+  async deleteTracking(id) {
+    if (LIVE) return must(sb.rpc('delete_tracking', { p_bo: DB._bo, p_id: id }));
+    const st = Demo.st, t = (st.tracking || []).find(x => x.id === id && x.box_office_id === DB._bo); need('tickets.tracking'); if (!t) return;
+    if (st.orders.some(o => o.box_office_id === DB._bo && o.data.tracking === t.code)) throw new Error('This code has orders — switch it off instead, so its report is kept');
+    st.tracking = st.tracking.filter(x => x !== t); audit('tracking.deleted', 'Deleted tracking code ' + t.code); Demo.save();
+  },
   async saveVenues(list) {
     if (!LIVE) { need('seating.edit'); const bo = Demo.st.boxOffices.find(b => b.id === DB._bo), was = (bo.venues || []).length; bo.venues = clone(list);
       audit('venues.saved', list.length === was ? 'Edited venue charts' : list.length > was ? 'Added a venue chart' : 'Deleted a venue chart'); Demo.save(); return; }
     await must(sb.rpc('save_venues', { p_bo: DB._bo, p: list }));
   },
-  async checkDiscount(eventId, code) {
-    if (!LIVE) { const ev = Demo.st.events.find(e => e.id === eventId); return ev ? findDiscount(ev, code, Demo.st.orders) : null; }
-    return must(sb.rpc('check_discount', { p_event: eventId, p_code: code }));
+  // A code typed at checkout: {kind:'promo', ...targeting} | {kind:'promo', error} | {kind:'tracking', code} | null
+  async checkCode(eventIds, code) {
+    if (!LIVE) {
+      const st = Demo.fresh(), ev = st.events.find(e => eventIds.includes(e.id)); if (!ev) return null;
+      const f = findCode(st, ev.box_office_id, code); if (!f) return null;
+      if (f.promo) { const e = promoUsable(f.promo, code, st.orders, ''); return e ? { kind: 'promo', error: e } : { kind: 'promo', ...publicPromo(f.promo, code) }; }
+      return trackingUsable(f.tracking, eventIds, st.orders) ? { kind: 'tracking', code: f.tracking.code } : null;
+    }
+    return must(sb.rpc('check_code', { p_events: eventIds, p_code: code }));
   },
   async unlock(eventId, password) {
     if (!LIVE) {
@@ -1020,14 +1275,15 @@ const DB = {
 function seedDemo() {
   const day = (d, h = 20, m = 0) => { const x = new Date(); x.setDate(x.getDate() + d); x.setHours(h, m, 0, 0); return x.toISOString(); };
   const tt = (name, price, qty, extra = {}) => ({ id: shortId('tt_'), name, price, qty, min: 1, max: 10, admits: 1, desc: '', hidden: false, ...extra });
+  const prod = (name, price, qty, extra = {}) => ({ id: shortId('ad_'), name, price, qty, max: 0, desc: '', category: 'Other', salesStart: '', salesEnd: '', ticketTypeIds: [], areas: [], standalone: false, ...extra });
   const base = { capacity: 0, timezone: 'America/New_York', currency: 'USD', visibility: 'public', online: false, onlineUrl: '', image: '', allDay: false,
     timeSlots: [], seating: { enabled: false }, addons: [], questions: [], waitlistMode: 'soldout', emails: { confirmation: '', reminders: [] },
     contact: { name: '', email: '', phone: '' }, policies: '', instructions: '' };
-  const mk = (o) => ({ ...base, id: uid(), status: 'published', created_at: day(-30), secrets: { password: '', ticketPasswords: {}, discounts: [] }, ...o });
+  const mk = (o) => ({ ...base, id: uid(), status: 'published', created_at: day(-30), secrets: { password: '', ticketPasswords: {} }, ...o });
 
-  const vipTT = tt('Premium', 12000, 0, { desc: 'Front centre, rows A–C', max: 8 });
-  const stallsTT = tt('Stalls', 6500, 0, { desc: 'Ground floor' });
-  const circleTT = tt('Circle', 4500, 0, { desc: 'Raised rows J–L' });
+  const vipTT = tt('Premium', 10000, 0, { desc: 'Front centre, rows A–C', max: 8, group: 'Reserved seating' });
+  const stallsTT = tt('Stalls', 6500, 0, { desc: 'Ground floor', group: 'Reserved seating', breaks: [{ min: 6, price: 5500 }] });
+  const circleTT = tt('Circle', 4500, 0, { desc: 'Raised rows J–L', group: 'Reserved seating', phases: [{ id: shortId('ph_'), label: 'Early bird', price: 3900, from: '', until: day(12, 23, 59), upTo: 0 }] });
   const ev1 = mk({ slug: 'winter-orchestra-gala', name: 'Winter Orchestra Gala', category: 'Concert',
     summary: 'A full symphony orchestra with guest soloists.', start: day(41, 19, 30), end: day(41, 22, 0), doors: '6:45 PM',
     venue: 'Grand Lyric Theatre', address: '1500 Broadway, New York, NY 10036',
@@ -1041,9 +1297,15 @@ function seedDemo() {
         { id: shortId('sec_'), code: 'RGT', name: 'Stalls right', kind: 'rows', x: 235, y: 18, rot: -9, rows: 8, seatsPerRow: 6, rowStart: 'A', ticketTypeId: stallsTT.id },
         { id: shortId('sec_'), code: 'CIR', name: 'Circle', level: 'L2', kind: 'rows', x: -299, y: 40, rot: 0, rows: 3, seatsPerRow: 24, rowStart: 'J', curve: 40, ticketTypeId: circleTT.id },
       ] },
-    addons: [{ id: shortId('ad_'), name: 'Printed programme', price: 800, qty: 0 }, { id: shortId('ad_'), name: 'Parking pass', price: 2500, qty: 150 }],
-    questions: [{ id: shortId('q_'), label: 'How did you hear about us?', type: 'select', options: 'Instagram, Email, Friend, Poster, Other', required: false }],
-    secrets: { password: '', ticketPasswords: {}, discounts: [{ id: shortId('dc_'), code: 'EARLYBIRD', type: 'pct', amount: 15, limit: 100, expires: day(20), ticketTypeIds: [] }] } });
+    addons: [prod('Printed programme', 800, 0, { category: 'Merchandise', standalone: true }), prod('Parking pass', 2500, 150, { category: 'Parking', max: 2, desc: 'Garage on W 47th St, all evening' }),
+      prod('Pre-show dinner', 5500, 80, { category: 'Dinner', desc: 'Three courses in the Lyric Room, 5:30 PM' }), prod('Meet the soloists', 4500, 20, { category: 'Meet & greet', max: 2, desc: 'After the show, backstage' })],
+    questions: [{ id: shortId('q_'), label: 'How did you hear about us?', type: 'select', options: 'Instagram, Email, Friend, Poster, Other', required: false }] });
+  { const [, park, dinner, meet] = ev1.addons; meet.areas = ['Premium centre'];
+    ev1.bundles = [{ id: shortId('bd_'), name: 'Premium + dinner', desc: 'A Premium seat and the pre-show dinner — save $10', price: 14500, qty: 40, max: 4, parts: [{ ticketTypeIds: [vipTT.id], qty: 1 }], addons: [{ addonId: dinner.id, qty: 1 }] },
+      { id: shortId('bd_'), name: 'Date night', desc: 'Two Stalls or Circle seats + parking', price: 13500, qty: 0, max: 2, parts: [{ ticketTypeIds: [stallsTT.id, circleTT.id], qty: 2 }], addons: [{ addonId: park.id, qty: 1 }] }];
+    ev1.upsells = [{ id: shortId('up_'), addonId: dinner.id, text: 'Make a night of it — dinner before the show', ticketTypeIds: [vipTT.id], areas: [], prices: [], minQty: 1, perTicket: true },
+      { id: shortId('up_'), addonId: meet.id, text: 'Front-row guests can meet the soloists', ticketTypeIds: [], areas: ['Premium centre'], prices: [], minQty: 1, perTicket: false },
+      { id: shortId('up_'), addonId: park.id, text: 'Driving in? Reserve parking', ticketTypeIds: [stallsTT.id], areas: [], prices: [], minQty: 2, perTicket: false }]; }
   // Premium = front three rows of the centre block (per-seat price + area overrides).
   ev1.seating.areas = {}; const L1 = seatLayout(ev1.seating); L1.seats.filter(p => p.sec.code === 'CEN' && ['A', 'B', 'C'].includes(p.row)).forEach(p => { ev1.seating.prices[p.id] = vipTT.id; });
   L1.seats.filter(p => p.sec.code === 'CEN' && ['A', 'B', 'C'].includes(p.row)).forEach(p => { ev1.seating.areas[p.id] = 'Premium centre'; });
@@ -1051,14 +1313,15 @@ function seedDemo() {
   const ev2 = mk({ slug: 'neon-nights-live', name: 'Neon Nights Live', category: 'Live music', start: day(0, 20, 0), end: day(0, 23, 30), doors: '7:00 PM',
     summary: 'Tonight — three bands, one stage.', venue: 'The Warehouse', address: '210 Kent Ave, Brooklyn, NY 11249', audience: '18+ · ID required',
     description: 'Three of the city\'s best live acts on one stage. Standing room, full bar.\n\nPhoto ID required at the door.',
-    capacity: 450, ticketTypes: [tt('General admission', 3500, 380), tt('Early entry', 5500, 60, { desc: 'Doors 30 minutes early' }), tt('Group of 5', 15000, 30, { admits: 5, desc: 'Admits five — save $25', max: 4 }),
-      tt('VIP table', 60000, 5, { hidden: true, desc: 'Reserved table for 6 with bottle service', max: 1 })],
-    secrets: { password: '', ticketPasswords: {}, discounts: [{ id: shortId('dc_'), code: 'WELCOME10', type: 'fixed', amount: 1000, limit: 0, expires: '', ticketTypeIds: [] }] } });
+    capacity: 450, ticketTypes: [tt('General admission', 3500, 380), tt('Early entry', 5500, 60, { desc: 'Doors 30 minutes early' }), tt('Group of 5', 15000, 30, { admits: 5, desc: 'Admits five — save $25', max: 4, group: 'Groups' }),
+      tt('VIP table', 60000, 5, { hidden: true, desc: 'Reserved table for 6 with bottle service', max: 1, group: 'VIP' }), tt('Artist guest list', 0, 20, { adminOnly: true, desc: 'Issued by the box office' })],
+    addons: [prod('Parking', 1500, 40, { category: 'Parking' }), prod('Tour T-shirt', 2500, 0, { category: 'Merchandise', standalone: true })] });
+  ev2.bundles = [{ id: shortId('bd_'), name: 'Ticket + parking', desc: 'General admission and a parking spot', price: 4500, qty: 30, max: 4, parts: [{ ticketTypeIds: [ev2.ticketTypes[0].id], qty: 1 }], addons: [{ addonId: ev2.addons[0].id, qty: 1 }] }];
   ev2.secrets.ticketPasswords[ev2.ticketTypes[3].id] = 'VIPACCESS';
   const ev3 = mk({ slug: 'city-food-festival', name: 'City Food & Wine Festival', category: 'Food & drink',
     summary: 'Two tasting sessions, 40 vendors.', start: day(18, 12, 0), end: day(18, 20, 0), venue: 'Pier 36', address: '299 South St, New York, NY 10002',
     description: 'Taste your way through 40 local restaurants, bakeries and wineries. Choose your session at checkout. Unlimited tastings included.',
-    ticketTypes: [tt('Tasting pass', 4900, 0), tt('Designated driver', 1900, 0, { desc: 'Food only — no alcohol' })],
+    ticketTypes: [tt('Tasting pass', 4900, 0), tt('Designated driver', 1900, 0, { desc: 'Food only — no alcohol' })], addons: [prod('Park admission', 1200, 0, { category: 'Park admission', desc: 'Day entry to Pier Park rides' })],
     timeSlots: [{ id: shortId('ts_'), start: day(18, 12, 0), capacity: 250 }, { id: shortId('ts_'), start: day(18, 16, 30), capacity: 250 }] });
   const ev4 = mk({ slug: 'founders-summit', name: 'Founders Summit 2026', category: 'Conference', start: day(27, 9, 0), end: day(27, 17, 30),
     summary: 'A one-day conference for early-stage founders.', venue: 'Hudson Conference Center', address: '75 Hudson Yards, New York, NY 10001',
@@ -1068,7 +1331,7 @@ function seedDemo() {
   const ev5 = mk({ slug: 'kids-science-show', name: 'Big Bang Science Show', category: 'Family', start: day(55, 11, 0), end: day(55, 17, 0),
     summary: 'Hourly hands-on science shows for kids.', venue: 'Discovery Hall', address: '2900 Campus Rd, Brooklyn, NY 11210', audience: 'Ages 4+',
     description: 'Explosions, slime and liquid nitrogen — hourly 45-minute shows from 11 AM to 4 PM. Under 2s free (no ticket needed).',
-    ticketTypes: [tt('Adult', 2000, 0), tt('Child (2–12)', 1500, 0), tt('Family 4-pack', 6000, 0, { admits: 4 })],
+    ticketTypes: [tt('Adult', 2000, 0), tt('Child (2–12)', 1500, 0), tt('Family 4-pack', 6000, 0, { admits: 4, group: 'Groups' })],
     timeSlots: [11, 12, 13, 14, 15, 16].map(h => ({ id: shortId('ts_'), start: day(55, h, 0), capacity: 180 })) });
   const ev6 = mk({ slug: 'comedy-night', name: 'Late Night Comedy Club', category: 'Comedy', status: 'draft', start: day(70, 21, 0), end: day(70, 23, 0),
     summary: 'Five comics, one mic.', venue: 'TBA', address: '', description: 'Line-up coming soon.', ticketTypes: [tt('General', 2500, 120)] });
@@ -1088,6 +1351,9 @@ function seedDemo() {
   ev1.instructions = 'Bring your ticket QR on your phone. Coat check is on the lower level.';
   ev3.timeSlots.push({ id: shortId('ts_'), start: day(18, 19, 30), capacity: 120, label: 'Late tasting (private)', hidden: true });
   ev5.timeSlots[5].unavailable = true; ev5.timeSlots[0].soldOut = true; ev5.allDay = false; ev3.waitlistMode = 'always';
+  ev3.ticketTypes[0].slotPrices = { [ev3.timeSlots[1].id]: 5900 };  // the evening session costs more
+  ev3.bundles = [{ id: shortId('bd_'), name: 'Tasting pass + park admission', desc: 'Festival entry and a day at Pier Park — save $6', price: 5500, qty: 0, max: 6, parts: [{ ticketTypeIds: [ev3.ticketTypes[0].id], qty: 1 }], addons: [{ addonId: ev3.addons[0].id, qty: 1 }] }];
+  ev5.bundles = [{ id: shortId('bd_'), name: 'Family package', desc: '2 adults + 2 children — save $15', price: 5500, qty: 0, max: 2, parts: [{ ticketTypeIds: [ev5.ticketTypes[0].id], qty: 2 }, { ticketTypeIds: [ev5.ticketTypes[1].id], qty: 2 }], addons: [] }];
   const ev7 = mk({ slug: 'spring-jazz-brunch', name: 'Spring Jazz Brunch', category: 'Live music', start: day(64, 11, 30), end: day(64, 14, 0), venue: 'Skyline Roof',
     address: '22 W 32nd St, New York, NY 10001', summary: 'Live trio, brunch buffet, city views.', description: 'A relaxed late-morning set from the Skyline house trio with a brunch buffet.',
     publishAt: day(5, 10, 0), salesStart: day(7, 10, 0), waitlistMode: 'presale', capacity: 140,
@@ -1112,6 +1378,23 @@ function seedDemo() {
   // A few weeks of realistic sales so the dashboard has something to show.
   Demo.st = { platform: clone(DEFAULT_PLATFORM), boxOffices: [bo1, bo2, bo3], members, events, orders: [], tickets: [], waitlist: [], broadcasts: [],
     audit: [], sessions: [], mfa: {}, locks: {} };
+  // Promo + tracking codes (Stage 4) — box-office wide, each targeted.
+  const promo = (bo, code, o) => ({ id: shortId('pr_'), box_office_id: bo.id, code, active: true, note: '', type: 'pct', amount: 10, on: 'tickets', scope: ['tickets', 'bundles'],
+    eventIds: [], slotIds: [], ticketTypeIds: [], areas: [], prices: [], addonIds: [], bundleIds: [], startsAt: '', expires: '', maxUses: 0, perCustomer: 0, maxItems: 0, maxTickets: 0,
+    minSpend: 0, minQty: 0, maxQty: 0, codes: [], created_at: day(-35), created_by: bo.owner, ...o });
+  const sunday = (() => { const x = new Date(); x.setDate(x.getDate() + ((7 - x.getDay()) % 7 || 7)); x.setHours(10, 0, 0, 0); return x.toISOString(); })();
+  Demo.st.promos = [
+    promo(bo1, 'EARLYBIRD', { amount: 15, eventIds: [ev1.id], maxUses: 100, expires: day(20), note: 'Season announcement email' }),
+    promo(bo1, 'BINAH15', { amount: 15, eventIds: [ev1.id], prices: [10000], maxTickets: 4, maxUses: 100, expires: sunday, note: 'Partner organisation — $100 seats only' }),
+    promo(bo1, 'WELCOME10', { type: 'order', amount: 1000, eventIds: [ev2.id], perCustomer: 1, note: 'First-time buyers' }),
+    promo(bo1, 'NOFEES', { type: 'pct', amount: 100, on: 'fee', minQty: 4, note: 'Booking fee waived on 4+ tickets' }),
+    promo(bo1, 'PRESS', { type: 'pct', amount: 100, eventIds: [ev1.id], maxTickets: 2, maxItems: 2, note: 'Single-use press codes', codes: Array.from({ length: 12 }, () => 'PRESS-' + randCode(5)) }),
+    promo(bo1, 'PARKFREE', { type: 'pct', amount: 100, scope: ['addons'], addonIds: [ev1.addons[1].id], maxItems: 1, minSpend: 20000, note: 'Free parking on orders over $200' }),
+    promo(bo2, 'FAMILY5', { type: 'fixed', amount: 500, eventIds: [ev5.id], ticketTypeIds: [ev5.ticketTypes[1].id], note: '$5 off each child ticket' })];
+  const trk = (bo, code, name, kind, o = {}) => ({ id: shortId('tr_'), box_office_id: bo.id, code, name, kind, active: true, eventIds: [], startsAt: '', expires: '', maxUses: 0, created_at: day(-30), ...o });
+  Demo.st.tracking = [trk(bo1, 'ALEX', 'Alex Rivera', 'Promoter'), trk(bo1, 'RADIO101', 'City Radio 101 morning show', 'Campaign', { expires: day(30) }),
+    trk(bo1, 'HOTELPARTNER', 'Midtown Grand Hotel concierge', 'Partner', { eventIds: [ev1.id] }), trk(bo2, 'FOODBLOG', 'Eat the City blog', 'Affiliate')];
+  const codeFor = { [ev1.id]: ['EARLYBIRD', 'BINAH15'], [ev2.id]: ['WELCOME10'] }, refFor = { [bo1.id]: ['ALEX', 'RADIO101', 'HOTELPARTNER'], [bo2.id]: ['FOODBLOG'] };
   // Seat statuses on the gala: camera positions blocked, a family hold, a broken seat (Stage 3).
   const sst = (seat, status, note) => ({ id: uid(), box_office_id: bo1.id, event_id: ev1.id, slot_id: '', seat, status, note, by: 'moishsonn@gmail.com', at: day(-6, 11) });
   Demo.st.seatStatus = [sst('CEN-A1', 'blocked', 'Camera position'), sst('CEN-A12', 'blocked', 'Camera position'), sst('CIR-K1', 'blocked', 'Sound desk'), sst('CIR-K24', 'blocked', 'Sound desk'),
@@ -1124,7 +1407,8 @@ function seedDemo() {
     const count = ev === ev1 ? 46 : ev === ev2 ? 60 : 24;
     for (let i = 0; i < count; i++) {
       const name = rnd(first) + ' ' + rnd(last), email = name.toLowerCase().replace(' ', '.') + (n++) + '@example.com';
-      const t = rnd(ev.ticketTypes.filter(x => !x.hidden)), qty = t.admits > 1 ? 1 : 1 + Math.floor(Math.random() * 3);
+      const t = rnd(ev.ticketTypes.filter(x => !x.hidden && !x.adminOnly)), qty = t.admits > 1 ? 1 : 1 + Math.floor(Math.random() * 3);
+      if (t === vipTT && Math.random() < .55) continue;  // keep some Premium seats for the demo
       const item = { eventId: ev.id, ticketTypeId: t.id, qty, slotId: ev.timeSlots.length ? rnd(ev.timeSlots).id : null };
       if (ev.seating.enabled) {
         const off = offSeats(availabilityFrom(Demo.st.tickets, ev.id, Demo.st.seatStatus), ''), free = Object.keys(ev.seating.index).filter(id => ev.seating.index[id] === t.id && !off.has(id));
@@ -1132,8 +1416,9 @@ function seedDemo() {
         if (seats.length !== qty) continue; item.seats = seats;
       }
       try {
-        const r = demoPlaceOrder({ buyer: { name, email, phone: '' }, items: [item], addons: [], payment: Math.random() < .85 ? 'card' : 'offline', optIn: Math.random() < .6,
-          code: Math.random() < .12 ? (ev.secrets.discounts[0]?.code || '') : '', source: rnd(['', '', 'instagram', 'facebook', 'newsletter']) }, { owner: true });
+        const adds = (ev.addons || []).filter(a => !a.ticketTypeIds?.length && !a.areas?.length && Math.random() < .15).map(a => ({ eventId: ev.id, addonId: a.id, qty: 1 }));
+        const r = demoPlaceOrder({ buyer: { name, email, phone: '' }, items: [item], addons: adds, payment: Math.random() < .85 ? 'card' : 'offline', optIn: Math.random() < .6,
+          code: Math.random() < .14 ? rnd(codeFor[ev.id] || ['']) : '', tracking: Math.random() < .18 ? rnd(refFor[ev.box_office_id] || ['']) : '', source: rnd(['', '', 'instagram', 'facebook', 'newsletter']) }, { owner: true });
         const o = Demo.st.orders.find(x => x.id === r.id); o.created_at = day(-Math.floor(Math.random() * 28), 8 + Math.floor(Math.random() * 14), Math.floor(Math.random() * 60));
         if (Math.random() < .04) { o.status = 'refunded'; Demo.st.tickets.forEach(t => { if (t.order_id === o.id) { if (t.seat) seatLog(ev, t.slot_id, t.seat, 'cancelled', `Order ${o.ref} refunded — seat released`, { ref: o.ref, by: 'moishsonn@gmail.com' }); t.status = 'cancelled'; } }); }
       } catch (e) { /* sold out etc. — skip */ }
@@ -1142,6 +1427,14 @@ function seedDemo() {
   { // two complimentary press seats on the gala
     const off = offSeats(availabilityFrom(Demo.st.tickets, ev1.id, Demo.st.seatStatus), ''), free = Object.keys(ev1.seating.index).filter(id => ev1.seating.index[id] === stallsTT.id && !off.has(id)).slice(-2);
     try { demoPlaceOrder({ buyer: { name: 'City Arts Review', email: 'press@example.com', phone: '' }, items: [{ eventId: ev1.id, ticketTypeId: stallsTT.id, qty: 2, seats: free }], addons: [], payment: 'manual', comp: true, source: 'box office' }, { owner: true, email: 'moishsonn@gmail.com' }); } catch (e) { }
+  }
+  { // a few bundle sales
+    const buy = (ev, it, extra = {}) => { try { const r = demoPlaceOrder({ buyer: { name: rnd(first) + ' ' + rnd(last), email: `bundle${n++}@example.com`, phone: '' }, items: [{ eventId: ev.id, ...it }], addons: [], payment: 'card', ...extra }, { owner: true });
+      Demo.st.orders.find(x => x.id === r.id).created_at = day(-Math.floor(Math.random() * 20), 9 + Math.floor(Math.random() * 12)); } catch (e) { } };
+    for (let i = 0; i < 4; i++) buy(ev2, { bundleId: ev2.bundles[0].id, qty: 1 + (i % 2) });
+    for (let i = 0; i < 3; i++) buy(ev5, { bundleId: ev5.bundles[0].id, qty: 1, slotId: ev5.timeSlots[1 + i].id });
+    for (let i = 0; i < 2; i++) { const off = offSeats(availabilityFrom(Demo.st.tickets, ev1.id, Demo.st.seatStatus), ''), seat = Object.keys(ev1.seating.index).filter(id => ev1.seating.index[id] === vipTT.id && !off.has(id))[3 + i * 4];
+      if (seat) buy(ev1, { bundleId: ev1.bundles[0].id, qty: 1, seats: [seat] }, i ? { tracking: 'HOTELPARTNER' } : {}); }
   }
   ev1.seating.noSingles = true;  // switched on after the sample sales
   bo1.venues = [eventToVenue(ev1, 'Grand Lyric Theatre'), eventToVenue(bo1.eventTemplates[4].event, 'Skyline Roof — dinner layout')];
@@ -1154,7 +1447,7 @@ function seedDemo() {
   Demo.st.views = {};
   for (const ev of events.filter(e => e.status === 'published')) {
     const n = Demo.st.orders.filter(o => o.event_ids.includes(ev.id)).length * (8 + Math.floor(Math.random() * 7)) + 40, hits = [], pool = Array.from({ length: Math.ceil(n * .7) }, () => randCode(6).toLowerCase());
-    for (let i = 0; i < n; i++) hits.push([Date.now() - Math.pow(Math.random(), 1.6) * 28 * 864e5, rnd(pool), rnd(['', '', '', 'instagram', 'facebook', 'newsletter', 'whatsapp'])]);
+    for (let i = 0; i < n; i++) { const ref = Math.random() < .2 ? rnd(refFor[ev.box_office_id] || ['']) : ''; hits.push([Date.now() - Math.pow(Math.random(), 1.6) * 28 * 864e5, rnd(pool), rnd(['', '', '', 'instagram', 'facebook', 'newsletter', 'whatsapp']), ...(ref ? [ref] : [])]); }
     hits.push(...Array.from({ length: 4 + Math.floor(Math.random() * 6) }, () => [Date.now() - Math.random() * 5e5, randCode(6).toLowerCase(), '']));
     Demo.st.views[ev.id] = { hits: hits.sort((a, b) => a[0] - b[0]) };
   }

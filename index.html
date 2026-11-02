@@ -215,7 +215,7 @@ textarea.inp{min-height:90px;resize:vertical}
 .pub-foot a:hover{color:#fff}
 
 /* ── Admin ─────────────────────────────── */
-.admin{display:grid;grid-template-columns:236px 1fr;min-height:100vh}
+.admin{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:100vh}
 .side{background:var(--ink);color:#c9d2df;padding:20px 14px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:2px;overflow:auto}
 .side .logo{height:34px;color:#fff;margin:4px 10px 6px;display:flex;align-items:center;gap:10px;text-decoration:none}
 .side .logo small{font-size:9px;font-weight:700;letter-spacing:.2em;color:var(--mut);text-transform:uppercase}
@@ -505,7 +505,7 @@ body.scan-mode{background:#000}
   .ev-hero .inner,.ev-layout,.checkout,.cols{grid-template-columns:1fr}
   .ticket-panel{position:static}
   .kpis{grid-template-columns:1fr 1fr}
-  .admin{grid-template-columns:1fr}
+  .admin{grid-template-columns:minmax(0,1fr)}
   .side{display:none}
   .main{padding:20px 16px calc(90px + var(--safe-b))}
   .mob-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--ink);z-index:50;padding:8px 6px calc(8px + var(--safe-b));justify-content:space-around}
@@ -532,6 +532,32 @@ body.scan-mode{background:#000}
   .page-head h1{font-size:30px}
   .kv{grid-template-columns:1fr 1fr}
 }
+fieldset{min-width:0}  /* a fieldset otherwise refuses to shrink below its content on phones */
+/* Stage 4 — ticket groups, price rules, packages, add-ons, offers, promotions */
+.tt-group{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3);margin:16px 0 8px}
+.tt-group:first-child{margin-top:4px}
+.tt .price-note{color:var(--text-2)}
+.tt.bundle{background:#fdfbf4}.tt .save{color:var(--ok);font-weight:700}
+.tt select.inp-sm{margin-top:6px;display:block}
+.chip.mini{padding:1px 7px;font-size:10px;vertical-align:1px}
+.upsells{margin-top:14px;display:grid;gap:8px}
+.upsell{display:flex;justify-content:space-between;align-items:center;gap:10px;border:1px dashed var(--line);border-radius:12px;padding:10px 12px;background:#fdfbf4}
+details.rules{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+details.rules>summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--text-2)}
+.rule-row{display:grid;grid-template-columns:1.2fr .8fr 1.2fr 1.2fr .8fr auto;gap:8px;align-items:end;margin-bottom:6px}
+.rule-row.two{grid-template-columns:1fr 1fr auto;max-width:420px}
+.rule-row .field{margin:0}.rule-row .icon-btn{margin-bottom:6px}
+.targets{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;margin:10px 0}
+.targets>.fl{flex-basis:100%;margin:0}
+.check.tog{margin:0}
+.part{display:flex;gap:10px;align-items:center;margin-bottom:6px}.part .field{margin:0}
+.promo-grid{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:18px;align-items:start}
+.promo-grid>div:last-child{position:sticky;top:16px}
+.kv-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}
+.kv-grid .v{font-size:20px;font-weight:700;margin-top:2px}
+.between.line{padding:6px 0;border-bottom:1px solid var(--line);gap:10px}
+@media (max-width:1100px){.promo-grid{grid-template-columns:1fr}.promo-grid>div:last-child{position:static}}
+@media (max-width:760px){.rule-row{grid-template-columns:repeat(2,minmax(0,1fr))}.rule-row .inp{min-width:0}.rule-row .icon-btn{justify-self:start}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 @media print{
   .e-ticket{break-after:page;page-break-after:always}
