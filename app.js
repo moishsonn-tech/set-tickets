@@ -120,7 +120,9 @@ async function onRoute() {
   document.body.classList.toggle('scan-mode', S.route.page === 'scan');
   const r = S.route;
   if (r.page === 'e' || r.page === 'embed') {
-    const ev = S.events.find(e => e.slug === r.params[0]) || S.adm?.events.find(e => e.slug === r.params[0]);
+    let ev = S.events.find(e => e.slug === r.params[0]) || S.adm?.events.find(e => e.slug === r.params[0]);
+    if (!ev && !S._fetched?.[r.params[0]]) { (S._fetched ||= {})[r.params[0]] = 1; DB.eventBySlug(r.params[0]).then(e => { if (e) { S.events.push(e); onRoute(); } }).catch(() => { }); }
+    if (ev && eventLive(ev) && !/preview=1/.test(location.hash) && S._viewed !== ev.id + location.hash) { S._viewed = ev.id + location.hash; DB.trackView(ev.id, sessionStorage.getItem('set_src')); }
     if (ev && S.sel?.eventId !== ev.id) S.sel = { eventId: ev.id, qty: {}, slotId: '', seats: [], addons: {}, unlocked: { event: false, tts: [] }, pw: '' };
     if (ev) refreshAvail(ev.id);
   }
@@ -192,7 +194,7 @@ function soldOut(ev, av) {
 }
 function listedEvents() {
   const now = Date.now() - 6 * 3600e3;
-  return S.events.filter(e => e.status === 'published' && e.visibility !== 'private' && D(e.end || e.start) >= now).sort((a, b) => D(a.start) - D(b.start));
+  return S.events.filter(e => eventListed(e) && D(e.end || e.start) >= now).sort((a, b) => D(a.start) - D(b.start));
 }
 
 function Home() {
@@ -283,17 +285,18 @@ function EventPage() {
   const ev = S.events.find(e => e.slug === S.route.params[0]) || S.adm?.events.find(e => e.slug === S.route.params[0]);
   if (!ev) return NotFound();
   const sel = S.sel, av = S.avail[ev.id];
-  const preview = ev.status !== 'published';
+  const preview = !eventLive(ev), shows = (ev.timeSlots || []).filter(s => !s.hidden), multiDay = new Set(shows.map(s => fmtDate(s.start))).size > 1;
+  const contact = ev.contact?.email || ev.contact?.phone ? ev.contact : { email: S.settings.contactEmail };
   return `
   <section class="ev-hero"><div class="bg" style="${artBg(ev)}"></div>
     <div class="inner">
       <div>
-        ${preview ? '<span class="chip warn" style="margin-bottom:14px">Preview — not published</span>' : ''}
+        ${preview ? `<span class="chip warn" style="margin-bottom:14px">Preview — ${ev.archived ? 'archived' : ev.status !== 'published' ? 'not published' : ev.visibility === 'hidden' ? 'hidden from the public' : 'publishes ' + esc(fmtDT(ev.publishAt))}</span>` : ''}
         <div class="eyebrow" style="color:var(--accent)">${esc(ev.category || 'Event')}${ev.audience ? ' · ' + esc(ev.audience) : ''}</div>
         <h1 style="margin-top:10px">${esc(ev.name)}</h1>
         <div class="facts">
-          <div>${ic('cal')} ${esc(fmtDate(ev.start, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }))}</div>
-          <div>${ic('clock')} ${esc(fmtTime(ev.start))}${ev.end ? ' – ' + esc(fmtTime(ev.end)) : ''}${ev.doors ? ' · Doors ' + esc(ev.doors) : ''}</div>
+          <div>${ic('cal')} ${multiDay ? `${shows.length} dates · ${esc(fmtDate(shows[0].start, { month: 'short', day: 'numeric' }))} – ${esc(fmtDate(shows[shows.length - 1].start, { month: 'short', day: 'numeric', year: 'numeric' }))}` : esc(fmtDate(ev.start, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }))}</div>
+          <div>${ic('clock')} ${ev.allDay ? 'All day' : shows.length > 1 ? `${shows.length} showtimes` : esc(fmtTime(ev.start)) + (ev.end ? ' – ' + esc(fmtTime(ev.end)) : '')}${ev.doors ? ' · Doors ' + esc(ev.doors) : ''}</div>
           <div>${ic('pin')} ${ev.online ? 'Online event' : esc([ev.venue, ev.address].filter(Boolean).join(' · '))}</div>
         </div>
         <div class="row wrap" style="margin-top:22px">
@@ -310,6 +313,9 @@ function EventPage() {
       ${ev.seating?.enabled && sel && (!ev.timeSlots?.length || sel.slotId) && !(ev.hasPassword && !sel.unlocked.event) ? BuyerSeatMap(ev, av, sel) : ''}
       <div class="eyebrow dash" ${ev.seating?.enabled ? 'style="margin-top:28px"' : ''}>About this event</div>
       <p class="ev-desc" style="margin-top:14px">${esc(ev.description || ev.summary || '')}</p>
+      ${ev.instructions ? `<div class="sep" style="margin:28px 0"></div><div class="eyebrow dash">Good to know</div><p class="ev-desc" style="margin-top:12px">${esc(ev.instructions)}</p>` : ''}
+      ${ev.policies ? `<div class="sep" style="margin:28px 0"></div><div class="eyebrow dash">Event policies</div><p class="ev-desc small" style="margin-top:12px">${esc(ev.policies)}</p>` : ''}
+      ${contact?.email || contact?.phone ? `<div class="sep" style="margin:28px 0"></div><div class="eyebrow dash">Questions?</div><p style="margin-top:10px">${contact.name ? esc(contact.name) + '<br>' : ''}${contact.email ? `<a href="mailto:${esc(contact.email)}">${esc(contact.email)}</a>` : ''}${contact.phone ? (contact.email ? ' · ' : '') + esc(contact.phone) : ''}</p>` : ''}
       ${!ev.online && ev.address ? `<div class="sep" style="margin:28px 0"></div><div class="eyebrow dash">Venue</div>
         <p style="margin-top:10px"><b>${esc(ev.venue)}</b><br><span class="muted">${esc(ev.address)}</span></p>
         <div class="map"><iframe loading="lazy" title="Map" src="https://maps.google.com/maps?q=${encodeURIComponent(ev.address)}&output=embed"></iframe></div>` : ''}
@@ -325,7 +331,9 @@ function TicketPanel(ev, sel, av) {
   if (!av) return '<p class="muted">Loading tickets…</p>';
   const now = new Date();
   if (ev.salesEnd && D(ev.salesEnd) < now) return '<h3>Sales have ended</h3><p class="muted small">Tickets are no longer available online.</p>';
-  if (soldOut(ev, av)) return Waitlist(ev);
+  if (ev.salesStart && D(ev.salesStart) > now) return `<span class="chip info">Coming soon</span><h3 style="margin-top:10px">Tickets go on sale ${esc(fmtDT(ev.salesStart))}</h3>${['presale', 'always'].includes(ev.waitlistMode) ? '<div class="sep"></div>' + Waitlist(ev, 'presale') : ''}`;
+  const shown = (ev.timeSlots || []).filter(s => !s.hidden);
+  if (soldOut(ev, av) || (shown.length && shown.every(s => slotState(s, av) !== 'open'))) return Waitlist(ev, 'soldout');
   const onMap = new Set(Object.values(ev.seating?.index || {}));
   const tts = ev.ticketTypes.filter(t => (!t.hidden || sel.unlocked.tts.includes(t.id)) && (!ev.seating?.enabled || onMap.has(t.id)));
   const hasLocked = ev.ticketTypes.some(t => t.hidden && t.locked && !sel.unlocked.tts.includes(t.id));
@@ -341,9 +349,9 @@ function TicketPanel(ev, sel, av) {
   const count = seated ? sel.seats.length : sum(Object.values(sel.qty), x => x);
   return `
     <div class="between"><h3>Tickets</h3>${ev.capacity && evLeft < 50 ? `<span class="chip warn">${evLeft} left</span>` : ''}</div>
-    ${ev.timeSlots?.length ? `<div class="eyebrow" style="margin:14px 0 8px">1 · Choose a time</div><div class="slot-list">${ev.timeSlots.map(s => {
-      const l = +s.capacity > 0 ? +s.capacity - (av.slots[s.id] || 0) : 99;
-      return `<button class="slot ${sel.slotId === s.id ? 'on' : ''}" ${l <= 0 ? 'disabled' : ''} data-action="pickSlot" data-id="${s.id}"><b>${esc(fmtTime(s.start))}</b>${l <= 0 ? 'Full' : l < 20 ? l + ' left' : esc(fmtDate(s.start, { month: 'short', day: 'numeric' }))}</button>`; }).join('')}</div>
+    ${shown.length ? `<div class="eyebrow" style="margin:14px 0 8px">1 · Choose a ${new Set(shown.map(s => fmtDate(s.start))).size > 1 ? 'date & time' : 'time'}</div><div class="slot-list">${shown.slice().sort((a, b) => D(a.start) - D(b.start)).map(s => {
+      const st = slotState(s, av), l = +s.capacity > 0 ? +s.capacity - (av.slots[s.id] || 0) : 99;
+      return `<button class="slot ${sel.slotId === s.id ? 'on' : ''}" ${st !== 'open' ? 'disabled' : ''} data-action="pickSlot" data-id="${s.id}"><b>${esc(fmtTime(s.start))}</b>${st === 'soldout' ? 'Sold out' : st === 'unavailable' ? 'Unavailable' : esc(fmtDate(s.start, { month: 'short', day: 'numeric' })) + (l < 20 ? ' · ' + l + ' left' : '')}${s.label ? `<small>${esc(s.label)}</small>` : ''}</button>`; }).join('')}</div>
       <div class="eyebrow" style="margin:18px 0 8px">2 · Choose tickets</div>` : '<div style="height:12px"></div>'}
     ${seated ? (slotOK ? (sel.seats.length ? `<div class="seat-chips">${sel.seats.map(id => `<button class="chip" data-action="pickSeat" data-v="${esc(id)}" title="Remove">${esc(seatName(ev, id, true))} ✕</button>`).join('')}</div>` : '<p class="small muted" style="margin-bottom:10px">Choose seats on the map.</p>') : '<p class="muted small">Pick a time to see seats.</p>') : ''}
     <div style="${slotOK ? '' : 'opacity:.45;pointer-events:none'}">
@@ -362,7 +370,8 @@ function TicketPanel(ev, sel, av) {
     <div class="sep"></div>
     <div class="between" style="margin-bottom:12px"><span class="muted">${count} ticket${count === 1 ? '' : 's'}</span><b style="font-size:18px">${money(total, ev.currency)}</b></div>
     <button class="btn btn-accent btn-lg btn-block" data-action="addToCart" ${count ? '' : 'disabled'}>Get tickets <span class="arr">→</span></button>
-    <p class="small muted" style="text-align:center;margin-top:10px">Booking fees and tax shown at checkout.</p>`;
+    <p class="small muted" style="text-align:center;margin-top:10px">Booking fees and tax shown at checkout.</p>
+    ${ev.waitlistMode === 'always' ? `<details style="margin-top:14px"><summary class="small muted" style="cursor:pointer">Can't find what you want? Join the waitlist</summary><div style="margin-top:10px">${Waitlist(ev, 'always')}</div></details>` : ''}`;
 }
 const TIER_COLORS = ['#020a16', '#2f66b2', '#7a5aa6', '#1f8a5b', '#b35c34', '#0e7490', '#9d174d', '#4d7c0f'];
 const tierColor = (ev, ttId) => { const i = ev.ticketTypes.findIndex(t => t.id === ttId); return i < 0 ? '#c9c5ba' : TIER_COLORS[i % TIER_COLORS.length]; };
@@ -406,13 +415,14 @@ function BuyerSeatMap(ev, av, sel) {
     <div class="legend">${ev.ticketTypes.filter(t => used.includes(t.id)).map(t => `<span><i style="background:${tierColor(ev, t.id)}"></i>${esc(t.name)} ${money(t.price, ev.currency)}</span>`).join('')}
       <span><i style="background:#d7d4cb"></i>Sold</span><span><i style="background:var(--accent);box-shadow:0 0 0 2px var(--ink)"></i>Your seats</span></div></div>`;
 }
-function Waitlist(ev) {
-  if (!ev.waitlist) return '<h3>Sold out</h3><p class="muted small">This event is sold out.</p>';
+function Waitlist(ev, why) {
+  if (ev.waitlistMode === 'off' || (why === 'presale' && !['presale', 'always'].includes(ev.waitlistMode))) return why === 'soldout' ? '<h3>Sold out</h3><p class="muted small">This event is sold out.</p>' : '';
   const w = S.ui.wl || {};
-  if (w.done === ev.id) return `<h3>You're on the list</h3><p class="muted small" style="margin-top:6px">We'll email you if tickets become available.</p>`;
-  return `<span class="chip bad">Sold out</span><h3 style="margin-top:10px">Join the waitlist</h3><p class="muted small" style="margin:4px 0 14px">Be first to hear if tickets free up.</p>
+  if (w.done === ev.id) return `<h3>You're on the list</h3><p class="muted small" style="margin-top:6px">We'll let you know as soon as tickets are available.</p>`;
+  return `${why === 'soldout' ? '<span class="chip bad">Sold out</span>' : ''}<h3 style="margin-top:10px">${why === 'presale' ? 'Get notified' : 'Join the waitlist'}</h3><p class="muted small" style="margin:4px 0 14px">${why === 'presale' ? 'Hear the moment tickets go on sale.' : 'Be first to hear if tickets free up.'}</p>
     <div class="field"><input class="inp" data-input="wlName" placeholder="Your name" value="${esc(w.name || '')}"></div>
     <div class="field"><input class="inp" type="email" data-input="wlEmail" placeholder="Email" value="${esc(w.email || '')}"></div>
+    <div class="field"><input class="inp" type="tel" data-input="wlPhone" placeholder="Mobile (optional)" value="${esc(w.phone || '')}"></div>
     <button class="btn btn-dark btn-block" data-action="joinWaitlist" data-id="${ev.id}">Join waitlist</button>`;
 }
 
@@ -627,24 +637,176 @@ function Dashboard() {
     </tbody></table></div></div>`;
 }
 const statusChip = s => `<span class="chip ${{ paid: 'ok', pending: 'warn', cancelled: 'bad', refunded: 'bad' }[s] || ''}">${esc(s)}</span>`;
-const evChip = e => e.status === 'published' ? (e.visibility === 'private' ? '<span class="chip info">Private</span>' : '<span class="chip ok">On sale</span>') : e.status === 'draft' ? '<span class="chip">Draft</span>' : '<span class="chip bad">Cancelled</span>';
 
+// ── Events (Stage 2): list, templates, overview, showtimes, waitlist, team, history ─────────────
+const evChip = e => e.archived ? '<span class="chip">Archived</span>' : e.status === 'cancelled' ? '<span class="chip bad">Cancelled</span>' : e.status === 'draft' ? '<span class="chip">Draft</span>'
+  : e.publishAt && D(e.publishAt) > Date.now() ? `<span class="chip info">Publishes ${esc(fmtDate(e.publishAt, { month: 'short', day: 'numeric' }))}</span>`
+  : e.visibility === 'hidden' ? '<span class="chip warn">Hidden</span>' : e.visibility === 'link' ? '<span class="chip info">Link only</span>'
+  : e.salesStart && D(e.salesStart) > Date.now() ? `<span class="chip info">Sales open ${esc(fmtDate(e.salesStart, { month: 'short', day: 'numeric' }))}</span>` : '<span class="chip ok">On sale</span>';
+const EV_FILTERS = [['upcoming', 'Upcoming'], ['drafts', 'Drafts'], ['past', 'Past'], ['archived', 'Archived'], ['templates', 'Templates']];
 function EventsList() {
-  const q = S.ui.q.toLowerCase();
-  const evs = S.adm.events.filter(e => !q || e.name.toLowerCase().includes(q)).sort((a, b) => D(b.start) - D(a.start));
-  return head('Events', `${S.adm.events.length} events`, can('events.create') ? `<button class="btn btn-accent" data-action="newEvent">${ic('plus', 15)} New event</button>` : '') + `
-  <div class="toolbar"><input class="inp" data-input="q" placeholder="Search events…" value="${esc(S.ui.q)}"></div>
-  <div class="tbl-wrap"><table class="tbl"><thead><tr><th></th><th>Event</th><th>Date</th><th>Status</th><th>Sold</th><th>Revenue</th><th></th></tr></thead><tbody>
-  ${evs.map(e => { const s = evStats(e); return `<tr class="click" data-action="go" data-v="#/admin/event/${e.id}/details">
+  const f = S.ui.evf || 'upcoming', q = S.ui.q.toLowerCase(), now = Date.now() - 6 * 3600e3;
+  const pick = { upcoming: e => !e.archived && e.status !== 'draft' && D(e.end || e.start) >= now, drafts: e => !e.archived && e.status === 'draft', past: e => !e.archived && e.status !== 'draft' && D(e.end || e.start) < now, archived: e => e.archived }[f];
+  const evs = f === 'templates' ? [] : S.adm.events.filter(e => pick(e) && (!q || e.name.toLowerCase().includes(q))).sort((a, b) => (f === 'past' || f === 'archived' ? -1 : 1) * (D(a.start) - D(b.start)));
+  const count = k => k === 'templates' ? (S.adm.bo.eventTemplates || []).length : S.adm.events.filter({ upcoming: e => !e.archived && e.status !== 'draft' && D(e.end || e.start) >= now, drafts: e => !e.archived && e.status === 'draft', past: e => !e.archived && e.status !== 'draft' && D(e.end || e.start) < now, archived: e => e.archived }[k]).length;
+  return head('Events', `${S.adm.events.filter(e => !e.archived).length} events`, can('events.create') ? `<button class="btn btn-accent" data-action="newEvent">${ic('plus', 15)} New event</button>` : '') + `
+  <div class="toolbar"><div class="tabs">${EV_FILTERS.map(([k, t]) => `<button class="${f === k ? 'on' : ''}" data-action="evFilter" data-v="${k}">${t} <span class="muted">${count(k)}</span></button>`).join('')}</div>
+    ${f !== 'templates' ? `<input class="inp" data-input="q" placeholder="Search events…" value="${esc(S.ui.q)}">` : ''}</div>
+  ${f === 'templates' ? EventTemplates() : `<div class="tbl-wrap"><table class="tbl"><thead><tr><th></th><th>Event</th><th>Date</th><th>Status</th><th>Sold</th><th>${can('finance.totals') ? 'Revenue' : ''}</th><th></th></tr></thead><tbody>
+  ${evs.map(e => { const s = evStats(e), n = (e.timeSlots || []).filter(x => !x.hidden).length; return `<tr class="click" data-action="go" data-v="#/admin/event/${e.id}/overview">
     <td style="width:66px"><div class="thumb" style="${artBg(e)}"></div></td>
-    <td><b>${esc(e.name)}</b><div class="small muted">${esc(e.venue || '')}</div></td><td>${esc(fmtDT(e.start))}</td><td>${evChip(e)}</td>
-    <td class="tnum">${s.sold}${s.cap ? ' / ' + s.cap : ''}</td><td class="tnum">${money(s.rev)}</td>
-    <td style="white-space:nowrap"><a class="btn btn-ghost btn-sm" href="#/e/${esc(e.slug)}" target="_blank" data-stop="1">View</a> ${can('events.create') ? `<button class="btn btn-ghost btn-sm" data-action="dupEvent" data-id="${e.id}">Duplicate</button>` : ''}</td></tr>`; }).join('')}
-  </tbody></table></div>`;
+    <td><b>${esc(e.name)}</b><div class="small muted">${esc(e.online ? 'Online' : e.venue || '')}</div></td><td>${esc(e.allDay ? fmtDate(e.start, { month: 'short', day: 'numeric', year: 'numeric' }) : fmtDT(e.start))}${n > 1 ? `<div class="small muted">${n} showtimes</div>` : ''}</td><td>${evChip(e)}</td>
+    <td class="tnum">${s.sold}${s.cap ? ' / ' + s.cap : ''}</td><td class="tnum">${can('finance.totals') ? money(s.rev) : ''}</td>
+    <td style="white-space:nowrap" data-stop="1"><a class="btn btn-ghost btn-sm" href="#/e/${esc(e.slug)}" target="_blank">View</a> ${can('events.create') ? `<button class="btn btn-ghost btn-sm" data-action="dupEvent" data-id="${e.id}">Duplicate</button>` : ''}</td></tr>`; }).join('') || `<tr><td colspan="7" class="empty">No ${esc(EV_FILTERS.find(x => x[0] === f)[1].toLowerCase())} events.</td></tr>`}
+  </tbody></table></div>`}`;
+}
+function EventTemplates() {
+  const list = S.adm.bo.eventTemplates || [];
+  return `<p class="muted" style="margin:-4px 0 16px;max-width:680px">A template keeps an event's set-up — ticket types, prices, seating map, add-ons, questions, emails and policies — but never its orders, dates or discount codes. Save one from any event's editor.</p>
+  <div class="tpl-grid">${list.map(t => { const e = t.event; return `<div class="card"><h3>${esc(t.name)}</h3>
+    <p class="small muted" style="margin:6px 0 12px">${esc(e.ticketTypes.map(x => x.name + ' ' + money(x.price)).join(' · '))}${e.seating?.enabled ? ' · reserved seating' : ''}${e.audience ? ' · ' + esc(e.audience) : ''}<br>${pad(t.at?.[0] ?? 20)}:${pad(t.at?.[1] ?? 0)} · ${Math.round((t.minutes || 180) / 6) / 10} h</p>
+    ${can('events.create') ? `<button class="btn btn-accent btn-sm" data-action="fromTemplate" data-v="${t.id}">Create event</button> <button class="btn btn-ghost btn-sm" data-action="rmEvTemplate" data-v="${t.id}">Delete</button>` : ''}</div>`; }).join('') || '<p class="muted">No templates yet.</p>'}</div>`;
+}
+function NewEventModal() {
+  const list = S.adm.bo.eventTemplates || [];
+  modal('New event', `<div class="new-ev"><button class="item-card" data-action="blankEvent"><b>Blank event</b><span class="small muted">Start from scratch</span></button>
+    ${list.map(t => `<button class="item-card" data-action="fromTemplate" data-v="${t.id}"><b>${esc(t.name)}</b><span class="small muted">${esc(t.event.ticketTypes.length)} ticket types${t.event.seating?.enabled ? ' · seating map' : ''}</span></button>`).join('')}</div>`);
+}
+const ETABS = [['overview', 'Overview'], ['details', 'Details'], ['tickets', 'Tickets'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['checkout', 'Checkout'], ['discounts', 'Discounts'],
+  ['emails', 'Emails'], ['waitlist', 'Waitlist'], ['team', 'Team'], ['history', 'History'], ['share', 'Share & embed']];
+function EventEditor() {
+  const ev = S.draft; if (!ev) return '<p class="muted">Event not found.</p>';
+  const tab = S.route.params[1] || 'overview', ro = !can('events.edit', ev.id), pub = can('events.publish', ev.id);
+  const body = { overview: EdOverview, details: EdDetails, tickets: EdTickets, schedule: EdSchedule, seating: EdSeating, checkout: EdCheckout, discounts: EdDiscounts, emails: EdEmails, waitlist: EdWaitlist, team: EdTeam, history: EdHistory, share: EdShare }[tab] || EdOverview;
+  const live = ['overview', 'team', 'history', 'waitlist'].includes(tab);  // these tabs act immediately, not through "Save changes"
+  return `<a href="#/admin/events" class="small muted" style="text-decoration:none">← Events</a>
+  ${head(esc(ev.name || 'Untitled event'), `${evChip(ev)} ${S.dirty ? '<span class="chip warn">Unsaved changes</span>' : ''}`,
+    `<a class="btn btn-ghost" href="#/e/${esc(ev.slug)}?preview=1" target="_blank">Preview</a>
+    ${can('events.create') ? '<button class="btn btn-ghost" data-action="saveTemplate">Save as template</button>' : ''}
+    ${pub && !ev.archived ? (ev.status === 'published' ? '<button class="btn btn-ghost" data-action="setStatus" data-v="draft">Unpublish</button>' : ev.status === 'draft' ? '<button class="btn btn-dark" data-action="setStatus" data-v="published">Publish</button>' : '') : ''}
+    ${ro ? '' : `<button class="btn btn-accent" data-action="saveEvent" ${S.dirty ? '' : 'disabled'}>Save changes</button>`}`)}
+  <nav class="etabs">${ETABS.map(([k, t]) => `<a class="${tab === k ? 'on' : ''}" href="#/admin/event/${ev.id}/${k}">${t}</a>`).join('')}</nav>
+  ${live ? body(ev) : `<fieldset ${ro ? 'disabled' : ''} style="border:0">${body(ev)}</fieldset>`}`;
+}
+function EdOverview(ev) {
+  const saved = S.adm.events.find(e => e.id === ev.id) || ev, tks = S.adm.tickets.filter(t => t.event_id === ev.id), valid = tks.filter(t => t.status === 'valid');
+  const so = sellout(saved, tks), fin = can('finance.totals'), v = S.adm.views?.[ev.id] || { total: 0, unique: 0, today: 0, last10m: 0, bySrc: {} };
+  const os = S.adm.orders.filter(o => o.event_ids.includes(ev.id) && ['paid', 'pending'].includes(o.status));
+  const paidOrders = new Set(os.filter(o => o.status === 'paid' && !o.data.comp).map(o => o.id)), compOrders = new Set(os.filter(o => o.data.comp).map(o => o.id));
+  const collected = sum(os.filter(o => o.status === 'paid'), o => sum(o.data.lines.filter(l => l.eventId === ev.id), l => l.unit * l.qty) - (o.data.discount || 0) * (sum(o.data.lines.filter(l => l.eventId === ev.id), l => l.unit * l.qty) / Math.max(1, o.data.subtotal)));
+  const s = evStats(saved), blocked = (saved.seating?.enabled ? (saved.seating.blocked || []).length : 0) * so.shows;
+  const pct = x => (x * 100).toFixed(x && x < .1 ? 1 : 0) + '%';
+  const kpi = (l, val, d = '', dark) => `<div class="kpi ${dark ? 'dark' : ''}"><div class="eyebrow">${l}</div><div class="v">${val}</div>${d ? `<div class="d" ${dark ? 'style="color:var(--mut)"' : ''}>${d}</div>` : ''}</div>`;
+  const slots = (saved.timeSlots || []);
+  return `${fin ? `<div class="eyebrow dash" style="margin:4px 0 12px">Sellout value</div>
+  <div class="kpis">${kpi('Potential sellout revenue', so.unknown && !so.total ? '—' : money(so.total), so.unknown ? 'Set a capacity or ticket limits to complete this' : so.estimate ? 'Unlimited ticket types counted up to capacity' : `${so.shows > 1 ? so.shows + ' showtimes · ' : ''}face value`, true)}
+    ${kpi('Sold (face value)', money(so.soldValue), so.total ? pct(so.pct) + ' of potential' : '')}${kpi('Remaining potential', money(so.remaining))}${kpi('Collected', money(Math.round(collected)), 'paid orders, after discounts')}</div>
+  <div class="bar big" style="margin:-4px 0 22px"><i style="width:${Math.min(100, so.pct * 100)}%"></i></div>
+  <div class="cols"><div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>By ticket type</h3></div><table class="tbl"><thead><tr><th>Ticket</th><th>Price</th><th>Inventory</th><th>Sold</th><th>Potential</th><th>Remaining</th></tr></thead><tbody>
+    ${so.byTT.map(r => `<tr><td>${esc(r.tt.name)}${r.tt.hidden ? ' <span class="chip">hidden</span>' : ''}</td><td class="tnum">${money(r.tt.price)}</td><td class="tnum">${r.capacity == null ? '∞' : r.capacity}</td><td class="tnum">${r.sold}</td><td class="tnum">${money(r.potential)}</td><td class="tnum">${money(Math.max(0, r.potential - r.soldValue))}</td></tr>`).join('')}</tbody></table></div>
+  ${so.bySec.length ? `<div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>By seating section</h3></div><table class="tbl"><thead><tr><th>Section</th><th>Seats</th><th>Sold</th><th>Blocked</th><th>Potential</th><th>Remaining</th></tr></thead><tbody>
+    ${so.bySec.map(r => `<tr><td>${esc(r.name)}</td><td class="tnum">${r.seats}</td><td class="tnum">${r.sold}</td><td class="tnum">${r.blocked}</td><td class="tnum">${money(r.potential)}</td><td class="tnum">${money(Math.max(0, r.potential - r.soldValue))}</td></tr>`).join('')}</tbody></table></div>` : `<div class="card"><h3>How this is calculated</h3><p class="small muted" style="margin-top:6px">Every sellable ticket × its price, per showtime. It updates by itself when prices, quantities, showtimes, seats or blocks change, and as tickets sell. Comps use up inventory but count at $0 collected.</p></div>`}</div>` : ''}
+  <div class="eyebrow dash" style="margin:22px 0 12px">Performance</div>
+  <div class="kpis">${kpi('Page views', v.total.toLocaleString(), `${v.unique.toLocaleString()} unique · ${v.today} today`)}${kpi('Viewing now', v.last10m, 'last 10 minutes')}
+    ${kpi('Conversion', v.unique ? pct(os.length / v.unique) : '—', `${os.length} orders from ${v.unique} visitors`)}${kpi('Tickets issued', valid.length, `${valid.filter(t => paidOrders.has(t.order_id)).length} paid · ${valid.filter(t => compOrders.has(t.order_id)).length} comp`)}</div>
+  <div class="kpis">${kpi('Remaining capacity', s.cap ? Math.max(0, s.cap - s.sold) : '∞', s.cap ? `of ${s.cap}` : 'no limit set')}${kpi('Blocked seats', blocked)}${kpi('Checked in', s.checked, valid.length ? pct(s.checked / valid.length) : '')}${fin ? kpi('Revenue to date', money(s.rev)) : kpi('Waitlist', S.adm.waitlist.filter(w => w.event_id === ev.id).length)}</div>
+  <div class="cols">${slots.length ? `<div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>By showtime</h3></div><table class="tbl"><thead><tr><th>Showtime</th><th>Status</th><th>Sold</th><th>Capacity</th><th>Checked in</th>${fin ? '<th>Revenue</th>' : ''}</tr></thead><tbody>
+    ${slots.map(sl => { const st = valid.filter(t => t.slot_id === sl.id), state = slotState(sl, availabilityFrom(tks, ev.id)); const rev = sum(os, o => sum(o.data.lines.filter(l => l.eventId === ev.id && l.slotId === sl.id), l => l.unit * l.qty));
+      return `<tr><td>${esc(fmtDT(sl.start))}${sl.label ? `<div class="small muted">${esc(sl.label)}</div>` : ''}</td><td>${SLOT_CHIP[state]}</td><td class="tnum">${st.length}</td><td class="tnum">${+sl.capacity || '∞'}</td><td class="tnum">${st.filter(t => t.checked_in_at).length}</td>${fin ? `<td class="tnum">${money(rev)}</td>` : ''}</tr>`; }).join('')}
+    <tr><td><b>All showtimes</b></td><td></td><td class="tnum"><b>${valid.length}</b></td><td class="tnum">${sum(slots, x => +x.capacity) || '∞'}</td><td class="tnum">${s.checked}</td>${fin ? `<td class="tnum"><b>${money(s.rev)}</b></td>` : ''}</tr></tbody></table></div>` : ''}
+    <div class="card"><h3>Traffic sources</h3><div class="small muted" style="margin-bottom:10px">Page views by tracking link (?src=)</div>${Object.entries(v.bySrc).sort((a, b) => b[1] - a[1]).map(([k, n]) => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span>${esc(k)}</span><b class="tnum">${n}</b></div>`).join('') || '<p class="muted small">No views yet.</p>'}</div></div>`;
+}
+const SLOT_CHIP = { open: '<span class="chip ok">On sale</span>', soldout: '<span class="chip bad">Sold out</span>', unavailable: '<span class="chip warn">Unavailable</span>', hidden: '<span class="chip">Hidden</span>' };
+function EdDetails(ev) {
+  const vis = Object.entries(VISIBILITY);
+  return `<div class="cols"><div class="stack"><div class="card">
+    ${inp('name', 'Event name')}
+    <div class="grid2">${inp('slug', 'URL', { hint: esc(shareUrl(ev.slug)) })}${inp('category', 'Category', { ph: 'Concert, Kumzitz, Family…' })}</div>
+    ${inp('summary', 'Short summary')}
+    ${inp('description', 'Description', { t: 'area' })}
+    ${inp('image', 'Image / banner URL', { ph: 'https://…', hint: 'Use a 16:10 photo or poster, at least 1200px wide.' })}
+    <div class="grid2">${inp('audience', 'Audience note', { ph: 'e.g. Men & boys only' })}${inp('doors', 'Doors open', { ph: '7:00 PM' })}</div></div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Event contact</div><p class="small muted" style="margin:-4px 0 12px">Shown on the event page. Leave blank to use the box office's contact details.</p>
+      <div class="grid3">${inp('contact.name', 'Name')}${inp('contact.email', 'Email')}${inp('contact.phone', 'Phone')}</div></div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Policies & instructions</div>
+      ${inp('policies', 'Event-specific policies', { t: 'area', ph: 'e.g. No refunds within 7 days. Strollers not permitted.' })}
+      ${inp('instructions', 'Attendee instructions', { t: 'area', ph: 'Parking, entrance, dress code, what to bring…' })}</div>
+  </div><div class="stack">
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">When</div>
+      ${chk('allDay', 'All-day event')}<div style="height:10px"></div>
+      ${ev.allDay ? `<div class="grid2">${inp('start', 'Starts', { t: 'dt' })}${inp('end', 'Ends', { t: 'dt' })}</div>` : `${inp('start', 'Starts', { t: 'dt' })}${inp('end', 'Ends', { t: 'dt' })}`}
+      ${sel('timezone', 'Time zone', [['America/New_York', 'Eastern'], ['America/Chicago', 'Central'], ['America/Denver', 'Mountain'], ['America/Los_Angeles', 'Pacific'], ['Europe/London', 'London'], ['Asia/Jerusalem', 'Israel']])}
+      ${(ev.timeSlots || []).length ? `<p class="small muted">This event has ${ev.timeSlots.length} showtimes — manage them on the <a href="#/admin/event/${ev.id}/schedule">Showtimes</a> tab.</p>` : ''}</div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Where</div>
+      ${chk('online', 'Online / virtual event')}<div style="height:10px"></div>
+      ${ev.online ? inp('onlineUrl', 'Joining link (shown to ticket holders only)', { ph: 'https://zoom.us/…' }) : inp('venue', 'Venue') + inp('address', 'Address')}</div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Capacity & visibility</div>
+      ${inp('capacity', 'Total capacity', { t: 'int', hint: '0 = limited only by ticket quantities / showtimes' })}
+      ${sel('visibility', 'Who can see it', vis)}
+      ${inp('secrets.password', 'Password or access code', { hint: 'Optional. Buyers must enter it to see tickets.' })}
+      ${sel('currency', 'Currency', [['USD', 'USD $'], ['GBP', 'GBP £'], ['EUR', 'EUR €'], ['ILS', 'ILS ₪'], ['CAD', 'CAD $']])}</div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Schedule</div>
+      ${inp('publishAt', 'Publish automatically at', { t: 'dt', hint: 'Optional. The event stays off the public site until then (it still needs to be Published).' })}
+      ${inp('salesStart', 'Ticket sales open', { t: 'dt', hint: 'Before this, the page shows when sales open (and the waitlist, if on).' })}
+      ${inp('salesEnd', 'Ticket sales close', { t: 'dt', hint: 'Leave blank to sell until the event starts.' })}</div>
+    ${can('events.publish', ev.id) ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Status</div><div class="row wrap">
+      ${ev.status !== 'cancelled' ? '<button type="button" class="btn btn-ghost btn-sm" data-action="setStatus" data-v="cancelled">Cancel event</button>' : '<button type="button" class="btn btn-ghost btn-sm" data-action="setStatus" data-v="draft">Restore as draft</button>'}
+      <button type="button" class="btn btn-ghost btn-sm" data-action="archiveEvent">${ev.archived ? 'Unarchive' : 'Archive'}</button>
+      <button type="button" class="btn btn-danger btn-sm" data-action="deleteEvent">Delete</button></div>
+      <p class="small muted" style="margin-top:10px">Archive hides a finished event everywhere but keeps every order and report. Delete only works for events that never had orders.</p></div>` : ''}
+  </div></div>`;
+}
+function EdSchedule(ev) {
+  const g = S.ui.gen || (S.ui.gen = { mode: 'weekly', from: toLocalInput(ev.start).slice(0, 10), until: '', count: 8, days: [new Date(ev.start).getDay()], times: toLocalInput(ev.start).slice(11, 16), cap: +ev.capacity || 100, every: 60, to: '17:00' });
+  const av = availabilityFrom(S.adm.tickets, ev.id), slots = (ev.timeSlots || []).map((s, i) => ({ s, i })).sort((a, b) => D(a.s.start) - D(b.s.start));
+  const flag = (i, k, t) => `<label class="check small" style="white-space:nowrap"><input type="checkbox" data-bind="draft.timeSlots.${i}.${k}" data-t="bool" ${ev.timeSlots[i][k] ? 'checked' : ''}> <span>${t}</span></label>`;
+  return `<div class="cols" style="grid-template-columns:1.5fr 1fr;align-items:start"><div class="card"><div class="between" style="margin-bottom:6px"><h3>Showtimes</h3><button type="button" class="btn btn-ghost btn-sm" data-action="addSlot">${ic('plus', 14)} Add one</button></div>
+    <p class="small muted" style="margin-bottom:14px">One event, many dates or times. Buyers pick a showtime; each has its own capacity (and its own seats on a seating map). Leave empty for a single-time event. Changing one showtime never changes the others.</p>
+    ${slots.map(({ s, i }) => { const n = av.slots[s.id] || 0; return `<div class="slot-row ${s.hidden ? 'dim' : ''}"><div class="row" style="gap:8px;flex-wrap:wrap">${inp(`timeSlots.${i}.start`, '', { t: 'dt', cls: 'grow' })}<div style="width:110px">${inp(`timeSlots.${i}.capacity`, '', { t: 'int', ph: 'Capacity' })}</div>
+      <div style="flex:1;min-width:140px">${inp(`timeSlots.${i}.label`, '', { ph: 'Label (optional)' })}</div>${SLOT_CHIP[slotState(s, av)]}<span class="chip">${n} sold</span>
+      <button type="button" class="icon-btn" data-action="delSlot" data-i="${i}" ${n ? 'disabled title="Has tickets — hide or mark unavailable instead"' : 'title="Remove"'}>${ic('x', 14)}</button></div>
+      <div class="row" style="gap:16px;margin-top:6px">${flag(i, 'hidden', 'Hide')}${flag(i, 'unavailable', 'Unavailable')}${flag(i, 'soldOut', 'Mark sold out')}</div></div>`; }).join('') || '<p class="muted">No showtimes — this is a single-time event.</p>'}
+  </div><div class="card"><h3>Add showtimes in bulk</h3><div class="tabs" style="margin:10px 0 14px">${[['daily', 'Daily'], ['weekly', 'Weekly'], ['custom', 'Custom dates'], ['interval', 'Timed entry']].map(([k, t]) => `<button type="button" class="${g.mode === k ? 'on' : ''}" data-action="genMode" data-v="${k}">${t}</button>`).join('')}</div>
+    ${g.mode === 'custom' ? `<div class="field"><label class="fl">Dates</label><textarea class="inp" data-input="gen.dates" placeholder="2026-12-24, 2026-12-25, 2026-12-31">${esc(g.dates || '')}</textarea><div class="small muted" style="margin-top:4px">Comma or line separated (YYYY-MM-DD)</div></div>`
+      : `<div class="grid2"><div class="field"><label class="fl">${g.mode === 'interval' ? 'Date' : 'Starting'}</label><input class="inp" type="date" data-input="gen.from" value="${esc(g.from)}"></div>
+        ${g.mode === 'interval' ? '' : `<div class="field"><label class="fl">Until (or count)</label><input class="inp" type="date" data-input="gen.until" value="${esc(g.until)}"></div>`}</div>`}
+    ${g.mode === 'weekly' ? `<div class="field"><label class="fl">On</label><div class="row wrap" style="gap:6px">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d, i) => `<button type="button" class="chip ${g.days.includes(i) ? 'info' : ''}" style="cursor:pointer;border:0" data-action="genDay" data-v="${i}">${d}</button>`).join('')}</div></div>` : ''}
+    ${g.mode === 'interval' ? `<div class="grid3"><div class="field"><label class="fl">From</label><input class="inp" type="time" data-input="gen.times" value="${esc(g.times)}"></div><div class="field"><label class="fl">Until</label><input class="inp" type="time" data-input="gen.to" value="${esc(g.to)}"></div><div class="field"><label class="fl">Every (min)</label><input class="inp" type="number" data-input="gen.every" value="${esc(g.every)}"></div></div>`
+      : `<div class="field"><label class="fl">Times each day</label><input class="inp" data-input="gen.times" value="${esc(g.times)}" placeholder="14:00, 19:30"><div class="small muted" style="margin-top:4px">Several shows a day? List each time.</div></div>`}
+    <div class="grid2">${g.mode === 'daily' || g.mode === 'weekly' ? `<div class="field"><label class="fl">Max showtimes</label><input class="inp" type="number" data-input="gen.count" value="${esc(g.count)}"></div>` : ''}<div class="field"><label class="fl">Capacity each</label><input class="inp" type="number" data-input="gen.cap" value="${esc(g.cap)}"></div></div>
+    <button type="button" class="btn btn-dark btn-block" data-action="genSlots">Add showtimes</button><p class="small muted" style="margin-top:8px">Duplicates of existing showtimes are skipped. Save changes afterwards.</p></div></div>`;
+}
+function EdWaitlist(ev) {
+  const wl = S.adm.waitlist.filter(w => w.event_id === ev.id).sort((a, b) => D(a.created_at) - D(b.created_at)), waiting = wl.filter(w => !w.notified_at);
+  return `<div class="cols" style="align-items:start"><div class="card"><h3>Waitlist settings</h3>
+    <fieldset ${can('events.edit', ev.id) ? '' : 'disabled'} style="border:0">${sel('waitlistMode', 'When to offer it', Object.entries(WAITLIST_MODES))}</fieldset>
+    <p class="small muted">We collect name, email and phone. Save changes after switching. “Always shown” lets you open it whenever you like — even while tickets are on sale.</p>
+    ${S.dirty ? '<button class="btn btn-accent btn-sm" data-action="saveEvent">Save changes</button>' : ''}
+    ${can('comms.notify', ev.id) ? `<div class="sep"></div><h3>Notify the waitlist</h3><p class="small muted" style="margin:4px 0 10px">Tell the ${waiting.length} people still waiting that tickets are available. Each person is notified once.</p>
+      <textarea class="inp" data-input="wlMsg" placeholder="Good news — more tickets for ${esc(ev.name)} are now on sale: ${esc(shareUrl(ev.slug, 'waitlist'))}">${esc(S.ui.wlMsg || '')}</textarea>
+      <button class="btn btn-dark" style="margin-top:10px" data-action="notifyWL" ${waiting.length ? '' : 'disabled'}>Notify ${waiting.length}</button>
+      <p class="small muted" style="margin-top:8px">${DB.live ? 'Email delivery is connected in Stage 8; until then this records the notice.' : 'Demo: recorded, not emailed.'}</p>` : ''}</div>
+  <div class="card" style="padding:0"><div class="between" style="padding:16px 20px 8px"><h3>${wl.length} on the waitlist</h3>${wl.length && can('customers.export') ? `<button class="btn btn-ghost btn-sm" data-action="exportWL" data-id="${ev.id}">Export CSV</button>` : ''}</div>
+    <table class="tbl"><thead><tr><th>Name</th><th>Contact</th><th>Joined</th><th>Notified</th></tr></thead><tbody>
+    ${wl.map(w => `<tr><td><b>${esc(w.name || '—')}</b></td><td class="small">${esc(w.email)}${w.phone ? '<br>' + esc(w.phone) : ''}</td><td class="small muted">${esc(fmtDT(w.created_at))}</td><td class="small">${w.notified_at ? esc(ago(w.notified_at)) : '<span class="muted">waiting</span>'}</td></tr>`).join('') || '<tr><td colspan="4" class="empty">Nobody yet.</td></tr>'}</tbody></table></div></div>`;
+}
+function EdTeam(ev) {
+  const team = S.adm.team.slice().sort((a, b) => (b.owner - a.owner) || (a.name || a.email).localeCompare(b.name || b.email)), edit = can('admin.perms');
+  const has = m => m.owner || m.events === 'all' || (m.events || []).includes(ev.id);
+  return `<p class="muted" style="margin:-4px 0 16px;max-width:680px">Who on the team can work on this event. What they can <i>do</i> is set by their permissions on the <a href="#/admin/team">Team</a> page; here you choose whether this event is included.</p>
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Member</th><th>Permissions</th><th>Access to this event</th></tr></thead><tbody>
+  ${team.map(m => `<tr><td><b>${esc(m.name || m.email)}</b><div class="small muted">${esc(m.email)}</div></td><td>${accessLabel(m)}</td><td>
+    ${m.owner ? '<span class="chip ok">Always (owner)</span>' : m.events === 'all' ? `<span class="chip ok">Yes — all events</span>${edit && m.email !== S.adm.me.email ? ` <button class="btn btn-ghost btn-sm" data-action="evAccess" data-v="${esc(m.email)}" data-on="0">Limit to other events</button>` : ''}`
+      : has(m) ? `<span class="chip ok">Yes</span>${edit && m.email !== S.adm.me.email ? ` <button class="btn btn-ghost btn-sm" data-action="evAccess" data-v="${esc(m.email)}" data-on="0">Remove</button>` : ''}`
+      : `<span class="chip">No</span>${edit && m.email !== S.adm.me.email ? ` <button class="btn btn-ghost btn-sm" data-action="evAccess" data-v="${esc(m.email)}" data-on="1">Add to this event</button>` : ''}`}</td></tr>`).join('')}</tbody></table></div>
+  ${!edit ? '<p class="small muted" style="margin-top:10px">You need “Edit team permissions” to change access.</p>' : ''}`;
+}
+function EdHistory(ev) {
+  const list = (S.adm.audit || []).filter(a => a.target === ev.id);
+  return `<p class="muted" style="margin:-4px 0 16px">Every change to this event — dates, venue, capacity, status, visibility, ticket settings and prices, showtimes and seating — with who made it and the before/after values.</p>${AuditTable(list)}`;
 }
 
 // ── Event editor ─────────────────────────────────────────────────────────────
-const ETABS = [['details', 'Details'], ['tickets', 'Tickets'], ['schedule', 'Time slots'], ['seating', 'Seating'], ['checkout', 'Checkout'], ['discounts', 'Discounts'], ['emails', 'Emails & waitlist'], ['share', 'Share & embed']];
 const inp = (path, label, o = {}) => {
   const v = getPath(S.draft, path), t = o.t || 'text';
   const val = t === 'money' ? (v == null || v === '' ? '' : (+v / 100).toFixed(2).replace(/\.00$/, '')) : t === 'dt' ? toLocalInput(v) : (v ?? '');
@@ -656,42 +818,6 @@ const inp = (path, label, o = {}) => {
 const chk = (path, label) => `<label class="check"><input type="checkbox" data-bind="draft.${path}" data-t="bool" ${getPath(S.draft, path) ? 'checked' : ''}> <span>${label}</span></label>`;
 const sel = (path, label, opts) => `<div class="field">${label ? `<label class="fl">${label}</label>` : ''}<select class="inp" data-bind="draft.${path}">${opts.map(([v, t]) => `<option value="${esc(v)}" ${String(getPath(S.draft, path) ?? '') === String(v) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></div>`;
 
-function EventEditor() {
-  const ev = S.draft; if (!ev) return '<p class="muted">Event not found.</p>';
-  const tab = S.route.params[1] || 'details', ro = !can('events.edit', S.draft?.id);
-  const body = { details: EdDetails, tickets: EdTickets, schedule: EdSchedule, seating: EdSeating, checkout: EdCheckout, discounts: EdDiscounts, emails: EdEmails, share: EdShare }[tab] || EdDetails;
-  return `<a href="#/admin/events" class="small muted" style="text-decoration:none">← Events</a>
-  ${head(esc(ev.name || 'Untitled event'), `${evChip(ev)} ${S.dirty ? '<span class="chip warn">Unsaved changes</span>' : ''}`,
-    ro ? '' : `<a class="btn btn-ghost" href="#/e/${esc(ev.slug)}" target="_blank">Preview</a>
-    ${ev.status === 'published' ? '<button class="btn btn-ghost" data-action="setStatus" data-v="draft">Unpublish</button>' : '<button class="btn btn-dark" data-action="setStatus" data-v="published">Publish</button>'}
-    <button class="btn btn-accent" data-action="saveEvent" ${S.dirty ? '' : 'disabled'}>Save changes</button>`)}
-  <nav class="etabs">${ETABS.map(([k, t]) => `<a class="${tab === k ? 'on' : ''}" href="#/admin/event/${ev.id}/${k}">${t}</a>`).join('')}</nav>
-  <fieldset ${ro ? 'disabled' : ''} style="border:0">${body(ev)}</fieldset>`;
-}
-function EdDetails(ev) {
-  return `<div class="cols"><div class="card">
-    ${inp('name', 'Event name')}
-    <div class="grid2">${inp('slug', 'URL', { hint: esc(shareUrl(ev.slug)) })}${inp('category', 'Category', { ph: 'Concert, Kumzitz, Family…' })}</div>
-    ${inp('summary', 'Short summary')}
-    ${inp('description', 'Description', { t: 'area' })}
-    ${inp('image', 'Image URL', { ph: 'https://…', hint: 'Use a 16:10 photo or poster, at least 1200px wide.' })}
-    <div class="grid2">${inp('audience', 'Audience note', { ph: 'e.g. Men & boys only' })}${inp('doors', 'Doors open', { ph: '7:00 PM' })}</div>
-  </div><div class="stack">
-    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">When</div>
-      ${inp('start', 'Starts', { t: 'dt' })}${inp('end', 'Ends', { t: 'dt' })}
-      ${sel('timezone', 'Time zone', [['America/New_York', 'Eastern'], ['America/Chicago', 'Central'], ['America/Denver', 'Mountain'], ['America/Los_Angeles', 'Pacific'], ['Europe/London', 'London'], ['Asia/Jerusalem', 'Israel']])}
-      ${inp('salesEnd', 'Online sales end', { t: 'dt', hint: 'Leave blank to sell until the event starts.' })}</div>
-    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Where</div>
-      ${chk('online', 'Online / virtual event')}<div style="height:10px"></div>
-      ${ev.online ? inp('onlineUrl', 'Joining link (shown to ticket holders only)', { ph: 'https://zoom.us/…' }) : inp('venue', 'Venue') + inp('address', 'Address')}</div>
-    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Capacity & visibility</div>
-      ${inp('capacity', 'Total capacity', { t: 'int', hint: '0 = limited only by ticket quantities' })}
-      ${sel('visibility', 'Listing', [['public', 'Public — listed on the box office'], ['private', 'Private — only people with the link']])}
-      ${inp('secrets.password', 'Event password', { hint: 'Optional. Buyers must enter it to see tickets.' })}
-      ${sel('currency', 'Currency', [['USD', 'USD $'], ['GBP', 'GBP £'], ['EUR', 'EUR €'], ['ILS', 'ILS ₪'], ['CAD', 'CAD $']])}
-      ${can('events.publish', ev.id) ? `<div class="sep"></div><div class="row wrap"><button type="button" class="btn btn-ghost btn-sm" data-action="setStatus" data-v="cancelled">Cancel event</button><button type="button" class="btn btn-danger btn-sm" data-action="deleteEvent">Delete</button></div>` : ''}</div>
-  </div></div>`;
-}
 function EdTickets(ev) {
   const sold = evStats(ev), av = availabilityFrom(S.adm.tickets, ev.id);
   return `<div class="between" style="margin-bottom:14px"><p class="muted">${sold.sold} sold. Ticket types, prices, limits and sale windows.</p><button type="button" class="btn btn-dark btn-sm" data-action="addTT">${ic('plus', 14)} Add ticket type</button></div>
@@ -703,18 +829,6 @@ function EdTickets(ev) {
     <div class="grid3">${inp(`ticketTypes.${i}.salesStart`, 'On sale from', { t: 'dt' })}${inp(`ticketTypes.${i}.salesEnd`, 'Off sale at', { t: 'dt' })}${inp(`secrets.ticketPasswords.${t.id}`, 'Access code', { hint: 'Hidden types appear only with this code' })}</div>
     ${chk(`ticketTypes.${i}.hidden`, 'Hidden — only visible with the access code')}
   </div>`).join('')}`;
-}
-function EdSchedule(ev) {
-  const g = S.ui.gen || (S.ui.gen = { date: toLocalInput(ev.start).slice(0, 10), from: '10:00', to: '17:00', every: 60, cap: 100 });
-  const av = availabilityFrom(S.adm.tickets, ev.id);
-  return `<div class="cols"><div class="card"><div class="between" style="margin-bottom:12px"><h3>Time slots</h3><button type="button" class="btn btn-ghost btn-sm" data-action="addSlot">${ic('plus', 14)} Add slot</button></div>
-    <p class="small muted" style="margin-bottom:14px">For recurring shows or timed entry. Buyers pick a slot; each has its own capacity. Leave empty for a single-time event.</p>
-    ${(ev.timeSlots || []).map((s, i) => `<div class="row" style="margin-bottom:8px">${inp(`timeSlots.${i}.start`, '', { t: 'dt', cls: 'grow' })}${inp(`timeSlots.${i}.capacity`, '', { t: 'int' })}<span class="chip">${av.slots[s.id] || 0} sold</span><button type="button" class="icon-btn" data-action="delSlot" data-i="${i}">${ic('x', 14)}</button></div>`).join('') || '<p class="muted">No time slots.</p>'}
-  </div><div class="card"><h3>Generate recurring slots</h3><p class="small muted" style="margin-bottom:12px">Create a run of slots in one go.</p>
-    <div class="field"><label class="fl">Date</label><input class="inp" type="date" data-input="gen.date" value="${esc(g.date)}"></div>
-    <div class="grid2"><div class="field"><label class="fl">From</label><input class="inp" type="time" data-input="gen.from" value="${esc(g.from)}"></div><div class="field"><label class="fl">Until</label><input class="inp" type="time" data-input="gen.to" value="${esc(g.to)}"></div></div>
-    <div class="grid2"><div class="field"><label class="fl">Every (minutes)</label><input class="inp" type="number" data-input="gen.every" value="${esc(g.every)}"></div><div class="field"><label class="fl">Capacity each</label><input class="inp" type="number" data-input="gen.cap" value="${esc(g.cap)}"></div></div>
-    <button type="button" class="btn btn-dark btn-block" data-action="genSlots">Generate</button></div></div>`;
 }
 function soldSeatIds(ev) { return S.adm.tickets.filter(t => t.event_id === ev.id && t.status === 'valid' && t.seat).map(t => t.seat); }
 function EdSeating(ev) {
@@ -861,9 +975,7 @@ function EdEmails(ev) {
       ${S.adm.broadcasts.filter(x => x.event_id === ev.id).map(x => `<div class="small muted" style="margin-top:10px">“${esc(x.subject)}” · ${x.recipients} recipients · ${esc(ago(x.created_at))}</div>`).join('')}</div>
     <div class="card"><div class="between"><h3>Automatic reminders</h3><button type="button" class="btn btn-ghost btn-sm" data-action="addRem">${ic('plus', 14)} Add</button></div>
       ${(ev.emails?.reminders || []).map((r, i) => `<div class="item-card" style="margin-top:10px"><div class="grid2">${inp(`emails.reminders.${i}.hoursBefore`, 'Hours before start', { t: 'int' })}${sel(`emails.reminders.${i}.channel`, 'Channel', [['email', 'Email'], ['sms', 'Text message'], ['whatsapp', 'WhatsApp']])}</div>${inp(`emails.reminders.${i}.body`, 'Message', { t: 'area' })}<button type="button" class="btn btn-ghost btn-sm" data-action="delRem" data-i="${i}">Remove</button></div>`).join('') || '<p class="small muted" style="margin-top:8px">No reminders scheduled.</p>'}</div>
-  </div><div class="card"><div class="between"><h3>Waitlist</h3>${wl.length ? `<button type="button" class="btn btn-ghost btn-sm" data-action="exportWL" data-id="${ev.id}">Export CSV</button>` : ''}</div>
-    ${chk('waitlist', 'Offer a waitlist when sold out')}<div class="sep"></div>
-    ${wl.map(w => `<div class="between" style="padding:8px 0;border-bottom:1px solid var(--line)"><div><b>${esc(w.name || '—')}</b><div class="small muted">${esc(w.email)}</div></div><span class="small muted">${esc(ago(w.created_at))}</span></div>`).join('') || '<p class="muted">Nobody on the waitlist.</p>'}</div></div>`;
+  </div></div>`;
 }
 function EdShare(ev) {
   const url = shareUrl(ev.slug), embed = location.origin + location.pathname + '#/embed/' + ev.slug;
@@ -928,7 +1040,8 @@ function ManualOrderModal() {
     ${ev ? `<div class="grid2"><div class="field"><label class="fl">Ticket type</label><select class="inp" data-input="mo.tt">${ev.ticketTypes.map(t => `<option value="${t.id}" ${m.tt === t.id ? 'selected' : ''}>${esc(t.name)} — ${money(t.price)}</option>`).join('')}</select></div>
       <div class="field"><label class="fl">Quantity</label><input class="inp" type="number" min="1" data-input="mo.qty" value="${esc(m.qty)}"></div></div>
       ${ev.timeSlots?.length ? `<div class="field"><label class="fl">Time slot</label><select class="inp" data-input="mo.slot">${ev.timeSlots.map(s => `<option value="${s.id}" ${m.slot === s.id ? 'selected' : ''}>${esc(fmtDT(s.start))}</option>`).join('')}</select></div>` : ''}` : ''}
-    <div class="grid2"><div class="field"><label class="fl">Buyer name</label><input class="inp" data-input="mo.name" value="${esc(m.name)}"></div><div class="field"><label class="fl">Buyer email</label><input class="inp" data-input="mo.email" value="${esc(m.email)}"></div></div>`,
+    <div class="grid2"><div class="field"><label class="fl">Buyer name</label><input class="inp" data-input="mo.name" value="${esc(m.name)}"></div><div class="field"><label class="fl">Buyer email</label><input class="inp" data-input="mo.email" value="${esc(m.email)}"></div></div>
+    ${ev && can('tickets.comps', ev.id) ? `<label class="check"><input type="checkbox" data-action="moComp" ${m.comp ? 'checked' : ''}> <span>Complimentary — issue free, keep the real ticket type and its face value for reporting</span></label>` : ''}`,
     `<button class="btn btn-ghost" data-action="closeModal">Cancel</button><button class="btn btn-accent" data-action="saveManual">Create order</button>`);
 }
 function Attendees() {
@@ -1454,7 +1567,7 @@ async function persistEvent(ev) {
   }
   const saved = await DB.saveEvent(ev);
   upsertLocal(S.adm.events, JSON.parse(JSON.stringify(saved)));
-  S.events = S.events.filter(e => e.id !== saved.id); if (saved.status === 'published') { const { secrets, ...pub } = saved; S.events.push({ ...pub, hasPassword: !!secrets?.password, ticketTypes: pub.ticketTypes.map(t => ({ ...t, locked: !!secrets?.ticketPasswords?.[t.id] })) }); }
+  S.events = S.events.filter(e => e.id !== saved.id); if (eventLive(normEvent(saved))) { const { secrets, ...pub } = saved; S.events.push({ ...pub, hasPassword: !!secrets?.password, ticketTypes: pub.ticketTypes.map(t => ({ ...t, locked: !!secrets?.ticketPasswords?.[t.id] })) }); }
   return saved;
 }
 const A = {
@@ -1510,7 +1623,7 @@ const A = {
   },
   resendMine: () => toast(DB.live ? 'Email delivery is not connected yet — save this page.' : 'Demo mode: email sending is off. Your tickets are on this page.'),
   findOrder: async () => { const f = S.ui.find || {}; try { const r = await DB.lookupOrder(f.ref || '', f.email || ''); if (r) location.hash = '#/order/' + r.id + '/' + r.key; else { f.err = 'No order matches that number and email.'; S.ui.find = f; render(); } } catch (e) { toast(e.message, true); } },
-  joinWaitlist: async el => { const w = S.ui.wl || {}; try { await DB.joinWaitlist(el.dataset.id, w.name || '', w.email || ''); S.ui.wl = { done: el.dataset.id }; render(); } catch (e) { toast(e.message, true); } },
+  joinWaitlist: async el => { const w = S.ui.wl || {}; try { await DB.joinWaitlist(el.dataset.id, w.name || '', w.email || '', w.phone || ''); S.ui.wl = { done: el.dataset.id }; render(); } catch (e) { toast(e.message, true); } },
   // ── admin ──
   login: async () => {
     const l = S.ui.login; l.err = '';
@@ -1584,29 +1697,49 @@ const A = {
   boDelete: async el => { const b = S.plat.bos.find(x => x.id === el.dataset.id); const typed = window.prompt(`Permanently delete ${b.name}? This can't be undone. Type the box office name to confirm.`); if (typed?.trim() !== b.name) return toast('Not deleted'); try { await DB.deleteBoxOffice(b.id); S.plat = null; toast('Deleted'); render(); } catch (e) { toast(e.message, true); } },
   savePlatform: async () => { const f = S.ui.ps; try { await DB.savePlatform({ name: f.name, publicRegistration: !!f.publicRegistration, feePct: +f.feePct || 0, feeFixed: +f.feeFixed || 0, plans: f.plans, admins: f.adminsText.split(',') }); S.ui.ps = null; S.plat = null; await refreshPublic(); toast('Platform settings saved'); render(); } catch (e) { toast(e.message, true); } },
   register: async () => { const f = S.ui.reg; try { await DB.createBoxOffice({ name: f.name, ownerEmail: f.ownerEmail, ownerName: f.ownerName }, true); f.done = true; render(); } catch (e) { toast(e.message, true); } },
-  newEvent: async () => {
-    const start = new Date(Date.now() + 30 * 864e5); start.setHours(20, 0, 0, 0); const end = new Date(start.getTime() + 3 * 3600e3);
+  newEvent: () => { if ((S.adm.bo.eventTemplates || []).length) NewEventModal(); else A.blankEvent(); },
+  blankEvent: async () => {
+    closeModal(); const start = new Date(Date.now() + 30 * 864e5); start.setHours(20, 0, 0, 0); const end = new Date(start.getTime() + 3 * 3600e3);
     const ev = { id: uid(), slug: 'new-event-' + randCode(4).toLowerCase(), status: 'draft', name: 'New event', category: 'Concert', summary: '', description: '', image: '', venue: '', address: '', audience: '', doors: '',
       start: start.toISOString(), end: end.toISOString(), timezone: 'America/New_York', currency: S.settings.currency, capacity: 0, visibility: 'public', online: false, onlineUrl: '',
-      ticketTypes: [newTT()], timeSlots: [], seating: { enabled: false }, addons: [], questions: [], waitlist: true, emails: { confirmation: '', reminders: [] }, created_at: new Date().toISOString(),
+      ticketTypes: [newTT()], timeSlots: [], seating: { enabled: false }, addons: [], questions: [], waitlistMode: 'soldout', emails: { confirmation: '', reminders: [] }, created_at: new Date().toISOString(),
+      allDay: false, contact: { name: '', email: '', phone: '' }, policies: '', instructions: '',
       secrets: { password: '', ticketPasswords: {}, discounts: [] } };
     try { const s = await persistEvent(ev); location.hash = '#/admin/event/' + s.id + '/details'; } catch (e) { toast(e.message, true); }
   },
   dupEvent: async el => {
-    const src = JSON.parse(JSON.stringify(S.adm.events.find(e => e.id === el.dataset.id)));
-    const ttMap = {}; src.ticketTypes.forEach(t => { const n = shortId('tt_'); ttMap[t.id] = n; t.id = n; });
-    (src.seating?.sections || []).forEach(x => { x.ticketTypeId = ttMap[x.ticketTypeId] || ''; });
-    if (src.seating?.prices) Object.keys(src.seating.prices).forEach(k => { src.seating.prices[k] = ttMap[src.seating.prices[k]] || ''; });
-    src.secrets.ticketPasswords = Object.fromEntries(Object.entries(src.secrets.ticketPasswords || {}).map(([k, v]) => [ttMap[k], v]));
-    (src.secrets.discounts || []).forEach(d => d.ticketTypeIds = (d.ticketTypeIds || []).map(i => ttMap[i]));
-    Object.assign(src, { id: uid(), name: src.name + ' (copy)', slug: src.slug + '-' + randCode(3).toLowerCase(), status: 'draft', created_at: new Date().toISOString(), timeSlots: (src.timeSlots || []).map(s => ({ ...s, id: shortId('ts_') })) });
-    try { const s = await persistEvent(src); toast('Duplicated'); location.hash = '#/admin/event/' + s.id + '/details'; } catch (e) { toast(e.message, true); }
+    const src = S.adm.events.find(e => e.id === el.dataset.id), ev = cloneEventStructure(src);
+    Object.assign(ev, { name: src.name + ' (copy)', slug: src.slug + '-' + randCode(3).toLowerCase() });
+    try { const s = await persistEvent(ev); toast('Duplicated as a draft'); location.hash = '#/admin/event/' + s.id + '/details'; } catch (e) { toast(e.message, true); }
   },
+  fromTemplate: async el => {
+    const t = S.adm.bo.eventTemplates.find(x => x.id === el.dataset.v); closeModal();
+    const ev = eventFromTemplate(t); if (ev.seating?.enabled) ev.seating.index = seatIndex(ev.seating);
+    try { const s = await persistEvent(ev); toast('Created from “' + t.name + '” — set the date and publish'); location.hash = '#/admin/event/' + s.id + '/details'; } catch (e) { toast(e.message, true); }
+  },
+  saveTemplate: async () => {
+    const name = window.prompt('Template name', S.draft.name); if (!name?.trim()) return;
+    const list = (S.adm.bo.eventTemplates || []).concat(eventToTemplate(S.draft, name.trim()));
+    try { await DB.saveEventTemplates(list); S.adm.bo.eventTemplates = list; toast('Saved as template “' + name.trim() + '”'); } catch (e) { toast(e.message, true); }
+  },
+  rmEvTemplate: async el => { if (!confirmIn('Delete this template? Events made from it are not affected.')) return; const list = S.adm.bo.eventTemplates.filter(t => t.id !== el.dataset.v); try { await DB.saveEventTemplates(list); S.adm.bo.eventTemplates = list; render(); } catch (e) { toast(e.message, true); } },
+  evFilter: el => { S.ui.evf = el.dataset.v; render(); },
+  archiveEvent: async () => { S.draft.archived = !S.draft.archived; await A.saveEvent(); },
+  notifyWL: async () => { const ev = S.draft; try { const n = await DB.notifyWaitlist(ev.id, S.ui.wlMsg || `Tickets for ${ev.name} are available: ${shareUrl(ev.slug, 'waitlist')}`); S.ui.wlMsg = ''; await reloadAdmin(); toast(`Notified ${n} ${n === 1 ? 'person' : 'people'}`); render(); } catch (e) { toast(e.message, true); } },
+  evAccess: async el => {
+    const m = JSON.parse(JSON.stringify(S.adm.team.find(x => x.email === el.dataset.v))), id = S.draft.id;
+    if (el.dataset.on === '1') m.events = [...new Set([...(m.events === 'all' ? [] : m.events), id])];
+    else m.events = (m.events === 'all' ? S.adm.events.map(e => e.id) : m.events).filter(x => x !== id);
+    try { await DB.saveMember(m); await reloadAdmin(); toast('Access updated'); render(); } catch (e) { toast(e.message, true); }
+  },
+  moComp: el => { S.ui.mo.comp = el.checked; },
+  genMode: el => { S.ui.gen.mode = el.dataset.v; render(); },
+  genDay: el => { const d = S.ui.gen.days, v = +el.dataset.v, i = d.indexOf(v); if (i >= 0) d.splice(i, 1); else d.push(v); render(); },
   saveEvent: async () => {
     const ev = S.draft; ev.slug = slugify(ev.slug || ev.name);
     if (S.adm.events.some(e => e.slug === ev.slug && e.id !== ev.id)) return toast('Another event already uses that URL', true);
     if (!ev.ticketTypes.length) return toast('Add at least one ticket type', true);
-    try { const s = await persistEvent(ev); S.draft = JSON.parse(JSON.stringify(s)); S.dirty = false; toast('Saved'); render(); } catch (e) { toast(e.message, true); }
+    try { const s = await persistEvent(ev); S.draft = JSON.parse(JSON.stringify(s)); S.dirty = false; await reloadAdmin(); toast('Saved'); render(); } catch (e) { toast(e.message, true); }
   },
   setStatus: async el => { if (el.dataset.v === 'cancelled' && !confirmIn('Cancel this event? It will be removed from sale.')) return; S.draft.status = el.dataset.v; await A.saveEvent(); },
   deleteEvent: async () => {
@@ -1617,12 +1750,27 @@ const A = {
   addTT: () => { S.draft.ticketTypes.push(newTT()); dirty(); render(); },
   delTT: el => { const t = S.draft.ticketTypes[+el.dataset.i]; if (S.adm.tickets.some(x => x.ticket_type_id === t.id && x.status === 'valid')) return toast('Tickets of this type are sold — hide it instead', true); S.draft.ticketTypes.splice(+el.dataset.i, 1); dirty(); render(); },
   moveTT: el => { const a = S.draft.ticketTypes, i = +el.dataset.i; if (i > 0) { [a[i - 1], a[i]] = [a[i], a[i - 1]]; dirty(); render(); } },
-  addSlot: () => { (S.draft.timeSlots ||= []).push({ id: shortId('ts_'), start: S.draft.start, capacity: 100 }); dirty(); render(); },
-  delSlot: el => { S.draft.timeSlots.splice(+el.dataset.i, 1); dirty(); render(); },
-  genSlots: () => { const g = S.ui.gen; const [fh, fm] = g.from.split(':').map(Number), [th, tm] = g.to.split(':').map(Number);
-    const d = new Date(g.date + 'T00:00'); let m = fh * 60 + fm; const endM = th * 60 + tm; let n = 0;
-    while (m <= endM && n < 200) { const s = new Date(d); s.setHours(0, m, 0, 0); (S.draft.timeSlots ||= []).push({ id: shortId('ts_'), start: s.toISOString(), capacity: +g.cap || 0 }); m += Math.max(5, +g.every || 60); n++; }
-    S.draft.timeSlots.sort((a, b) => D(a.start) - D(b.start)); dirty(); toast(n + ' slots added'); render(); },
+  addSlot: () => { (S.draft.timeSlots ||= []).push({ id: shortId('ts_'), start: S.draft.start, capacity: +S.draft.capacity || 100 }); dirty(); render(); },
+  delSlot: el => { const s = S.draft.timeSlots[+el.dataset.i]; if (S.adm.tickets.some(t => t.slot_id === s.id)) return toast('This showtime has tickets — hide it or mark it unavailable instead', true); S.draft.timeSlots.splice(+el.dataset.i, 1); dirty(); render(); },
+  genSlots: () => {
+    const g = S.ui.gen, ev = S.draft, have = new Set((ev.timeSlots || []).map(s => D(s.start).getTime())), out = [];
+    const at = (day, hm) => { const [h, m] = String(hm).trim().split(':').map(Number); if (isNaN(h)) return null; const d = new Date(day + 'T00:00'); d.setHours(h, m || 0, 0, 0); return d; };
+    const times = String(g.times || '').split(/[,\s]+/).filter(Boolean);
+    let days = [];
+    if (g.mode === 'custom') days = String(g.dates || '').split(/[\s,]+/).filter(x => /^\d{4}-\d{2}-\d{2}$/.test(x));
+    else if (g.mode === 'interval') days = [g.from];
+    else { const d = new Date(g.from + 'T00:00'), end = g.until ? new Date(g.until + 'T23:59') : null, max = Math.min(+g.count || 50, 366);
+      for (let i = 0; i < 730 && days.length < max && (!end || d <= end); i++, d.setDate(d.getDate() + 1)) if (g.mode === 'daily' || g.days.includes(d.getDay())) days.push(toLocalInput(d.toISOString()).slice(0, 10)); }
+    for (const day of days) {
+      if (g.mode === 'interval') { const a = at(day, g.times), b = at(day, g.to); for (let t = a; a && b && t <= b; t = new Date(t.getTime() + Math.max(5, +g.every || 60) * 6e4)) out.push(t); }
+      else times.forEach(t => { const d = at(day, t); if (d) out.push(d); });
+    }
+    const fresh = out.filter(d => !have.has(d.getTime()));
+    if (!fresh.length) return toast(out.length ? 'Those showtimes already exist' : 'Nothing to add — check the dates and times', true);
+    if (fresh.length > 400) return toast('That would add ' + fresh.length + ' showtimes — narrow the range', true);
+    (ev.timeSlots ||= []).push(...fresh.map(d => ({ id: shortId('ts_'), start: d.toISOString(), capacity: +g.cap || 0 })));
+    ev.timeSlots.sort((a, b) => D(a.start) - D(b.start)); dirty(); toast(`Added ${fresh.length} showtime${fresh.length === 1 ? '' : 's'} — save to keep them`); render();
+  },
   zoom: el => { S.ui.zoom = Math.max(1, Math.min(3, (S.ui.zoom || 1) + (+el.dataset.d) * .5)); render(); },
   smMode: el => { S.ui.smMode = el.dataset.v; render(); },
   smPaint: el => { S.ui.smPaint = el.dataset.v; render(); },
@@ -1651,7 +1799,7 @@ const A = {
   broadcast: async el => { const b = S.ui.bc; if (!b.subject.trim() || !b.body.trim()) return toast('Add a subject and message', true);
     try { const row = await DB.addBroadcast({ event_id: S.draft.id, subject: b.subject, body: b.body, recipients: +el.dataset.n, created_by: S.user.email }); S.adm.broadcasts.push(row); S.ui.bc = { subject: '', body: '' };
       toast('Queued for ' + el.dataset.n + ' buyers — sending is off until email is connected'); render(); } catch (e) { toast(e.message, true); } },
-  exportWL: el => download('waitlist.csv', csv([['Name', 'Email', 'Joined'], ...S.adm.waitlist.filter(w => w.event_id === el.dataset.id).map(w => [w.name, w.email, w.created_at])])),
+  exportWL: el => { download('waitlist.csv', csv([['Name', 'Email', 'Phone', 'Joined', 'Notified'], ...S.adm.waitlist.filter(w => w.event_id === el.dataset.id).map(w => [w.name, w.email, w.phone || '', w.created_at, w.notified_at || ''])])); DB.log('export.waitlist', 'Exported the waitlist'); },
   openOrder: el => OrderModal(el.dataset.id),
   pick: el => { S.ui.picked[el.dataset.id] = el.checked; render(); },
   orderStatus: async el => { if (['cancelled', 'refunded'].includes(el.dataset.v) && !confirmIn('Cancel this order and void its tickets?' + (el.dataset.v === 'refunded' ? ' Refund the card in Stripe.' : ''))) return;
@@ -1668,7 +1816,7 @@ const A = {
     if (ev.seating?.enabled) { const av = availabilityFrom(S.adm.tickets, ev.id);
       seats = Object.keys(ev.seating.index || {}).filter(id => ev.seating.index[id] === tt && !av.seats.includes((slot || '') + '|' + id)).slice(0, qty);
       if (seats.length < qty) return toast('Not enough free seats in that tier', true); }
-    try { await DB.placeOrder({ buyer: { name: m.name, email: m.email, phone: '' }, items: [{ eventId: ev.id, ticketTypeId: tt, qty, slotId: slot, seats }], addons: [], payment: 'manual', source: 'box office' }, true);
+    try { await DB.placeOrder({ buyer: { name: m.name, email: m.email, phone: '' }, items: [{ eventId: ev.id, ticketTypeId: tt, qty, slotId: slot, seats }], addons: [], payment: 'manual', comp: !!m.comp, source: 'box office' }, true);
       closeModal(); await reloadAdmin(); toast('Order created'); render(); } catch (e) { toast(e.message, true); }
   },
   exportOrders: () => download('orders.csv', csv([['Order', 'Placed', 'Status', 'Name', 'Email', 'Phone', 'Events', 'Tickets', 'Subtotal', 'Discount', 'Code', 'Fees', 'Tax', 'Donation', 'Total', 'Payment', 'Source', 'Marketing opt-in'],
@@ -1730,7 +1878,7 @@ document.addEventListener('input', e => {
   if (el.dataset.input) {
     const k = el.dataset.input, v = el.value;
     if (k === 'homeq') S.home.q = v; else if (k === 'pw') S.sel.pw = v;
-    else if (k === 'wlName' || k === 'wlEmail') (S.ui.wl ||= {})[k === 'wlName' ? 'name' : 'email'] = v;
+    else if (k === 'wlName' || k === 'wlEmail' || k === 'wlPhone') (S.ui.wl ||= {})[{ wlName: 'name', wlEmail: 'email', wlPhone: 'phone' }[k]] = v;
     else if (k === 'findRef' || k === 'findEmail') (S.ui.find ||= {})[k === 'findRef' ? 'ref' : 'email'] = v;
     else if (k === 'loginEmail') S.ui.login.email = v; else if (k === 'loginCode') S.ui.login.code = v; else if (k === 'loginTotp') S.ui.login.totp = v;
     else if (k === 'sc.q') { S.sc.q = v; return render(); }
