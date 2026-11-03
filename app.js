@@ -22,7 +22,10 @@ const shareUrl = (slug, src) => location.origin + location.pathname + '#/e/' + s
 
 function toast(msg, bad) { const t = document.createElement('div'); t.className = 'toast' + (bad ? ' bad' : ''); t.textContent = msg; $('#toast').append(t); setTimeout(() => t.remove(), 3600); }
 function download(name, text, type = 'text/csv') { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
-function csv(rows) { return rows.map(r => r.map(v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }).join(',')).join('\n'); }
+// CSV for spreadsheets. A text cell starting with = + - @ tab or CR would run as a formula in Excel / Sheets ("CSV injection"), so it gets
+// a leading apostrophe; real numbers (negative amounts too) stay numbers.
+const csvCell = v => { let s = String(v ?? ''); if (typeof v !== 'number' && /^[=+\-@\t\r]/.test(s)) s = "'" + s; return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+function csv(rows) { return rows.map(r => r.map(csvCell).join(',')).join('\n'); }
 function ics(ev) {
   const f = iso => D(iso).toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
   return ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//SET Tickets//EN', 'BEGIN:VEVENT', 'UID:' + ev.id + '@set', 'DTSTAMP:' + f(new Date().toISOString()),
@@ -913,7 +916,7 @@ function AdminShell() {
   if (!S.user || S.user.mfa) return Login();
   if (!S.adm) return `<div class="empty" style="padding-top:30vh">Loading…</div>`;
   if (!S.adm.bo) return S.adm.super ? (setTimeout(() => { location.hash = '#/platform'; }), '') : Gate('No box office yet', `${esc(S.user.email)} isn't on any box office team. Ask an owner to invite you.`);
-  if (S.adm.blocked) return Gate(S.adm.bo.name + ' is ' + BO_STATUS[S.adm.blocked].toLowerCase(), S.adm.blocked === 'pending' ? 'The platform team is reviewing this box office. You\'ll get an email when it\'s approved.' : 'Event pages and checkout are offline and staff access is paused. Contact the platform team.');
+  if (S.adm.blocked) return Gate(S.adm.bo.name + ' is ' + BO_STATUS[S.adm.blocked].toLowerCase(), S.adm.blocked === 'pending' ? 'The platform team is reviewing this box office. You\'ll get an email when it\'s approved.' : 'Event pages and checkout are offline and staff access is paused. Contact the platform team.' + (S.adm.me?.owner ? '<br><br>Your records are still yours: <a href="#" data-action="gateXp">download all of your data</a>.' : ''));
   const sub = S.route.sub, page = { dashboard: Dashboard, events: EventsList, event: EventEditor, venues: Venues, orders: Orders, customers: Customers, promos: Promos, attendees: Attendees, checkin: CheckIn, reports: Reports, marketing: Marketing, team: Team, branding: Branding, settings: Settings, security: Security }[sub] || Dashboard;
   const allowed = NAV.filter(navOk), navKey = sub === 'event' ? 'events' : sub, entry = NAV.find(n => n[0] === navKey);
   const body = S.adm.needs2fa && sub !== 'security' ? Gate2fa() : entry && !navOk(entry) ? `<div class="empty"><div class="display" style="font-size:28px">No access</div><p class="muted" style="margin-top:8px">You don't have permission to open ${esc(entry[1])}. Ask a box office admin.</p></div>` : scannerOnly() && (sub || 'dashboard') === 'dashboard' ? ScannerHome() : page();
@@ -1088,7 +1091,12 @@ function EdOverview(ev) {
   const pct = x => (x * 100).toFixed(x && x < .1 ? 1 : 0) + '%';
   const kpi = (l, val, d = '', dark) => `<div class="kpi ${dark ? 'dark' : ''}"><div class="eyebrow">${l}</div><div class="v">${val}</div>${d ? `<div class="d" ${dark ? 'style="color:var(--mut)"' : ''}>${d}</div>` : ''}</div>`;
   const slots = (saved.timeSlots || []);
-  return `${fin ? `<div class="eyebrow dash" style="margin:4px 0 12px">Sellout value</div>
+  const fr = can('finance.reports') ? finReport(finX(), { eventId: ev.id }) : null;
+  return `${fr ? `<div class="between wrap" style="gap:8px;margin:4px 0 12px"><div class="eyebrow dash">Financial dashboard</div><div class="row wrap"><a class="btn btn-ghost btn-sm" href="#/admin/reports" data-action="repOpenEvent" data-id="${ev.id}">Full report →</a>${can('finance.export') ? `<button class="btn btn-ghost btn-sm" data-action="xpEventId" data-id="${ev.id}">Export everything for this event</button>` : ''}</div></div>
+  <div class="cols" style="margin-bottom:18px">${FinDash(fr.totals, { title: 'Money for this event' })}<div class="card"><h3>Profit</h3><div class="sum-line"><span>Revenue <span class="small muted">excl. sales tax</span></span><span class="tnum">${money(fr.totals.revenue)}</span></div>
+    <div class="sum-line"><span>Refunds, chargebacks & processing</span><span class="tnum">−${money(fr.totals.refunds + fr.totals.credits + fr.totals.chargebacks + fr.totals.processing + fr.totals.platform)}</span></div><div class="sum-line"><span>Expenses</span><span class="tnum">−${money(fr.totals.expenses)}</span></div>
+    <div class="sum-line total"><span>${fr.totals.profitFinal ? 'Event profit' : 'Estimated profit'}</span><span class="tnum">${money(fr.totals.profit)}</span></div>${can('finance.reports') ? `<a class="small" href="#/admin/reports/profit" data-action="repProfit" data-id="${ev.id}">Expenses & profit →</a>` : ''}</div></div>` : ''}
+  ${fin ? `<div class="eyebrow dash" style="margin:4px 0 12px">Sellout value</div>
   <div class="kpis">${kpi('Potential sellout revenue', so.unknown && !so.total ? '—' : money(so.total), so.unknown ? 'Set a capacity or ticket limits to complete this' : so.estimate ? 'Unlimited ticket types counted up to capacity' : `${so.shows > 1 ? so.shows + ' showtimes · ' : ''}face value`, true)}
     ${kpi('Sold (face value)', money(so.soldValue), so.total ? pct(so.pct) + ' of potential' : '')}${kpi('Remaining potential', money(so.remaining))}${kpi('Collected', money(Math.round(collected)), 'paid orders, after discounts')}</div>
   <div class="bar big" style="margin:-4px 0 22px"><i style="width:${Math.min(100, so.pct * 100)}%"></i></div>
@@ -1821,7 +1829,7 @@ const OrderModal = id => { location.hash = '#/admin/orders/' + id; };   // the o
 const TK_CHIP = { valid: '', cancelled: '<span class="chip bad mini">cancelled</span>', replaced: '<span class="chip mini">replaced</span>' };
 const tkType = t => evById(t.event_id)?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name || 'Ticket';
 const tkWhere = t => { const ev = evById(t.event_id), slot = t.slot_id && ev?.timeSlots?.find(s => s.id === t.slot_id); return [t.seat ? seatName(ev, t.seat, true, t) : '', slot ? fmtDT(slot.start) : ''].filter(Boolean).join(' · ') || 'General admission'; };
-const LOG_ICON = { reissue: '⟲', change: '⇄', cancel: '✕', refund: '↩', payment: '＋', addon: '＋', customer: '✎', holder: '✎', note: '✎', message: '✉', resend: '✉', paid: '✓', cancelled: '✕', credit: '★', placed: '•' };
+const LOG_ICON = { chargeback: '!', reissue: '⟲', change: '⇄', cancel: '✕', refund: '↩', payment: '＋', addon: '＋', customer: '✎', holder: '✎', note: '✎', message: '✉', resend: '✉', paid: '✓', cancelled: '✕', credit: '★', placed: '•' };
 function orderTimeline(o) {
   const rows = (S.adm.orderLog || []).filter(x => x.order_id === o.id).map(x => ({ at: x.at, kind: x.kind, text: x.summary, by: x.by, note: x.kind === 'note' ? '' : x.note }));
   rows.push({ at: o.created_at, kind: 'placed', text: `order placed — ${o.data.payment === 'manual' ? 'staff order' : o.data.payment}${o.data.comp ? ' · complimentary' : ''}`, by: o.data.payment === 'manual' ? '' : o.buyer_email });
@@ -1831,7 +1839,7 @@ function orderTimeline(o) {
 function OrderView(id) {
   const o = S.adm.orders.find(x => x.id === id);
   if (!o) return `<a href="#/admin/orders" class="small muted" style="text-decoration:none">← Orders</a><div class="empty">Order not found.</div>`;
-  if (S.ui.oid !== id) { S.ui.oid = id; S.ui.op = null; S.ui.osel = {}; }
+  if (S.ui.oid !== id) { S.ui.oid = id; S.ui.op = null; S.ui.osel = {}; S.ui.cb = null; }
   const d = o.data, cur = d.currency, ev0 = o.event_ids[0], m = orderMoney(o), fin = can('finance.totals'), all = S.adm.tickets.filter(t => t.order_id === id);
   const shown = S.ui.oAll ? all : all.filter(t => t.status !== 'replaced'), live = all.filter(t => t.status === 'valid'), sel = live.filter(t => S.ui.osel[t.id]), paid = o.status === 'paid';
   const pay = o.payment, mails = (S.adm.outbox || []).filter(x => x.order_id === o.id).sort((a, b) => D(b.at) - D(a.at)), notes = (S.adm.orderLog || []).filter(x => x.order_id === o.id && x.kind === 'note');
@@ -1858,7 +1866,7 @@ function OrderView(id) {
         <td>${esc(tkType(t))}${t.area && t.area !== tkType(t) ? `<div class="small muted">${esc(t.area)}</div>` : ''}${t.comp ? ' <span class="chip info mini">comp</span>' : ''}${t.bundle ? ` <span class="chip mini">${esc(t.bundle.name)}</span>` : ''}${t.price_override ? ' <span class="chip warn mini">price override</span>' : ''}</td>
         <td class="small">${esc(tkWhere(t))}</td>
         <td class="small">${esc(t.holder || '')}${t.status === 'valid' && can('orders.customer', ev0) ? ` <a href="#" class="small" data-action="opOpen" data-v="holder" data-id="${t.id}">rename</a>` : ''}</td>
-        ${fin ? `<td class="tnum small">${money(t.face, cur)}</td><td class="tnum small">${money(t.paid, cur)}${t.discount ? `<div class="muted">−${money(t.discount, cur)} ${esc(t.promo || '')}</div>` : ''}${t.refunded ? `<div style="color:var(--bad)">refunded ${money(t.refunded, cur)}</div>` : ''}</td>` : ''}
+        ${fin ? `<td class="tnum small">${money(t.face, cur)}</td><td class="tnum small">${money(t.paid, cur)}${t.discount ? `<div class="muted">−${money(t.discount, cur)} ${esc(t.promo || '')}</div>` : ''}${t.fee || t.tax ? `<div class="muted">+${money((t.fee || 0) + (t.tax || 0), cur)} fee & tax</div>` : ''}${t.refunded ? `<div style="color:var(--bad)">${t.credited ? `credited ${money(t.credited, cur)}` : `refunded ${money(t.refunded, cur)}`}</div>` : ''}</td>` : ''}
         <td>${t.status !== 'valid' ? TK_CHIP[t.status] : t.checked_in_at ? `<span class="chip ok mini">in ${esc(fmtTime(t.checked_in_at))}</span>` : '<span class="chip mini">not in</span>'}</td></tr>`).join('') || `<tr><td colspan="8" class="muted small" style="padding:14px 20px">${o.status === 'pending' || o.status === 'awaiting_payment' ? 'No tickets yet — they are issued once the payment is confirmed.' : 'No tickets.'}</td></tr>`}
       </tbody></table></div></div>
     <div class="card"><div class="between"><h3>Products & add-ons</h3>${paid ? btn('addAddon', 'Add product', 'orders.edit') : ''}</div>
@@ -1880,13 +1888,19 @@ function OrderView(id) {
       <div class="sep"></div>
       <div class="sum-line"><span class="muted">Collected</span><span class="tnum">${money(m.collected, cur)}</span></div>
       ${m.refunded ? `<div class="sum-line"><span class="muted">Refunded</span><span class="tnum">−${money(m.refunded, cur)}</span></div>` : ''}${m.credited ? `<div class="sum-line"><span class="muted">Given back as credit</span><span class="tnum">−${money(m.credited, cur)}</span></div>` : ''}
-      <div class="sum-line total"><span>Net</span><span class="tnum">${money(m.collected - m.refunded - m.credited, cur)}</span></div>
+      ${m.chargedBack ? `<div class="sum-line"><span class="muted">Chargebacks</span><span class="tnum">−${money(m.chargedBack, cur)}</span></div>` : ''}
+      <div class="sum-line total"><span>Net</span><span class="tnum">${money(m.collected - m.refunded - m.credited - m.chargedBack, cur)}</span></div>
       ${m.due ? `<div class="banner warn" style="margin:10px 0 0">Balance due: <b>${money(m.due, cur)}</b>${btn('collect', 'Record payment', 'orders.edit', 'btn-dark')}</div>` : ''}
       ${d.platformFee != null || d.processingFee != null ? `<div class="small muted" style="margin-top:6px">Kept by others: ${d.platformFee != null ? `platform fee ${money(d.platformFee, cur)}` : ''}${d.processingFee != null ? ` · card processing ${money(d.processingFee, cur)}` : ''}</div>` : ''}</div>`}
     ${pay ? `<div class="card"><h3>Payment</h3><div class="small" style="margin-top:6px">${esc(GATEWAYS[pay.provider]?.name || pay.provider || d.payment || '')}${pay.test ? ' (test)' : ''}${pay.ref ? ` · transaction <code>${esc(pay.ref)}</code>` : ''}${pay.last4 ? ` · ${esc(pay.brand)} •••• ${esc(pay.last4)}` : pay.brand ? ' · ' + esc(pay.brand) : ''}${pay.markedPaidBy ? ' · marked paid by ' + esc(pay.markedPaidBy) : ''}${o.paid_at ? ' · ' + esc(fmtDT(o.paid_at)) : ''}</div>
       ${(pay.attempts || []).filter(a => !a.ok).map(a => `<div class="small" style="color:var(--bad)">${esc(fmtDT(a.at))} · ${esc(a.brand || a.method || '')} ${a.last4 ? '•••• ' + esc(a.last4) : ''} — ${esc(a.error || 'failed')}</div>`).join('')}${pay.note ? `<div class="small" style="color:var(--warn)">${esc(pay.note)}</div>` : ''}
       ${o.status === 'awaiting_payment' ? `<div class="small muted" style="margin-top:6px">Card checkout in progress — seats held until ${esc(fmtTime(o.expires_at))}. No tickets until the payment is confirmed.</div>` : ''}
       ${o.status === 'pending' ? `<div class="small muted" style="margin-top:6px">Pay-later reservation: no tickets yet. “Mark paid” issues them and sends the confirmation.</div>` : ''}</div>` : ''}
+    ${(d.chargebacks || []).length || (wasPaid(o) && pay?.provider && pay.provider !== 'manual' && can('orders.refund', ev0)) ? `<div class="card"><div class="between"><h3>Chargebacks</h3>${wasPaid(o) && can('orders.refund', ev0) && !S.ui.cb ? '<button class="btn btn-ghost btn-sm" data-action="cbOpen">Record chargeback</button>' : ''}</div>
+      ${(d.chargebacks || []).map(c => `<div class="between small line"><span>${esc(fmtDT(c.at))} · ${money(c.amount, cur)}${c.reason ? ' · ' + esc(c.reason) : ''}${c.ref ? ` · <code>${esc(c.ref)}</code>` : ''}<div class="muted">${esc(CB_STATUS[c.status])}${c.closed_at ? ' · ' + esc(fmtDT(c.closed_at)) : ''}</div></span>
+        ${c.status === 'open' && can('orders.refund', ev0) ? `<span class="row"><button class="btn btn-ghost btn-sm" data-action="cbClose" data-id="${c.id}" data-v="won">Won</button><button class="btn btn-ghost btn-sm" data-action="cbClose" data-id="${c.id}" data-v="lost">Lost</button></span>` : `<span class="chip mini ${c.status === 'won' ? 'ok' : c.status === 'lost' ? 'bad' : 'warn'}">${esc(c.status)}</span>`}</div>`).join('') || '<p class="small muted" style="margin-top:6px">None. The processor reports disputes automatically; record one here if it told you another way.</p>'}
+      ${S.ui.cb ? `<div class="sep"></div>${opRow('Disputed amount ($)', `<input class="inp" inputmode="decimal" data-input="cb.amount" value="${esc(S.ui.cb.amount)}">`)}${opRow('Reason', `<input class="inp" data-input="cb.reason" value="${esc(S.ui.cb.reason)}" placeholder="e.g. fraudulent, product not received">`)}${opRow('Processor dispute id (optional)', `<input class="inp" data-input="cb.ref" value="${esc(S.ui.cb.ref)}">`)}
+        <div class="row"><button class="btn btn-dark btn-sm" data-action="cbAdd">Record</button><button class="btn btn-ghost btn-sm" data-action="cbCancel">Cancel</button></div>` : ''}</div>` : ''}
     ${d.credit ? `<div class="card"><h3>Credit used</h3><div class="small" style="margin-top:6px"><code>${esc(d.credit.code)}</code> · ${money(d.credit.amount, cur)}${d.credit.restored ? ' · returned to the credit' : ''}</div></div>` : ''}
     ${qs.length ? `<div class="card"><h3>Checkout answers</h3>${qs.map(q => `<div class="small" style="margin-top:6px"><span class="muted">${esc(q.label)}:</span> ${ans(q, d.answers?.[q.id])}</div>`).join('')}</div>` : ''}
     <div class="card"><h3>Internal notes</h3><p class="small muted" style="margin:2px 0 8px">Only your team sees these.</p>
@@ -2486,33 +2500,243 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter') { if (_wedge.buf.length >= 6) scanCheck(_wedge.buf); _wedge.buf = ''; } else if (e.key.length === 1) _wedge.buf += e.key;
 });
 
-// ── Reports ──────────────────────────────────────────────────────────────────
+// ── Reports, money & exports (Stage 9) ───────────────────────────────────────
+// Every figure comes from finReport() in data.js (the orders' and tickets' own stored money). The server already masked what this person
+// may not see (money, fees, processing, customer details), so a report or export can never show more than the back office does.
+const REP_TABS = [['overview', 'Overview', 'finance.reports'], ['events', 'Events', 'finance.reports'], ['payouts', 'Payouts & reconciliation', 'finance.payouts'], ['profit', 'Profitability', 'finance.reports|finance.expenses'],
+  ['exports', 'Export center', 'finance.export|customers.export'], ['accounting', 'Accounting', 'finance.export']];
+const tabOk = t => t[2].split('|').some(k => can(k));
+const finX = () => S.adm._fin || (S.adm._fin = { events: S.adm.events, orders: S.adm.orders, tickets: S.adm.tickets, statuses: S.adm.seatStatus || [], expenses: S.adm.expenses || [], expenseFinal: S.adm.expenseFinal || {} });
+const repF = () => (S.ui.rep ||= emptyFin());
+const finRep = (f = repF()) => finReport(finX(), f);
+const $$ = c => c == null || c === '' ? '' : Math.round(c) / 100;
+const pctTxt = (a, b) => b ? (a / b * 100).toFixed(1) + '%' : '—';
+const ttName = (evId, id) => evById(evId)?.ticketTypes.find(t => t.id === id)?.name || id;
+const addonName = id => { for (const e of S.adm.events) { const a = (e.addons || []).find(x => x.id === id); if (a) return a.name; } return id; };
+const bundleName = id => { for (const e of S.adm.events) { const b = (e.bundles || []).find(x => x.id === id); if (b) return b.name; } return id; };
+const slotName = (evId, id) => { const s = evById(evId)?.timeSlots?.find(x => x.id === id); return s ? fmtDT(s.start) : id; };
+function FinFilters(keys = ['eventId', 'slotId', 'from', 'to', 'ttId', 'area', 'price', 'promo', 'tracking', 'addonId', 'bundleId', 'method']) {
+  const f = repF(), ev = evById(f.eventId), sel = (k, label, opts) => keys.includes(k) && opts.length ? `<label class="ff"><span>${label}</span><select class="inp" data-action-change="repSet" data-k="${k}"><option value="">All</option>${opts.map(([v, t]) => `<option value="${esc(v)}" ${String(f[k]) === String(v) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>` : '';
+  const evs = ev ? [ev] : S.adm.events, areas = [...new Set(evs.flatMap(e => e.seating?.enabled ? Object.values(e.seating.meta || {}).map(m => m[0]).filter(Boolean) : []))].sort();
+  const prices = [...new Set(evs.flatMap(e => e.ticketTypes.map(t => +t.price || 0)))].sort((a, b) => a - b);
+  return `<div class="fin-filters">
+    <label class="ff"><span>Event</span><select class="inp" data-action-change="repSet" data-k="eventId">${evOptions(f.eventId)}</select></label>
+    ${sel('slotId', 'Showtime', (ev?.timeSlots || []).map(s => [s.id, fmtDT(s.start)]))}
+    ${keys.includes('from') ? `<label class="ff"><span>From</span><input class="inp" type="date" value="${esc(f.from)}" data-action-change="repSet" data-k="from"></label><label class="ff"><span>To</span><input class="inp" type="date" value="${esc(f.to)}" data-action-change="repSet" data-k="to"></label>` : ''}
+    ${sel('ttId', 'Ticket type', ev ? ev.ticketTypes.map(t => [t.id, t.name]) : [])}
+    ${sel('area', 'Seating area', areas.map(a => [a, a]))}
+    ${sel('price', 'Price level', prices.map(p => [p, money(p)]))}
+    ${sel('promo', 'Promo code', (S.adm.promos || []).map(p => [p.code, p.code]))}
+    ${sel('tracking', 'Tracking code', (S.adm.tracking || []).map(t => [t.code, t.code + (t.name ? ' — ' + t.name : '')]))}
+    ${sel('addonId', 'Product', evs.flatMap(e => (e.addons || []).map(a => [a.id, a.name + (ev ? '' : ' · ' + e.name)])))}
+    ${sel('bundleId', 'Package', evs.flatMap(e => (e.bundles || []).map(b => [b.id, b.name + (ev ? '' : ' · ' + e.name)])))}
+    ${sel('method', 'Payment method', Object.entries(PAY_LABEL))}
+    ${keys.includes('customer') ? `<label class="ff"><span>Customer email</span><input class="inp" value="${esc(f.customer)}" placeholder="name@…" data-action-change="repSet" data-k="customer"></label>` : ''}
+    ${Object.entries(f).some(([k, v]) => v !== '' && keys.concat('eventId').includes(k)) ? `<button class="btn btn-ghost btn-sm" data-action="repClear">Clear filters</button>` : ''}</div>`;
+}
+// Eli's event financial dashboard (Step 9 §3), for any filter: from potential sellout down to what the box office keeps.
+function FinDash(t, o = {}) {
+  const proc = can('finance.processing'), plat = can('finance.fees'), L = (label, v, cls = '', note = '') => `<div class="sum-line ${cls}"><span>${label}${note ? ` <span class="small muted">${note}</span>` : ''}</span><span class="tnum">${v}</span></div>`;
+  const neg = c => c ? '−' + money(c) : money(0), opt = (label, c, sign = '') => c ? L(label, (sign === '-' ? '−' : c < 0 ? '−' : '') + money(Math.abs(c))) : '';
+  return `<div class="card fin-dash"><div class="between"><h3>${esc(o.title || 'Financial summary')}</h3>${o.partial ? '<span class="chip mini warn">tickets / products matching the filter only</span>' : ''}</div>
+    ${o.potential === false ? '' : L('Potential sellout revenue', money(t.potential), 'muted-line', `remaining ${money(t.remaining)}`)}
+    <div class="sep"></div>
+    ${L('Gross ticket value sold', money(t.tface))}${opt('Products & add-ons', t.pface)}
+    ${L('Discounts', neg(t.discount))}${opt('Package savings & price overrides', t.savings, t.savings > 0 ? '-' : '')}
+    ${L('Complimentary ticket value', money(t.comp), 'muted-line', `${t.comps} comp ticket${t.comps === 1 ? '' : 's'} — not collected`)}
+    ${L('Booking fees collected', money(t.fees))}${L('Sales tax', money(t.tax))}
+    ${opt('Donations', t.donation)}${opt('Card fees paid by buyers', t.cardFee)}${opt('Paid with credit', -t.creditUsed, '-')}${opt('Order changes & adjustments', t.changes)}
+    ${L('Collected', money(t.collected), 'sub')}
+    ${L('Refunds', neg(t.refunds))}${opt('Refunded as credit', t.credits, '-')}${opt('Chargebacks', t.chargebacks, '-')}
+    ${proc ? L('Processing fees', neg(t.processing)) : L('Processing fees', '<span class="muted">hidden</span>')}
+    ${L(proc ? 'Net collected' : 'Net (before card processing)', money(t.net), 'total')}
+    ${o.partial ? '' : plat ? `${opt('Platform fee', t.platform, '-')}${t.platform ? L('Net to the box office', money(t.netBo), 'sub') : ''}` : ''}
+    <div class="small muted" style="margin-top:10px">${t.orders} order${t.orders === 1 ? '' : 's'} · ${t.sold} ticket${t.sold === 1 ? '' : 's'} valid${t.offline ? ` · ${money(t.offline)} paid offline / manually` : ''}${t.unpaid ? ` · <span style="color:var(--warn)">${money(t.unpaid)} unpaid (${t.unpaidOrders} pay-later)</span>` : ''}${t.failedPayments ? ` · ${t.failedPayments} failed payment attempt${t.failedPayments === 1 ? '' : 's'}` : ''}</div></div>`;
+}
+const FIN_COLS = [['orders', 'Orders', 0], ['sold', 'Tickets', 0], ['tface', 'Gross', 1], ['discount', 'Discounts', 1], ['fees', 'Fees', 1], ['tax', 'Tax', 1], ['collected', 'Collected', 1], ['refunds', 'Refunds', 1], ['net', 'Net', 1]];
+const BY_DIMS = [['event', 'Event'], ['day', 'Day'], ['month', 'Month'], ['tt', 'Ticket type'], ['area', 'Seating area'], ['slot', 'Showtime'], ['promo', 'Promo code'], ['tracking', 'Tracking code'], ['product', 'Product'], ['bundle', 'Package'], ['method', 'Payment method']];
+function dimLabel(dim, rep) {
+  const ev = evById(rep.f.eventId);
+  return { event: k => evById(k)?.name || 'Other', tt: k => ev ? ttName(ev.id, k) : (S.adm.events.map(e => e.ticketTypes.find(t => t.id === k) && e.name + ' · ' + e.ticketTypes.find(t => t.id === k).name).find(Boolean) || k),
+    slot: k => { const e = S.adm.events.find(x => (x.timeSlots || []).some(s => s.id === k)); return e ? slotName(e.id, k) + (ev ? '' : ' · ' + e.name) : k; },
+    product: addonName, bundle: bundleName, method: k => PAY_LABEL[k] || k, day: k => fmtDate(k + 'T12:00', { weekday: 'short', month: 'short', day: 'numeric' }), month: k => fmtDate(k + '-15T12:00', { month: 'long', year: 'numeric' }) }[dim] || (k => k);
+}
+function finGroupRows(rep, dim) { const rows = finGroup(rep, dim, dimLabel(dim, rep)); return ['day', 'month'].includes(dim) ? rows.sort((a, b) => b.key.localeCompare(a.key)) : rows.sort((a, b) => b.collected - a.collected); }
+function FinTable(rows, first = 'Name') {
+  const tot = finTotals([]); for (const r of rows) for (const [k] of FIN_COLS) tot[k] += r[k] || 0;
+  return `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>${esc(first)}</th>${FIN_COLS.map(c => `<th class="r">${c[1]}</th>`).join('')}</tr></thead><tbody>
+    ${rows.map(r => `<tr><td>${esc(r.label)}</td>${FIN_COLS.map(([k, , m]) => `<td class="tnum r">${m ? money(r[k]) : r[k]}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${FIN_COLS.length + 1}" class="muted small">Nothing matches these filters.</td></tr>`}
+    ${rows.length > 1 ? `<tr class="tot"><td><b>Total</b></td>${FIN_COLS.map(([k, , m]) => `<td class="tnum r"><b>${m ? money(tot[k]) : tot[k]}</b></td>`).join('')}</tr>` : ''}</tbody></table></div>`;
+}
 function Reports() {
-  const os = liveOrders(), evId = S.ui.repEv, ev = evById(evId);
-  const scoped = evId ? os.filter(o => o.event_ids.includes(evId)) : os;
-  const rows = S.adm.events.map(e => { const eo = os.filter(o => o.event_ids.includes(e.id)), s = evStats(e);
-    return { e, s, orders: eo.length, disc: sum(eo, o => o.data.discount), fees: sum(eo, o => o.data.fee), don: sum(eo, o => o.data.donation), unpaid: sum(eo.filter(o => o.status === 'pending'), o => o.data.total) }; }).sort((a, b) => b.s.rev - a.s.rev);
-  const src = {}; scoped.forEach(o => { const k = o.data.source || 'direct'; src[k] = (src[k] || 0) + o.data.total; });
-  const tot = Object.values(src).reduce((a, b) => a + b, 0) || 1;
-  const heat = {}; S.adm.tickets.filter(t => t.status === 'valid' && t.slot_id && (!evId || t.event_id === evId)).forEach(t => { const s = evById(t.event_id)?.timeSlots?.find(x => x.id === t.slot_id); if (!s) return; const d = D(s.start); const k = d.getDay() + '-' + d.getHours(); heat[k] = (heat[k] || 0) + 1; });
-  const hours = [...new Set(Object.keys(heat).map(k => +k.split('-')[1]))].sort((a, b) => a - b), hmax = Math.max(1, ...Object.values(heat));
-  return head('Reports', 'Revenue, ticket sales and channels', `<select class="inp" style="width:auto;border-radius:999px" data-input="repEv">${evOptions(evId)}</select><button class="btn btn-ghost" data-action="exportReport">Export CSV</button><button class="btn btn-ghost" data-action="exportTickets">Ticket detail CSV</button>`) + `
-  <div class="kpis"><div class="kpi dark"><div class="eyebrow">Gross</div><div class="v">${money(sum(scoped, o => o.data.total))}</div></div>
-    <div class="kpi"><div class="eyebrow">Ticket revenue</div><div class="v">${money(sum(scoped, o => o.data.subtotal - o.data.discount))}</div></div>
-    <div class="kpi"><div class="eyebrow">Booking fees</div><div class="v">${money(sum(scoped, o => o.data.fee))}</div></div>
-    <div class="kpi"><div class="eyebrow">Avg order</div><div class="v">${money(scoped.length ? sum(scoped, o => o.data.total) / scoped.length : 0)}</div></div></div>
-  <div class="cols"><div class="card"><h3>Daily sales</h3><div class="small muted">Last 28 days</div>${barChart(dailySeries(scoped, 28, o => o.data.total), v => money(v))}</div>
-  <div class="card"><h3>Sales by source</h3><div class="small muted" style="margin-bottom:12px">From tracking links (?src=)</div>${Object.entries(src).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<div style="margin-bottom:10px"><div class="between small"><b>${esc(k)}</b><span>${money(v)}</span></div><div class="bar"><i style="width:${v / tot * 100}%"></i></div></div>`).join('') || '<p class="muted">No sales yet.</p>'}</div></div>
-  ${ev ? `<div class="card" style="margin-top:18px;padding:0"><div style="padding:16px 20px 4px"><h3>${esc(ev.name)} · by ticket type</h3><div class="small muted">From each ticket: its real type, face value, what was collected, discounts and comps — packages included.</div></div><div class="tbl-wrap"><table class="tbl" style="margin-top:8px"><thead><tr><th>Ticket</th><th>Price</th><th>Sold</th><th>Comps</th><th>In packages</th><th>Remaining</th><th>Face value</th><th>Discounts</th><th>Collected</th></tr></thead><tbody>
-    ${ev.ticketTypes.map(t => { const ids = new Set(scoped.map(o => o.id)), tk = S.adm.tickets.filter(x => x.event_id === ev.id && x.ticket_type_id === t.id && x.status === 'valid' && ids.has(x.order_id));
-      return `<tr><td>${esc(t.name)}</td><td>${money(t.price)}</td><td class="tnum">${tk.length}</td><td class="tnum">${tk.filter(x => x.comp).length}</td><td class="tnum">${tk.filter(x => x.bundle).length}</td><td class="tnum">${+t.qty ? Math.max(0, t.qty - tk.length) : '∞'}</td><td class="tnum">${money(sum(tk, x => x.face))}</td><td class="tnum">${money(sum(tk, x => x.discount))}</td><td class="tnum">${money(sum(tk, x => x.paid))}</td></tr>`; }).join('')}</tbody></table></div>
-    ${(ev.addons || []).length || (ev.bundles || []).length ? `<div style="padding:4px 20px 16px"><div class="fl" style="margin-top:8px">Products & packages</div>${[...(ev.bundles || []).map(b => { const ls = scoped.flatMap(o => o.data.lines.filter(l => l.kind === 'bundle' && l.bundleId === b.id)); return [b.name + ' (package)', sum(ls, l => l.qty), sum(ls, l => l.unit * l.qty - (l.disc || 0))]; }),
-      ...(ev.addons || []).map(a => { const ls = scoped.flatMap(o => o.data.lines.filter(l => l.kind === 'addon' && l.addonId === a.id)), inB = sum(scoped.flatMap(o => o.data.lines.filter(l => l.kind === 'bundle')), l => sum((l.addons || []).filter(x => x.addonId === a.id), x => x.qty * l.qty)); return [a.name + (inB ? ` (+${inB} in packages)` : ''), sum(ls, l => l.qty), sum(ls, l => l.unit * l.qty - (l.disc || 0))]; })]
-      .map(([n, q, v]) => `<div class="between small line"><span>${esc(n)}</span><span class="tnum">${q} sold · ${money(v)}</span></div>`).join('')}</div>` : ''}</div>` : ''}
-  ${hours.length ? `<div class="card" style="margin-top:18px"><h3>Time-slot heat map</h3><div class="small muted" style="margin-bottom:12px">Tickets per slot — busiest and quietest times</div><div style="overflow:auto"><table class="heat" style="border-spacing:4px;border-collapse:separate"><tr><td></td>${hours.map(h => `<td class="small muted">${h % 12 || 12}${h < 12 ? 'a' : 'p'}</td>`).join('')}</tr>
-    ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d, di) => `<tr><td class="small muted">${d}</td>${hours.map(h => { const v = heat[di + '-' + h] || 0; return `<td style="background:rgba(2,10,22,${v ? .08 + v / hmax * .85 : .03});color:${v / hmax > .5 ? '#fff' : 'var(--text)'}">${v || ''}</td>`; }).join('')}</tr>`).join('')}</table></div></div>` : ''}
-  <div class="tbl-wrap" style="margin-top:18px"><table class="tbl"><thead><tr><th>Event</th><th>Date</th><th>Orders</th><th>Tickets</th><th>Discounts</th><th>Fees</th><th>Donations</th><th>Unpaid</th><th>Ticket revenue</th></tr></thead><tbody>
-    ${rows.map(r => `<tr><td><b>${esc(r.e.name)}</b></td><td class="small">${esc(fmtDate(r.e.start, { month: 'short', day: 'numeric', year: 'numeric' }))}</td><td class="tnum">${r.orders}</td><td class="tnum">${r.s.sold}</td><td class="tnum">${money(r.disc)}</td><td class="tnum">${money(r.fees)}</td><td class="tnum">${money(r.don)}</td><td class="tnum">${r.unpaid ? `<span style="color:var(--warn)">${money(r.unpaid)}</span>` : '—'}</td><td class="tnum"><b>${money(r.s.rev)}</b></td></tr>`).join('')}</tbody></table></div>`;
+  const tabs = REP_TABS.filter(tabOk), tab = tabs.find(t => t[0] === S.route.params[0])?.[0] || tabs[0]?.[0] || 'overview';
+  const body = { overview: RepOverview, events: RepEvents, payouts: RepPayouts, profit: RepProfit, exports: RepExports, accounting: RepAccounting }[tab]();
+  return head('Reports', 'Sales, money, payouts, profit and exports — from every order and ticket') + `<nav class="etabs">${tabs.map(([k, l]) => `<a class="${tab === k ? 'on' : ''}" href="#/admin/reports${k === 'overview' ? '' : '/' + k}">${l}</a>`).join('')}</nav>` + body;
+}
+function RepOverview() {
+  const rep = finRep(), t = rep.totals, f = rep.f, ev = evById(f.eventId), dim = S.ui.repBy || (ev ? 'tt' : 'event');
+  const days = {}; rep.items.forEach(i => { days[i.day] = (days[i.day] || 0) + i.collected; });
+  const series = []; for (let i = 27; i >= 0; i--) { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - i); const k = localDay(d.toISOString()); series.push({ label: fmtDate(d.toISOString(), { month: 'short', day: 'numeric' }), short: fmtDate(d.toISOString(), { month: 'numeric', day: 'numeric' }), v: days[k] || 0 }); }
+  const meth = finGroupRows(rep, 'method'), mtot = sum(meth, r => r.collected) || 1;
+  return FinFilters() + `
+  <div class="kpis"><div class="kpi dark"><div class="eyebrow">Collected</div><div class="v">${money(t.collected)}</div><div class="d" style="color:var(--mut)">${t.orders} orders</div></div>
+    <div class="kpi"><div class="eyebrow">${can('finance.processing') ? 'Net collected' : 'Net before processing'}</div><div class="v">${money(t.net)}</div><div class="d">after refunds${can('finance.processing') ? ' & processing' : ''}</div></div>
+    <div class="kpi"><div class="eyebrow">Tickets sold</div><div class="v">${t.sold.toLocaleString()}</div><div class="d">${t.comps} comps · gross ${money(t.tface)}</div></div>
+    <div class="kpi"><div class="eyebrow">Remaining potential</div><div class="v">${money(t.remaining)}</div><div class="d">of ${money(t.potential)} sellout</div></div></div>
+  <div class="cols"><div>${FinDash(t, { title: ev ? ev.name + ' — financial dashboard' : 'Financial summary', partial: rep.partial })}</div>
+    <div class="stack"><div class="card"><h3>Collected per day</h3><div class="small muted">Last 28 days · hover a bar for the amount</div>${barChart(series, v => money(v))}</div>
+      <div class="card"><h3>By payment method</h3><div class="small muted" style="margin-bottom:12px">Card, wallets, cash and other offline payments</div>${meth.map(r => `<div style="margin-bottom:10px"><div class="between small"><b>${esc(r.label)}</b><span class="tnum">${money(r.collected)} · ${r.orders} order${r.orders === 1 ? '' : 's'}</span></div><div class="bar"><i style="width:${Math.max(0, r.collected) / mtot * 100}%"></i></div></div>`).join('') || '<p class="muted small">No sales yet.</p>'}</div></div></div>
+  <div class="card" style="margin-top:18px;padding:0"><div class="between wrap" style="padding:16px 20px 8px;gap:8px"><h3>Breakdown</h3><label class="ff inline"><span>Group by</span><select class="inp" data-action-change="repBy">${BY_DIMS.map(([k, l]) => `<option value="${k}" ${dim === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+    ${['tt', 'area', 'slot', 'product', 'bundle'].includes(dim) ? `<p class="small muted" style="padding:0 20px">${dim === 'product' ? 'Products only' : dim === 'bundle' ? 'Package tickets and products only' : 'Tickets only'} — donations, fees not tied to a ticket and later order changes stay in the totals above.</p>` : ''}
+    ${FinTable(finGroupRows(rep, dim), BY_DIMS.find(d => d[0] === dim)[1])}</div>`;
+}
+function RepEvents() {
+  const x = finX(), rows = S.adm.events.slice().sort((a, b) => D(b.start) - D(a.start)).map(e => { const r = finReport(x, { eventId: e.id }); return { e, t: r.totals }; });
+  return `<p class="small muted" style="margin:0 0 12px">Every event at a glance. Profit is <b>estimated</b> until all of an event's expenses are entered (Profitability tab).</p>
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Event</th><th>Date</th><th class="r">Potential</th><th class="r">Gross sold</th><th class="r">Collected</th><th class="r">Refunds</th><th class="r">Net</th><th class="r">Expenses</th><th class="r">Profit</th><th class="r">Remaining</th></tr></thead><tbody>
+    ${rows.map(({ e, t }) => `<tr class="click" data-action="repOpenEvent" data-id="${e.id}"><td><b>${esc(e.name)}</b></td><td class="small">${esc(fmtDate(e.start, { month: 'short', day: 'numeric', year: 'numeric' }))}</td><td class="tnum r">${money(t.potential)}</td><td class="tnum r">${money(t.tface)}</td>
+      <td class="tnum r">${money(t.collected)}</td><td class="tnum r">${t.refunds + t.credits ? '−' + money(t.refunds + t.credits) : '—'}</td><td class="tnum r"><b>${money(t.net)}</b></td><td class="tnum r">${t.expenses ? money(t.expenses) : '—'}</td>
+      <td class="tnum r" style="color:${t.profit < 0 ? 'var(--bad)' : 'inherit'}">${money(t.profit)}${t.profitFinal ? '' : ' <span class="chip mini">est.</span>'}</td><td class="tnum r">${money(t.remaining)}</td></tr>`).join('') || '<tr><td colspan="10" class="muted">No events yet.</td></tr>'}</tbody></table></div>`;
+}
+function RepPayouts() {
+  if (!can('finance.payouts')) return '<p class="muted">You need the “View payouts” permission.</p>';
+  const f = repF(), tx = S.ui.recImport?.rows || S.adm.procTx || [], rec = reconcile(S.adm.orders, tx, f), ps = payoutSummary(S.adm.payouts || [], S.adm.procTx || []), rep = finRep({ ...emptyFin(), eventId: f.eventId, from: f.from, to: f.to });
+  const cbs = S.adm.orders.filter(o => (o.data.chargebacks || []).length && (!f.eventId || o.event_ids.includes(f.eventId))), failed = S.adm.orders.filter(o => (o.payment?.attempts || []).some(a => !a.ok) && (!f.eventId || o.event_ids.includes(f.eventId)));
+  const kpi = (l, v, d = '') => `<div class="kpi"><div class="eyebrow">${l}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`, src = S.ui.recImport ? `imported file “${esc(S.ui.recImport.name)}” (${tx.length} rows)` : 'the processor’s own transaction record';
+  const ST = { matched: 'ok', different: 'bad', 'missing at processor': 'warn', 'not in SET': 'warn' }, showAll = S.ui.recAll;
+  return FinFilters(['eventId', 'from', 'to']) + `
+  <div class="kpis">${kpi('Total processed', money(ps.processed), 'card & wallet payments')}${kpi('Pending payouts', money(ps.pending), `${money(ps.notYetPaidOut)} not paid out yet · ${money(ps.inTransit)} on the way`)}
+    ${kpi('Completed payouts', money(ps.completed), `${(S.adm.payouts || []).filter(p => p.status === 'paid').length} payouts`)}${kpi('Failed payments', failed.reduce((a, o) => a + o.payment.attempts.filter(z => !z.ok).length, 0), `${ps.failedN ? ps.failedN + ' failed payout(s) · ' : ''}${failed.length} order${failed.length === 1 ? '' : 's'}`)}</div>
+  <div class="kpis">${kpi('Refunds', money(rep.totals.refunds + rep.totals.credits), `${money(rep.totals.credits)} as credit`)}${kpi('Chargebacks', money(rep.totals.chargebacks), `${cbs.length} disputed order${cbs.length === 1 ? '' : 's'}`)}
+    ${kpi('Expected from processor', money(rec.totals.setNet), 'SET’s records')}${kpi('Difference', `<span style="color:${rec.totals.diff ? 'var(--bad)' : 'inherit'}">${money(rec.totals.diff)}</span>`, `${rec.issues.length} transaction${rec.issues.length === 1 ? '' : 's'} to check`)}</div>
+  <div class="card"><div class="between wrap" style="gap:10px"><div><h3>Reconciliation</h3><div class="small muted">SET’s orders, refunds and chargebacks compared with ${src}, matched by the processor’s transaction id.</div></div>
+    <div class="row wrap"><label class="btn btn-ghost btn-sm" style="cursor:pointer">Import processor report (CSV)<input type="file" accept=".csv,text/csv" data-action-change="recFile" hidden></label>${S.ui.recImport ? '<button class="btn btn-ghost btn-sm" data-action="recClear">Use the processor ledger</button>' : ''}
+      ${can('finance.export') ? '<button class="btn btn-ghost btn-sm" data-action="xp" data-k="recon" data-fmt="csv">Export</button>' : ''}</div></div>
+    <div class="cols" style="margin-top:12px">${['byEvent', 'byDay'].map(k => `<div><div class="fl">${k === 'byEvent' ? 'By event' : 'By date'}</div><div class="tbl-wrap"><table class="tbl"><thead><tr><th>${k === 'byEvent' ? 'Event' : 'Date'}</th><th class="r">SET</th><th class="r">Processor</th><th class="r">Difference</th></tr></thead><tbody>
+      ${rec[k].slice(0, 14).map(r => `<tr><td class="small">${esc(k === 'byEvent' ? evById(r.key)?.name || '—' : r.key)}${r.issues ? ` <span class="chip mini bad">${r.issues}</span>` : ''}</td><td class="tnum r small">${money(r.setNet)}</td><td class="tnum r small">${money(r.procNet)}</td><td class="tnum r small" style="color:${r.diff ? 'var(--bad)' : 'inherit'}">${r.diff ? money(r.diff) : '—'}</td></tr>`).join('') || '<tr><td colspan="4" class="muted small">No card payments.</td></tr>'}</tbody></table></div>${rec[k].length > 14 ? `<p class="small muted" style="margin-top:6px">Latest 14 of ${rec[k].length} — Export for all.</p>` : ''}</div>`).join('')}</div>
+    <div class="between" style="margin-top:14px"><div class="fl">${showAll ? 'All transactions' : 'Needs attention'}</div><label class="check small"><input type="checkbox" data-action="recAll" ${showAll ? 'checked' : ''}> <span>Show matched too</span></label></div>
+    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Transaction</th><th>Order</th><th>Date</th><th>Status</th><th>What differs</th><th class="r">SET net</th><th class="r">Processor net</th></tr></thead><tbody>
+      ${(showAll ? rec.rows : rec.issues).slice(0, 300).map(r => `<tr><td class="small"><code>${esc(r.ref)}</code></td><td class="small">${r.orderRef ? `<a href="#/admin/orders/${esc(r.set.orderId)}">${esc(r.orderRef)}</a>` : '—'}</td><td class="small">${esc(r.day)}</td><td><span class="chip mini ${ST[r.status]}">${esc(r.status)}</span></td>
+        <td class="small">${r.diffs.map(d => `${esc(d.label)}: SET ${money(d.set)} · processor ${money(d.processor)}`).join('<br>') || '—'}</td><td class="tnum r small">${money(r.setNet)}</td><td class="tnum r small">${money(r.procNet)}</td></tr>`).join('') || '<tr><td colspan="7" class="muted small">Everything matches.</td></tr>'}</tbody></table></div></div>
+  <div class="cols" style="margin-top:18px"><div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>Payouts</h3><div class="small muted">Money the processor sent to your bank account</div></div><div class="tbl-wrap" style="border:0;box-shadow:none"><table class="tbl"><thead><tr><th>Payout</th><th>Arrives</th><th>Status</th><th class="r">Amount</th></tr></thead><tbody>
+      ${(S.adm.payouts || []).slice().sort((a, b) => D(b.arrival_at) - D(a.arrival_at)).slice(0, 60).map(p => `<tr><td class="small"><code>${esc(p.id)}</code></td><td class="small">${esc(fmtDate(p.arrival_at, { month: 'short', day: 'numeric', year: 'numeric' }))}</td><td><span class="chip mini ${p.status === 'paid' ? 'ok' : ['failed', 'canceled'].includes(p.status) ? 'bad' : 'info'}">${esc(p.status.replace('_', ' '))}</span></td><td class="tnum r">${money(p.amount)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted small">No payouts yet.</td></tr>'}</tbody></table></div></div>
+    <div class="stack"><div class="card"><h3>Chargebacks</h3>${cbs.flatMap(o => o.data.chargebacks.map(c => `<div class="between small line"><span><a href="#/admin/orders/${o.id}">${esc(o.ref)}</a> · ${esc(fmtDT(c.at))}${c.reason ? ' · ' + esc(c.reason) : ''}</span><span class="row"><span class="chip mini ${c.status === 'won' ? 'ok' : c.status === 'lost' ? 'bad' : 'warn'}">${esc(c.status)}</span><span class="tnum">${money(c.amount)}</span></span></div>`)).join('') || '<p class="small muted">None.</p>'}</div>
+      <div class="card"><h3>Failed payments</h3>${failed.slice(0, 30).map(o => { const fa = o.payment.attempts.filter(a => !a.ok); return `<div class="between small line"><span><a href="#/admin/orders/${o.id}">${esc(o.ref)}</a> · ${esc(fa[fa.length - 1].error || 'failed')}</span><span class="muted">${fa.length}× · ${esc(o.status === 'paid' ? 'paid on retry' : o.status.replace('_', ' '))}</span></div>`; }).join('') || '<p class="small muted">None.</p>'}</div></div></div>`;
+}
+function RepProfit() {
+  const f = repF(), x = finX(), ev = evById(f.eventId) || S.adm.events.find(e => (S.adm.expenses || []).some(z => z.event_id === e.id)) || S.adm.events.map(e => [e, finReport(x, { eventId: e.id }).totals.collected]).sort((a, b) => b[1] - a[1])[0]?.[0];
+  if (!ev) return '<p class="muted">No events yet.</p>';
+  const rep = finReport(finX(), { eventId: ev.id }), t = rep.totals, edit = can('finance.expenses', ev.id), ex = rep.expenses.slice().sort((a, b) => String(b.date).localeCompare(String(a.date))), dr = S.ui.exp ||= { category: 'Venue', description: '', amount: '', date: '', vendor: '' };
+  const byCat = EXPENSE_CATS.map(c => [c, sum(ex.filter(e => e.category === c), e => e.amount)]).filter(z => z[1]), neg = c => c ? '−' + money(c) : '—', L = (l, v, cls = '') => `<div class="sum-line ${cls}"><span>${l}</span><span class="tnum">${v}</span></div>`;
+  return `<div class="fin-filters"><label class="ff"><span>Event</span><select class="inp" data-action-change="repSet" data-k="eventId">${evOptions(ev.id, 'Choose an event')}</select></label></div>
+  <div class="cols"><div class="card"><div class="between"><h3>${esc(ev.name)}</h3>${t.profitFinal ? '<span class="chip ok mini">final — all expenses entered</span>' : '<span class="chip warn mini">estimated profit</span>'}</div>
+    ${L('Revenue <span class="small muted">collected, excluding sales tax</span>', money(t.revenue))}${L('Refunds & credits', neg(t.refunds + t.credits))}${t.chargebacks ? L('Chargebacks', neg(t.chargebacks)) : ''}
+    ${L('Processing & ticketing costs <span class="small muted">card processing + platform fee</span>', can('finance.processing') ? neg(t.processing + t.platform) : '<span class="muted">hidden</span>')}${L('Event expenses', neg(t.expenses))}
+    ${L(t.profitFinal ? 'Event profit' : 'Estimated event profit', `<span style="color:${t.profit < 0 ? 'var(--bad)' : 'inherit'}">${money(t.profit)}</span>`, 'total')}
+    <p class="small muted" style="margin-top:8px">${t.profitFinal ? `Marked complete by ${esc(S.adm.expenseFinal[ev.id].by)} on ${esc(fmtDT(S.adm.expenseFinal[ev.id].at))}.` : 'This is an estimate until every expense is in — tick the box below when it is.'}</p>
+    ${edit ? `<label class="check small" style="margin-top:6px"><input type="checkbox" data-action="expFinal" data-id="${ev.id}" ${t.profitFinal ? 'checked' : ''}> <span>All of this event’s expenses are entered</span></label>` : ''}
+    ${byCat.length ? `<div class="sep"></div><div class="fl">By category</div>${byCat.map(([c, v]) => `<div class="between small line"><span>${esc(c)}</span><span class="tnum">${money(v)}</span></div>`).join('')}` : ''}</div>
+  <div class="card" style="padding:0"><div class="between wrap" style="padding:16px 20px 8px;gap:8px"><h3>Expenses</h3>${edit ? `<label class="btn btn-ghost btn-sm" style="cursor:pointer">Import CSV<input type="file" accept=".csv,text/csv" data-action-change="expFile" data-id="${ev.id}" hidden></label>` : ''}</div>
+    ${edit ? `<div class="exp-form"><select class="inp" data-input="exp.category" aria-label="Category">${EXPENSE_CATS.map(c => `<option ${dr.category === c ? 'selected' : ''}>${c}</option>`).join('')}</select><input class="inp" type="date" data-input="exp.date" value="${esc(dr.date)}" aria-label="Date"><input class="inp" inputmode="decimal" data-input="exp.amount" placeholder="Amount $" value="${esc(dr.amount)}">
+      <input class="inp wide" data-input="exp.description" placeholder="Description" value="${esc(dr.description)}"><input class="inp" data-input="exp.vendor" placeholder="Vendor (optional)" value="${esc(dr.vendor)}">
+      <button class="btn btn-dark btn-sm" data-action="expAdd" data-id="${ev.id}">Add</button></div><p class="small muted" style="padding:0 20px">CSV columns: Date, Category, Description, Vendor, Amount.</p>` : ''}
+    <div class="tbl-wrap" style="border:0;box-shadow:none"><table class="tbl"><thead><tr><th>Date</th><th>Category</th><th>Description</th><th class="r">Amount</th><th></th></tr></thead><tbody>
+      ${ex.map(e => `<tr><td class="small">${esc(e.date || '—')}</td><td>${esc(e.category)}</td><td class="small">${esc(e.description)}${e.vendor ? `<div class="muted">${esc(e.vendor)}</div>` : ''}${e.imported ? ' <span class="chip mini">imported</span>' : ''}</td><td class="tnum r">${money(e.amount)}</td><td>${edit ? `<a href="#" class="small" data-action="expDel" data-id="${e.id}">delete</a>` : ''}</td></tr>`).join('') || '<tr><td colspan="5" class="muted small">No expenses yet.</td></tr>'}
+      ${ex.length ? `<tr class="tot"><td colspan="3"><b>Total</b></td><td class="tnum r"><b>${money(t.expenses)}</b></td><td></td></tr>` : ''}</tbody></table></div></div></div>`;
+}
+
+/* ── Export center ── each export is a table built from the loaded (already permission-masked) data; CSV or Excel (Xlsx in xlsx.js). */
+const ownsData = () => S.adm.me.owner || S.adm.me.support || (can('finance.export') && can('customers.export'));
+const tkFlat = t => { const ev = evById(t.event_id), sp = t.seat && ev ? seatParts(ev, t.seat, t) : {}; return { ev, sp, tt: ev?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name || '' }; };
+const orderOf = id => S.adm.orders.find(o => o.id === id);
+function xpRows(k, rep) {
+  const items = rep.items, oids = new Set(items.map(i => i.orderId)), os = S.adm.orders.filter(o => oids.has(o.id)), tks = items.filter(i => i.kind === 'ticket').map(i => i.ticket);
+  const evf = rep.f.eventId, inEv = o => !evf || o.event_ids.includes(evf);
+  const T = {
+    summary: () => { const t = rep.totals; return [['Line', 'Amount'], ['Potential sellout revenue', $$(t.potential)], ['Remaining potential', $$(t.remaining)], ['Gross ticket value sold', $$(t.tface)], ['Products & add-ons (face)', $$(t.pface)], ['Discounts', -$$(t.discount)], ['Package savings & price overrides', -$$(t.savings)],
+      ['Complimentary ticket value (not collected)', $$(t.comp)], ['Booking fees', $$(t.fees)], ['Sales tax', $$(t.tax)], ['Donations', $$(t.donation)], ['Card fees paid by buyers', $$(t.cardFee)], ['Paid with credit', $$(t.creditUsed)], ['Order changes & adjustments', $$(t.changes)],
+      ['Collected', $$(t.collected)], ['Refunds', -$$(t.refunds)], ['Refunded as credit', -$$(t.credits)], ['Chargebacks', -$$(t.chargebacks)], ['Processing fees', -$$(t.processing)], ['Net collected', $$(t.net)], ['Platform fee', -$$(t.platform)], ['Net to the box office', $$(t.netBo)],
+      ['Ticket revenue', $$(t.ticketRev)], ['Product revenue', $$(t.productRev)], ['Package revenue', $$(t.bundleRev)], ['Offline / manual payments', $$(t.offline)], ['Unpaid (pay later)', $$(t.unpaid)], ['Failed payment attempts', t.failedPayments],
+      ['Event expenses', $$(t.expenses)], [t.profitFinal ? 'Event profit' : 'Estimated event profit', $$(t.profit)], ['Orders', t.orders], ['Tickets valid', t.sold], ['Comp tickets', t.comps]]; },
+    byEvent: () => [['Event', ...FIN_COLS.map(c => c[1])], ...finGroupRows(rep, 'event').map(r => [r.label, ...FIN_COLS.map(([c, , m]) => m ? $$(r[c]) : r[c])])],
+    byDay: () => [['Date', ...FIN_COLS.map(c => c[1])], ...finGroupRows(rep, 'day').map(r => [r.key, ...FIN_COLS.map(([c, , m]) => m ? $$(r[c]) : r[c])])],
+    orders: () => [['Order', 'Placed', 'Paid', 'Status', 'Name', 'Email', 'Phone', 'Events', 'Tickets & packages', 'Products', 'Face value', 'Subtotal', 'Discount', 'Promo code', 'Tracking code', 'Booking fees', 'Sales tax', 'Donation', 'Card fee (buyer)', 'Credit used', 'Total', 'Extra collected', 'Refunded', 'Credited', 'Chargebacks', 'Processing fee', 'Platform fee', 'Net', 'Payment method', 'Transaction id', 'Source', 'UTM campaign', 'Marketing opt-in'],
+      ...os.map(o => { const d = o.data, m = orderMoney(o); return [o.ref, o.created_at, o.paid_at || '', o.status, d.buyer.name, o.buyer_email, d.buyer.phone || '', [...new Set(d.lines.map(l => l.eventName))].join('; '), d.lines.filter(l => l.kind !== 'addon').map(l => l.qty + 'x ' + l.name).join('; '),
+        d.lines.filter(l => l.kind === 'addon').map(l => l.qty + 'x ' + l.name).join('; '), $$(d.faceValue), $$(d.subtotal), $$(d.discount), d.code || '', d.tracking || '', $$((d.fee || 0) + (d.serviceFee || 0)), $$(d.tax), $$(d.donation), $$(d.processing), $$(m.creditUsed), $$(d.total), $$(m.extra), $$(m.refunded), $$(m.credited), $$(m.chargedBack),
+        $$(d.processingFee), $$(d.platformFee), $$(m.net - m.credited - (d.processingFee || 0)), PAY_LABEL[payMethodOf(o)], o.payment?.ref || '', d.source || '', d.utm?.campaign || '', d.optIn ? 'yes' : 'no']; })],
+    tickets: () => [['Ticket', 'Order', 'Status', 'Event', 'Showtime', 'Ticket type', 'Area', 'Table / box', 'Row', 'Seat', 'Holder', 'Face value', 'Paid', 'Discount', 'Promo code', 'Complimentary', 'Booking fee', 'Sales tax', 'Processing fee', 'Refunded', 'Credited', 'Net', 'Tracking code', 'Package', 'Products', 'Price override', 'Checked in'],
+      ...tks.map(t => { const { ev, sp, tt } = tkFlat(t), o = orderOf(t.order_id), n = ticketFin(t); return [t.code, o?.ref, t.status, ev?.name, t.slot_id ? slotName(t.event_id, t.slot_id) : '', tt, sp.area || t.area || '', sp.unit || '', sp.row || '', sp.seat || '', t.holder,
+        $$(t.face), $$(t.paid), $$(t.discount), t.promo || '', t.comp ? 'yes' : '', $$(t.fee), $$(t.tax), $$(t.proc), $$(n.refund), $$(n.credit), t.paid == null ? '' : $$(n.net), t.tracking || o?.data.tracking || '', t.bundle?.name || '', (t.extras || []).join('; '), t.price_override ? 'yes' : '', t.checked_in_at || '']; })],
+    seats: () => { const ev = evById(evf); if (!ev?.seating?.enabled) return [['Seat ID', 'Note'], ['', 'Choose a reserved-seating event']];
+      const st = seatStates(ev, { tickets: S.adm.tickets, statuses: S.adm.seatStatus || [], orders: S.adm.orders, slotId: rep.f.slotId || '' });
+      return [['Seat ID', 'Area', 'Row', 'Seat', 'Status', 'Price level', 'Customer', 'Order', 'Ticket'], ...[...st.values()].map(({ p, state, t }) => { const o = t && orderOf(t.order_id); return [p.id, p.area, p.row, p.label || p.num, state, ttName(ev.id, p.tt), t?.holder || '', o?.ref || '', t?.code || '']; })]; },
+    checkins: () => [['Ticket', 'Order', 'Event', 'Holder', 'Ticket type', 'Seat', 'Checked in', 'Entrance', 'Device', 'By', 'Manual', 'Override'],
+      ...S.adm.tickets.filter(t => t.status === 'valid' && (!evf || t.event_id === evf) && oids.has(t.order_id)).map(t => { const { ev, sp, tt } = tkFlat(t), c = t.checkin || {}; return [t.code, orderOf(t.order_id)?.ref, ev?.name, t.holder, tt, [sp.area, sp.unit, sp.row && 'Row ' + sp.row, sp.seat].filter(Boolean).join(' '), t.checked_in_at || '', c.entrance || '', c.device || '', c.by || '', c.manual ? 'yes' : '', c.override ? 'yes' : '']; })],
+    products: () => [['Order', 'Event', 'Product', 'Qty', 'Removed', 'Unit price', 'Discount', 'Paid', 'Promo code'], ...items.filter(i => i.kind === 'addon' || i.kind === 'bundleExtra').map(i => [i.ref, evById(i.eventId)?.name, i.name + (i.kind === 'bundleExtra' ? ' (in package)' : ''), i.qty ?? '', i.kind === 'addon' ? (orderOf(i.orderId).data.lines.find(l => l.kind === 'addon' && l.addonId === i.addonId)?.removed || 0) : '', i.kind === 'addon' ? $$(i.pface / Math.max(1, orderOf(i.orderId).data.lines.find(l => l.kind === 'addon' && l.addonId === i.addonId)?.qty || 1)) : '', $$(i.discount), $$(i.productRev), i.promo])],
+    refunds: () => [['Order', 'Date', 'Amount', 'Booking fees in it', 'Where', 'Credit code', 'Status', 'Processor refund id', 'By', 'Note'], ...os.filter(inEv).flatMap(o => (o.data.refunds || []).map(r => [o.ref, r.at, $$(r.amount), $$(r.fees), REFUND_TO[r.to] || r.to, r.credit || '', r.status, r.ref || '', r.by || '', r.note || '']))],
+    credits: () => [['Code', 'Customer', 'Amount', 'Used', 'Remaining', 'Status', 'For event', 'Expires', 'From order', 'Issued by', 'Issued'], ...(S.adm.credits || []).filter(c => (!evf || c.event_id === evf || os.some(o => o.id === c.source_order)) && (!rep.f.customer || c.email.includes(rep.f.customer.toLowerCase()))).map(c => [c.code, c.email, $$(c.amount), $$(c.used), $$(c.remaining), c.status, c.event_id ? evById(c.event_id)?.name || '' : 'any', c.expires || '', c.source_ref || '', c.issued_by, c.issued_at])],
+    chargebacks: () => [['Order', 'Opened', 'Amount', 'Status', 'Reason', 'Processor id', 'Closed'], ...os.flatMap(o => (o.data.chargebacks || []).map(c => [o.ref, c.at, $$(c.amount), c.status, c.reason || '', c.ref || '', c.closed_at || '']))],
+    payments: () => [['Order', 'Date', 'Method', 'Processor', 'Transaction id', 'Card', 'Amount', 'Processing fee', 'Failed attempts', 'Status'], ...os.flatMap(o => [[o.ref, o.paid_at || o.created_at, PAY_LABEL[payMethodOf(o)], o.payment?.provider || '', o.payment?.ref || '', o.payment?.last4 ? o.payment.brand + ' •••• ' + o.payment.last4 : o.payment?.brand || '', $$(o.data.total), $$(o.data.processingFee), (o.payment?.attempts || []).filter(a => !a.ok).length, o.status],
+      ...(o.data.charges || []).map(c => [o.ref, c.at, PAY_METHODS[c.method] || c.method, 'manual', c.ref || '', '', $$(c.amount), '', '', c.reason || 'later payment'])])],
+    traffic: () => { const evs = evf ? [evById(evf)] : S.adm.events; return [['Event', 'Source', 'Page views', 'Orders', 'Tickets', 'Collected', 'Conversion (orders / views)'], ...evs.flatMap(e => { const v = S.adm.views?.[e.id] || { bySrc: {} }, srcs = new Set([...Object.keys(v.bySrc || {}), ...items.filter(i => i.eventId === e.id).map(i => orderOf(i.orderId)?.data.source || 'direct')]);
+      return [...srcs].map(s => { const its = items.filter(i => i.eventId === e.id && (orderOf(i.orderId)?.data.source || 'direct') === s), t = finTotals(its), views = v.bySrc?.[s] || 0; return [e.name, s, views, t.orders, t.sold, $$(t.collected), views ? Math.round(t.orders / views * 1000) / 10 + '%' : '']; }); })]; },
+    history: () => [['When', 'Order', 'Change', 'By', 'Note', 'Before', 'After'], ...(S.adm.orderLog || []).filter(r => oids.has(r.order_id)).map(r => [r.at, r.ref, r.summary, r.by, r.note || '', r.before ? JSON.stringify(r.before) : '', r.after ? JSON.stringify(r.after) : ''])],
+    customers: () => { const g = {}; for (const o of os) { const c = g[o.buyer_email] ||= { name: o.data.buyer.name, email: o.buyer_email, phone: o.data.buyer.phone || '', orders: 0, tickets: 0, collected: 0, refunds: 0, first: o.created_at, last: o.created_at, optIn: false }; c.orders++; c.optIn ||= !!o.data.optIn; c.first = c.first < o.created_at ? c.first : o.created_at; c.last = c.last > o.created_at ? c.last : o.created_at; }
+      for (const i of items) { const c = g[i.email]; if (!c) continue; c.tickets += i.sold || 0; c.collected += i.collected; c.refunds += i.refunds + i.credits; }
+      return [['Name', 'Email', 'Phone', 'Orders', 'Tickets', 'Collected', 'Refunds & credits', 'First order', 'Last order', 'Marketing opt-in'], ...Object.values(g).map(c => [c.name, c.email, c.phone, c.orders, c.tickets, $$(c.collected), $$(c.refunds), c.first, c.last, c.optIn ? 'yes' : 'no'])]; },
+    payouts: () => [['Payout', 'Created', 'Arrives', 'Status', 'Amount', 'Transactions'], ...(S.adm.payouts || []).map(p => [p.id, p.created_at, p.arrival_at, p.status, $$(p.amount), p.tx ?? ''])],
+    expenses: () => [['Event', 'Date', 'Category', 'Description', 'Vendor', 'Amount'], ...(S.adm.expenses || []).filter(e => !evf || e.event_id === evf).map(e => [evById(e.event_id)?.name, e.date, e.category, e.description, e.vendor || '', $$(e.amount)])],
+    recon: () => { const r = reconcile(S.adm.orders, S.ui.recImport?.rows || S.adm.procTx || [], rep.f); return [['Transaction', 'Order', 'Date', 'Status', 'SET net', 'Processor net', 'Difference', 'What differs'], ...r.rows.map(x => [x.ref, x.orderRef, x.day, x.status, $$(x.setNet), $$(x.procNet), $$(x.diff), x.diffs.map(d => `${d.label}: SET ${$$(d.set)} / processor ${$$(d.processor)}`).join('; ')])]; },
+    journal: () => [['Date', 'Account', 'Debit', 'Credit', 'Memo'], ...journal(rep, S.adm.bo.settings?.accounting?.accounts).map(j => [j.date, j.account, $$(j.debit) || '', $$(j.credit) || '', j.memo])],
+  };
+  return T[k]();
+}
+// [key, label, permission, what it is]
+const XP_SETS = [['summary', 'Financial summary', 'finance.export', 'Every line of the financial dashboard'], ['byEvent', 'Sales by event', 'finance.export', 'One row per event'], ['byDay', 'Sales by day', 'finance.export', 'One row per day'],
+  ['orders', 'Orders', 'finance.export', 'Every order with its full money breakdown'], ['tickets', 'Tickets (financial history)', 'finance.export', 'Face, paid, discount, fees, tax, processing, refunds, credits, net — per ticket'],
+  ['customers', 'Customers', 'customers.export', 'Buyers in this selection with what they spent'], ['products', 'Products & add-ons', 'finance.export', 'Every product line'], ['payments', 'Payments & transaction ids', 'finance.export', 'Method, processor, transaction id, fees, failed attempts'],
+  ['refunds', 'Refunds', 'finance.export', 'Every refund, where it went'], ['credits', 'Credits', 'finance.export', 'Credits issued, used and left'], ['chargebacks', 'Chargebacks', 'finance.export', 'Disputed payments'],
+  ['checkins', 'Check-ins', 'finance.export', 'Who came in, when and where'], ['seats', 'Seat status', 'finance.export', 'Every seat of the event (choose an event)'], ['traffic', 'Traffic & conversion', 'finance.export', 'Page views, sources and conversion'],
+  ['history', 'Order history', 'finance.export', 'Every change made to these orders'], ['payouts', 'Payouts', 'finance.payouts', 'From the processor'], ['expenses', 'Event expenses', 'finance.export', 'Entered or imported costs'],
+  ['recon', 'Reconciliation', 'finance.payouts', 'SET vs the processor, per transaction'], ['journal', 'Accounting journal', 'finance.export', 'Daily balanced journal (debits = credits)']];
+const xpOk = s => can(s[2]);
+const EVENT_SHEETS = ['summary', 'orders', 'tickets', 'seats', 'checkins', 'products', 'payments', 'refunds', 'credits', 'chargebacks', 'traffic', 'history', 'expenses', 'customers', 'byDay'];
+function RepExports() {
+  const rep = finRep(), ev = evById(rep.f.eventId), sets = XP_SETS.filter(xpOk);
+  return FinFilters(['eventId', 'slotId', 'from', 'to', 'ttId', 'area', 'price', 'promo', 'tracking', 'addonId', 'bundleId', 'method', 'customer']) + `
+  <p class="small muted" style="margin:-4px 0 14px">${rep.totals.orders} order${rep.totals.orders === 1 ? '' : 's'} match these filters. Every export uses them. Money is in ${esc(S.adm.bo.settings.currency || 'USD')}, as plain numbers.</p>
+  ${ev && can('finance.export') ? `<div class="card hl" style="margin-bottom:16px"><div class="between wrap" style="gap:10px"><div><h3>Export everything for this event</h3><div class="small muted">${esc(ev.name)} — orders, tickets, customers, seats, check-ins, products, payments, refunds, credits, chargebacks, traffic, order history, expenses and the financial breakdown in one file.</div></div>
+    <div class="row"><button class="btn btn-accent btn-sm" data-action="xpEvent" data-fmt="xlsx">Excel workbook</button><button class="btn btn-ghost btn-sm" data-action="xpEvent" data-fmt="zip">CSV files (.zip)</button></div></div></div>` : ''}
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Export</th><th>What’s in it</th><th></th></tr></thead><tbody>
+    ${sets.map(([k, l, , d]) => `<tr><td><b>${esc(l)}</b></td><td class="small muted">${esc(d)}</td><td style="white-space:nowrap"><button class="btn btn-ghost btn-sm" data-action="xp" data-k="${k}" data-fmt="csv">CSV</button> <button class="btn btn-ghost btn-sm" data-action="xp" data-k="${k}" data-fmt="xlsx">Excel</button></td></tr>`).join('')}
+    ${can('finance.export') ? `<tr><td><b>All of the above</b></td><td class="small muted">One Excel workbook, a sheet per export</td><td><button class="btn btn-dark btn-sm" data-action="xpAll">Excel</button></td></tr>` : ''}</tbody></table></div>
+  <div class="card" style="margin-top:18px"><h3>Your data belongs to you</h3><p class="small muted" style="margin:6px 0 12px">${esc(S.adm.bo.name)} can always download its complete records — every event, order, ticket, customer, payment, refund and change — without asking the platform. ${ownsData() ? '' : 'The owner (or someone who can export both customer and financial data) can download everything.'}</p>
+    ${ownsData() ? `<div class="row wrap"><button class="btn btn-ghost btn-sm" data-action="xpOwn" data-fmt="xlsx">Download all our data (Excel)</button><button class="btn btn-ghost btn-sm" data-action="xpOwn" data-fmt="json">Complete data (JSON)</button></div>` : ''}</div>`;
+}
+function RepAccounting() {
+  const acc = S.ui.acct ||= clone(S.adm.bo.settings?.accounting?.accounts || {}), rep = finRep(), j = journal(rep, S.adm.bo.settings?.accounting?.accounts), edit = can('admin.settings');
+  const dr = sum(j, x => x.debit), cr = sum(j, x => x.credit);
+  return FinFilters(['eventId', 'from', 'to', 'method']) + `
+  <div class="cols"><div class="card"><h3>Connect your accounting system</h3><p class="small muted" style="margin:6px 0 10px">SET builds a balanced journal for every day of sales. Import it into your books today; direct sync plugs into the same journal.</p>
+    ${ACCOUNTING_PROVIDERS.map(([k, n, d]) => `<div class="between small line"><span><b>${esc(n)}</b><div class="muted">${esc(d)}</div></span><span class="chip mini">${k === 'api' ? 'available' : 'not connected'}</span></div>`).join('')}
+    <div class="sep"></div><div class="fl">Download the journal for these filters</div><div class="row wrap"><button class="btn btn-ghost btn-sm" data-action="xpJournal" data-v="quickbooks">QuickBooks Online (.csv)</button><button class="btn btn-ghost btn-sm" data-action="xpJournal" data-v="xero">Xero manual journal (.csv)</button><button class="btn btn-ghost btn-sm" data-action="xp" data-k="journal" data-fmt="xlsx">Excel</button></div>
+    <p class="small muted" style="margin-top:8px">${j.length} lines · debits ${money(dr)} = credits ${money(cr)}${dr === cr ? ' ✓' : ' — not balanced'}</p></div>
+  <div class="card"><div class="between"><h3>Account names</h3>${edit ? '<button class="btn btn-dark btn-sm" data-action="acctSave">Save</button>' : ''}</div><p class="small muted" style="margin:6px 0 10px">Match each line to an account in your chart of accounts (Xero uses the code).</p>
+    ${ACCOUNTS.map(([k, n, code]) => `<div class="acct-row"><span class="small">${esc(n)}</span><input class="inp" ${edit ? '' : 'disabled'} data-input="acct.${k}" value="${esc(acc[k] || '')}" placeholder="${esc(n)}"><input class="inp" ${edit ? '' : 'disabled'} data-input="acct.${k}_code" value="${esc(acc[k + '_code'] || '')}" placeholder="${esc(code)}"></div>`).join('')}</div></div>
+  <div class="card" style="margin-top:18px;padding:0"><div style="padding:16px 20px 4px"><h3>Journal preview</h3></div><div class="tbl-wrap" style="border:0;box-shadow:none"><table class="tbl"><thead><tr><th>Date</th><th>Account</th><th class="r">Debit</th><th class="r">Credit</th><th>Memo</th></tr></thead><tbody>
+    ${j.slice(-60).reverse().map(x => `<tr><td class="small">${esc(x.date)}</td><td class="small">${esc(x.account)}</td><td class="tnum r small">${x.debit ? money(x.debit) : ''}</td><td class="tnum r small">${x.credit ? money(x.credit) : ''}</td><td class="small muted">${esc(x.memo)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted small">No sales in this period.</td></tr>'}</tbody></table></div></div>`;
+}
+const fileStamp = () => localDay(new Date().toISOString());
+function xpDownload(name, sheets, fmt) {
+  if (fmt === 'csv') return download(name + '.csv', csv(sheets[0].rows));
+  if (fmt === 'zip') return download(name + '.zip', Xlsx.zip(sheets.map(s => ({ name: slugify(s.name) + '.csv', data: '﻿' + csv(s.rows) }))), 'application/zip');
+  download(name + '.xlsx', Xlsx.xlsx(sheets), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+}
+// the raw tables of exportAll() → one sheet each (nested values as JSON text)
+function ownSheets(d) {
+  const flat = v => v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : v;
+  return Object.entries(d).filter(([, v]) => Array.isArray(v)).map(([k, rows]) => { const cols = [...new Set(rows.flatMap(r => Object.keys(r || {})))]; return { name: k.replace(/_/g, ' '), rows: [cols, ...rows.map(r => cols.map(c => flat(r[c])))] }; })
+    .concat([{ name: 'box office', rows: [['field', 'value'], ...Object.entries(d.box_office || {}).map(([k, v]) => [k, flat(v)])] }]);
 }
 
 // ── Marketing, team, settings ────────────────────────────────────────────────
@@ -3008,7 +3232,7 @@ const boChip = s => `<span class="chip ${{ active: 'ok', pending: 'warn', suspen
 function POverview() {
   const P = S.plat, live = P.orders.filter(o => ['paid', 'pending'].includes(o.status)), since = Date.now() - 30 * 864e5;
   const by = s => P.bos.filter(b => b.status === s).length, pend = P.bos.filter(b => b.status === 'pending');
-  return head('Platform overview', `${P.bos.length} box offices · ${esc(P.platform.name)}`, `<button class="btn btn-accent" data-action="newBo">${ic('plus', 15)} New box office</button>`) + `
+  return head('Platform overview', `${P.bos.length} box offices · ${esc(P.platform.name)}`, `<button class="btn btn-ghost" data-action="platXp">Export platform data</button><button class="btn btn-accent" data-action="newBo">${ic('plus', 15)} New box office</button>`) + `
   ${pend.length ? `<div class="banner warn" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><span><b>${pend.length} waiting for approval:</b> ${pend.map(b => esc(b.name)).join(', ')}</span><a class="btn btn-dark btn-sm" href="#/platform/boxoffices">Review</a></div>` : ''}
   <div class="kpis"><div class="kpi dark"><div class="eyebrow">Processing volume</div><div class="v">${money(sum(live, o => o.total))}</div><div class="d" style="color:var(--mut)">${money(sum(live.filter(o => D(o.created_at) >= since), o => o.total))} last 30 days</div></div>
     <div class="kpi"><div class="eyebrow">Platform fees earned</div><div class="v">${money(sum(live, o => o.platformFee))}</div><div class="d">${esc(P.platform.feePct)}% + ${money(P.platform.feeFixed)} / paid ticket</div></div>
@@ -3142,6 +3366,38 @@ function seatMapEdit(key, val, dflt) {
   dirty(); render(); toast(n + ' seat' + (n === 1 ? '' : 's') + ' updated');
 }
 const A = {
+  // ── Stage 9: reports, expenses, chargebacks, exports ──
+  repClear: () => { S.ui.rep = emptyFin(); render(); },
+  repProfit: el => { S.ui.rep = { ...emptyFin(), eventId: el.dataset.id }; location.hash = '#/admin/reports/profit'; },
+  xpEventId: el => { S.ui.rep = { ...emptyFin(), eventId: el.dataset.id }; A.xpEvent({ dataset: { fmt: 'xlsx' } }); },
+  repOpenEvent: el => { S.ui.rep = { ...emptyFin(), eventId: el.dataset.id }; S.ui.repBy = 'tt'; location.hash = '#/admin/reports'; },
+  recClear: () => { S.ui.recImport = null; render(); },
+  recAll: () => { S.ui.recAll = !S.ui.recAll; render(); },
+  expAdd: async el => { const e = S.ui.exp || {}; try { await DB.saveExpense({ event_id: el.dataset.id, category: e.category || 'Venue', description: e.description, vendor: e.vendor, date: e.date, amount: opDollars(e.amount) });
+    S.ui.exp = { category: e.category || 'Venue', description: '', amount: '', date: '', vendor: '' }; await reloadAdmin(); toast('Expense added'); render(); } catch (x) { toast(x.message, true); } },
+  expDel: async el => { if (!confirmIn('Delete this expense?')) return; try { await DB.deleteExpense(el.dataset.id); await reloadAdmin(); toast('Expense deleted'); render(); } catch (x) { toast(x.message, true); } },
+  expFinal: async el => { try { await DB.setExpensesFinal(el.dataset.id, el.checked); await reloadAdmin(); toast(el.checked ? 'Profit marked final' : 'Profit marked estimated'); render(); } catch (x) { toast(x.message, true); render(); } },
+  cbAdd: async () => { const o = S.adm.orders.find(x => x.id === S.ui.oid), c = S.ui.cb || {}; if (!o) return;
+    try { await DB.orderAction(o.id, 'chargeback', { amount: opDollars(c.amount), reason: c.reason, ref: c.ref }); S.ui.cb = null; await reloadAdmin(); toast('Chargeback recorded'); render(); } catch (x) { toast(x.message, true); } },
+  cbOpen: () => { const o = S.adm.orders.find(x => x.id === S.ui.oid); S.ui.cb = { amount: o ? String((o.data.total || 0) / 100) : '', reason: '', ref: '' }; render(); },
+  cbCancel: () => { S.ui.cb = null; render(); },
+  cbClose: async el => { try { await DB.orderAction(S.ui.oid, 'chargeback', { id: el.dataset.id, status: el.dataset.v }); await reloadAdmin(); toast('Chargeback ' + el.dataset.v); render(); } catch (x) { toast(x.message, true); } },
+  xp: el => { const k = el.dataset.k, s = XP_SETS.find(x => x[0] === k); if (!s || !xpOk(s)) return toast('You don\'t have permission to export that', true);
+    xpDownload(`${slugify(S.adm.bo.name)}-${k}-${fileStamp()}`, [{ name: s[1], rows: xpRows(k, finRep()) }], el.dataset.fmt); },
+  xpAll: () => { const rep = finRep(); xpDownload(`${slugify(S.adm.bo.name)}-reports-${fileStamp()}`, XP_SETS.filter(xpOk).map(s => ({ name: s[1], rows: xpRows(s[0], rep) })), 'xlsx'); },
+  xpEvent: el => { const rep = finRep(), ev = evById(rep.f.eventId); if (!ev) return toast('Choose an event', true); if (!can('finance.export')) return toast('You need the “Export financial reports” permission', true);
+    const sets = EVENT_SHEETS.map(k => XP_SETS.find(s => s[0] === k)).filter(s => s && xpOk(s) && (s[0] !== 'seats' || ev.seating?.enabled));
+    xpDownload(`${slugify(ev.name)}-everything-${fileStamp()}`, sets.map(s => ({ name: s[1], rows: xpRows(s[0], rep) })), el.dataset.fmt); },
+  xpOwn: async el => { try { const d = await DB.exportAll(S.adm.bo.id), name = `${slugify(S.adm.bo.name)}-all-data-${fileStamp()}`;
+    if (el.dataset.fmt === 'json') download(name + '.json', JSON.stringify(d, null, 1), 'application/json'); else xpDownload(name, ownSheets(d), 'xlsx'); toast('Downloaded — amounts are in cents'); } catch (x) { toast(x.message, true); } },
+  gateXp: async () => { try { const d = await DB.exportAll(S.adm.bo.id); xpDownload(`${slugify(S.adm.bo.name)}-all-data-${fileStamp()}`, ownSheets(d), 'xlsx'); } catch (x) { toast(x.message, true); } },
+  platXp: async () => { try { const d = await DB.platformExport(); xpDownload(`platform-data-${fileStamp()}`, ownSheets({ ...d, box_office: d.platform }), 'xlsx'); toast('Platform data downloaded'); } catch (x) { toast(x.message, true); } },
+  xpJournal: el => { const rep = finRep(), accts = S.adm.bo.settings?.accounting?.accounts || {}, j = journal(rep, accts), code = k => accts[k + '_code'] || ACCOUNTS.find(a => a[0] === k)[2];
+    const rows = el.dataset.v === 'xero' ? [['*Narration', '*Date', 'Description', '*AccountCode', '*TaxRate', '*Amount'], ...j.map(x => ['SET ticket sales ' + x.date, x.date, x.memo, code(x.key), 'Tax Exempt', $$(x.debit - x.credit)])]
+      : [['Journal No', 'Journal Date', 'Account', 'Debits', 'Credits', 'Description', 'Name'], ...j.map(x => ['SET-' + x.date.replace(/-/g, ''), x.date, x.account, $$(x.debit) || '', $$(x.credit) || '', x.memo, ''])];
+    download(`${slugify(S.adm.bo.name)}-journal-${el.dataset.v}-${fileStamp()}.csv`, csv(rows)); },
+  acctSave: async () => { try { const accounts = Object.fromEntries(Object.entries(S.ui.acct || {}).map(([k, v]) => [k, String(v).trim().slice(0, 80)]).filter(([, v]) => v));
+    await DB.saveBoxOffice({ settings: { ...S.adm.bo.settings, accounting: { accounts } } }); await reloadAdmin(); S.ui.acct = null; toast('Account names saved'); render(); } catch (x) { toast(x.message, true); } },
   go: el => { location.hash = el.dataset.v; },
   homeView: el => { S.home.view = el.dataset.v; render(); },
   homeCat: el => { S.home.cat = el.dataset.v; render(); },
@@ -3604,11 +3860,7 @@ const A = {
   exportAtt: () => { const ev = evById(S.ui.attEv); download(slugify(ev?.name || 'attendees') + '-door-list.csv', csv([['Name', 'Email', 'Ticket type', 'Area', 'Table / box', 'Row', 'Seat', 'Time slot', 'Code', 'Order', 'Checked in', 'Entrance'],
     ...S.adm.tickets.filter(t => t.event_id === S.ui.attEv && t.status === 'valid').map(t => { const o = S.adm.orders.find(x => x.id === t.order_id); const sp = t.seat ? seatParts(ev, t.seat, t) : {}; return [t.holder, o?.buyer_email, ev.ticketTypes.find(x => x.id === t.ticket_type_id)?.name, sp.area || '', sp.unit || '', sp.row || '', sp.seat || '', t.slot_id ? fmtDT(ev.timeSlots.find(s => s.id === t.slot_id)?.start) : '', t.code, o?.ref, t.checked_in_at || '', t.checkin?.entrance || '']; })])); },
   // one row per ticket: original type, face value, collected, discount + code, comp, tracking code, products, package, price override
-  exportTickets: () => { const ids = new Set(liveOrders().filter(o => !S.ui.repEv || o.event_ids.includes(S.ui.repEv)).map(o => o.id));
-    download('ticket-detail.csv', csv([['Order', 'Placed', 'Status', 'Event', 'Showtime', 'Ticket type', 'Area', 'Table / box', 'Row', 'Seat', 'Face value', 'Collected', 'Discount', 'Promo code', 'Complimentary', 'Price override', 'Tracking code', 'Package', 'Products', 'Holder', 'Ticket code', 'Checked in'],
-      ...S.adm.tickets.filter(t => ids.has(t.order_id) && (!S.ui.repEv || t.event_id === S.ui.repEv)).map(t => { const o = S.adm.orders.find(x => x.id === t.order_id), ev = evById(t.event_id), sp = t.seat ? seatParts(ev, t.seat, t) : {};
-        return [o.ref, o.created_at, t.status === 'valid' ? o.status : 'cancelled', ev?.name, t.slot_id ? ev?.timeSlots?.find(x => x.id === t.slot_id)?.start : '', ev?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name, sp.area || '', sp.unit || '', sp.row || '', sp.seat || '',
-          t.face == null ? '' : t.face / 100, t.paid == null ? '' : t.paid / 100, t.discount == null ? '' : t.discount / 100, t.promo || '', t.comp ? 'yes' : '', t.price_override ? 'yes' : '', t.tracking || o.data.tracking || '', t.bundle?.name || '', (t.extras || []).join('; '), t.holder, t.code, t.checked_in_at || '']; })])); },
+  exportTickets: () => { S.ui.rep = { ...emptyFin(), eventId: S.ui.repEv || '' }; download('ticket-detail.csv', csv(xpRows('tickets', finRep()))); },
   exportReport: () => download('sales-report.csv', csv([['Event', 'Date', 'Tickets sold', 'Ticket revenue'], ...S.adm.events.map(e => { const s = evStats(e); return [e.name, e.start, s.sold, s.rev / 100]; })])),
   // ── Stage 8: marketing, messages, automations, integrations ──
   pxYes: () => { try { localStorage.setItem('set_px', 'yes'); } catch (e) { } $('#pxBanner')?.remove(); loadPixels(); },
@@ -3709,6 +3961,12 @@ const A = {
 const confirmIn = msg => window.confirm(msg);
 const CHANGE = {
   rr: () => render(),
+  // ── Stage 9: reports & exports ──
+  repSet: el => { const f = repF(), k = el.dataset.k; f[k] = el.value.trim();
+    if (k === 'eventId') Object.assign(f, { slotId: '', ttId: '', area: '', addonId: '', bundleId: '' }); render(); },
+  repBy: el => { S.ui.repBy = el.value; render(); },
+  recFile: el => { const file = el.files?.[0]; if (!file) return; file.text().then(txt => { try { S.ui.recImport = { name: file.name, rows: parseProcessorCsv(txt) }; toast(`${S.ui.recImport.rows.length} processor transactions loaded — nothing is saved`); render(); } catch (e) { toast(e.message, true); } }); },
+  expFile: el => { const file = el.files?.[0], id = el.dataset.id; if (!file) return; file.text().then(async txt => { try { const rows = parseExpenseCsv(txt); const n = await DB.importExpenses(id, rows); await reloadAdmin(); toast(`${n} expense${n === 1 ? '' : 's'} imported`); render(); } catch (e) { toast(e.message, true); } }); },
   segVal: el => { const f = S.ui[el.dataset.p].filter, k = el.dataset.k; f[k] = k === 'tags' ? tagsOf(el.value) : el.value; if (el.dataset.p === 'cmp') S.ui.cmp.segId = ''; render(); },
   cmpSeg: el => { const sg = (S.adm.bo.segments || []).find(x => x.id === el.value); S.ui.cmp.segId = el.value; if (sg) S.ui.cmp.filter = { ...emptySeg(), ...clone(sg.filter) }; render(); },
   auTags: el => { S.ui.au.cond.tags = tagsOf(el.value); render(); },

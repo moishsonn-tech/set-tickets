@@ -1,5 +1,5 @@
 // Network-first shell cache: always fresh when online, still opens offline (door check-in in a dead zone).
-const C = 'set-v2', SHELL = ['./', 'index.html', 'app.js', 'mailtpl.js', 'data.js', 'config.js', 'set-logo.svg', 'icon.svg'];
+const C = 'set-v3', SHELL = ['./', 'index.html', 'app.js', 'mailtpl.js', 'xlsx.js', 'data.js', 'config.js', 'set-logo.svg', 'icon.svg'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(C).then(c => c.addAll(SHELL))); self.skipWaiting(); });
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
