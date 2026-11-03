@@ -111,6 +111,9 @@ function parseRoute() {
   const [path, qs] = location.hash.replace(/^#\/?/, '').split('?');
   const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
   const qp = new URLSearchParams(qs || ''), src = qp.get('src'), ref = qp.get('ref');
+  // UTM tags (from the hash link or the page URL) stay with the visit and go on the order; utm_source also counts as the traffic source
+  const sp = new URLSearchParams(location.search), utm = {}; for (const k of UTM_KEYS) { const v = qp.get('utm_' + k) || sp.get('utm_' + k); if (v) utm[k] = v.slice(0, 80); }
+  if (Object.keys(utm).length) { try { sessionStorage.setItem('set_utm', JSON.stringify(utm)); } catch (e) { } if (!src && utm.source) sessionStorage.setItem('set_src', utm.source.toLowerCase().slice(0, 60)); }
   if (src) sessionStorage.setItem('set_src', src);
   if (ref) sessionStorage.setItem('set_ref', ref.trim().toUpperCase().slice(0, 40));  // tracking / referral code link
   if (parts[0] === 'admin') return { page: 'admin', sub: parts[1] || 'dashboard', params: parts.slice(2) };
@@ -127,11 +130,13 @@ async function onRoute() {
   if (r.page === 'e' || r.page === 'embed') {
     let ev = S.events.find(e => e.slug === r.params[0]) || S.adm?.events.find(e => e.slug === r.params[0]);
     if (!ev && !S._fetched?.[r.params[0]]) { (S._fetched ||= {})[r.params[0]] = 1; DB.eventBySlug(r.params[0]).then(e => { if (e) { S.events.push(e); onRoute(); } }).catch(() => { }); }
-    if (ev && eventLive(ev) && !/preview=1/.test(location.hash) && S._viewed !== ev.id + location.hash) { S._viewed = ev.id + location.hash; DB.trackView(ev.id, sessionStorage.getItem('set_src'), sessionStorage.getItem('set_ref')); DB.ping(ev.id, cartTicketsFor(ev.id)); }
+    if (ev && eventLive(ev) && !/preview=1/.test(location.hash) && S._viewed !== ev.id + location.hash) { S._viewed = ev.id + location.hash; DB.trackView(ev.id, sessionStorage.getItem('set_src'), sessionStorage.getItem('set_ref')); pix('ViewContent', { name: ev.name, id: ev.id }); DB.ping(ev.id, cartTicketsFor(ev.id)); }
     if (ev && S.sel?.eventId !== ev.id) S.sel = { eventId: ev.id, qty: {}, slotId: '', seats: [], addons: {}, bundles: {}, picks: {}, unlocked: { event: false, tts: [] }, pw: '' };
     if (ev) refreshAvail(ev.id);
   }
   if (r.page === 'order') loadOrder(r.params[0], r.params[1]);
+  if (r.page === 'unsubscribe' && S._unsubTok !== r.params[0]) { S._unsubTok = r.params[0]; S.unsub = null;
+    DB.unsubInfo(r.params[0]).then(u => { S.unsub = u || { error: 'This preferences link is not valid any more.' }; S.ui.unsub = { email: !!u?.email_on, sms: !!u?.sms_on }; render(); }).catch(e => { S.unsub = { error: e.message }; render(); }); }
   if (r.page === 'account') { S.wallet = null; if (r.params[0] === 'password') S.ui.wtab = 'profile'; }
   if (r.page === 'cart') cartEventIds().forEach(id => { if (!S.avail[id]) refreshAvail(id); });  // price phases + product stock
   if (r.page === 'platform' && r.params[0] !== S._platSub) { S._platSub = r.params[0]; S.plat = null; }  // fresh numbers on each platform page
@@ -175,7 +180,7 @@ function hydrate() {
 // ══════════════════════════════════════════════════════════════════════════════
 function PubShell() {
   const r = S.route, solid = !['home', 'e', 'b'].includes(r.page);
-  const body = { home: Home, e: EventPage, embed: EventPage, cart: Checkout, order: OrderPage, tickets: FindTickets, b: BoxOfficePage, register: Register, account: Account }[r.page] || NotFound;
+  const body = { home: Home, e: EventPage, embed: EventPage, cart: Checkout, order: OrderPage, tickets: FindTickets, b: BoxOfficePage, register: Register, account: Account, unsubscribe: Unsubscribe }[r.page] || NotFound;
   const bo = S.bo, brandLogo = bo && safeUrl(bo.branding.logo);
   return `
   <nav class="pub-nav ${solid ? 'solid' : ''}">
@@ -600,7 +605,7 @@ function Checkout() {
   ].filter(Boolean);
   if (!co.payment || payOpts.find(p => p.v === co.payment)?.off) co.payment = (payOpts.find(p => !p.off) || {}).v || '';
   const perEv = ticketsPerEvent(q), orderQs = set.questions || [];
-  const field = (k, label, o = {}) => `<div><label class="fl">${label}${o.req ? ' *' : ''}</label><input class="inp" ${o.type ? `type="${o.type}"` : ''} data-bind="co.${k}" ${o.ac ? `autocomplete="${o.ac}"` : ''} value="${esc(getPath(co, k) || '')}"></div>`;
+  const field = (k, label, o = {}) => `<div><label class="fl">${label}${o.req ? ' *' : ''}</label><input class="inp" ${o.type ? `type="${o.type}"` : ''} data-bind="co.${k}" ${k === 'phone' ? 'data-action-change="rr"' : ''} ${o.ac ? `autocomplete="${o.ac}"` : ''} value="${esc(getPath(co, k) || '')}"></div>`;
   return `<div class="container"><div class="checkout">
     <div>
       <a href="javascript:history.back()" class="small muted" style="text-decoration:none">← Keep shopping</a>
@@ -627,6 +632,7 @@ function Checkout() {
         <div class="sep"></div>
         <label class="check"><input type="checkbox" data-bind="co.terms" ${co.terms ? 'checked' : ''}> <span>I agree to the <a href="#" data-action="showTerms">terms & conditions</a>.</span></label>
         ${ck.optIn !== false ? `<label class="check" style="margin-top:8px"><input type="checkbox" data-bind="co.optIn" ${co.optIn ? 'checked' : ''}> <span>Email me about future ${esc(set.name)} events.</span></label>` : ''}
+        ${ck.smsOptIn !== false && ck.phone !== 'off' && normPhone(co.phone) ? `<label class="check" style="margin-top:8px"><input type="checkbox" data-bind="co.smsOptIn" ${co.smsOptIn ? 'checked' : ''}> <span>Text me news and offers from ${esc(set.name)}. Msg &amp; data rates may apply; reply STOP to opt out.</span></label>` : ''}
       </div>
     </div>
     <aside class="ticket-panel"><div class="card">
@@ -755,6 +761,7 @@ async function payWith(card) {
 }
 function endPay() { S.co = { ...S.co, pay: null, busy: false, err: '', attempt: null, card: null }; try { localStorage.removeItem('set_pay'); } catch (e) { } render(); }
 async function checkoutDone(r) {
+  pix('Purchase', { value: r.total || 0, currency: S.settings.currency || 'USD', id: r.id, ref: r.ref, n: S.cart.items.reduce((a, i) => a + (+i.qty || 0), 0) });
   cartEventIds().forEach(id => DB.ping(id, 0, true));   // live activity: this visitor's cart became an order
   S.cart = { items: [], addons: [], donation: 0, unlock: {} }; saveCart(); S.co.credit = null; S.co.creditCode = ''; S.co.useAcct = false; S.myCredits = null; S._credReq = 0;
   S.co = { ...S.co, busy: false, disc: null, code: '', tracking: '', answers: {}, tanswers: {}, terms: false, pay: null, attempt: null, card: null, err: '' };
@@ -894,7 +901,7 @@ function FindTickets() {
 // ══════════════════════════════════════════════════════════════════════════════
 const NAV = [
   ['dashboard', 'Dashboard', 'home'], ['events', 'Events', 'cal', 'events.view'], ['venues', 'Venues', 'pin', 'seating.view'], ['orders', 'Orders', 'cart', 'orders.view'], ['customers', 'Customers', 'users', 'customers.profiles'], ['promos', 'Promotions', 'tag', 'tickets.discounts|tickets.discountsEdit|tickets.tracking|finance.reports'], ['attendees', 'Door list', 'users', 'door.attendees'],
-  ['checkin', 'Scanner app', 'scan', 'door.scan'], ['reports', 'Reports', 'chart', 'finance.reports'], ['marketing', 'Marketing', 'mega', 'comms.email'],
+  ['checkin', 'Scanner app', 'scan', 'door.scan'], ['reports', 'Reports', 'chart', 'finance.reports'], ['marketing', 'Marketing', 'mega', 'comms.email|comms.marketing|comms.lists|comms.automations|admin.integrations|admin.api'],
   ['team', 'Team', 'team', 'admin.invite|admin.perms|admin.remove'], ['branding', 'Branding', 'brush', 'admin.settings'], ['settings', 'Settings', 'gear', 'admin.settings'], ['security', 'My security', 'lock'],
 ];
 const navOk = n => !n[3] || n[3].split('|').some(k => can(k));
@@ -927,7 +934,7 @@ const Gate = (title, msg) => `<div style="min-height:100vh;display:grid;place-it
   <h1 class="display" style="font-size:28px">${esc(title)}</h1><p class="muted" style="margin:8px 0 18px">${msg}</p><div class="row wrap">${S.adm?.super ? '<a class="btn btn-dark" href="#/platform">Platform admin</a>' : ''}<button class="btn btn-ghost" data-action="signOut">Sign out</button></div></div></div>`;
 const Gate2fa = () => `<div class="card" style="max-width:520px"><h3>Two-factor sign-in required</h3><p class="muted small" style="margin:6px 0 14px">${esc(S.adm.bo.name)} requires everyone on the team to use an authenticator app. It takes a minute.</p><a class="btn btn-accent" href="#/admin/security">Set it up</a></div>`;
 const DEMO_PEOPLE = [['moishsonn@gmail.com', 'Platform owner', 'Super admin + owns Skyline Live'], ['manager@skyline.example', 'Event manager', 'Only the Orchestra Gala'], ['support@skyline.example', 'Customer service', 'Orders & refunds'],
-  ['finance@skyline.example', 'Finance', 'Reports only, no editing'], ['door@example.com', 'Door staff', 'Tonight\'s show only'], ['director@harborarts.example', 'Another box office', 'Harbor Arts — can\'t see Skyline']];
+  ['finance@skyline.example', 'Finance', 'Reports only, no editing'], ['marketing@skyline.example', 'Marketing', 'Campaigns, automations, audience'], ['door@example.com', 'Door staff', 'Tonight\'s show only'], ['director@harborarts.example', 'Another box office', 'Harbor Arts — can\'t see Skyline']];
 function Login(title = 'Organizer sign in', sub = 'explore the back office') {
   const l = S.ui.login, mfa = S.user?.mfa || l.mfa;
   return `<div style="min-height:100vh;display:grid;place-items:center;background:var(--ink);padding:20px">
@@ -1736,16 +1743,20 @@ function TrackingEditor(t) {
 const newPromo = evId => ({ _kind: 'promo', id: shortId('pr_'), code: '', active: true, note: '', type: 'pct', amount: 10, on: 'tickets', scope: ['tickets', 'bundles'], eventIds: evId ? [evId] : [], slotIds: [], ticketTypeIds: [], areas: [], prices: [],
   addonIds: [], bundleIds: [], startsAt: '', expires: '', maxUses: 0, perCustomer: 0, maxItems: 0, maxTickets: 0, minSpend: 0, minQty: 0, maxQty: 0, codes: [] });
 function EdEmails(ev) {
-  const wl = S.adm.waitlist.filter(w => w.event_id === ev.id), holders = new Set(S.adm.tickets.filter(t => t.event_id === ev.id && t.status === 'valid').map(t => S.adm.orders.find(o => o.id === t.order_id)?.buyer_email));
-  const b = S.ui.bc || (S.ui.bc = { subject: '', body: '' });
+  const holders = new Set(S.adm.tickets.filter(t => t.event_id === ev.id && t.status === 'valid').map(t => S.adm.orders.find(o => o.id === t.order_id)?.buyer_email).filter(Boolean));
+  const b = S.ui.bc?.ev === ev.id ? S.ui.bc : (S.ui.bc = { ev: ev.id, subject: '', body: '', channel: 'email', sendAt: '' }), past = (S.adm.broadcasts || []).filter(x => x.event_id === ev.id);
+  const sms = can('comms.sms'), auto = (S.adm.automations || []).filter(a => a.enabled && TIMED_TRIGGERS.includes(a.trigger.type)).map(a => a.name), rems = ev.emails?.reminders || [];
   return `<div class="cols"><div class="stack">
     <div class="card"><h3>Order confirmation</h3><p class="small muted" style="margin-bottom:10px">Extra message included in every confirmation email for this event.</p>${inp('emails.confirmation', '', { t: 'area', ph: 'e.g. Parking is on 38th St. Please arrive 20 minutes early.' })}</div>
-    <div class="card"><h3>Email ticket holders</h3><p class="small muted" style="margin-bottom:12px">Send an update to all ${holders.size} buyers for this event.</p>
-      <div class="field"><input class="inp" data-input="bc.subject" placeholder="Subject" value="${esc(b.subject)}"></div><div class="field"><textarea class="inp" data-input="bc.body" placeholder="Message">${esc(b.body)}</textarea></div>
-      <button type="button" class="btn btn-dark" data-action="broadcast" data-n="${holders.size}">Send to ${holders.size} buyers</button>
-      ${S.adm.broadcasts.filter(x => x.event_id === ev.id).map(x => `<div class="small muted" style="margin-top:10px">“${esc(x.subject)}” · ${x.recipients} recipients · ${esc(ago(x.created_at))}</div>`).join('')}</div>
+    <div class="card"><h3>Message ticket holders</h3><p class="small muted" style="margin-bottom:12px">Venue changes, door times, last-minute news — to all ${holders.size} buyers with valid tickets. Goes to everyone with a ticket, opted in or not, so keep it to event information.</p>
+      ${sms ? `<div class="field"><select class="inp" data-bind="ui.bc.channel">${[['email', 'Email'], ['sms', 'Text message'], ['both', 'Email + text']].map(([k, l]) => `<option value="${k}" ${b.channel === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>` : ''}
+      ${b.channel !== 'sms' ? `<div class="field"><input class="inp" data-bind="ui.bc.subject" placeholder="Subject" value="${esc(b.subject)}"></div>` : ''}<div class="field"><textarea class="inp" data-bind="ui.bc.body" placeholder="Message — {{first_name}}, {{event}}, {{date}}, {{tickets_link}} work here">${esc(b.body)}</textarea></div>
+      <div class="field"><label class="fl">Send at (optional)</label><input class="inp" type="datetime-local" data-bind="ui.bc.sendAt" value="${esc(b.sendAt)}"></div>
+      <button type="button" class="btn btn-dark" data-action="broadcast">${b.sendAt ? 'Schedule' : 'Send'} to ${holders.size} ticket holders</button>
+      ${past.map(x => `<div class="small muted" style="margin-top:10px">“${esc(x.name || x.subject)}” · ${esc(x.channel === 'both' ? 'email + text' : x.channel || 'email')} · ${x.queued ?? x.recipients} sent${x.status === 'scheduled' ? ' · scheduled ' + esc(fmtDT(x.send_at)) : ' · ' + esc(ago(x.send_at || x.created_at))}</div>`).join('')}</div>
     <div class="card"><div class="between"><h3>Automatic reminders</h3><button type="button" class="btn btn-ghost btn-sm" data-action="addRem">${ic('plus', 14)} Add</button></div>
-      ${(ev.emails?.reminders || []).map((r, i) => `<div class="item-card" style="margin-top:10px"><div class="grid2">${inp(`emails.reminders.${i}.hoursBefore`, 'Hours before start', { t: 'int' })}${sel(`emails.reminders.${i}.channel`, 'Channel', [['email', 'Email'], ['sms', 'Text message'], ['whatsapp', 'WhatsApp']])}</div>${inp(`emails.reminders.${i}.body`, 'Message', { t: 'area' })}<button type="button" class="btn btn-ghost btn-sm" data-action="delRem" data-i="${i}">Remove</button></div>`).join('') || '<p class="small muted" style="margin-top:8px">No reminders scheduled.</p>'}</div>
+      <p class="small muted" style="margin-top:4px">${rems.length ? 'This event uses its own reminders instead of the standard pre-event reminder.' : `None set here — the box office's workflows apply${auto.length ? ': ' + esc(auto.join(', ')) : ''}.`}</p>
+      ${rems.map((r, i) => `<div class="item-card" style="margin-top:10px"><div class="grid2">${inp(`emails.reminders.${i}.hoursBefore`, 'Hours before start', { t: 'int' })}${sel(`emails.reminders.${i}.channel`, 'Send as', [['email', 'Email'], ['sms', 'Text message'], ['both', 'Email + text']])}</div>${inp(`emails.reminders.${i}.body`, 'Message', { t: 'area' })}<button type="button" class="btn btn-ghost btn-sm" data-action="delRem" data-i="${i}">Remove</button></div>`).join('')}</div>
   </div></div>`;
 }
 function EdShare(ev) {
@@ -1882,7 +1893,7 @@ function OrderView(id) {
       ${notes.map(n => `<div class="note-row"><div class="small">${esc(n.summary)}</div><div class="small muted">${esc(n.by)} · ${esc(fmtDT(n.at))}</div></div>`).join('')}
       ${can('orders.edit', ev0) ? `<textarea class="inp" rows="2" data-input="onote" placeholder="Add a note…">${esc(S.ui.onote || '')}</textarea><button class="btn btn-ghost btn-sm" style="margin-top:6px" data-action="opGo" data-v="note">Add note</button>` : ''}</div>
     <div class="card"><h3>Communications</h3><p class="small muted" style="margin:2px 0 8px">Every email to this customer about this order${DB.live ? '' : ' (queued — sending switches on in Stage 8)'}.</p>
-      ${mails.map(x => `<div class="between small line"><span><b>${esc({ confirmation: 'Order confirmation', confirmation_copy: 'Confirmation (resent)', tickets: 'Tickets resent', updated: 'Updated tickets', cancelled: 'Cancellation', refund: 'Refund', message: x.subject || 'Message' }[x.kind] || x.kind)}</b>${x.kind === 'message' && x.body ? `<div class="muted">${esc(x.body.slice(0, 120))}</div>` : ''}</span><span class="muted" style="text-align:right">${esc(x.status)} · ${esc(fmtDT(x.at))}${x.by ? `<div>${esc(x.by)}</div>` : ''}</span></div>`).join('') || '<p class="small muted">Nothing sent yet.</p>'}</div>
+      ${mails.map(x => `<div class="between small line click" data-action="msgOpen" data-id="${x.id}"><span><b>${esc(x.kind === 'message' && x.subject ? x.subject : kindLabel(x))}</b>${x.kind === 'message' && x.body ? `<div class="muted">${esc(x.body.slice(0, 120))}</div>` : ''}<div class="muted">${esc(fmtDT(x.sent_at || x.send_at || x.at))} · ${esc(x.to)}</div></span>${msgChip(x)}</div>`).join('')}
   </div></div>`;
 }
 // The action panel at the top of the order page. S.ui.op = {kind, ...fields}; everything re-renders as you choose.
@@ -2050,12 +2061,12 @@ function customerIndex() {
 function Customers() {
   if (S.route.params[0]) return CustomerView(S.route.params[0]);
   const q = String(S.ui.cq || '').trim().toLowerCase(), all = customerIndex(), list = all.filter(c => !q || [c.name, c.email, c.phone].join(' ').toLowerCase().includes(q)).sort((a, b) => D(b.last) - D(a.last));
-  return head('Customers', `${all.length} customers · ${all.filter(c => c.account).length} with an account`, can('customers.export') ? '<button class="btn btn-ghost" data-action="exportCustomers">Export CSV</button>' : '') + `
+  return head('Customers', `${all.length} customers · ${all.filter(c => c.account).length} with an account`, (navOk(NAV.find(n => n[0] === 'marketing')) ? '<a class="btn btn-ghost" href="#/admin/marketing/audience">Segment & export</a>' : '') + (can('customers.export') ? '<button class="btn btn-ghost" data-action="exportCustomers">Export CSV</button>' : '')) + `
   <div class="toolbar"><input class="inp" style="flex:1" data-input="cq" data-rr="1" placeholder="Search name, email or phone…" value="${esc(S.ui.cq || '')}"></div>
-  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Customer</th><th>Orders</th><th>Tickets</th><th>Spent</th><th>Refunds</th><th>Credit</th><th>Account</th><th>Last order</th></tr></thead><tbody>
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Customer</th><th>Orders</th><th>Tickets</th><th>Spent</th><th>Refunds</th><th>Credit</th><th>Marketing</th><th>Account</th><th>Last order</th></tr></thead><tbody>
   ${list.slice(0, 400).map(c => `<tr class="click" data-action="go" data-v="#/admin/customers/${encodeURIComponent(c.email)}"><td><b>${esc(c.name)}</b><div class="small muted">${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''}</div></td>
-    <td class="tnum">${c.orders.length}</td><td class="tnum">${c.tickets.filter(t => t.status === 'valid').length}</td><td class="tnum">${money(c.spent)}</td><td class="tnum">${c.refunds ? money(c.refunds) : '—'}</td><td class="tnum">${c.credit ? `<span class="chip ok mini">${money(c.credit)}</span>` : '—'}</td>
-    <td>${c.account ? '<span class="chip ok mini">yes</span>' : '<span class="muted small">guest</span>'}</td><td class="small muted">${esc(fmtDT(c.last))}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No customers match.</td></tr>'}</tbody></table></div>`;
+    <td class="tnum">${c.orders.length}</td><td class="tnum">${c.tickets.filter(t => t.status === 'valid').length}</td><td class="tnum">${money(c.spent)}</td><td class="tnum">${c.refunds ? money(c.refunds) : '—'}</td><td class="tnum">${c.credit ? `<span class="chip ok mini">${money(c.credit)}</span>` : '—'}</td><td>${consentChips(contactFor(c.email), c.phone)}</td>
+    <td>${c.account ? '<span class="chip ok mini">yes</span>' : '<span class="muted small">guest</span>'}</td><td class="small muted">${esc(fmtDT(c.last))}</td></tr>`).join('') || '<tr><td colspan="9" class="empty">No customers match.</td></tr>'}</tbody></table></div>`;
 }
 function CustomerView(email) {
   const c = customerIndex().find(x => x.email === email);
@@ -2087,7 +2098,10 @@ function CustomerView(email) {
         <button class="btn btn-dark btn-sm" style="margin-top:8px" data-action="creditIssue">Issue credit</button>` : ''}</div>
     <div class="card"><h3>Internal notes</h3>${notes.map(n => `<div class="note-row"><div class="small">${esc(n.body)}</div><div class="small muted">${esc(n.by)} · ${esc(fmtDT(n.at))}</div></div>`).join('') || '<p class="small muted" style="margin:6px 0">No notes yet.</p>'}
       <textarea class="inp" rows="2" data-input="cnote" placeholder="Add a note about this customer…">${esc(S.ui.cnote || '')}</textarea><button class="btn btn-ghost btn-sm" style="margin-top:6px" data-action="custNote" data-v="${esc(email)}">Add note</button></div>
+    ${CustomerConsent(email, contactFor(email), c.phone)}
     <div class="card"><h3>Codes & products</h3>
+      <div class="small" style="margin-top:6px"><span class="muted">First came from:</span> ${(() => { const o = c.orders.slice().sort((a, b) => D(a.created_at) - D(b.created_at))[0]; const u = o?.data.utm; return o ? esc(u ? [u.source, u.medium, u.campaign].filter(Boolean).join(' / ') : o.data.tracking ? 'ref ' + o.data.tracking : o.data.source || 'direct') : '—'; })()}</div>
+      <div class="small" style="margin-top:6px"><span class="muted">Events attended:</span> ${(() => { const ids = [...new Set(c.tickets.filter(t => t.checked_in_at).map(t => t.event_id))]; return ids.length ? ids.map(id => esc(evName(id))).join(', ') : '—'; })()}</div>
       <div class="small" style="margin-top:6px"><span class="muted">Promo codes used:</span> ${codes.map(x => `<span class="chip mini">${esc(x)}</span>`).join(' ') || '—'}</div>
       <div class="small" style="margin-top:6px"><span class="muted">Referral / tracking codes:</span> ${refs.map(x => `<span class="chip mini">${esc(x)}</span>`).join(' ') || '—'}</div>
       <div class="small" style="margin-top:6px"><span class="muted">Products bought:</span> ${Object.entries(prods).filter(([, n]) => n > 0).map(([k, n]) => `${esc(k)} × ${n}`).join(', ') || '—'}</div>
@@ -2183,20 +2197,8 @@ function ManualOrder() {
   </div></div>`;
 }
 // The order confirmation: ONE email per order with every ticket and its Area / Row / Seat, plus one PDF of all tickets.
-function OrderEmail(o, tks) {
-  const d = o.data, valid = tks.filter(t => t.status === 'valid'), evs = [...new Set(d.lines.map(l => l.eventId))].map(evById).filter(Boolean), bo = boOf(evs[0]) || S.adm?.bo;
-  return `<div class="email-pv"><div class="em-brand">${esc(bo?.name || 'SET')}</div>
-    <h2>Your tickets — ${esc(evs.map(e => e.name).join(' & '))}</h2>
-    <p>Hi ${esc((d.buyer.name || '').split(' ')[0])}, thank you for your order <b>${esc(o.ref)}</b>. ${valid.length === 1 ? 'Your ticket is' : `All ${valid.length} tickets are`} below and attached as one PDF.</p>
-    ${evs.map(ev => `<div class="em-ev"><b>${esc(ev.name)}</b><div class="small">${esc(fmtDT(ev.start))} · ${esc([ev.venue, ev.address].filter(Boolean).join(', '))}</div>
-      ${ev.emails?.confirmation ? `<p class="small" style="margin-top:8px">${esc(ev.emails.confirmation)}</p>` : ''}
-      <table><thead><tr><th>Ticket type / Area</th><th>Row</th><th>Seat</th><th>Ticket no.</th></tr></thead><tbody>
-      ${valid.filter(t => t.event_id === ev.id).map(t => { const tt = ev.ticketTypes.find(x => x.id === t.ticket_type_id), sp = t.seat ? seatParts(ev, t.seat, t) : null;
-        return `<tr><td>${esc(sp ? (sp.area && sp.area !== tt?.name ? `${tt?.name || ''} · ${sp.area}` : sp.area) : tt?.name || 'Ticket')}</td><td>${esc(sp?.row || '—')}</td><td>${esc(sp?.seat || (sp ? '—' : 'General'))}</td><td class="tnum">${esc(t.code)}</td></tr>`; }).join('')}</tbody></table></div>`).join('')}
-    <div class="em-btn">View &amp; download your tickets</div>
-    <p class="small muted">📎 tickets-${esc(o.ref)}.pdf — ${valid.length} page${valid.length === 1 ? '' : 's'}, one ticket per page with its QR code</p>
-    <div class="em-tot"><span>Order total</span><b>${money(d.total, d.currency)}</b></div></div>`;
-}
+// the confirmation email exactly as the sender renders it (mailtpl.js): one email per order with every ticket
+function OrderEmail(o) { return msgPreview({ kind: 'confirmation', channel: 'email', category: 'transactional', order_id: o.id, event_id: o.event_ids[0], email: o.buyer_email, to: o.buyer_email }); }
 function Attendees() {
   const evId = S.ui.attEv || S.adm.events.filter(e => e.status === 'published').sort((a, b) => D(a.start) - D(b.start)).find(e => D(e.start) > Date.now())?.id || S.adm.events[0]?.id;
   S.ui.attEv = evId; const ev = evById(evId); const q = S.ui.q.trim().toLowerCase();
@@ -2514,16 +2516,269 @@ function Reports() {
 }
 
 // ── Marketing, team, settings ────────────────────────────────────────────────
+// ── Marketing, messages & automation (Stage 8) ───────────────────────────────
+// One outbox (S.adm.outbox) for everything sent; campaigns are S.adm.broadcasts; consent + tags on S.adm.contacts; segments = filters.
+const MK_TABS = [['overview', 'Overview'], ['campaigns', 'Campaigns'], ['automations', 'Automations'], ['audience', 'Audience'], ['messages', 'Messages'], ['tracking', 'Tracking'], ['integrations', 'Integrations']];
+const admPeople = f => segmentPeople({ orders: S.adm.orders, tickets: S.adm.tickets, contacts: S.adm.contacts, waitlist: S.adm.waitlist, credits: S.adm.credits, accounts: S.adm.accounts }, f);
+const contactFor = email => (S.adm.contacts || []).find(c => c.email === email);
+const evName = id => evById(id)?.name || 'an event';
+const MSG_CHIP = { queued: 'info', sending: 'info', sent: 'ok', failed: 'bad', suppressed: 'warn', cancelled: '', 'not sent (staff choice)': '' };
+const msgChip = m => `<span class="chip mini ${MSG_CHIP[m.status] ?? ''}">${esc(m.status === 'queued' && D(m.send_at || m.at) > Date.now() + 6e4 ? 'scheduled ' + fmtDT(m.send_at) : MSG_STATUS[m.status] || m.status)}</span>`;
+const kindLabel = m => (MSG_KINDS[m.kind]?.[0] || m.kind) + (m.channel === 'sms' ? ' · text' : '');
+function consentChips(c, phone) {
+  const e = !c ? '<span class="chip mini">no consent recorded</span>' : c.suppressed ? `<span class="chip mini bad">suppressed · ${esc(c.suppressed)}</span>` : c.email_optin && !c.unsub_email_at ? '<span class="chip mini ok">email ✓</span>'
+    : c.unsub_email_at ? '<span class="chip mini warn">unsubscribed</span>' : '<span class="chip mini">email: no opt-in</span>';
+  const s = c?.unsub_sms_at ? '<span class="chip mini warn">texts: STOP</span>' : c?.sms_optin ? '<span class="chip mini ok">texts ✓</span>' : (c?.phone || phone) ? '<span class="chip mini">texts: service only</span>' : '';
+  return e + ' ' + s;
+}
+// the render context for a message, from what the back office already holds (LIVE: the server builds the same with msg_context())
+function msgCtx(m) {
+  const o = m.order_id && S.adm.orders.find(x => x.id === m.order_id), ev = evById(m.event_id || o?.event_ids?.[0]), bo = S.adm.bo, c = contactFor(m.email);
+  const tks = o ? S.adm.tickets.filter(t => t.order_id === o.id && t.status === 'valid').map(t => { const e = evById(t.event_id), tt = e?.ticketTypes.find(x => x.id === t.ticket_type_id), sp = t.seat && e ? seatParts(e, t.seat, t) : null;
+    return { event_id: t.event_id, slot_id: t.slot_id, type: tt?.name || 'Ticket', area: sp?.area || t.area || '', row: sp?.row || t.row || '', seat: sp?.seat || t.seat_label || '', unit: t.unit || '', code: t.code }; }) : [];
+  return { bo: { name: bo.name, slug: bo.slug, branding: bo.branding, mail: bo.settings?.mail }, event: ev ? { ...ev } : null, tickets: tks, contact: { name: c?.name || '', token: c ? 'preview-token' : '' },
+    order: o ? { id: o.id, key: 'private-key', ref: o.ref, buyer: o.data.buyer, events: [...new Set(o.data.lines.map(l => l.eventId))].map(evById).filter(Boolean).map(e => ({ id: e.id, name: e.name, start: e.start, venue: e.venue, address: e.address, confirmation: e.emails?.confirmation })) } : null };
+}
+function msgPreview(m) {
+  const r = MailTpl.render(m, msgCtx(m), { appUrl: location.origin + location.pathname });
+  return m.channel === 'sms' ? `<div class="sms-pv">${esc(r.sms)}</div><p class="small muted" style="margin-top:8px">${r.sms.length} characters · ${Math.ceil(r.sms.length / 153) || 1} SMS segment(s)</p>`
+    : `<div class="small muted" style="margin-bottom:6px">Subject: <b>${esc(r.subject)}</b></div><iframe class="mail-pv" sandbox title="Email preview" srcdoc="${esc(r.html)}"></iframe>`;
+}
 function Marketing() {
-  const opted = [...new Map(S.adm.orders.filter(o => o.data.optIn).map(o => [o.buyer_email, o])).values()];
-  const codes = S.adm.promos || [];
-  return head('Marketing', 'Audience, codes and promotion') + `
-  <div class="kpis"><div class="kpi"><div class="eyebrow">Opted-in contacts</div><div class="v">${opted.length}</div></div><div class="kpi"><div class="eyebrow">All buyers</div><div class="v">${new Set(S.adm.orders.map(o => o.buyer_email)).size}</div></div>
-    <div class="kpi"><div class="eyebrow">Active codes</div><div class="v">${codes.length}</div></div><div class="kpi"><div class="eyebrow">Waitlist</div><div class="v">${S.adm.waitlist.length}</div></div></div>
-  <div class="cols"><div class="card"><div class="between"><h3>Mailing list</h3><button class="btn btn-ghost btn-sm" data-action="exportOptIn">Export for Mailchimp</button></div><p class="small muted" style="margin:4px 0 12px">Buyers who ticked “email me about future events”.</p>
-    ${opted.slice(0, 12).map(o => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span>${esc(o.data.buyer.name)}</span><span class="muted">${esc(o.buyer_email)}</span></div>`).join('') || '<p class="muted">No contacts yet.</p>'}</div>
-  <div class="card"><h3>Promo codes</h3><p class="small muted" style="margin:4px 0 12px">Manage codes and tracking links on <a href="#/admin/promos">Promotions</a>.</p>${codes.map(d => `<a class="between small" style="padding:7px 0;border-bottom:1px solid var(--line);text-decoration:none" href="#/admin/promos/code/${d.id}"><b class="tnum">${esc(d.code)}</b><span class="muted">${esc(promoLabel(d))} · ${esc(promoTargets(d))}</span></a>`).join('') || '<p class="muted">No codes.</p>'}</div></div>
-  <div class="card" style="margin-top:18px"><h3>Tracking pixels</h3><p class="small muted" style="margin:4px 0 0">Set Google Analytics 4 and Meta Pixel IDs in <a href="#/admin/settings">Settings</a>; they load on every public page.</p></div>`;
+  const tab = MK_TABS.some(t => t[0] === S.route.params[0]) ? S.route.params[0] : 'overview';
+  const body = { overview: MkOverview, campaigns: MkCampaigns, automations: MkAutomations, audience: MkAudience, messages: MkMessages, tracking: MkTracking, integrations: MkIntegrations }[tab]();
+  return head('Marketing', 'Emails, texts, automations, audience, tracking and integrations', !DB.live && can('comms.email') ? `<button class="btn btn-ghost" data-action="runSender" title="Demo: what the every-minute sender does">${ic('mega', 14)} Run sender now</button>` : '')
+    + `<nav class="etabs">${MK_TABS.map(([k, l]) => `<a class="${tab === k ? 'on' : ''}" href="#/admin/marketing${k === 'overview' ? '' : '/' + k}">${l}</a>`).join('')}</nav>` + body;
+}
+function MkOverview() {
+  const cs = S.adm.contacts || [], ob = S.adm.outbox || [], d30 = Date.now() - 30 * 864e5, kpi = (l, v, d = '') => `<div class="kpi"><div class="eyebrow">${l}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`;
+  const sent = ob.filter(m => m.status === 'sent' && D(m.sent_at) >= d30), sched = ob.filter(m => m.status === 'queued' && D(m.send_at) > Date.now() + 6e4), failed = ob.filter(m => m.status === 'failed');
+  return `<div class="kpis">${kpi('Contacts', cs.length, `${cs.filter(c => c.email_optin && !c.unsub_email_at && !c.suppressed).length} opted in to email`)}${kpi('Text opt-ins', cs.filter(c => c.sms_optin && !c.unsub_sms_at).length, `${cs.filter(c => c.phone).length} with a mobile number`)}
+    ${kpi('Sent · 30 days', sent.length, `${sent.filter(m => m.category === 'marketing').length} marketing · ${sent.filter(m => m.channel === 'sms').length} texts`)}${kpi('Scheduled', sched.length, failed.length ? `<span style="color:var(--bad)">${failed.length} failed</span>` : 'none failed')}</div>
+  <div class="cols"><div class="card"><div class="between"><h3>Recent campaigns</h3><a class="small" href="#/admin/marketing/campaigns">All campaigns →</a></div>${CampaignRows((S.adm.broadcasts || []).slice().sort((a, b) => D(b.send_at || b.created_at) - D(a.send_at || a.created_at)).slice(0, 5))}</div>
+    <div class="card"><div class="between"><h3>Automations</h3><a class="small" href="#/admin/marketing/automations">Manage →</a></div>${(S.adm.automations || []).map(a => { const s = autoSentence(a, evName);
+      return `<div class="line small"><div class="between"><b>${esc(a.name)}</b>${a.enabled ? '<span class="chip ok mini">on</span>' : '<span class="chip mini">off</span>'}</div><div class="muted">${esc(s.when)}${s.cond ? ' · ' + esc(s.cond) : ''} → ${esc(s.then)}</div></div>`; }).join('') || '<p class="small muted">None yet.</p>'}</div></div>
+  <div class="card" style="margin-top:16px"><h3>How sending works</h3><p class="small muted" style="margin-top:6px">Every message — confirmations, ticket changes, reminders, campaigns, automation emails and texts — goes through one outbox. Just before sending, consent is checked again:
+    ticket and order emails go to every buyer (unless the address bounced or was suppressed); <b>marketing</b> needs a recorded opt-in and no unsubscribe; texts need a mobile number and no STOP reply, and marketing texts their own opt-in.
+    ${DB.live ? 'The sender runs every minute (Resend for email, the text provider for SMS).' : '<b>Demo mode:</b> messages are marked “sent” in this browser — nothing actually leaves it.'}</p></div>`;
+}
+function CampaignRows(list) {
+  const ob = S.adm.outbox || [];
+  return list.map(b => { const ms = ob.filter(m => m.campaign_id === b.id), st = k => ms.filter(m => m.status === k).length, sk = Object.values(b.skipped || {}).reduce((a, x) => a + x, 0);
+    return `<div class="line small"><div class="between"><span><b>${esc(b.name || b.subject)}</b> <span class="chip mini ${b.category === 'marketing' ? 'info' : ''}">${b.kind === 'waitlist' ? 'waitlist' : b.category === 'marketing' ? 'marketing' : 'event update'}</span> <span class="muted">${esc(b.channel === 'both' ? 'email + text' : b.channel === 'sms' ? 'text' : 'email')}</span></span>
+      <span>${b.status === 'scheduled' ? `<span class="chip info mini">scheduled ${esc(fmtDT(b.send_at))}</span>` : b.status === 'cancelled' ? '<span class="chip mini">cancelled</span>' : `<span class="chip ok mini">sent ${esc(ago(b.send_at || b.created_at))}</span>`}</span></div>
+      <div class="muted">${b.event_id ? esc(evName(b.event_id)) + ' · ' : ''}${esc(segLabel(b.filter || {}, evName))} · ${b.recipients ?? 0} matched · ${b.queued ?? ms.length} queued${sk ? ` · ${sk} held back (${esc(Object.entries(b.skipped).map(([k, n]) => n + ' ' + k).join(', '))})` : ''}
+        ${ms.length ? ` · ${st('sent')} sent${st('failed') ? `, <span style="color:var(--bad)">${st('failed')} failed</span>` : ''}${st('suppressed') ? `, ${st('suppressed')} held` : ''}` : ''}</div>
+      ${b.status === 'scheduled' && (b.category === 'marketing' ? can('comms.marketing') : can('comms.email')) ? `<button class="btn btn-ghost btn-sm" style="margin-top:4px" data-action="cmpCancel" data-id="${b.id}">Cancel</button>` : ''}</div>`; }).join('') || '<p class="small muted" style="margin-top:6px">Nothing sent yet.</p>';
+}
+// the audience filter, used by campaigns, the audience page and the customer list. p = the S.ui key holding { filter }
+function SegEditor(p, opt = {}) {
+  const f = S.ui[p].filter, evs = S.adm.events.filter(e => !e.archived || f.eventIds.includes(e.id)), chosen = f.eventIds.length ? evs.filter(e => f.eventIds.includes(e.id)) : evs;
+  const tts = chosen.flatMap(e => e.ticketTypes.map(t => ({ id: t.id, name: t.name + (f.eventIds.length === 1 ? '' : ' · ' + e.name) })));
+  const areas = [...new Set(S.adm.tickets.filter(t => t.area && chosen.some(e => e.id === t.event_id)).map(t => t.area))].sort();
+  const tog = (k, v, label) => `<button type="button" class="chip-btn ${f[k].includes(v) ? 'on' : ''}" data-action="segTog" data-p="${p}" data-k="${k}" data-v="${esc(v)}">${esc(label)}</button>`;
+  const ro = !!opt.transactional;
+  return `<div class="seg">
+    ${ro ? '' : `<div class="field"><label class="fl">Who</label><select class="inp" data-action-change="segVal" data-p="${p}" data-k="status">${Object.entries(SEG_STATUS).map(([k, l]) => `<option value="${k}" ${f.status === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>`}
+    <div class="field"><label class="fl">Event${ro ? ' — ticket holders of' : 's (bought tickets for any of)'}</label><div class="chips">${evs.map(e => tog('eventIds', e.id, e.name)).join('') || '<span class="small muted">No events</span>'}</div></div>
+    ${tts.length ? `<details ${f.ticketTypeIds.length || f.areas.length ? 'open' : ''}><summary class="small">Ticket type & seating area</summary><div class="field" style="margin-top:8px"><label class="fl">Ticket types</label><div class="chips">${tts.slice(0, 40).map(t => tog('ticketTypeIds', t.id, t.name)).join('')}</div></div>
+      ${areas.length ? `<div class="field"><label class="fl">Seating areas</label><div class="chips">${areas.map(a => tog('areas', a, a)).join('')}</div></div>` : ''}</details>` : ''}
+    <details ${f.from || f.to || f.promo || f.tracking || f.checkin !== 'any' || f.tags.length ? 'open' : ''}><summary class="small">Purchase date, codes, check-in, tags</summary>
+      <div class="grid2" style="margin-top:8px"><div class="field"><label class="fl">Bought from</label><input class="inp" type="date" data-action-change="segVal" data-p="${p}" data-k="from" value="${esc(f.from)}"></div>
+        <div class="field"><label class="fl">Bought until</label><input class="inp" type="date" data-action-change="segVal" data-p="${p}" data-k="to" value="${esc(f.to)}"></div>
+        <div class="field"><label class="fl">Promo code used</label><select class="inp" data-action-change="segVal" data-p="${p}" data-k="promo"><option value="">Any</option>${(S.adm.promos || []).map(x => `<option ${f.promo === x.code ? 'selected' : ''}>${esc(x.code)}</option>`).join('')}</select></div>
+        <div class="field"><label class="fl">Tracking / referral code</label><select class="inp" data-action-change="segVal" data-p="${p}" data-k="tracking"><option value="">Any</option>${(S.adm.tracking || []).map(x => `<option ${f.tracking === x.code ? 'selected' : ''}>${esc(x.code)}</option>`).join('')}</select></div>
+        <div class="field"><label class="fl">Checked in</label><select class="inp" data-action-change="segVal" data-p="${p}" data-k="checkin">${[['any', 'Either'], ['in', 'Checked in'], ['out', 'Not checked in']].map(([k, l]) => `<option value="${k}" ${f.checkin === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+        ${ro ? '' : `<div class="field"><label class="fl">Customer tags</label><input class="inp" data-action-change="segVal" data-p="${p}" data-k="tags" value="${esc(f.tags.join(', '))}" placeholder="e.g. VIP, Press"></div>`}</div></details>
+  </div>`;
+}
+const newCampaign = (o = {}) => ({ name: '', channel: 'email', category: 'marketing', subject: '', body: '', sendAt: '', segId: '', filter: { ...emptySeg(), status: 'optedIn' }, ...o });
+function MkCampaigns() {
+  const c = S.ui.cmp ||= newCampaign(), people = admPeople(c.category === 'transactional' ? { ...c.filter, status: 'buyers' } : c.filter), cat = c.category;
+  const chans = c.channel === 'both' ? ['email', 'sms'] : [c.channel], reach = ch => people.filter(p => !sendGate(p.contact, ch, cat, ch === 'email' ? p.email : p.phone)).length;
+  const canSend = cat === 'marketing' ? can('comms.marketing') : can('comms.email') || can('comms.notify'), segs = S.adm.bo.segments || [];
+  const sample = people[0], pm = { kind: cat === 'marketing' ? 'campaign' : 'update', channel: chans[0], category: cat, subject: c.subject, body: c.body, email: sample?.email || '' };
+  return `<div class="cols"><div class="card"><h3>New ${cat === 'marketing' ? 'campaign' : 'event update'}</h3>
+    <div class="grid2" style="margin-top:10px"><div class="field"><label class="fl">Type</label><select class="inp" data-bind="ui.cmp.category"><option value="marketing" ${cat === 'marketing' ? 'selected' : ''}>Marketing — opted-in contacts only</option>
+      <option value="transactional" ${cat === 'transactional' ? 'selected' : ''}>Event update — ticket holders (venue change, doors, last-minute news)</option></select></div>
+      <div class="field"><label class="fl">Send as</label><select class="inp" data-bind="ui.cmp.channel">${[['email', 'Email'], ['sms', 'Text message'], ['both', 'Email + text']].filter(([k]) => k === 'email' || can('comms.sms')).map(([k, l]) => `<option value="${k}" ${c.channel === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>
+    ${cat === 'marketing' && segs.length ? `<div class="field"><label class="fl">Saved segment</label><select class="inp" data-action-change="cmpSeg"><option value="">Custom audience…</option>${segs.map(s => `<option value="${s.id}" ${c.segId === s.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select></div>` : ''}
+    ${SegEditor('cmp', { transactional: cat === 'transactional' })}
+    <div class="reach"><b>${people.length}</b> ${people.length === 1 ? 'person matches' : 'people match'} · ${chans.map(ch => `<b>${reach(ch)}</b> can get ${ch === 'email' ? 'this email' : 'this text'}`).join(' · ')}
+      ${cat === 'marketing' ? '<div class="small muted">Marketing only reaches people who opted in and haven’t unsubscribed.</div>' : '<div class="small muted">Event updates go to every ticket holder of the chosen event(s) — keep them to event information, not promotion.</div>'}</div>
+    ${chans.includes('email') ? `<div class="field"><label class="fl">Subject</label><input class="inp" data-bind="ui.cmp.subject" value="${esc(c.subject)}" placeholder="e.g. Doors now open at 6:30"></div>` : ''}
+    <div class="field"><label class="fl">Message</label><textarea class="inp" rows="7" data-bind="ui.cmp.body" placeholder="Hi {{first_name}}, …">${esc(c.body)}</textarea>
+      <div class="small muted" style="margin-top:4px">Personalise with ${MSG_VARS.slice(0, 11).map(([k, l]) => `<code title="${esc(l)}">{{${k}}}</code>`).join(' ')}${c.channel !== 'email' ? ' · Texts: keep it short; “Reply STOP to opt out” is added to marketing texts.' : ''}</div></div>
+    <div class="grid2"><div class="field"><label class="fl">When</label><input class="inp" type="datetime-local" data-bind="ui.cmp.sendAt" value="${esc(c.sendAt)}"><div class="small muted" style="margin-top:4px">Leave empty to send now.</div></div>
+      <div class="field"><label class="fl">Internal name (optional)</label><input class="inp" data-bind="ui.cmp.name" value="${esc(c.name)}"></div></div>
+    <div class="row wrap">${canSend ? `<button class="btn btn-accent" data-action="cmpSend">${c.sendAt ? 'Schedule' : 'Send now'} to ${chans.map(reach).reduce((a, b) => Math.max(a, b), 0)}</button>` : '<span class="small muted">You don’t have permission to send this.</span>'}
+      <button class="btn btn-ghost" data-action="cmpPreview" ${c.body ? '' : 'disabled'}>Preview</button></div>
+    ${c.body && sample ? `<div class="sep"></div><div class="fl">Preview for ${esc(sample.name || sample.email)}</div>${msgPreview(pm)}` : ''}</div>
+  <div class="card"><h3>Campaigns & updates</h3>${CampaignRows((S.adm.broadcasts || []).slice().sort((a, b) => D(b.send_at || b.created_at) - D(a.send_at || a.created_at)))}</div></div>`;
+}
+const newAuto = () => ({ name: '', enabled: true, trigger: { type: 'ticket.purchased', hours: 24 }, cond: { eventIds: [], ticketTypeIds: [], areas: [], prices: [], minQty: 0, promo: '', tags: [] }, timing: { mode: 'now', hours: 0 }, actions: [{ type: 'email', category: 'transactional', subject: '', body: '' }], promo: '' });
+function MkAutomations() {
+  if (S.ui.au) return AutoEditor(S.ui.au);
+  const all = S.adm.automations || [], std = all.filter(a => a.std), mine = all.filter(a => !a.std), ed = can('comms.automations');
+  const row = a => { const s = autoSentence(a, evName); return `<div class="item-card" style="margin-top:10px"><div class="between"><b>${esc(a.name)}</b><span class="row">${ed ? `<label class="switch-sm"><input type="checkbox" data-action="auToggle" data-id="${a.id}" ${a.enabled ? 'checked' : ''}> ${a.enabled ? 'On' : 'Off'}</label>
+      <button class="btn btn-ghost btn-sm" data-action="auEdit" data-id="${a.id}">Edit</button>${a.std ? '' : `<button class="btn btn-ghost btn-sm" data-action="auDel" data-id="${a.id}">Delete</button>`}` : a.enabled ? '<span class="chip ok mini">on</span>' : '<span class="chip mini">off</span>'}</span></div>
+    <div class="auto-flow small"><span><i>When</i> ${esc(s.when)}</span>${s.cond ? `<span><i>If</i> ${esc(s.cond)}</span>` : ''}<span><i>Then</i> ${esc(s.then)}</span></div>
+    <div class="small muted">${a.runs ? `Ran ${a.runs} time${a.runs === 1 ? '' : 's'} · last ${esc(ago(a.last_run))}` : 'Hasn’t run yet'}${a.std === 'purchase' ? ' · Plus, always: the order confirmation email (built in), purchase analytics, and tracking pixels on the order page (Meta Conversions API too when connected).' : ''}${a.std === 'pre' ? ' · Events with their own reminders (Event → Emails) use those instead.' : ''}</div></div>`; };
+  return `<div class="cols"><div><div class="between"><h3>Standard workflows</h3></div><p class="small muted">Purchase → confirmation, audience, analytics, pixels · 24 h before → reminder with the ticket link · after the event → thank you, feedback, optional next-event offer.</p>${std.map(row).join('')}</div>
+    <div><div class="between"><h3>Your automations</h3>${ed ? `<button class="btn btn-accent btn-sm" data-action="auNew">${ic('plus', 14)} New automation</button>` : ''}</div><p class="small muted">Trigger → conditions → actions. Example: when someone buys VIP, 48 hours before the event, send VIP instructions by email and text.</p>${mine.map(row).join('') || '<p class="small muted" style="margin-top:10px">None yet.</p>'}</div></div>`;
+}
+function AutoEditor(a) {
+  const T = a.trigger.type, timed = TIMED_TRIGGERS.includes(T), c = a.cond, evs = S.adm.events.filter(e => !e.archived), chosen = c.eventIds.length ? evs.filter(e => c.eventIds.includes(e.id)) : evs;
+  const tog = (k, v, label) => `<button type="button" class="chip-btn ${c[k].includes(v) ? 'on' : ''}" data-action="auTog" data-k="${k}" data-v="${esc(v)}">${esc(label)}</button>`;
+  const prices = [...new Set(chosen.flatMap(e => e.ticketTypes.map(t => +t.price || 0)))].sort((x, y) => x - y), areas = [...new Set(S.adm.tickets.filter(t => t.area && chosen.some(e => e.id === t.event_id)).map(t => t.area))].sort();
+  const igs = S.adm.integrations || [], act = (x, i) => { const f = (k, l, ph = '', area) => area ? `<div class="field"><label class="fl">${l}</label><textarea class="inp" rows="4" data-bind="ui.au.actions.${i}.${k}" placeholder="${esc(ph)}">${esc(x[k] || '')}</textarea></div>` : `<div class="field"><label class="fl">${l}</label><input class="inp" data-bind="ui.au.actions.${i}.${k}" value="${esc(x[k] || '')}" placeholder="${esc(ph)}"></div>`;
+    return `<div class="item-card" style="margin-top:10px"><div class="between"><b class="small">${i + 1}. ${AUTO_ACTIONS[x.type]}</b><button class="btn btn-ghost btn-sm" data-action="auActDel" data-i="${i}">Remove</button></div>
+      ${x.type === 'email' || x.type === 'sms' ? `<div class="field"><label class="fl">Kind</label><select class="inp" data-bind="ui.au.actions.${i}.category"><option value="transactional" ${x.category !== 'marketing' ? 'selected' : ''}>Event / ticket information — every buyer</option><option value="marketing" ${x.category === 'marketing' ? 'selected' : ''}>Marketing — opted-in only</option></select></div>
+        ${x.type === 'email' ? f('subject', 'Subject') : ''}${f('body', 'Message', 'Hi {{first_name}}, …', true)}${x.type === 'email' ? f('link', 'Link for {{link}} (optional — e.g. a feedback form)', 'https://…') : ''}` : ''}
+      ${x.type === 'tag' || x.type === 'untag' ? f('tag', 'Tag', 'e.g. VIP or Attendee: {{event}}') : ''}
+      ${x.type === 'staff' ? f('to', 'Staff email', 'name@your-box-office.com') + f('subject', 'Subject') + f('body', 'Note', '', true) : ''}
+      ${x.type === 'webhook' || x.type === 'crm' ? `<div class="field"><label class="fl">${x.type === 'webhook' ? 'Webhook' : 'CRM'}</label><select class="inp" data-bind="ui.au.actions.${i}.integrationId"><option value="">Choose…</option>${igs.filter(g => x.type === 'webhook' ? g.kind === 'webhook' : INTEGRATIONS[g.kind]?.crm).map(g => `<option value="${g.id}" ${x.integrationId === g.id ? 'selected' : ''}>${esc(g.name)} · ${esc(INTEGRATIONS[g.kind].name)}</option>`).join('')}</select>${igs.length ? '' : '<div class="small muted" style="margin-top:4px">Connect one under Integrations first.</div>'}</div>` : ''}</div>`; };
+  return `<a href="#/admin/marketing/automations" class="small muted" data-action="auCancel" style="text-decoration:none">← Automations</a>${head(a.id ? esc(a.name) : 'New automation', 'Trigger → conditions → actions', `<button class="btn btn-ghost" data-action="auCancel">Cancel</button><button class="btn btn-accent" data-action="auSave">Save automation</button>`)}
+  <div class="cols"><div class="stack"><div class="card"><div class="field"><label class="fl">Name</label><input class="inp" data-bind="ui.au.name" value="${esc(a.name)}" placeholder="e.g. VIP arrival instructions"></div>
+      <label class="check"><input type="checkbox" data-bind="ui.au.enabled" data-t="bool" ${a.enabled ? 'checked' : ''}> <span>On</span></label></div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:10px">1 · Trigger</div><div class="grid2"><div class="field"><label class="fl">When</label><select class="inp" data-bind="ui.au.trigger.type" ${a.std ? 'disabled' : ''}>${Object.entries(AUTO_TRIGGERS).map(([k, l]) => `<option value="${k}" ${T === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      ${timed ? `<div class="field"><label class="fl">Hours ${T === 'event.approaching' ? 'before it starts' : 'after it ends'}</label><input class="inp" type="number" min="0" max="720" data-bind="ui.au.trigger.hours" data-t="int" value="${+a.trigger.hours || 0}"></div>` : ''}</div>
+      ${T === 'cart.abandoned' ? '<p class="small muted">A card checkout left unpaid until its timer ran out (the buyer gave their email).</p>' : T === 'no_show' ? '<p class="small muted">Nobody on the order checked in by the end of the event.</p>' : ''}</div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:10px">2 · Conditions <span class="muted" style="text-transform:none;letter-spacing:0">(all optional)</span></div>
+      <div class="field"><label class="fl">Events</label><div class="chips">${evs.map(e => tog('eventIds', e.id, e.name)).join('')}</div></div>
+      <div class="field"><label class="fl">Ticket types</label><div class="chips">${chosen.flatMap(e => e.ticketTypes.map(t => tog('ticketTypeIds', t.id, t.name + (chosen.length > 1 ? ' · ' + e.name : '')))).slice(0, 40).join('')}</div></div>
+      ${areas.length ? `<div class="field"><label class="fl">Seating areas</label><div class="chips">${areas.map(x => tog('areas', x, x)).join('')}</div></div>` : ''}
+      ${prices.length ? `<div class="field"><label class="fl">Price levels</label><div class="chips">${prices.map(x => `<button type="button" class="chip-btn ${c.prices.includes(x) ? 'on' : ''}" data-action="auTog" data-k="prices" data-v="${x}" data-num="1">${money(x)}</button>`).join('')}</div></div>` : ''}
+      <div class="grid3"><div class="field"><label class="fl">At least … tickets</label><input class="inp" type="number" min="0" data-bind="ui.au.cond.minQty" data-t="int" value="${+c.minQty || 0}"></div>
+        <div class="field"><label class="fl">Promo code</label><select class="inp" data-bind="ui.au.cond.promo"><option value="">Any / none</option>${(S.adm.promos || []).map(x => `<option ${c.promo === x.code ? 'selected' : ''}>${esc(x.code)}</option>`).join('')}</select></div>
+        <div class="field"><label class="fl">Customer has tags</label><input class="inp" data-action-change="auTags" value="${esc(c.tags.join(', '))}" placeholder="VIP"></div></div></div></div>
+  <div class="stack"><div class="card"><div class="eyebrow dash" style="margin-bottom:10px">3 · Actions</div>
+      <div class="grid2"><div class="field"><label class="fl">Send</label><select class="inp" data-bind="ui.au.timing.mode">${Object.entries(TIMING).map(([k, l]) => `<option value="${k}" ${a.timing.mode === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+        ${a.timing.mode !== 'now' ? `<div class="field"><label class="fl">Hours</label><input class="inp" type="number" min="0" max="720" data-bind="ui.au.timing.hours" data-t="int" value="${+a.timing.hours || 0}"></div>` : ''}</div>
+      ${a.std === 'offer' ? `<div class="field"><label class="fl">Promo code for {{promo_code}}</label><select class="inp" data-bind="ui.au.promo"><option value="">Choose…</option>${(S.adm.promos || []).map(x => `<option ${a.promo === x.code ? 'selected' : ''}>${esc(x.code)}</option>`).join('')}</select></div>` : ''}
+      ${a.actions.map(act).join('')}
+      <div class="row wrap" style="margin-top:12px">${Object.entries(AUTO_ACTIONS).filter(([k]) => k !== 'sms' || can('comms.sms')).map(([k, l]) => `<button class="btn btn-ghost btn-sm" data-action="auActAdd" data-v="${k}">${ic('plus', 12)} ${l}</button>`).join('')}</div>
+      <p class="small muted" style="margin-top:10px">Placeholders: ${MSG_VARS.map(([k, l]) => `<code title="${esc(l)}">{{${k}}}</code>`).join(' ')}</p></div></div></div>`;
+}
+function MkAudience() {
+  const au = S.ui.aud ||= { filter: emptySeg(), name: '' }, people = admPeople(au.filter), cs = S.adm.contacts || [], segs = S.adm.bo.segments || [];
+  const sup = cs.filter(c => c.suppressed || c.unsub_email_at || c.unsub_sms_at), log = (S.adm.consentLog || []).slice(0, 60);
+  const kpi = (l, v, d = '') => `<div class="kpi"><div class="eyebrow">${l}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`;
+  return `<div class="kpis">${kpi('Contacts', cs.length)}${kpi('Email opt-ins', cs.filter(c => c.email_optin && !c.unsub_email_at && !c.suppressed).length)}${kpi('Text opt-ins', cs.filter(c => c.sms_optin && !c.unsub_sms_at).length)}${kpi('Unsubscribed / suppressed', sup.length)}</div>
+  <div class="cols"><div class="card"><h3>Segment</h3>${segs.length ? `<div class="chips" style="margin:8px 0">${segs.map(s => `<button class="chip-btn" data-action="segLoad" data-id="${s.id}">${esc(s.name)}</button>`).join('')}</div>` : ''}${SegEditor('aud')}
+      <div class="reach"><b>${people.length}</b> people · ${people.filter(p => !sendGate(p.contact, 'email', 'marketing', p.email)).length} reachable by marketing email · ${people.filter(p => !sendGate(p.contact, 'sms', 'marketing', p.phone)).length} by marketing text</div>
+      <div class="row wrap">${can('customers.export') ? '<button class="btn btn-ghost btn-sm" data-action="audExport">Export CSV</button>' : ''}${can('comms.lists') ? `<input class="inp inp-sm" style="width:200px" data-input="aud.name" value="${esc(au.name)}" placeholder="Segment name"><button class="btn btn-ghost btn-sm" data-action="segSave">Save segment</button>` : ''}
+        ${can('comms.marketing') ? '<button class="btn btn-dark btn-sm" data-action="segCampaign">Email this segment</button>' : ''}</div>
+      ${segs.length && can('comms.lists') ? `<div class="small muted" style="margin-top:10px">Saved: ${segs.map(s => `${esc(s.name)} <a href="#" data-action="segDel" data-id="${s.id}" title="Delete">×</a>`).join(' · ')}</div>` : ''}</div>
+    <div class="card" style="padding:0"><div class="tbl-wrap" style="border:0;box-shadow:none"><table class="tbl"><thead><tr><th>Person</th><th>Consent</th><th>Tags</th><th>Spent</th></tr></thead><tbody>
+      ${people.slice(0, 150).map(p => `<tr class="click" data-action="go" data-v="#/admin/customers/${encodeURIComponent(p.email)}"><td><b>${esc(p.name || '—')}</b><div class="small muted">${esc(p.email)}${p.phone ? ' · ' + esc(p.phone) : ''}</div></td>
+        <td>${consentChips(p.contact, p.phone)}</td><td>${(p.contact?.tags || []).map(t => `<span class="chip mini">${esc(t)}</span>`).join(' ')}</td><td class="tnum">${money(p.spent)}</td></tr>`).join('') || '<tr><td colspan="4" class="empty">Nobody matches.</td></tr>'}</tbody></table></div>
+      ${people.length > 150 ? `<p class="small muted" style="padding:10px 16px">Showing 150 of ${people.length} — export for the full list.</p>` : ''}</div></div>
+  <div class="cols" style="margin-top:16px"><div class="card"><h3>Suppression & unsubscribes</h3><p class="small muted" style="margin:4px 0 10px">Suppressed addresses get no email at all (bounces, complaints, requests); unsubscribed people still get their tickets and event information.</p>
+      ${can('comms.consent') ? `<div class="row"><input class="inp" data-input="supEmail" value="${esc(S.ui.supEmail || '')}" placeholder="email@example.com"><button class="btn btn-ghost btn-sm" data-action="supAdd">Suppress</button></div>` : ''}
+      ${sup.slice(0, 80).map(c => `<div class="between small line"><span>${esc(c.email)}<div class="muted">${c.suppressed ? `suppressed (${esc(c.suppressed)}) ${esc(fmtDT(c.suppressed_at))}` : ''}${c.unsub_email_at ? ` unsubscribed ${esc(fmtDT(c.unsub_email_at))}` : ''}${c.unsub_sms_at ? ` · texts stopped ${esc(fmtDT(c.unsub_sms_at))}` : ''}</div></span>
+        ${can('comms.consent') && c.suppressed ? `<button class="btn btn-ghost btn-sm" data-action="ctAct" data-v="unsuppress" data-email="${esc(c.email)}">Remove</button>` : ''}</div>`).join('') || '<p class="small muted">Nobody.</p>'}</div>
+    <div class="card"><h3>Consent history</h3><p class="small muted" style="margin:4px 0 10px">Every opt-in and opt-out with its date and source.</p>${log.map(r => `<div class="between small line"><span><b>${esc(r.email)}</b> · ${esc(CONSENT_LABEL[r.action.split(':')[0]] || r.action)}${r.action.includes(':') ? ' (' + esc(r.action.split(':')[1]) + ')' : ''}<div class="muted">${esc(r.source)} · ${esc(r.by)}</div></span><span class="muted">${esc(fmtDT(r.at))}</span></div>`).join('') || '<p class="small muted">No changes yet.</p>'}</div></div>`;
+}
+const CONSENT_LABEL = { optin: 'opted in to email', optout: 'unsubscribed from email', sms_optin: 'opted in to texts', sms_optout: 'stopped texts', sms_start: 'allowed texts again', suppress: 'suppressed', unsuppress: 'suppression removed' };
+function MkMessages() {
+  const q = S.ui.mq ||= { status: '', channel: '', kind: '', text: '' }, t = q.text.trim().toLowerCase();
+  const list = (S.adm.outbox || []).filter(m => (!q.status || (q.status === 'scheduled' ? m.status === 'queued' && D(m.send_at) > Date.now() + 6e4 : m.status === q.status)) && (!q.channel || (m.channel || 'email') === q.channel)
+    && (!q.kind || m.kind === q.kind) && (!t || [m.to, m.email, m.subject, m.body].join(' ').toLowerCase().includes(t))).sort((a, b) => D(b.send_at || b.at) - D(a.send_at || a.at));
+  const sel = (k, opts) => `<select class="inp" data-bind="ui.mq.${k}">${opts.map(([v, l]) => `<option value="${v}" ${q[k] === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+  return `<div class="toolbar">${sel('status', [['', 'Any status'], ['scheduled', 'Scheduled'], ...Object.entries(MSG_STATUS)])}${sel('channel', [['', 'Email & text'], ['email', 'Email'], ['sms', 'Text']])}${sel('kind', [['', 'Every kind'], ...Object.entries(MSG_KINDS).map(([k, v]) => [k, v[0]])])}
+    <input class="inp" style="flex:1" data-input="mq.text" placeholder="Search address or subject…" value="${esc(q.text)}"><button class="btn btn-ghost btn-sm" data-action="mqGo">Search</button></div>
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>When</th><th>Message</th><th>To</th><th>Status</th><th></th></tr></thead><tbody>
+  ${list.slice(0, 300).map(m => `<tr class="click" data-action="msgOpen" data-id="${m.id}"><td class="small muted">${esc(fmtDT(m.sent_at || m.send_at || m.at))}</td><td><b>${esc(kindLabel(m))}</b> <span class="chip mini ${m.category === 'marketing' ? 'info' : ''}">${esc(m.category || 'transactional')}</span><div class="small muted">${esc(MailTpl.fill(m.subject || '', { event: evById(m.event_id)?.name || '' }).slice(0, 80))}</div></td>
+    <td class="small">${esc(m.to)}</td><td>${msgChip(m)}${m.error ? `<div class="small muted">${esc(m.error)}</div>` : ''}</td>
+    <td data-stop="1">${m.status === 'queued' ? `<button class="btn btn-ghost btn-sm" data-action="msgCancel" data-id="${m.id}">Cancel</button>` : ['failed', 'suppressed'].includes(m.status) ? `<button class="btn btn-ghost btn-sm" data-action="msgRetry" data-id="${m.id}">Retry</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">No messages.</td></tr>'}</tbody></table></div>
+  ${list.length > 300 ? `<p class="small muted" style="margin-top:8px">Showing the latest 300 of ${list.length}.</p>` : ''}`;
+}
+// where buyers came from: views (by ?src / utm_source), checkouts started, purchases, revenue, conversion — plus UTM campaigns
+function attribution() {
+  const rows = {}, R = k => rows[k] ||= { k, views: 0, checkouts: 0, orders: 0, tickets: 0, rev: 0 }, camps = {};
+  for (const v of Object.values(S.adm.views || {})) for (const [k, n] of Object.entries(v.bySrc || {})) R(k || 'direct').views += n;
+  for (const o of S.adm.orders) {
+    if (o.data.payment === 'manual') continue;
+    const k = o.data.utm?.source || o.data.source || 'direct', r = R(k), done = wasPaid(o) || o.status === 'pending';
+    r.checkouts++; if (done) { r.orders++; r.tickets += S.adm.tickets.filter(t => t.order_id === o.id && t.status !== 'replaced').length; r.rev += o.data.total || 0; }
+    if (o.data.utm?.campaign) { const c = camps[o.data.utm.campaign] ||= { k: o.data.utm.campaign, src: new Set(), checkouts: 0, orders: 0, rev: 0 }; c.src.add([o.data.utm.source, o.data.utm.medium].filter(Boolean).join(' / ')); c.checkouts++; if (done) { c.orders++; c.rev += o.data.total || 0; } }
+  }
+  return { rows: Object.values(rows).sort((a, b) => b.orders - a.orders || b.views - a.views), camps: Object.values(camps).sort((a, b) => b.orders - a.orders) };
+}
+function MkTracking() {
+  const px = S.adm.bo.settings.pixels || {}, a = attribution(), u = S.ui.utm ||= { ev: '', source: '', medium: '', campaign: '' }, fin = can('finance.totals'), pct = (x, y) => y ? (x / y * 100).toFixed(1) + '%' : '—';
+  const ev = evById(u.ev), qs = ['source', 'medium', 'campaign'].filter(k => u[k]).map(k => `utm_${k}=${encodeURIComponent(u[k].trim().toLowerCase().replace(/\s+/g, '-'))}`).join('&');
+  const link = location.origin + location.pathname + (ev ? '#/e/' + ev.slug : '#/b/' + S.adm.bo.slug) + (qs ? '?' + qs : '');
+  const pr = (S.adm.promos || []).map(p => { const os = S.adm.orders.filter(o => o.data.promo?.id === p.id && (wasPaid(o) || o.status === 'pending')); return { p, orders: os.length, rev: sum(os, o => o.data.total), disc: sum(os, o => (o.data.discount || 0) + (o.data.feeDiscount || 0)) }; }).filter(x => x.orders).sort((x, y) => y.orders - x.orders);
+  return `<div class="cols"><div class="card"><h3>Pixels & analytics</h3><div class="kv-grid" style="margin-top:10px">${[['Google Analytics 4', px.ga4], ['Meta Pixel', px.meta], ['TikTok Pixel', px.tiktok]].map(([k, v]) => `<div><div class="eyebrow">${k}</div><div class="small">${v ? `<span class="chip ok mini">on</span> <code>${esc(v)}</code>` : '<span class="chip mini">not set</span>'}</div></div>`).join('')}
+      <div><div class="eyebrow">Meta Conversions API</div><div class="small">${(S.adm.integrations || []).some(g => g.kind === 'meta_capi' && g.active) ? '<span class="chip ok mini">connected</span>' : '<span class="chip mini">not connected</span>'}</div></div></div>
+      <p class="small muted" style="margin-top:10px">Pixels load on public pages only and report page views, “view content” on event pages, “initiate checkout” and “purchase” (with the order value; the purchase is matched with the Conversions API so it isn’t counted twice).${px.consent ? ' A cookie banner asks first.' : ''} Set the IDs in <a href="#/admin/settings">Settings → Tracking</a>.</p></div>
+    <div class="card"><h3>Campaign link builder</h3><p class="small muted" style="margin:4px 0 10px">UTM tags are kept with the buyer’s order, so sales show up by source and campaign below.</p>
+      <div class="grid2"><div class="field"><label class="fl">Page</label><select class="inp" data-bind="ui.utm.ev"><option value="">Box office home</option>${S.adm.events.filter(e => !e.archived).map(e => `<option value="${e.id}" ${u.ev === e.id ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select></div>
+        <div class="field"><label class="fl">Source</label><input class="inp" data-input="utm.source" value="${esc(u.source)}" placeholder="instagram"></div>
+        <div class="field"><label class="fl">Medium</label><input class="inp" data-input="utm.medium" value="${esc(u.medium)}" placeholder="social, email, paid"></div>
+        <div class="field"><label class="fl">Campaign</label><input class="inp" data-input="utm.campaign" value="${esc(u.campaign)}" placeholder="winter-launch"></div></div>
+      <div class="row"><input class="inp" readonly value="${esc(link)}"><button class="btn btn-ghost btn-sm" data-action="utmBuild">Update</button><button class="btn btn-dark btn-sm" data-action="copyLink" data-v="${esc(link)}">Copy</button></div>
+      <p class="small muted" style="margin-top:8px">Promoters and partners: give them a tracking code on <a href="#/admin/promos/tracking">Promotions</a> (<code>?ref=CODE</code>).</p></div></div>
+  <div class="card" style="padding:0;margin-top:16px"><div style="padding:16px 20px 6px"><h3>Traffic source → purchase</h3></div><div class="tbl-wrap" style="border:0;box-shadow:none"><table class="tbl"><thead><tr><th>Source</th><th>Event page views</th><th>Checkouts</th><th>Purchases</th><th>Tickets</th>${fin ? '<th>Revenue</th>' : ''}<th>View → purchase</th><th>Checkout → purchase</th></tr></thead><tbody>
+    ${a.rows.map(r => `<tr><td><b>${esc(r.k)}</b></td><td class="tnum">${r.views.toLocaleString()}</td><td class="tnum">${r.checkouts}</td><td class="tnum">${r.orders}</td><td class="tnum">${r.tickets}</td>${fin ? `<td class="tnum">${money(r.rev)}</td>` : ''}<td class="tnum">${pct(r.orders, r.views)}</td><td class="tnum">${pct(r.orders, r.checkouts)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No traffic yet.</td></tr>'}</tbody></table></div></div>
+  <div class="cols" style="margin-top:16px"><div class="card"><h3>UTM campaigns</h3>${a.camps.map(c => `<div class="between small line"><span><b>${esc(c.k)}</b><div class="muted">${esc([...c.src].join(', '))}</div></span><span class="tnum">${c.orders} of ${c.checkouts} checkouts${fin ? ' · ' + money(c.rev) : ''}</span></div>`).join('') || '<p class="small muted" style="margin-top:6px">No orders with UTM tags yet — build a link above.</p>'}</div>
+    <div class="card"><h3>Promo-code attribution</h3>${pr.map(x => `<a class="between small line" style="text-decoration:none" href="#/admin/promos/code/${x.p.id}"><b class="tnum">${esc(x.p.code)}</b><span class="tnum">${x.orders} orders${fin ? ` · ${money(x.rev)} · ${money(x.disc)} off` : ''}</span></a>`).join('') || '<p class="small muted" style="margin-top:6px">No orders with codes yet.</p>'}</div></div>`;
+}
+function MkIntegrations() {
+  if (!can('admin.integrations') && !can('admin.api')) return '<div class="empty">You need “Access integrations” or “Access API settings”.</div>';
+  const igs = S.adm.integrations || [], dl = (S.adm.deliveries || []).slice(0, 40), f = S.ui.ig, keys = S.adm.apiKeys || [];
+  const form = f ? (() => { const def = INTEGRATIONS[f.kind]; return `<div class="card" style="margin-bottom:16px"><h3>${f.id ? 'Edit' : 'Connect'} ${esc(def.name)}</h3><p class="small muted" style="margin:4px 0 10px">${esc(def.blurb)}</p>
+      <div class="grid2"><div class="field"><label class="fl">Name</label><input class="inp" data-bind="ui.ig.name" value="${esc(f.name)}"></div>${def.fields.map(([k, l]) => `<div class="field"><label class="fl">${esc(l)}</label><input class="inp" data-bind="ui.ig.config.${k}" value="${esc(f.config[k] || '')}"></div>`).join('')}
+        ${def.secret ? `<div class="field"><label class="fl">${esc(def.secret)}</label><input class="inp" type="password" autocomplete="off" data-bind="ui.ig.secret" value="" placeholder="${f.secret_hint ? 'saved ' + esc(f.secret_hint) + ' — leave empty to keep' : 'paste it here'}"><div class="small muted" style="margin-top:4px">Stored on the server only — never shown again.</div></div>` : ''}</div>
+      ${f.kind === 'webhook' ? `<div class="field"><label class="fl">Send these events</label><div class="chips">${Object.entries(HOOK_EVENTS).map(([k, l]) => `<button type="button" class="chip-btn ${(f.config.events || []).includes(k) ? 'on' : ''}" data-action="igEv" data-v="${k}">${l}</button>`).join('')}</div></div>` : ''}
+      ${def.crm ? `<div class="field"><label class="fl">Who to sync</label><select class="inp" data-bind="ui.ig.config.who"><option value="optedIn" ${f.config.who !== 'all' ? 'selected' : ''}>Only people who opted in to marketing</option><option value="all" ${f.config.who === 'all' ? 'selected' : ''}>Every buyer (as non-marketing contacts)</option></select></div>` : ''}
+      <label class="check"><input type="checkbox" data-bind="ui.ig.active" data-t="bool" ${f.active !== false ? 'checked' : ''}> <span>Active</span></label>
+      <div class="row" style="margin-top:10px"><button class="btn btn-accent" data-action="igSave">Save</button><button class="btn btn-ghost" data-action="igCancel">Cancel</button></div></div>`; })() : '';
+  return `${form}<div class="cols"><div class="stack">${can('admin.integrations') ? `<div class="card"><h3>Connections</h3>
+      ${igs.map(g => `<div class="item-card" style="margin-top:10px"><div class="between"><span><b>${esc(g.name)}</b> <span class="chip mini">${esc(INTEGRATIONS[g.kind]?.name || g.kind)}</span> ${g.active ? '<span class="chip ok mini">active</span>' : '<span class="chip mini">off</span>'}</span>
+          <span class="row"><button class="btn btn-ghost btn-sm" data-action="igTest" data-id="${g.id}">Test</button><button class="btn btn-ghost btn-sm" data-action="igEdit" data-id="${g.id}">Edit</button><button class="btn btn-ghost btn-sm" data-action="igDel" data-id="${g.id}">Disconnect</button></span></div>
+        <div class="small muted">${g.kind === 'webhook' ? esc(g.config.url) + ' · ' + esc((g.config.events || []).map(e => HOOK_EVENTS[e]).join(', ')) : INTEGRATIONS[g.kind]?.crm ? (g.config.who === 'all' ? 'every buyer' : 'opted-in buyers') + (g.config.list ? ' → list ' + esc(g.config.list) : '') : esc(g.config.pixel || '')}
+          · key ${esc(g.secret_hint || '—')}${g.last_at ? ' · last sent ' + esc(ago(g.last_at)) : ''}${g.last_error ? ` · <span style="color:var(--bad)">${esc(g.last_error)}</span>` : ''}</div></div>`).join('') || '<p class="small muted" style="margin-top:6px">Nothing connected yet.</p>'}
+      <div class="sep"></div><div class="fl">Connect</div><div class="row wrap">${Object.entries(INTEGRATIONS).map(([k, d]) => `<button class="btn btn-ghost btn-sm" data-action="igNew" data-v="${k}">${esc(d.name)}</button>`).join('')}</div>
+      <p class="small muted" style="margin-top:10px">Your own customer list stays here either way — CRMs get a copy.</p></div>
+    <div class="card"><h3>Recent deliveries</h3>${dl.map(d => `<div class="between small line click" data-action="dlOpen" data-id="${d.id}"><span><b>${esc(HOOK_EVENTS[d.event] || d.event)}</b> → ${esc(igs.find(g => g.id === d.integration_id)?.name || d.kind)}<div class="muted">${esc(fmtDT(d.created_at))} · attempt ${d.attempts}${d.response ? ' · ' + esc(String(d.response).slice(0, 60)) : ''}</div></span>
+        <span class="chip mini ${d.status === 'delivered' ? 'ok' : d.status === 'failed' ? 'bad' : 'info'}">${esc(d.status)}</span></div>`).join('') || '<p class="small muted" style="margin-top:6px">None yet.</p>'}</div>` : ''}</div>
+    <div class="stack">${can('admin.api') ? `<div class="card"><h3>API keys</h3><p class="small muted" style="margin:4px 0 10px">Read-only access for your own systems. A key is shown once; only its fingerprint is stored.</p>
+      ${keys.map(k => `<div class="between small line"><span><b>${esc(k.name)}</b> <code>${esc(k.prefix)}…</code><div class="muted">${esc(k.scopes.map(s => API_SCOPES[s]).join(', '))} · created ${esc(fmtDate(k.created_at, { month: 'short', day: 'numeric' }))}${k.last_used_at ? ' · used ' + esc(ago(k.last_used_at)) : ''}</div></span>
+        ${k.revoked_at ? '<span class="chip mini bad">revoked</span>' : `<button class="btn btn-ghost btn-sm" data-action="keyRevoke" data-id="${k.id}">Revoke</button>`}</div>`).join('') || '<p class="small muted">No keys.</p>'}
+      <div class="sep"></div><div class="field"><label class="fl">New key</label><input class="inp" data-input="key.name" value="${esc(S.ui.key?.name || '')}" placeholder="e.g. Website event listing"></div>
+      <div class="chips">${Object.entries(API_SCOPES).map(([k, l]) => `<button type="button" class="chip-btn ${(S.ui.key?.scopes || ['events:read']).includes(k) ? 'on' : ''}" data-action="keyScope" data-v="${k}">${l}</button>`).join('')}</div>
+      <button class="btn btn-dark btn-sm" style="margin-top:10px" data-action="keyCreate">Create key</button></div>` : ''}
+    <div class="card"><h3>For developers</h3><p class="small muted" style="margin-top:6px">API: <code>GET …/functions/v1/api/v1/events</code> (also <code>orders</code>, <code>tickets</code>, <code>customers</code>) with <code>Authorization: Bearer set_live_…</code>, <code>?since=</code> and <code>?limit=</code>. 120 requests a minute.</p>
+      <p class="small muted">Webhooks: JSON <code>{id, type, created, data}</code> POSTed with <code>SET-Signature: t=…,v1=…</code> = HMAC-SHA256 of <code>t + "." + body</code> with your signing secret. Failed deliveries retry with back-off for about a day.</p></div></div></div>`;
+}
+// ── the buyer's preferences page (#/unsubscribe/<token>) ──
+function Unsubscribe() {
+  const u = S.unsub;
+  if (!u) return `<div class="wrap" style="padding:60px 16px"><div class="empty">Loading…</div></div>`;
+  if (u.error) return `<div class="wrap" style="padding:60px 16px"><div class="card" style="max-width:480px;margin:0 auto"><h2>Link not valid</h2><p class="muted" style="margin-top:8px">${esc(u.error)}</p></div></div>`;
+  return `<div class="wrap" style="padding:60px 16px"><div class="card" style="max-width:480px;margin:0 auto"><div class="eyebrow">${esc(u.box_office)}</div><h2 style="margin:6px 0 4px">Email & text preferences</h2><p class="small muted">${esc(u.email)}</p>
+    <label class="check" style="margin-top:16px"><input type="checkbox" data-bind="ui.unsub.email" data-t="bool" ${S.ui.unsub.email ? 'checked' : ''}> <span>News and offers by email</span></label>
+    ${u.has_phone ? `<label class="check" style="margin-top:8px"><input type="checkbox" data-bind="ui.unsub.sms" data-t="bool" ${S.ui.unsub.sms ? 'checked' : ''}> <span>Texts (marketing and event updates)</span></label>` : ''}
+    <p class="small muted" style="margin-top:12px">Your tickets and messages about events you've booked still arrive by email either way.</p>
+    <div class="row" style="margin-top:14px"><button class="btn btn-accent" data-action="unsubSave">Save preferences</button><button class="btn btn-ghost" data-action="unsubAll">Unsubscribe from everything</button></div>
+    ${u.saved ? '<p class="small" style="margin-top:10px;color:var(--ok)">Saved.</p>' : ''}</div></div>`;
+}
+// marketing & consent for one customer (the customer page)
+function CustomerConsent(email, c, phone) {
+  const ed = can('comms.consent'), cu = S.ui.cc?.email === email ? S.ui.cc : (S.ui.cc = { email, source: '', tag: '' });
+  const mails = (S.adm.outbox || []).filter(m => m.email === email || m.to === email).sort((a, b) => D(b.send_at || b.at) - D(a.send_at || a.at)).slice(0, 15);
+  const st = !c ? 'No consent recorded — gets ticket and event emails only.' : c.suppressed ? `Suppressed (${esc(c.suppressed)}) since ${esc(fmtDT(c.suppressed_at))} — no email at all.` : c.email_optin && !c.unsub_email_at ? `Opted in ${esc(fmtDT(c.email_optin_at))} · ${esc(c.email_optin_src || '')}` : c.unsub_email_at ? `Unsubscribed ${esc(fmtDT(c.unsub_email_at))}` : 'Not opted in to marketing.';
+  const sm = !c?.phone && !phone ? 'No mobile number.' : c?.unsub_sms_at ? `Replied STOP ${esc(fmtDT(c.unsub_sms_at))} — no texts.` : c?.sms_optin ? `Opted in to texts ${esc(fmtDT(c.sms_optin_at))} · ${esc(c.sms_optin_src || '')}` : 'Event and ticket texts only (no marketing opt-in).';
+  const b = (v, l) => `<button class="btn btn-ghost btn-sm" data-action="ctAct" data-v="${v}" data-email="${esc(email)}">${l}</button>`;
+  return `<div class="card"><h3>Marketing & consent</h3><div class="small" style="margin-top:6px"><b>Email:</b> ${st}</div><div class="small" style="margin-top:4px"><b>Texts:</b> ${sm}</div>
+    <div style="margin-top:8px">${(c?.tags || []).map(t => `<span class="chip mini">${esc(t)}${ed ? ` <a href="#" data-action="ctUntag" data-email="${esc(email)}" data-v="${esc(t)}" title="Remove">×</a>` : ''}</span>`).join(' ') || '<span class="small muted">No tags.</span>'}</div>
+    ${ed ? `<div class="sep"></div><div class="row wrap"><input class="inp inp-sm" style="width:150px" data-input="cc.tag" value="${esc(cu.tag)}" placeholder="Add tag"><button class="btn btn-ghost btn-sm" data-action="ctTag" data-email="${esc(email)}">Tag</button></div>
+      <div class="row wrap" style="margin-top:8px"><input class="inp inp-sm" style="flex:1;min-width:180px" data-input="cc.source" value="${esc(cu.source)}" placeholder="How they gave consent (for opt-ins)">
+        ${!(c?.email_optin && !c.unsub_email_at) ? b('optin', 'Record email opt-in') : b('optout', 'Unsubscribe')}${c?.phone ? (c.unsub_sms_at ? b('sms_start', 'Allow texts') : !c.sms_optin ? b('sms_optin', 'Record text opt-in') : b('sms_optout', 'Stop texts')) : ''}${c?.suppressed ? b('unsuppress', 'Remove suppression') : b('suppress', 'Suppress email')}</div>` : ''}
+    <div class="sep"></div><div class="fl">Messages</div>${mails.map(m => `<div class="between small line click" data-action="msgOpen" data-id="${m.id}"><span>${esc(kindLabel(m))}<div class="muted">${esc(fmtDT(m.sent_at || m.send_at || m.at))}</div></span>${msgChip(m)}</div>`).join('') || '<p class="small muted">None.</p>'}</div>`;
 }
 // ── Team & permissions ───────────────────────────────────────────────────────
 const tplName = id => (S.adm.bo.templates || []).find(t => t.id === id)?.name;
@@ -2710,15 +2965,18 @@ function Settings() {
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Checkout</div>
       <div class="grid2"><div class="field"><label class="fl">Mobile number</label><select class="inp" data-bind="set.checkout.phone">${[['off', 'Don\'t ask'], ['optional', 'Optional'], ['required', 'Required']].map(([v, t]) => `<option value="${v}" ${s.checkout?.phone === v ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
         <div class="field"><label class="fl">Address</label><select class="inp" data-bind="set.checkout.address">${[['off', 'Don\'t ask'], ['optional', 'Optional'], ['required', 'Required']].map(([v, t]) => `<option value="${v}" ${s.checkout?.address === v ? 'selected' : ''}>${t}</option>`).join('')}</select></div></div>
-      ${c('checkout.promo', 'Show the promo / referral code box')}${c('checkout.optIn', 'Offer the marketing opt-in')}
+      ${c('checkout.promo', 'Show the promo / referral code box')}${c('checkout.optIn', 'Offer the marketing email opt-in')}${c('checkout.smsOptIn', 'Offer the marketing text opt-in (when a mobile number is given)')}
       ${f('checkout.note', 'Message at the top of checkout')}${f('checkout.thanks', 'Message on the confirmation page')}</div>
     <div class="card">${QEditor('set', 'questions', s.questions || [], [])}</div>
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Staff security</div>${c('require2fa', 'Require two-factor sign-in for everyone on this team')}
       <p class="small muted">People without it are asked to set it up before they can see anything. <a href="#/admin/security">Set up yours</a>.</p></div>
   </div><div class="stack">
     ${can('admin.payments') ? PaymentsCard(s, c) : ''}
-    ${can('admin.integrations') ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Tracking</div>${f('pixels.ga4', 'Google Analytics 4 ID', 'text', 'e.g. G-XXXXXXX')}${f('pixels.meta', 'Meta Pixel ID')}</div>` : ''}
-    ${can('admin.api') ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Developers</div><p class="small muted">REST API + RPCs via Supabase: <code>place_order</code>, <code>availability</code>, <code>checkin</code>. Access follows the same box office and permission rules. Webhooks arrive in Stage 8.</p>
+    ${can('admin.integrations') ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Tracking</div>${f('pixels.ga4', 'Google Analytics 4 ID', 'text', 'e.g. G-XXXXXXX')}${f('pixels.meta', 'Meta Pixel ID')}${f('pixels.tiktok', 'TikTok Pixel ID')}
+      ${c('pixels.consent', 'Ask visitors before loading pixels (cookie banner)')}<p class="small muted">Server-side Meta Conversions API, CRMs and webhooks: <a href="#/admin/marketing/integrations">Marketing → Integrations</a>.</p></div>` : ''}
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Email sender</div>${f('mail.fromName', 'Sender name', 'text', 'Shown as the “from” name — defaults to the box office name')}${f('mail.replyTo', 'Reply-to address', 'email', 'Where customer replies go')}
+      <p class="small muted">Emails go out from the platform's verified sending domain with this name and reply-to.</p></div>
+    ${can('admin.api') ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Developers</div><p class="small muted">Read-only API keys, webhooks and CRM connections are on <a href="#/admin/marketing/integrations">Marketing → Integrations</a>.</p>
       ${!DB.live ? `<div class="sep"></div><button class="btn btn-danger btn-sm" data-action="demoReset">Reset demo data</button>` : ''}</div>` : ''}
   </div></div>`;
 }
@@ -2942,6 +3200,7 @@ const A = {
     if (a) a.qty += +el.dataset.q || 1; else S.cart.addons.push({ eventId: el.dataset.id, addonId: el.dataset.v, qty: +el.dataset.q || 1 }); saveCart(); toast('Added to your order'); render(); },
   delAddonLine: el => { S.cart.addons = S.cart.addons.filter(x => !(x.eventId === el.dataset.id && x.addonId === el.dataset.v)); saveCart(); render(); },
   placeOrder: async () => {
+    pix('InitiateCheckout', { value: cartQuote().total || 0, currency: S.settings.currency || 'USD' });
     const co = S.co, set = S.settings, ck = { ...DEFAULT_SETTINGS.checkout, ...(set.checkout || {}) }, q = cartQuote(); co.err = '';
     if (!co.name.trim() || !EMAIL_RE.test(co.email.trim())) co.err = 'Please enter your name and a valid email.';
     else if (ck.phone === 'required' && !String(co.phone || '').trim()) co.err = 'Please enter your mobile number.';
@@ -2953,8 +3212,8 @@ const A = {
     try {
       const r = await DB.placeOrder({ buyer: { name: co.name.trim(), email: co.email.trim(), phone: String(co.phone || '').trim(), ...(co.address ? { address: co.address.trim() } : {}) },
         items: S.cart.items, addons: S.cart.addons, code: co.disc?.code || '', tracking: co.tracking || sessionStorage.getItem('set_ref') || '',
-        donation: S.cart.donation || 0, payment: q.total === 0 ? 'free' : co.payment, answers: co.answers, ticketAnswers: tAnswers(), optIn: co.optIn,
-        source: sessionStorage.getItem('set_src') || null, unlock: S.cart.unlock, holdToken: DB.holdToken(), attempt: co.attempt,
+        donation: S.cart.donation || 0, payment: q.total === 0 ? 'free' : co.payment, answers: co.answers, ticketAnswers: tAnswers(), optIn: !!co.optIn, smsOptIn: !!co.smsOptIn && !!normPhone(co.phone),
+        source: sessionStorage.getItem('set_src') || null, utm: (() => { try { return JSON.parse(sessionStorage.getItem('set_utm') || 'null'); } catch (e) { return null; } })(), unlock: S.cart.unlock, holdToken: DB.holdToken(), attempt: co.attempt,
         credit: q.credit ? co.credit?.code || 'account' : '' });
       if (r.status === 'awaiting_payment') return startPay(r);
       checkoutDone(r);
@@ -3277,9 +3536,9 @@ const A = {
   clearCodes: () => { const used = new Set(S.adm.orders.filter(o => o.data.promo?.id === S.draft.id).map(o => String(o.data.code).toUpperCase())); S.draft.codes = (S.draft.codes || []).filter(c => used.has(c)); dirty(); render(); },
   addRem: () => { (S.draft.emails.reminders ||= []).push({ hoursBefore: S.settings.reminderHours || 24, channel: 'email', body: 'See you soon! Doors open at ' + (S.draft.doors || 'the listed time') + '.' }); dirty(); render(); },
   delRem: el => { S.draft.emails.reminders.splice(+el.dataset.i, 1); dirty(); render(); },
-  broadcast: async el => { const b = S.ui.bc; if (!b.subject.trim() || !b.body.trim()) return toast('Add a subject and message', true);
-    try { const row = await DB.addBroadcast({ event_id: S.draft.id, subject: b.subject, body: b.body, recipients: +el.dataset.n, created_by: S.user.email }); S.adm.broadcasts.push(row); S.ui.bc = { subject: '', body: '' };
-      toast('Queued for ' + el.dataset.n + ' buyers — sending is off until email is connected'); render(); } catch (e) { toast(e.message, true); } },
+  broadcast: async () => { const b = S.ui.bc;
+    try { const r = await DB.sendCampaign({ category: 'transactional', channel: b.channel || 'email', subject: b.subject, body: b.body, filter: { eventIds: [S.draft.id] }, sendAt: b.sendAt ? new Date(b.sendAt).toISOString() : null, name: b.subject || b.body.slice(0, 60) });
+      await reloadAdmin(); S.ui.bc = null; toast(`${r.status === 'scheduled' ? 'Scheduled' : 'Sent'} to ${r.queued} ticket holder${r.queued === 1 ? '' : 's'}`); render(); } catch (e) { toast(e.message, true); } },
   exportWL: el => { download('waitlist.csv', csv([['Name', 'Email', 'Phone', 'Joined', 'Notified'], ...S.adm.waitlist.filter(w => w.event_id === el.dataset.id).map(w => [w.name, w.email, w.phone || '', w.created_at, w.notified_at || ''])])); DB.log('export.waitlist', 'Exported the waitlist'); },
   openOrder: el => { location.hash = '#/admin/orders/' + el.dataset.id; },
   oSel: el => { S.ui.osel[el.dataset.id] = el.checked; render(); },
@@ -3319,8 +3578,10 @@ const A = {
     if (!o) return toast('No order with a balance due that this credit can pay', true);
     try { await DB.creditAction('apply', { id: c.id, order: o.id }); await reloadAdmin(); toast('Credit applied to ' + o.ref); render(); } catch (e) { toast(e.message, true); } },
   custNote: async el => { try { await DB.customerNote(el.dataset.v, S.ui.cnote); S.ui.cnote = ''; await reloadAdmin(); toast('Note added'); render(); } catch (e) { toast(e.message, true); } },
-  exportCustomers: () => { download('customers.csv', csv([['Name', 'Email', 'Phone', 'Orders', 'Tickets', 'Spent', 'Refunds', 'Credit', 'Account', 'Last order'], ...customerIndex().map(c => [c.name, c.email, c.phone, c.orders.length, c.tickets.filter(t => t.status === 'valid').length, c.spent / 100, c.refunds / 100, c.credit / 100, c.account ? 'yes' : '', c.last])])); DB.log('export.customers', 'Exported the customer list'); },
-  emailPv: el => { const o = S.adm.orders.find(x => x.id === el.dataset.id); modal('Confirmation email · ' + esc(o.ref), `<p class="small muted" style="margin-bottom:12px">One email per order — every ticket together, with the PDF tickets attached. (Sending switches on with email delivery in Stage 8; this is exactly what it will contain.)</p>${OrderEmail(o, S.adm.tickets.filter(t => t.order_id === o.id))}`); },
+  exportCustomers: () => { download('customers.csv', csv([['Name', 'Email', 'Phone', 'Orders', 'Tickets', 'Spent', 'Refunds', 'Credit', 'Account', 'Last order', 'Email marketing', 'Email opt-in date', 'Text marketing', 'Unsubscribed', 'Suppressed', 'Tags'], ...customerIndex().map(c => { const k = contactFor(c.email);
+      return [c.name, c.email, c.phone, c.orders.length, c.tickets.filter(t => t.status === 'valid').length, c.spent / 100, c.refunds / 100, c.credit / 100, c.account ? 'yes' : '', c.last,
+        k?.email_optin && !k.unsub_email_at && !k.suppressed ? 'yes' : 'no', k?.email_optin_at || '', k?.sms_optin && !k.unsub_sms_at ? 'yes' : 'no', k?.unsub_email_at || '', k?.suppressed || '', (k?.tags || []).join('; ')]; })])); DB.log('export.customers', 'Exported the customer list'); },
+  emailPv: el => { const o = S.adm.orders.find(x => x.id === el.dataset.id); modal('Confirmation email · ' + esc(o.ref), `<p class="small muted" style="margin-bottom:12px">One email per order — every ticket together, with a link to view and download them. This is exactly what the sender delivers.</p>${OrderEmail(o)}`); },
   pick: el => { S.ui.picked[el.dataset.id] = el.checked; render(); },
   orderStatus: async el => { if (['cancelled', 'refunded'].includes(el.dataset.v) && !confirmIn('Cancel this order and void its tickets?' + (el.dataset.v === 'refunded' ? ' Everything left is refunded to the original payment.' : ''))) return;
     try { await DB.setOrderStatus(el.dataset.id, el.dataset.v); await reloadAdmin(); toast('Order ' + el.dataset.v); OrderModal(el.dataset.id); render(); } catch (e) { toast(e.message, true); } },
@@ -3349,7 +3610,64 @@ const A = {
         return [o.ref, o.created_at, t.status === 'valid' ? o.status : 'cancelled', ev?.name, t.slot_id ? ev?.timeSlots?.find(x => x.id === t.slot_id)?.start : '', ev?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name, sp.area || '', sp.unit || '', sp.row || '', sp.seat || '',
           t.face == null ? '' : t.face / 100, t.paid == null ? '' : t.paid / 100, t.discount == null ? '' : t.discount / 100, t.promo || '', t.comp ? 'yes' : '', t.price_override ? 'yes' : '', t.tracking || o.data.tracking || '', t.bundle?.name || '', (t.extras || []).join('; '), t.holder, t.code, t.checked_in_at || '']; })])); },
   exportReport: () => download('sales-report.csv', csv([['Event', 'Date', 'Tickets sold', 'Ticket revenue'], ...S.adm.events.map(e => { const s = evStats(e); return [e.name, e.start, s.sold, s.rev / 100]; })])),
-  exportOptIn: () => download('mailing-list.csv', csv([['Email Address', 'First Name', 'Last Name'], ...[...new Map(S.adm.orders.filter(o => o.data.optIn).map(o => [o.buyer_email, o])).values()].map(o => { const [f, ...l] = o.data.buyer.name.split(' '); return [o.buyer_email, f, l.join(' ')]; })])),
+  // ── Stage 8: marketing, messages, automations, integrations ──
+  pxYes: () => { try { localStorage.setItem('set_px', 'yes'); } catch (e) { } $('#pxBanner')?.remove(); loadPixels(); },
+  pxNo: () => { try { localStorage.setItem('set_px', 'no'); } catch (e) { } $('#pxBanner')?.remove(); },
+  runSender: async () => { try { const r = await DB.runSender(); await reloadAdmin(); toast(`Sender ran: ${r.sent} message${r.sent === 1 ? '' : 's'} processed${r.queued ? ` · ${r.queued} automation step${r.queued === 1 ? '' : 's'} queued` : ''}`); render(); } catch (e) { toast(e.message, true); } },
+  segTog: el => { const f = S.ui[el.dataset.p].filter, k = el.dataset.k, v = el.dataset.v; f[k] = f[k].includes(v) ? f[k].filter(x => x !== v) : [...f[k], v];
+    if (k === 'eventIds') { f.ticketTypeIds = []; f.areas = []; } if (el.dataset.p === 'cmp') S.ui.cmp.segId = ''; render(); },
+  cmpSend: async () => { const c = S.ui.cmp;
+    try { const r = await DB.sendCampaign({ ...c, sendAt: c.sendAt ? new Date(c.sendAt).toISOString() : null }); await reloadAdmin(); S.ui.cmp = newCampaign({ category: c.category, channel: c.channel });
+      const held = Object.values(r.skipped || {}).reduce((a, x) => a + x, 0); toast(`${r.status === 'scheduled' ? 'Scheduled' : 'Sent'} — ${r.queued} message${r.queued === 1 ? '' : 's'}${held ? ` · ${held} held back (no consent / no number)` : ''}`); render(); } catch (e) { toast(e.message, true); } },
+  cmpPreview: () => { const c = S.ui.cmp, p = admPeople(c.category === 'transactional' ? { ...c.filter, status: 'buyers' } : c.filter)[0];
+    modal('Preview', (c.channel === 'sms' ? [] : ['email']).concat(c.channel === 'email' ? [] : ['sms']).map(ch => msgPreview({ kind: c.category === 'marketing' ? 'campaign' : 'update', channel: ch, category: c.category, subject: c.subject, body: c.body, email: p?.email || '', event_id: c.filter.eventIds[0] || null })).join('<div class="sep"></div>')); },
+  cmpCancel: async el => { try { await DB.campaignAction(el.dataset.id, 'cancel'); await reloadAdmin(); toast('Scheduled campaign cancelled'); render(); } catch (e) { toast(e.message, true); } },
+  segLoad: el => { const sg = (S.adm.bo.segments || []).find(x => x.id === el.dataset.id); if (sg) { S.ui.aud = { filter: { ...emptySeg(), ...clone(sg.filter) }, name: sg.name, id: sg.id }; render(); } },
+  segSave: async () => { const a = S.ui.aud, name = String(a.name || '').trim(); if (!name) return toast('Name the segment', true);
+    const list = (S.adm.bo.segments || []).filter(x => x.name !== name).concat({ id: a.id && (S.adm.bo.segments || []).some(x => x.id === a.id && x.name === name) ? a.id : 'sg_' + Math.random().toString(36).slice(2, 8), name, filter: clone(a.filter) });
+    try { S.adm.bo.segments = await DB.saveSegments(list); toast('Segment saved'); render(); } catch (e) { toast(e.message, true); } },
+  segDel: async el => { try { S.adm.bo.segments = await DB.saveSegments((S.adm.bo.segments || []).filter(x => x.id !== el.dataset.id)); render(); } catch (e) { toast(e.message, true); } },
+  segCampaign: () => { S.ui.cmp = newCampaign({ filter: clone(S.ui.aud.filter), segId: S.ui.aud.id || '' }); location.hash = '#/admin/marketing/campaigns'; },
+  audExport: () => { const people = admPeople(S.ui.aud.filter), c = x => x || '';
+    download('audience.csv', csv([['Email', 'Name', 'Phone', 'Email marketing', 'Email opt-in date', 'Email opt-in source', 'Text marketing', 'Text opt-in date', 'Unsubscribed', 'Suppressed', 'Tags', 'Orders', 'Spent'],
+      ...people.map(p => { const k = p.contact; return [p.email, p.name, p.phone, k?.email_optin && !k.unsub_email_at && !k.suppressed ? 'yes' : 'no', c(k?.email_optin_at), c(k?.email_optin_src), k?.sms_optin && !k.unsub_sms_at ? 'yes' : 'no', c(k?.sms_optin_at),
+        c(k?.unsub_email_at), c(k?.suppressed), (k?.tags || []).join('; '), p.orders.length, (p.spent / 100).toFixed(2)]; })])); },
+  supAdd: async () => { try { await DB.contactAction(String(S.ui.supEmail || '').trim(), 'suppress', { reason: 'manual' }); S.ui.supEmail = ''; await reloadAdmin(); toast('Address suppressed'); render(); } catch (e) { toast(e.message, true); } },
+  ctAct: async el => { const v = el.dataset.v; try { await DB.contactAction(el.dataset.email, v, { source: S.ui.cc?.source || '', reason: v === 'suppress' ? 'manual' : '' }); if (S.ui.cc) S.ui.cc.source = ''; await reloadAdmin(); toast('Saved'); render(); } catch (e) { toast(e.message, true); } },
+  ctTag: async el => { const t = String(S.ui.cc?.tag || '').trim(); if (!t) return toast('Type a tag', true); try { await DB.contactAction(el.dataset.email, 'tag', { tags: t }); S.ui.cc.tag = ''; await reloadAdmin(); render(); } catch (e) { toast(e.message, true); } },
+  ctUntag: async el => { try { await DB.contactAction(el.dataset.email, 'untag', { tags: el.dataset.v }); await reloadAdmin(); render(); } catch (e) { toast(e.message, true); } },
+  auNew: () => { S.ui.au = newAuto(); render(); },
+  auEdit: el => { const a = (S.adm.automations || []).find(x => x.id === el.dataset.id); if (!a) return; S.ui.au = { ...newAuto(), ...clone(a), cond: { ...newAuto().cond, ...clone(a.cond || {}) }, timing: { mode: 'now', hours: 0, ...clone(a.timing || {}) } }; render(); },
+  auCancel: () => { S.ui.au = null; location.hash = '#/admin/marketing/automations'; render(); },
+  auTog: el => { const c = S.ui.au.cond, k = el.dataset.k, v = el.dataset.num ? +el.dataset.v : el.dataset.v; c[k] = c[k].includes(v) ? c[k].filter(x => x !== v) : [...c[k], v]; if (k === 'eventIds') { c.ticketTypeIds = []; c.areas = []; } render(); },
+  auActAdd: el => { const t = el.dataset.v; S.ui.au.actions.push({ type: t, ...(t === 'email' ? { category: 'transactional', subject: '', body: '' } : t === 'sms' ? { category: 'transactional', body: '' } : t === 'staff' ? { to: S.user.email, subject: '', body: '' } : {}) }); render(); },
+  auActDel: el => { S.ui.au.actions.splice(+el.dataset.i, 1); render(); },
+  auSave: async () => { try { await DB.saveAutomation(S.ui.au); S.ui.au = null; await reloadAdmin(); toast('Automation saved'); render(); } catch (e) { toast(e.message, true); } },
+  auDel: async el => { try { await DB.deleteAutomation(el.dataset.id); await reloadAdmin(); toast('Automation deleted'); render(); } catch (e) { toast(e.message, true); } },
+  auToggle: async el => { const a = (S.adm.automations || []).find(x => x.id === el.dataset.id); try { await DB.saveAutomation({ ...a, enabled: el.checked }); await reloadAdmin(); render(); } catch (e) { toast(e.message, true); render(); } },
+  mqGo: () => render(),
+  utmBuild: () => render(),
+  msgOpen: el => { const m = (S.adm.outbox || []).find(x => x.id === el.dataset.id); if (!m) return;
+    modal(esc(kindLabel(m)), `<div class="small muted" style="margin-bottom:10px">To <b>${esc(m.to)}</b> · ${msgChip(m)} · ${esc(m.category || 'transactional')}${m.sent_at ? ' · sent ' + esc(fmtDT(m.sent_at)) : ' · ' + esc(fmtDT(m.send_at || m.at))}${m.provider ? ' · via ' + esc(m.provider) : ''}${m.error ? `<br>${esc(m.error)}` : ''}</div>${msgPreview(m)}`); },
+  msgCancel: async el => { try { await DB.outboxAction(el.dataset.id, 'cancel'); await reloadAdmin(); render(); } catch (e) { toast(e.message, true); } },
+  msgRetry: async el => { try { await DB.outboxAction(el.dataset.id, 'retry'); await reloadAdmin(); toast('Queued again'); render(); } catch (e) { toast(e.message, true); } },
+  igNew: el => { const k = el.dataset.v; S.ui.ig = { kind: k, name: INTEGRATIONS[k].name, active: true, config: k === 'webhook' ? { url: '', events: ['payment.completed'] } : { who: 'optedIn' }, secret: '' }; render(); },
+  igEdit: el => { const g = (S.adm.integrations || []).find(x => x.id === el.dataset.id); if (g) { S.ui.ig = { ...clone(g), secret: '' }; render(); } },
+  igCancel: () => { S.ui.ig = null; render(); },
+  igEv: el => { const c = S.ui.ig.config, v = el.dataset.v; c.events = (c.events || []).includes(v) ? c.events.filter(x => x !== v) : [...(c.events || []), v]; render(); },
+  igSave: async () => { const f = S.ui.ig;
+    try { const r = await DB.saveIntegration(f, f.secret || null); S.ui.ig = null; await reloadAdmin(); render();
+      if (r.secret) modal('Webhook signing secret', `<p class="small">Copy it now — it is not shown again. Use it to check the <code>SET-Signature</code> header on every delivery.</p><pre class="code">${esc(r.secret)}</pre>`); else toast('Saved'); } catch (e) { toast(e.message, true); } },
+  igDel: async el => { try { await DB.deleteIntegration(el.dataset.id); await reloadAdmin(); toast('Disconnected'); render(); } catch (e) { toast(e.message, true); } },
+  igTest: async el => { try { const d = await DB.testIntegration(el.dataset.id); await reloadAdmin(); toast(DB.live ? 'Test delivery queued' : 'Test recorded (demo mode — nothing is posted)'); render(); } catch (e) { toast(e.message, true); } },
+  dlOpen: el => { const d = (S.adm.deliveries || []).find(x => x.id === el.dataset.id); if (d) modal(esc(HOOK_EVENTS[d.event] || d.event), `<div class="small muted" style="margin-bottom:8px">${esc(d.status)} · attempt ${d.attempts} · ${esc(d.response || '')}</div><pre class="code">${esc(JSON.stringify(d.payload, null, 2))}</pre>`); },
+  keyScope: el => { const k = S.ui.key ||= { name: '', scopes: ['events:read'] }, v = el.dataset.v; k.scopes ||= ['events:read']; k.scopes = k.scopes.includes(v) ? k.scopes.filter(x => x !== v) : [...k.scopes, v]; render(); },
+  keyCreate: async () => { const k = S.ui.key ||= { name: '', scopes: ['events:read'] };
+    try { const r = await DB.createApiKey(k.name, k.scopes || ['events:read']); S.ui.key = null; await reloadAdmin(); render();
+      modal('Your new API key', `<p class="small">Copy it now — it is shown only once.</p><pre class="code">${esc(r.key)}</pre><p class="small muted">Example:</p><pre class="code">curl -H "Authorization: Bearer ${esc(r.key)}" \\\n  https://&lt;project&gt;.supabase.co/functions/v1/api/v1/events</pre>`); } catch (e) { toast(e.message, true); } },
+  keyRevoke: async el => { try { await DB.revokeApiKey(el.dataset.id); await reloadAdmin(); toast('Key revoked'); render(); } catch (e) { toast(e.message, true); } },
+  unsubSave: async () => { try { S.unsub = { ...(await DB.unsubscribe(S._unsubTok, { email: !!S.ui.unsub.email, sms: !!S.ui.unsub.sms })), saved: true }; render(); } catch (e) { toast(e.message, true); } },
+  unsubAll: async () => { S.ui.unsub = { email: false, sms: false }; return A.unsubSave(); },
   toggleIn: el => doCheckin(el.dataset.v, el.dataset.undo === '1'),
   scPick: el => { if (S.sc.evId !== el.dataset.id) { S.sc.entrance = S.sc.slot = null; } S.sc.evId = el.dataset.id; S.sc.tab = 'scan'; S.sc.q = ''; S.sc.pick = null; saveScanCtx(); render(); doorTick(); },
   scBack: () => { S.sc.evId = ''; S.sc.setup = false; camStop(); saveScanCtx(); render(); },
@@ -3390,6 +3708,10 @@ const A = {
 };
 const confirmIn = msg => window.confirm(msg);
 const CHANGE = {
+  rr: () => render(),
+  segVal: el => { const f = S.ui[el.dataset.p].filter, k = el.dataset.k; f[k] = k === 'tags' ? tagsOf(el.value) : el.value; if (el.dataset.p === 'cmp') S.ui.cmp.segId = ''; render(); },
+  cmpSeg: el => { const sg = (S.adm.bo.segments || []).find(x => x.id === el.value); S.ui.cmp.segId = el.value; if (sg) S.ui.cmp.filter = { ...emptySeg(), ...clone(sg.filter) }; render(); },
+  auTags: el => { S.ui.au.cond.tags = tagsOf(el.value); render(); },
   // a floor plan under the builder: downscaled in the browser so it stays small enough to store with the event
   smBg: el => { const f = el.files?.[0]; if (!f) return; if (!/^image\//.test(f.type)) return toast('Choose an image file', true);
     const img = new Image(), url = URL.createObjectURL(f);
@@ -3417,7 +3739,7 @@ document.addEventListener('input', e => {
   const el = e.target;
   if (el.dataset.bind) {
     const [root, ...rest] = el.dataset.bind.split('.'), path = rest.join('.'), t = el.dataset.t;
-    let v = t === 'bool' ? el.checked : el.value;
+    let v = t === 'bool' || el.type === 'checkbox' ? el.checked : el.value;
     if (t === 'money') v = el.value === '' ? 0 : Math.round(parseFloat(el.value) * 100);
     else if (t === 'moneyOpt') v = el.value === '' ? '' : Math.round(parseFloat(el.value) * 100);
     else if (t === 'int') v = el.value === '' ? 0 : parseInt(el.value, 10);
@@ -3479,12 +3801,30 @@ function startHeroCanvas() {
 }
 
 // ── Tracking pixels (GA4 / Meta) on public pages ─────────────────────────────
-let _pixels = false;
+// Pixels: GA4, Meta, TikTok on public pages only (never the back office). With the cookie-banner setting they wait for the visitor's yes.
+// Purchases carry the order id as the event id, so Meta matches the browser event with the server one (Conversions API) and counts it once.
+let _pixels = false, _pixQ = [];
+const pixOk = () => { const p = S.settings.pixels || {}; if (!p.consent) return true; try { return localStorage.getItem('set_px') === 'yes'; } catch (e) { return false; } };
 function loadPixels() {
-  const p = S.settings.pixels || {}; if (_pixels || location.hash.startsWith('#/admin')) return;
-  if (/^G-[A-Z0-9]+$/.test(p.ga4 || '')) { _pixels = true; const s = document.createElement('script'); s.async = true; s.src = 'https://www.googletagmanager.com/gtag/js?id=' + p.ga4; document.head.append(s);
-    window.dataLayer = window.dataLayer || []; window.gtag = function () { dataLayer.push(arguments); }; gtag('js', new Date()); gtag('config', p.ga4); }
-  if (/^\d+$/.test(p.meta || '')) { _pixels = true; const s = document.createElement('img'); s.src = `https://www.facebook.com/tr?id=${p.meta}&ev=PageView&noscript=1`; s.width = s.height = 1; s.style.display = 'none'; document.body.append(s); }
+  const p = S.settings.pixels || {}; if (_pixels || location.hash.startsWith('#/admin') || location.hash.startsWith('#/platform') || location.hash.startsWith('#/scan')) return;
+  const any = /^G-[A-Z0-9]+$/.test(p.ga4 || '') || /^\d{6,20}$/.test(p.meta || '') || /^[A-Z0-9]{8,30}$/.test(p.tiktok || '');
+  if (!any) return;
+  if (!pixOk()) { let ask = true; try { ask = localStorage.getItem('set_px') !== 'no'; } catch (e) { } if (ask && !$('#pxBanner')) { const d = document.createElement('div'); d.id = 'pxBanner'; d.className = 'px-banner';
+    d.innerHTML = `<span>We use cookies to measure our ads and improve this site.</span><span class="row"><button class="btn btn-ghost btn-sm" data-action="pxNo">No thanks</button><button class="btn btn-accent btn-sm" data-action="pxYes">Accept</button></span>`; document.body.append(d); } return; }
+  _pixels = true; const add = src => { const s = document.createElement('script'); s.async = true; s.src = src; document.head.append(s); };
+  if (/^G-[A-Z0-9]+$/.test(p.ga4 || '')) { add('https://www.googletagmanager.com/gtag/js?id=' + p.ga4); window.dataLayer = window.dataLayer || []; window.gtag = function () { dataLayer.push(arguments); }; gtag('js', new Date()); gtag('config', p.ga4); }
+  if (/^\d{6,20}$/.test(p.meta || '')) { const f = window.fbq = function () { f.callMethod ? f.callMethod.apply(f, arguments) : f.queue.push(arguments); }; f.push = f; f.loaded = true; f.version = '2.0'; f.queue = [];
+    add('https://connect.facebook.net/en_US/fbevents.js'); fbq('init', p.meta); fbq('track', 'PageView'); }
+  if (/^[A-Z0-9]{8,30}$/.test(p.tiktok || '')) { const t = window.ttq = window.ttq || []; ['page', 'track', 'identify'].forEach(m => { t[m] = function () { t.push([m, ...arguments]); }; });
+    add('https://analytics.tiktok.com/i18n/pixel/events.js?sdkid=' + p.tiktok + '&lib=ttq'); t.page(); }
+  _pixQ.splice(0).forEach(([n, d]) => pix(n, d));
+}
+function pix(name, d = {}) {
+  if (!_pixels) { if (_pixQ.length < 20) _pixQ.push([name, d]); return; }
+  const value = (+d.value || 0) / 100, cur = d.currency || 'USD';
+  if (window.gtag) gtag('event', { ViewContent: 'view_item', InitiateCheckout: 'begin_checkout', Purchase: 'purchase' }[name], name === 'Purchase' ? { transaction_id: d.ref, value, currency: cur } : name === 'ViewContent' ? { items: [{ item_id: d.id, item_name: d.name }] } : { value, currency: cur });
+  if (window.fbq) fbq('track', name, name === 'ViewContent' ? { content_name: d.name, content_ids: [d.id] } : { value, currency: cur, ...(d.n ? { num_items: d.n } : {}) }, d.id && name === 'Purchase' ? { eventID: d.id } : undefined);
+  if (window.ttq?.track) ttq.track({ ViewContent: 'ViewContent', InitiateCheckout: 'InitiateCheckout', Purchase: 'CompletePayment' }[name], name === 'ViewContent' ? { content_id: d.id, content_name: d.name } : { value, currency: cur });
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────

@@ -80,7 +80,7 @@ const seatTaken=(slug,seat)=>E(`offSeats(availabilityFrom(Demo.st.tickets,Demo.s
   await E(`DB.payOrder('${r1.id}','${o1.access_key}',${JSON.stringify(CARD)})`);
   ok(tickets(r1.id).length===2 && order(r1.id).payment.attempts.length===4,'paying again after success never charges twice or issues extra tickets');
   ok(E(`confirmPayment(Demo.st,Demo.st.orders.find(o=>o.id==='${r1.id}'),{provider:'demo',ref:'dup'})`)==='already','a duplicate processor confirmation is ignored');
-  ok(E(`Demo.st.outbox.filter(m=>m.order_id==='${r1.id}').length`)===1,'exactly ONE confirmation email queued for the order');
+  ok(E(`Demo.st.outbox.filter(m=>m.order_id==='${r1.id}'&&m.kind==='confirmation').length`)===1,'exactly ONE confirmation email queued for the order');
   // interrupted / expired checkout → seats released
   const s2=free('winter-orchestra-gala','Stalls',1);
   const r2=await E(place({items:[{eventId:g.id,ticketTypeId:stalls.id,qty:1,seats:s2}],attempt:'att-2'}));
@@ -165,7 +165,7 @@ const seatTaken=(slug,seat)=>E(`offSeats(availabilityFrom(Demo.st.tickets,Demo.s
   E(`S.co.card=${JSON.stringify(CARD)}`); await E('A.payCard()'); await until(()=>W().location.hash.startsWith('#/order/')); await until(()=>W().document.querySelectorAll('.e-ticket').length===3);
   ok(has('You\'re going!') && has('Download PDF') && has('Visa •••• 4242'),'confirmation page with tickets, PDF download and payment');
   const oo=E('S.order.order'); ok(oo.data.buyer.address==='1 Main St' && oo.data.buyer.phone && !('platformFee' in oo.data) && !('processingFee' in oo.data) && !('payment' in oo) && !('access_key' in oo),'buyer view never includes the platform or processor fees, payment internals or keys');
-  ok(E(`Demo.st.outbox.filter(m=>m.order_id==='${oo.id}').length`)===1,'one confirmation email for the whole multi-event order');
+  ok(E(`Demo.st.outbox.filter(m=>m.order_id==='${oo.id}'&&m.kind==='confirmation').length`)===1,'one confirmation email for the whole multi-event order');
   ok(has('Save your tickets'),'guest checkout → offered an account to save the tickets');
   E(`Object.assign(Demo.st.boxOffices.find(b=>b.slug==='skyline-live').settings.checkout,{phone:'optional',address:'off'});Demo.save()`); await E('refreshPublic()');
 

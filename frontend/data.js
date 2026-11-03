@@ -29,7 +29,7 @@ const PERMS = [
   ['customers', 'Customer data', [['names', 'View customer names', 'v'], ['emails', 'View email addresses', 'v'], ['phones', 'View phone numbers', 'v'], ['profiles', 'View full customer profiles', 'v'], ['export', 'Export customer information']]],
   ['finance', 'Sales & finance', [['totals', 'View ticket sales totals', 'v'], ['reports', 'View financial reports', 'v'], ['fees', 'View fees', 'v'], ['processing', 'View payment processing information', 'v'], ['payouts', 'View payouts', 'v'], ['export', 'Export financial reports']]],
   ['door', 'Event-day access', [['scan', 'Scan tickets'], ['checkin', 'Check customers in'], ['undo', 'Undo check-in'], ['override', 'Override scanner warnings'], ['search', 'Look up guests at the door (name, email, phone, order)'], ['log', 'View scan history', 'v'], ['attendees', 'View attendee lists', 'v'], ['devices', 'Manage scanner devices'], ['staff', 'Manage door staff']]],
-  ['comms', 'Communication', [['email', 'Send customer emails'], ['notify', 'Send event notifications'], ['lists', 'Access attendee mailing lists', 'v']]],
+  ['comms', 'Communication', [['email', 'Send customer emails'], ['notify', 'Send event notifications'], ['lists', 'Access attendee mailing lists', 'v'], ['marketing', 'Send marketing campaigns'], ['sms', 'Send text messages'], ['automations', 'Manage automations'], ['consent', 'Manage consent, suppression & customer tags']]],
   ['admin', 'Administration', [['invite', 'Invite team members'], ['remove', 'Remove team members'], ['perms', 'Edit team permissions'], ['integrations', 'Access integrations'], ['api', 'Access API settings'], ['payments', 'Access payment settings'], ['settings', 'Access box office settings']]],
 ];
 const ALL_PERMS = PERMS.flatMap(([g, , ks]) => ks.map(k => g + '.' + k[0]));
@@ -66,11 +66,11 @@ async function totpOk(secret, code) { const s = Math.floor(Date.now() / 30000); 
 const DEFAULT_SETTINGS = {
   name: 'SET Tickets', currency: 'USD', feePct: 0, feeFixed: 0, feeMode: 'buyer', taxPct: 0,
   terms: 'All sales are final. Tickets are non-refundable except if the event is cancelled. Event schedule and line-up subject to change.',
-  payments: { card: true, offline: true, door: true }, donations: true, pixels: { ga4: '', meta: '', tiktok: '' },
+  payments: { card: true, offline: true, door: true }, donations: true, pixels: { ga4: '', meta: '', tiktok: '', consent: false }, mail: { fromName: '', replyTo: '' },
   contactEmail: '', reminderHours: 24, require2fa: false,
   // Stage 5: who pays card processing, tax on fees, what checkout asks for, and questions asked on every order
   passProcessing: false, taxOnFees: false, questions: [],
-  checkout: { phone: 'optional', address: 'off', promo: true, optIn: true, note: '', thanks: '' },
+  checkout: { phone: 'optional', address: 'off', promo: true, optIn: true, smsOptIn: true, note: '', thanks: '' },
 };
 
 /* ── Payments (Stage 5): one gateway interface, many processors ──
@@ -608,7 +608,7 @@ function singleGaps(ev, isFree, chosen) {
 }
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v11';
+const DEMO_KEY = 'set_demo_v12';
 const Demo = {
   st: null,
   load() {
@@ -832,9 +832,11 @@ function demoPlaceOrder(p, asTeam) {
     data: { buyer: p.buyer, lines: q.lines, subtotal: q.subtotal, ticketsTotal: q.ticketsTotal, addonsTotal: q.addonsTotal, discount: q.discount, feeDiscount: q.feeDiscount,
       fee: q.fee, serviceFee: q.serviceFee, tax: q.tax, donation: q.donation, processing: q.processing, processingFee: q.processingFee, total: q.total, refunded: 0, faceValue: q.faceValue,
       code: promo?.code || null, promo: promo ? { id: promo.id, code: findCode(st, bo.id, promo.code).promo.code } : null, tracking,
-      payment: q.total === 0 ? (q.credit ? 'credit' : 'free') : p.payment, credit: credit && q.credit ? { id: credit.id, code: credit.code, amount: q.credit } : null, answers: p.answers || {}, ticketAnswers: p.ticketAnswers || {}, optIn: !!p.optIn, source: p.source || null, currency: q.currency,
+      payment: q.total === 0 ? (q.credit ? 'credit' : 'free') : p.payment, credit: credit && q.credit ? { id: credit.id, code: credit.code, amount: q.credit } : null, answers: p.answers || {}, ticketAnswers: p.ticketAnswers || {}, optIn: !!p.optIn, smsOptIn: !!p.smsOptIn && !!normPhone(p.buyer?.phone), source: p.source || null, utm: cleanUtm(p.utm), currency: q.currency,
       platformFee: q.platformFee, ...(p.comp ? { comp: true } : {}) } };
   st.orders.push(order);
+  emitEvent(st, bo.id, 'order.created', hookOrder(st, order));
+  if (status === 'pending') orderContact(st, order);
   // the order now holds its seats itself (paid → tickets; unpaid → reserved until paid or expired), so this buyer's seat holds go
   for (const l of q.lines) if (l.seats?.length) st.seatStatus = (st.seatStatus || []).filter(r => !(r.event_id === l.eventId && l.seats.includes(r.seat) && [l.slotId || '', ''].includes(r.slot_id || '') && (r.status === 'checkout' || (manual && r.status === 'held'))));
   if (p.holdToken) st.seatStatus = (st.seatStatus || []).filter(r => !(r.status === 'checkout' && r.token === p.holdToken));
@@ -872,9 +874,12 @@ function issueOrderTickets(st, order, o = {}) {
         { bundle: { id: l.bundleId, name: l.name, n: c + 1 }, extras: [...extras(l.eventId), ...l.addons.map(a => `${a.name} × ${a.qty} (in ${l.name})`)] });
     }
   }
-  // ONE confirmation email per order, with every ticket (queued here; delivery is wired in Stage 8)
-  if (!(st.outbox ||= []).some(m => m.order_id === order.id && m.kind === 'confirmation'))
-    st.outbox.push({ id: uid(), box_office_id: order.box_office_id, order_id: order.id, kind: 'confirmation', to: order.buyer_email, at: nowIso(), status: 'queued' });
+  // ONE confirmation email per order, with every ticket (the sender delivers it; transactional — never held back for marketing consent)
+  if (!(st.outbox ||= []).some(m => m.order_id === order.id && m.kind === 'confirmation')) queueMail(st, order, 'confirmation', '', '', 'system');
+  orderContact(st, order);
+  const hk = hookOrder(st, order), ctx = orderCtx(st, order);
+  emitEvent(st, order.box_office_id, 'ticket.issued', { order_ref: order.ref, tickets: hk.tickets });
+  emitEvent(st, order.box_office_id, 'payment.completed', hk, ctx);
 }
 // The demo processor: Stripe's published test card numbers behave like Stripe test mode. Never stores the card — only brand + last 4.
 function demoCharge(st, order, card = {}) {
@@ -921,6 +926,7 @@ function expireOrders(st, now = Date.now()) {
   for (const o of st.orders || []) if (o.status === 'awaiting_payment' && new Date(o.expires_at) <= now) {
     o.status = 'expired'; n++;
     for (const l of o.data.lines || []) for (const u of lineUnits(l)) if (u.seat) { const ev = st.events.find(e => e.id === l.eventId); if (ev) seatLog(ev, l.slotId, u.seat, 'released', `Checkout ${o.ref} expired unpaid — seat released`, { ref: o.ref, by: 'system' }); }
+    emitEvent(st, o.box_office_id, 'cart.expired', hookOrder(st, o), { ...orderCtx(st, o, []), eventId: o.event_ids[0] });
   }
   return n;
 }
@@ -985,10 +991,6 @@ const eventPortion = (q, evId) => q.lines.filter(l => l.eventId === evId).reduce
 const orderExtras = (o, evId) => o.data.lines.filter(l => l.eventId === evId && l.kind === 'addon' && l.qty - (l.removed || 0) > 0).map(l => `${l.name} × ${l.qty - (l.removed || 0)}`);
 
 /* ── DEMO server side of orderAction() ── */
-function queueMail(st, o, kind, subject, body, by) {
-  const m = { id: uid(), box_office_id: o.box_office_id, order_id: o.id, kind, to: o.buyer_email, subject: String(subject || '').slice(0, 200), body: String(body || '').slice(0, 5000), by, at: nowIso(), status: 'queued' };
-  (st.outbox ||= []).push(m); return m;
-}
 function issueCreditRow(st, boId, c) {
   const email = String(c.email || '').trim().toLowerCase(), amount = cents(c.amount);
   if (!EMAIL_RE.test(email)) throw new Error('The credit needs the customer\'s email');
@@ -1164,7 +1166,8 @@ function demoOrderAction(id, action, p = {}) {
       res = changeOrderTickets(st, o, p, by);
       const r = res.tickets, s = r.map(x => `${x.from.seat || x.from.type} → ${x.to.seat || x.to.type}`).join('; ');
       log('change', `${r.length === 1 ? 'changed 1 ticket' : `changed ${r.length} tickets`}: ${s}${res.net > 0 ? ` · upgrade ${money_(res.net)} — ${UPGRADE_SETTLE[res.settle].toLowerCase()}` : res.net < 0 ? ` · downgrade ${money_(-res.net)} — ${DOWNGRADE_SETTLE[res.settle].toLowerCase()}${res.refund ? ' (' + refundText(res.refund) + ')' : ''}` : ''}`, res);
-      notify('updated', 'Your updated tickets', 'Your tickets have changed. Your new tickets are attached — the old ones no longer work.'); break;
+      notify('updated', 'Your updated tickets', 'Your tickets have changed. Your new tickets are attached — the old ones no longer work.');
+      emitEvent(st, o.box_office_id, 'seat.changed', { order_ref: o.ref, email: o.buyer_email, changes: r.map(x => ({ from: x.from, to: x.to })), net: res.net }); break;
     }
     case 'cancel': {
       const all = !!p.all || (p.tickets || []).length >= live().length && live().every(t => p.tickets.includes(t.id));
@@ -1176,6 +1179,8 @@ function demoOrderAction(id, action, p = {}) {
       log('cancel', `${all ? 'order cancelled' : `cancelled ${list.length} ticket${list.length === 1 ? '' : 's'}`} (${list.map(t => t.code).join(', ') || 'products'}) — ${SEAT_AFTER_CANCEL[p.seat || 'release'].toLowerCase()}${r ? ' · refunded ' + refundText(r) : ' · no refund'}`,
         { tickets: list.map(t => t.code), seat: p.seat || 'release', refund: r }, null, { status: o.status });
       notify('cancelled', all ? 'Your order was cancelled' : 'Some of your tickets were cancelled', r ? `A refund of ${money_(r.amount)} has been issued.` : '');
+      emitEvent(st, o.box_office_id, 'ticket.cancelled', { order_ref: o.ref, email: o.buyer_email, tickets: list.map(t => t.id), all }, { ...orderCtx(st, o, list), key: o.id + ':c' + (st.orderLog || []).length });
+      if (r) emitEvent(st, o.box_office_id, 'refund.issued', { order_ref: o.ref, email: o.buyer_email, amount: r.amount, to: r.to }, { ...orderCtx(st, o, list), key: o.id + ':r' + (st.orderLog || []).length });
       res = { cancelled: list.length, refund: r }; break;
     }
     case 'refund': {
@@ -1187,6 +1192,8 @@ function demoOrderAction(id, action, p = {}) {
       log('refund', `refunded ${refundText(r)}${{ full: ' (everything left)', tickets: ` (${Object.keys(plan.per).length} ticket${Object.keys(plan.per).length === 1 ? '' : 's'}${plan.fees ? ' + booking fee' : ''})`, fees: ' (booking fee)', percent: ` (${+p.pct}%)`, amount: '' }[p.mode]}${gone.length ? ` · ${gone.length} ticket${gone.length === 1 ? '' : 's'} cancelled` : p.cancel ? '' : ' · tickets kept'}`,
         { refund: r, cancelled: gone.map(t => t.code) }, null, { status: o.status });
       notify('refund', 'Your refund', `We've issued a refund of ${money_(r.amount)}${r.credit ? ` as credit — use code ${r.credit} on your next order` : ''}.`);
+      emitEvent(st, o.box_office_id, 'refund.issued', { order_ref: o.ref, email: o.buyer_email, amount: r.amount, to: r.to }, { ...orderCtx(st, o), key: o.id + ':r' + (st.orderLog || []).length });
+      if (gone.length) emitEvent(st, o.box_office_id, 'ticket.cancelled', { order_ref: o.ref, email: o.buyer_email, tickets: gone.map(t => t.id), all: p.mode === 'full' }, { ...orderCtx(st, o, gone), key: o.id + ':c' + (st.orderLog || []).length });
       res = { refund: r }; break;
     }
     case 'collect': {  // record money received later (balance due, extra charge)
@@ -1424,6 +1431,8 @@ function demoCheckin(code, undo, eventId, o) {
     need('door.override', t.event_id); override = true;
   }
   t.checked_in_at = nowIso(); t.checkin = { entrance: en?.name || '', device: dev?.id || '', device_name: dev?.name || '', by: DB._actor, manual: !!o.manual };
+  emitEvent(st, ord.box_office_id, 'customer.checked_in', { ticket_id: t.id, event_id: t.event_id, order_ref: ord.ref, email: ord.buyer_email, entrance: en?.name || '', at: t.checked_in_at },
+    { ...orderCtx(st, ord, [t]), key: t.id });
   return done('ok', override ? { override } : {});
 }
 // Each phone / tablet / handheld that scans is a device: named by its user, seen by admins, can be switched off if lost.
@@ -1438,6 +1447,400 @@ function scanDevice(st, o) {
 const guestMatch = (st, t, q, digits) => { const o = st.orders.find(x => x.id === t.order_id);
   return [t.holder, t.code, o?.ref, o?.buyer_email, o?.data?.buyer?.name].some(v => String(v || '').toLowerCase().includes(q))
     || (digits.length >= 4 && String(o?.data?.buyer?.phone || '').replace(/\D/g, '').includes(digits)); };
+
+/* ════════════ Messages, marketing & automation (Stage 8) ════════════
+   ONE outbox for everything the platform sends (st.outbox / SQL outbox): confirmations, resends, updated tickets, refunds, staff messages,
+   reminders, event updates, campaigns, waitlist notices, automation emails / texts and staff notifications. A row is queued with a send_at;
+   the sender delivers it when due after re-checking consent (sendGate): transactional mail (tickets, order changes, event information) goes
+   to every buyer unless the address bounced or was suppressed; marketing needs a recorded opt-in and no unsubscribe; texts need a mobile
+   number and no STOP. DEMO: demoDeliver() marks rows sent in this browser — nothing leaves it. LIVE: the `messaging` Edge Function claims
+   due rows (claim_outbox), renders them with mailtpl.js and sends through Resend / the SMS provider.
+   Consent + tags live on `contacts` (one per box office + email); every consent change is a `consentLog` row.
+   emitEvent() is the one place outside systems hear about things: matching webhooks / CRM connections get a `deliveries` row, and the same
+   call runs matching automations (Trigger → Conditions → Actions). Time-based triggers run in marketingTick(). */
+const MSG_KINDS = {
+  confirmation: ['Order confirmation', 'transactional'], confirmation_copy: ['Confirmation (resent)', 'transactional'], tickets: ['Tickets resent', 'transactional'],
+  updated: ['Updated tickets', 'transactional'], cancelled: ['Cancellation', 'transactional'], refund: ['Refund', 'transactional'], credit: ['Credit issued', 'transactional'],
+  message: ['Message from the box office', 'transactional'], reminder: ['Event reminder', 'transactional'], update: ['Event update', 'transactional'],
+  waitlist: ['Waitlist notice', 'transactional'], followup: ['After the event', 'transactional'], campaign: ['Campaign', 'marketing'], automation: ['Automation', 'transactional'],
+  staff: ['Staff notification', 'staff'] };
+const MSG_STATUS = { queued: 'Queued', sending: 'Sending', sent: 'Sent', failed: 'Failed', suppressed: 'Not sent — no consent', cancelled: 'Cancelled', 'not sent (staff choice)': 'Not sent (staff choice)' };
+const MSG_VARS = [['first_name', 'First name'], ['name', 'Full name'], ['event', 'Event name'], ['date', 'Event date'], ['time', 'Start time'], ['venue', 'Venue'], ['doors', 'Doors open'],
+  ['order_ref', 'Order number'], ['tickets_link', 'Link to their tickets'], ['event_link', 'Event page link'], ['box_office', 'Box office name'], ['promo_code', 'Promo code (automation)'], ['link', 'Your link (automation)']];
+const HOOK_EVENTS = { 'order.created': 'Order created', 'payment.completed': 'Payment completed', 'ticket.issued': 'Ticket issued', 'ticket.cancelled': 'Ticket cancelled',
+  'refund.issued': 'Refund issued', 'seat.changed': 'Seat changed', 'cart.expired': 'Cart expired', 'waitlist.signup': 'Waitlist signup', 'customer.checked_in': 'Customer checked in', 'event.updated': 'Event updated' };
+const AUTO_TRIGGERS = { 'ticket.purchased': 'Ticket purchased', 'ticket.cancelled': 'Ticket cancelled', 'refund.issued': 'Refund issued', 'waitlist.joined': 'Customer added to waitlist',
+  'event.approaching': 'Event approaching', 'checked_in': 'Customer checked in', 'no_show': 'Customer did not attend', 'cart.abandoned': 'Cart abandoned (checkout left unpaid)',
+  'promo.used': 'Promo code used', 'event.ended': 'Event ended' };
+const TRIGGER_OF = { 'payment.completed': ['ticket.purchased', 'promo.used'], 'ticket.cancelled': ['ticket.cancelled'], 'refund.issued': ['refund.issued'], 'waitlist.signup': ['waitlist.joined'],
+  'customer.checked_in': ['checked_in'], 'cart.expired': ['cart.abandoned'] };
+const TIMED_TRIGGERS = ['event.approaching', 'event.ended', 'no_show'];
+const AUTO_ACTIONS = { email: 'Send email', sms: 'Send text message', tag: 'Add customer tag', untag: 'Remove customer tag', staff: 'Notify staff', webhook: 'Trigger webhook', crm: 'Send to connected CRM' };
+const TIMING = { now: 'Right away', before: 'Hours before the event starts', after: 'Hours after the event ends', delay: 'Hours after the trigger' };
+// box office connections. Secrets (API keys, tokens, webhook signing secrets) are write-only: stored server-side, never sent back to the browser.
+const INTEGRATIONS = {
+  webhook: { name: 'Webhook', crm: false, fields: [['url', 'Endpoint URL (https://…)']], secret: '', blurb: 'Signed JSON POSTs to your own system for the events you choose.' },
+  mailchimp: { name: 'Mailchimp', crm: true, fields: [['dc', 'Data center (e.g. us21)'], ['list', 'Audience ID']], secret: 'API key', blurb: 'Adds buyers to an audience with their tags.' },
+  hubspot: { name: 'HubSpot', crm: true, fields: [], secret: 'Private app access token', blurb: 'Creates / updates contacts with purchase details.' },
+  activecampaign: { name: 'ActiveCampaign', crm: true, fields: [['url', 'API URL (https://you.api-us1.com)'], ['list', 'List ID']], secret: 'API key', blurb: 'Syncs contacts and tags to a list.' },
+  constantcontact: { name: 'Constant Contact', crm: true, fields: [['list', 'List ID']], secret: 'Access token', blurb: 'Adds opted-in buyers to a contact list.' },
+  meta_capi: { name: 'Meta Conversions API', crm: false, fields: [['pixel', 'Pixel ID'], ['test', 'Test event code (optional)']], secret: 'Access token', blurb: 'Sends purchases to Meta from the server (works with ad blockers; matched with the browser pixel).' },
+};
+const API_SCOPES = { 'events:read': 'Events & ticket types', 'orders:read': 'Orders', 'tickets:read': 'Tickets & check-ins', 'customers:read': 'Customers & consent' };
+const SEG_STATUS = { any: 'Everyone', buyers: 'Has bought tickets', optedIn: 'Opted in to marketing email', smsOptIn: 'Opted in to marketing texts', account: 'Has a customer account',
+  refunded: 'Had a refund', credit: 'Has credit', waitlist: 'On a waitlist', unsubscribed: 'Unsubscribed / suppressed' };
+const emptySeg = () => ({ eventIds: [], ticketTypeIds: [], areas: [], from: '', to: '', promo: '', tracking: '', checkin: 'any', status: 'any', tags: [] });
+const normPhone = p => { const s = String(p || '').trim(), d = s.replace(/\D/g, ''); if (d.length < 7) return ''; return s.startsWith('+') ? '+' + d : d.length === 10 ? '+1' + d : d.length === 11 && d[0] === '1' ? '+' + d : '+' + d; };
+// only https URLs on public hosts (no localhost / private IP literals) — the Edge Function re-checks the resolved address before every POST
+function publicUrl(u) {
+  let x; try { x = new URL(String(u || '').trim()); } catch (e) { return ''; }
+  if (x.protocol !== 'https:' || x.username || x.password) return '';
+  const h = x.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || !h.includes('.') && !h.includes(':')) return '';
+  if (/^(0|10|127)\.|^169\.254\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.|^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h) || /^\d+$/.test(h) || h.includes(':') && /^(::1?|f[cd]|fe80)/.test(h)) return '';
+  return x.toString();
+}
+
+/* ── contacts & consent ── */
+function contactOf(st, boId, email, make = true) {
+  email = String(email || '').trim().toLowerCase(); if (!EMAIL_RE.test(email)) return null;
+  let c = (st.contacts ||= []).find(x => x.box_office_id === boId && x.email === email);
+  if (!c && make) st.contacts.push(c = { id: uid(), box_office_id: boId, email, name: '', phone: '', email_optin: false, email_optin_at: null, email_optin_src: '', sms_optin: false, sms_optin_at: null,
+    sms_optin_src: '', unsub_email_at: null, unsub_sms_at: null, suppressed: null, suppressed_at: null, tags: [], token: randCode(24), created_at: nowIso(), updated_at: nowIso() });
+  return c;
+}
+// action: optin | optout (email marketing) · sms_optin | sms_optout (STOP — no texts at all) | sms_start · suppress | unsuppress (email, all mail) · tag | untag
+function consentChange(st, c, action, source, by, extra = '') {
+  const at = nowIso();
+  switch (action) {
+    case 'optin': Object.assign(c, { email_optin: true, email_optin_at: at, email_optin_src: source, unsub_email_at: null }); break;
+    case 'optout': if (!c.email_optin && c.unsub_email_at) return false; Object.assign(c, { email_optin: false, unsub_email_at: at }); break;
+    case 'sms_optin': if (!c.phone) throw new Error('No mobile number on file'); Object.assign(c, { sms_optin: true, sms_optin_at: at, sms_optin_src: source, unsub_sms_at: null }); break;
+    case 'sms_optout': if (c.unsub_sms_at) return false; Object.assign(c, { sms_optin: false, unsub_sms_at: at }); break;
+    case 'sms_start': if (!c.unsub_sms_at) return false; c.unsub_sms_at = null; break;
+    case 'suppress': Object.assign(c, { suppressed: ['bounced', 'complaint'].includes(extra) ? extra : 'manual', suppressed_at: at }); break;
+    case 'unsuppress': if (!c.suppressed) return false; Object.assign(c, { suppressed: null, suppressed_at: null }); break;
+    default: throw new Error('Unknown consent change');
+  }
+  c.updated_at = at;
+  (st.consentLog ||= []).unshift({ id: uid(), box_office_id: c.box_office_id, email: c.email, action: action === 'suppress' ? 'suppress:' + c.suppressed : action, source: String(source || '').slice(0, 160), by: by || 'system', at });
+  return true;
+}
+const tagsOf = s => [...new Set(String(s || '').split(',').map(x => x.trim().slice(0, 40)).filter(Boolean))];
+function tagContact(c, tags, on) { const t = tagsOf(Array.isArray(tags) ? tags.join(',') : tags); c.tags = on ? [...new Set([...(c.tags || []), ...t])] : (c.tags || []).filter(x => !t.includes(x)); c.updated_at = nowIso(); }
+// an order's buyer → their contact (name / phone kept fresh) + the consent they gave at checkout
+function orderContact(st, o) {
+  const c = contactOf(st, o.box_office_id, o.buyer_email); if (!c) return null;
+  const b = o.data.buyer || {}, src = `checkout · order ${o.ref}`;
+  if (b.name) c.name = String(b.name).slice(0, 120); if (normPhone(b.phone)) c.phone = normPhone(b.phone);
+  if (o.data.optIn && !c.email_optin) consentChange(st, c, 'optin', src, o.buyer_email);
+  if (o.data.smsOptIn && c.phone && !c.sms_optin) consentChange(st, c, 'sms_optin', src, o.buyer_email);
+  return c;
+}
+// may this message go to this person? '' = yes, otherwise the reason it is held back
+function sendGate(c, channel, category, to) {
+  if (category === 'staff') return '';
+  if (channel === 'sms') {
+    if (!to) return 'no mobile number';
+    if (c?.unsub_sms_at) return 'replied STOP to texts';
+    if (category === 'marketing' && !c?.sms_optin) return 'not opted in to marketing texts';
+    return '';
+  }
+  if (c?.suppressed) return `address suppressed (${c.suppressed})`;
+  if (category === 'marketing' && !(c?.email_optin && !c.unsub_email_at)) return c?.unsub_email_at ? 'unsubscribed from marketing' : 'not opted in to marketing email';
+  return '';
+}
+
+/* ── the outbox ── */
+function queueMsg(st, m) {
+  const kind = m.kind || 'message', row = { id: uid(), box_office_id: m.box_office_id, order_id: null, event_id: null, kind, channel: 'email', category: MSG_KINDS[kind]?.[1] || 'transactional',
+    to: '', email: '', subject: '', body: '', by: 'system', at: nowIso(), send_at: null, status: 'queued', attempts: 0, error: '', provider: '', provider_id: '', sent_at: null,
+    campaign_id: null, automation_id: null, dedupe: null, require_valid: false, ...m };
+  row.subject = String(row.subject || '').slice(0, 200); row.body = String(row.body || '').slice(0, 5000); row.send_at ||= row.at;
+  if (row.channel === 'email') row.to = String(row.to || row.email).toLowerCase(); else row.to = normPhone(row.to);
+  row.email = String(row.email || (row.channel === 'email' ? row.to : '')).toLowerCase();
+  if (row.dedupe && (st.outbox ||= []).some(x => x.dedupe === row.dedupe)) return null;
+  (st.outbox ||= []).push(row); return row;
+}
+function queueMail(st, o, kind, subject, body, by) {
+  return queueMsg(st, { box_office_id: o.box_office_id, order_id: o.id, event_id: o.event_ids?.[0] || null, kind, to: o.buyer_email, email: o.buyer_email, subject, body, by });
+}
+// why a due row must not go out now: { cancel } = no longer relevant (order cancelled) · otherwise held back for consent
+function outboxBlock(st, m) {
+  if (m.require_valid && m.order_id && !st.tickets.some(t => t.order_id === m.order_id && t.status === 'valid' && (!m.event_id || t.event_id === m.event_id)))
+    return { cancel: true, text: 'the order has no valid tickets any more' };
+  const c = (st.contacts || []).find(x => x.box_office_id === m.box_office_id && x.email === m.email), why = sendGate(c, m.channel || 'email', m.category || 'transactional', m.to);
+  return why ? { text: why } : null;
+}
+// DEMO sender: due rows become 'sent' (provider 'demo' — nothing leaves this browser); webhook / CRM deliveries are recorded, not posted
+function demoDeliver(st, now = Date.now()) {
+  let n = 0;
+  for (const m of st.outbox || []) {
+    if (m.status !== 'queued' || new Date(m.send_at || m.at) > now) continue;
+    const b = outboxBlock(st, m); m.attempts = (m.attempts || 0) + 1; n++;
+    if (b) Object.assign(m, { status: b.cancel ? 'cancelled' : 'suppressed', error: b.text });
+    else Object.assign(m, { status: 'sent', sent_at: new Date(now).toISOString(), provider: 'demo', provider_id: 'demo_' + randCode(10).toLowerCase(), error: '' });
+  }
+  for (const d of st.deliveries || []) if (d.status === 'queued') Object.assign(d, { status: 'delivered', attempts: 1, done_at: new Date(now).toISOString(), response: 'demo mode — recorded, not posted' });
+  return n;
+}
+
+/* ── segments: who matches a filter. x = { orders, tickets, contacts, waitlist, credits, accounts } (admin data or the demo store) ── */
+function segmentPeople(x, f = {}, boId) {
+  f = { ...emptySeg(), ...f }; const by = new Map(), inBo = r => !boId || r.box_office_id === boId;
+  const person = (email, name, phone) => { email = String(email || '').toLowerCase(); let p = by.get(email); if (!p) by.set(email, p = { email, name: name || '', phone: normPhone(phone), orders: [], tickets: [], waitlist: [], spent: 0 }); if (name && !p.name) p.name = name; if (!p.phone && normPhone(phone)) p.phone = normPhone(phone); return p; };
+  const counted = o => o.status !== 'expired' && o.status !== 'awaiting_payment';
+  const tkFilter = f.eventIds.length || f.ticketTypeIds.length || f.areas.length || f.checkin !== 'any', ordFilter = f.from || f.to || f.promo || f.tracking;
+  const ordOk = o => (!f.from || new Date(o.created_at) >= new Date(f.from)) && (!f.to || new Date(o.created_at) <= new Date(f.to + (f.to.length <= 10 ? 'T23:59:59' : '')))
+    && (!f.promo || String(o.data.code || '').toUpperCase() === f.promo.toUpperCase()) && (!f.tracking || String(o.data.tracking || '').toUpperCase() === f.tracking.toUpperCase());
+  const tkOk = t => t.status === 'valid' && (!f.eventIds.length || f.eventIds.includes(t.event_id)) && (!f.ticketTypeIds.length || f.ticketTypeIds.includes(t.ticket_type_id))
+    && (!f.areas.length || f.areas.includes(t.area)) && (f.checkin === 'any' || (f.checkin === 'in') === !!t.checked_in_at);
+  const ords = (x.orders || []).filter(o => inBo(o) && counted(o)), tByOrder = new Map();
+  for (const t of x.tickets || []) if (inBo(t)) (tByOrder.get(t.order_id) || tByOrder.set(t.order_id, []).get(t.order_id)).push(t);
+  for (const o of ords) {
+    const p = person(o.buyer_email, o.data.buyer?.name, o.data.buyer?.phone), tks = tByOrder.get(o.id) || [];
+    p.orders.push(o); p.spent += (wasPaid(o) ? o.data.total || 0 : 0) - (o.data.refunded || 0);
+    if (ordOk(o)) p.tickets.push(...tks.filter(tkOk)), p._ordOk = true;
+  }
+  for (const w of x.waitlist || []) if (inBo(w)) person(w.email, w.name, w.phone).waitlist.push(w);
+  for (const c of x.contacts || []) if (inBo(c)) { const p = person(c.email, c.name, c.phone); p.contact = c; }
+  const credit = new Set((x.credits || []).filter(c => inBo(c) && !c.revoked_at && (c.status ? c.status === 'active' : true)).map(c => c.email)), accts = new Set(x.accounts || []);
+  return [...by.values()].filter(p => {
+    const c = p.contact;
+    if (f.status === 'waitlist') { if (!p.waitlist.some(w => !f.eventIds.length || f.eventIds.includes(w.event_id))) return false; }
+    else {
+      if (tkFilter && !p.tickets.length) return false;
+      if (!tkFilter && ordFilter && !p._ordOk) return false;
+      if (f.status === 'buyers' && !p.orders.length) return false;
+    }
+    if (f.status === 'optedIn' && !(c?.email_optin && !c.unsub_email_at && !c.suppressed)) return false;
+    if (f.status === 'smsOptIn' && !(c?.sms_optin && !c.unsub_sms_at && p.phone)) return false;
+    if (f.status === 'account' && !accts.has(p.email)) return false;
+    if (f.status === 'refunded' && !p.orders.some(o => (o.data.refunded || 0) + (o.data.credited || 0) > 0)) return false;
+    if (f.status === 'credit' && !credit.has(p.email)) return false;
+    if (f.status === 'unsubscribed' && !(c?.unsub_email_at || c?.suppressed || c?.unsub_sms_at)) return false;
+    if (f.tags.length && !f.tags.every(t => (c?.tags || []).includes(t))) return false;
+    if (!p.orders.length && !p.waitlist.length && (tkFilter || ordFilter)) return false;
+    return true;
+  }).map(p => { const { _ordOk, ...r } = p; if (!r.name && r.contact?.name) r.name = r.contact.name; if (!r.phone && r.contact?.phone) r.phone = r.contact.phone; return r; });
+}
+const segLabel = (f, evName = id => id) => { f = { ...emptySeg(), ...f }; const parts = [];
+  if (f.status !== 'any') parts.push(SEG_STATUS[f.status]); if (f.eventIds.length) parts.push(f.eventIds.map(evName).join(' / ')); if (f.ticketTypeIds.length) parts.push(f.ticketTypeIds.length + ' ticket type(s)');
+  if (f.areas.length) parts.push(f.areas.join(' / ')); if (f.from || f.to) parts.push(`bought ${f.from || '…'} – ${f.to || '…'}`); if (f.promo) parts.push('code ' + f.promo); if (f.tracking) parts.push('ref ' + f.tracking);
+  if (f.checkin !== 'any') parts.push(f.checkin === 'in' ? 'checked in' : 'not checked in'); if (f.tags.length) parts.push('tagged ' + f.tags.join(', '));
+  return parts.join(' · ') || 'Everyone'; };
+
+/* ── events out: webhooks, CRM syncs, automations ── */
+function emitEvent(st, boId, type, data, ctx) {
+  const at = nowIso(), id = 'evt_' + randCode(14).toLowerCase(), crmType = ['payment.completed', 'waitlist.signup'].includes(type);
+  for (const ig of (st.integrations || []).filter(x => x.box_office_id === boId && x.active)) {
+    const want = ig.kind === 'webhook' ? (ig.config.events || []).includes(type) : INTEGRATIONS[ig.kind]?.crm ? crmType : ig.kind === 'meta_capi' ? type === 'payment.completed' : false;
+    if (want) (st.deliveries ||= []).unshift({ id: uid(), box_office_id: boId, integration_id: ig.id, kind: ig.kind, event: type, event_id: id, payload: { id, type, created: at, data }, status: 'queued', attempts: 0, created_at: at, response: '' });
+  }
+  if (ctx) for (const trig of TRIGGER_OF[type] || []) for (const a of (st.automations || []).filter(x => x.box_office_id === boId && x.enabled && x.trigger.type === trig)) {
+    if (trig === 'promo.used' && !ctx.promo) continue;
+    runAutomation(st, a, ctx, `${type}:${ctx.key || id}`);
+  }
+}
+// the payload outside systems get for an order: no access key, payment internals or platform money
+const hookOrder = (st, o) => ({ id: o.id, ref: o.ref, status: o.status, email: o.buyer_email, name: o.data.buyer?.name || '', phone: o.data.buyer?.phone || '', total: o.data.total, currency: o.data.currency || 'USD',
+  promo: o.data.code || null, tracking: o.data.tracking || null, utm: o.data.utm || null, created_at: o.created_at, paid_at: o.paid_at || null, event_ids: o.event_ids,
+  tickets: st.tickets.filter(t => t.order_id === o.id).map(t => ({ id: t.id, code_last4: String(t.code).slice(-4), event_id: t.event_id, ticket_type_id: t.ticket_type_id, area: t.area || null, row: t.row || null, seat: t.seat_label || null, status: t.status, face: t.face, paid: t.paid })) });
+const orderCtx = (st, o, tks) => ({ email: o.buyer_email, name: o.data.buyer?.name || '', phone: o.data.buyer?.phone || '', order_id: o.id, ref: o.ref, promo: o.data.code || '', key: o.id,
+  tickets: (tks || st.tickets.filter(t => t.order_id === o.id && t.status === 'valid')).map(t => ({ event_id: t.event_id, slot_id: t.slot_id || '', ticket_type_id: t.ticket_type_id, area: t.area || '', face: t.face, checked_in_at: t.checked_in_at })),
+  eventIds: o.event_ids });
+// conditions: events, ticket types, seating areas, price levels (face value), how many matching tickets, promo code, customer tags
+function autoTickets(a, ctx) {
+  const c = a.cond || {};
+  return (ctx.tickets || []).filter(t => (!c.eventIds?.length || c.eventIds.includes(t.event_id)) && (!c.ticketTypeIds?.length || c.ticketTypeIds.includes(t.ticket_type_id))
+    && (!c.areas?.length || c.areas.includes(t.area)) && (!c.prices?.length || c.prices.includes(t.face)));
+}
+function autoMatch(st, a, ctx) {
+  const c = a.cond || {}, tkCond = c.ticketTypeIds?.length || c.areas?.length || c.prices?.length || c.minQty > 0;
+  if (c.promo && String(ctx.promo || '').toUpperCase() !== String(c.promo).toUpperCase()) return null;
+  if (c.tags?.length) { const k = (st.contacts || []).find(x => x.box_office_id === a.box_office_id && x.email === ctx.email); if (!c.tags.every(t => (k?.tags || []).includes(t))) return null; }
+  if (!ctx.tickets?.length) return tkCond || (c.eventIds?.length && !(ctx.eventIds || []).some(id => c.eventIds.includes(id))) ? null : [];
+  const tks = autoTickets(a, ctx);
+  return tks.length && tks.length >= (c.minQty || 1) ? tks : null;
+}
+const evStart = (ev, slotId) => new Date(ev.timeSlots?.find(s => s.id === slotId)?.start || ev.start).getTime();
+const evEnd = (ev, slotId) => { const s = ev.timeSlots?.find(x => x.id === slotId); return new Date(s?.end || (s ? s.start : ev.end) || evStart(ev, slotId) + 3 * 36e5).getTime(); };
+function runAutomation(st, a, ctx, key) {
+  const tks = autoMatch(st, a, ctx); if (!tks) return 0;
+  const runs = (st.autoRuns ||= {}); if (runs[a.id + '|' + key]) return 0; runs[a.id + '|' + key] = nowIso();
+  const evId = tks[0]?.event_id || ctx.eventId || ctx.eventIds?.[0] || null, ev = evId && st.events.find(e => e.id === evId), slot = tks[0]?.slot_id || '';
+  const H = (+a.timing?.hours || 0) * 36e5, now = Date.now();
+  const sendAt = a.timing?.mode === 'before' && ev ? Math.max(now, evStart(ev, slot) - H) : a.timing?.mode === 'after' && ev ? Math.max(now, evEnd(ev, slot) + H) : a.timing?.mode === 'delay' ? now + H : now;
+  const ticketBased = ['ticket.purchased', 'promo.used', 'event.approaching', 'event.ended', 'checked_in'].includes(a.trigger.type);
+  const c = contactOf(st, a.box_office_id, ctx.email);
+  if (c) { if (ctx.name && !c.name) c.name = ctx.name; if (!c.phone && normPhone(ctx.phone)) c.phone = normPhone(ctx.phone); }
+  const fill = s => String(s || '').replace(/\{\{\s*event\s*\}\}/g, ev?.name || '').replace(/\{\{\s*promo_code\s*\}\}/g, a.promo || '');
+  for (const x of a.actions || []) {
+    const base = { box_office_id: a.box_office_id, order_id: ctx.order_id || null, event_id: evId, automation_id: a.id, by: 'automation: ' + a.name, send_at: new Date(sendAt).toISOString(),
+      require_valid: ticketBased && !!ctx.order_id, dedupe: `auto:${a.id}:${key}:${x.type}:${(a.actions || []).indexOf(x)}`, kind: a.kind || 'automation', vars: { promo_code: a.promo || '', link: x.link || '' } };
+    if (x.type === 'email') queueMsg(st, { ...base, channel: 'email', category: x.category || 'transactional', to: ctx.email, email: ctx.email, subject: x.subject, body: x.body });
+    else if (x.type === 'sms') queueMsg(st, { ...base, channel: 'sms', category: x.category || 'transactional', to: c?.phone || ctx.phone, email: ctx.email, body: x.body });
+    else if (x.type === 'staff') { if (EMAIL_RE.test(x.to || '')) queueMsg(st, { ...base, kind: 'staff', category: 'staff', require_valid: false, to: x.to, email: x.to, subject: x.subject || `Automation “${a.name}”`,
+      body: `${x.body ? x.body + '\n\n' : ''}${ctx.name || ''} <${ctx.email}>${ctx.ref ? ' · order ' + ctx.ref : ''}${ev ? ' · ' + ev.name : ''}` }); }
+    else if ((x.type === 'tag' || x.type === 'untag') && c) tagContact(c, fill(x.tag), x.type === 'tag');
+    else if (x.type === 'webhook' || x.type === 'crm') {
+      const ig = (st.integrations || []).find(i => i.id === x.integrationId && i.box_office_id === a.box_office_id && i.active);
+      if (ig) (st.deliveries ||= []).unshift({ id: uid(), box_office_id: a.box_office_id, integration_id: ig.id, kind: ig.kind, event: 'automation', event_id: 'evt_' + randCode(14).toLowerCase(),
+        payload: { type: 'automation', automation: a.name, trigger: a.trigger.type, created: nowIso(), data: { email: ctx.email, name: ctx.name, phone: ctx.phone || '', order_ref: ctx.ref || null, event_id: evId, tags: c?.tags || [] } }, status: 'queued', attempts: 0, created_at: nowIso(), response: '' });
+    }
+  }
+  a.runs = (a.runs || 0) + 1; a.last_run = nowIso();
+  return 1;
+}
+// time-based work, run every minute by the scheduler (LIVE: marketing_tick() via pg_cron; DEMO: on every back-office load):
+// event reminders set on the event, and automations triggered by an event approaching / ending / a no-show
+function marketingTick(st, now = Date.now()) {
+  let n = 0;
+  const holders = ev => { const by = new Map(); for (const t of st.tickets) if (t.event_id === ev.id && t.status === 'valid') { const k = t.order_id + '|' + (t.slot_id || ''); (by.get(k) || by.set(k, []).get(k)).push(t); } return by; };
+  for (const ev of st.events) {
+    if (ev.status !== 'published' || ev.archived) continue;
+    const autos = (st.automations || []).filter(a => a.box_office_id === ev.box_office_id && a.enabled && TIMED_TRIGGERS.includes(a.trigger.type)), rems = ev.emails?.reminders || [];
+    if (!autos.length && !rems.length) continue;
+    for (const [k, tks] of holders(ev)) {
+      const [oid, slot] = k.split('|'), o = st.orders.find(x => x.id === oid); if (!o) continue;
+      const start = evStart(ev, slot), end = evEnd(ev, slot);
+      rems.forEach((r, i) => {   // the event's own reminders (Event → Emails)
+        const at = start - (+r.hoursBefore || 0) * 36e5; if (now < at || now >= start) return;
+        const ch = r.channel === 'email' ? ['email'] : r.channel === 'both' ? ['email', 'sms'] : ['sms'];
+        for (const c of ch) if (queueMsg(st, { box_office_id: o.box_office_id, order_id: o.id, event_id: ev.id, kind: 'reminder', channel: c, to: c === 'email' ? o.buyer_email : o.data.buyer?.phone, email: o.buyer_email,
+          subject: `Reminder: {{event}} — {{date}}`, body: r.body || '', require_valid: true, dedupe: `rem:${ev.id}:${slot}:${i}:${o.id}:${c}` })) n++;
+      });
+      for (const a of autos) {
+        if (a.std === 'pre' && rems.length) continue;   // an event with its own reminders uses those instead of the standard one
+        const H = (+a.trigger.hours || 0) * 36e5, fire = a.trigger.type === 'event.approaching' ? start - H : end + H;
+        if (now < fire || (a.trigger.type === 'event.approaching' ? now >= start : now >= fire + 2 * 864e5)) continue;
+        const live = tks.filter(t => a.trigger.type !== 'no_show' || !t.checked_in_at);
+        if (a.trigger.type === 'no_show' && (live.length < tks.length || !live.length)) continue;   // nobody from this order came in
+        n += runAutomation(st, a, { ...orderCtx(st, o, live), eventId: ev.id }, `${a.trigger.type}:${ev.id}:${slot}:${o.id}`);
+      }
+    }
+  }
+  return n;
+}
+// the standard workflows (Eli Step 8 §7) every box office starts with — ordinary automations, so they can be edited or switched off
+function stdAutomations(bo) {
+  const A = (std, name, trigger, timing, actions, o = {}) => ({ id: 'au_' + std + '_' + bo.id, box_office_id: bo.id, std, name, enabled: true, trigger, cond: { eventIds: [], ticketTypeIds: [], areas: [], prices: [], minQty: 0, promo: '', tags: [] },
+    timing, actions, runs: 0, last_run: null, created_at: nowIso(), ...o });
+  return [
+    A('purchase', 'Purchase', { type: 'ticket.purchased' }, { mode: 'now', hours: 0 }, [{ type: 'tag', tag: 'Attendee: {{event}}' }]),
+    A('pre', 'Pre-event reminder', { type: 'event.approaching', hours: 24 }, { mode: 'now', hours: 0 }, [{ type: 'email', category: 'transactional', subject: 'Coming up: {{event}} — {{date}}',
+      body: 'Hi {{first_name}},\n\n{{event}} is coming up on {{date}} at {{time}} — {{venue}}. Doors open {{doors}}.\n\nYour tickets: {{tickets_link}}\n\nSee you there!' }], { kind: 'reminder' }),
+    A('post', 'Post-event thank you', { type: 'event.ended', hours: 12 }, { mode: 'now', hours: 0 }, [{ type: 'email', category: 'transactional', subject: 'Thanks for coming to {{event}}',
+      body: 'Hi {{first_name}},\n\nThank you for joining us at {{event}}. We would love to hear how it went — it takes a minute: {{link}}', link: '' }], { kind: 'followup' }),
+    A('offer', 'Next-event offer', { type: 'event.ended', hours: 48 }, { mode: 'now', hours: 0 }, [{ type: 'email', category: 'marketing', subject: 'A thank-you offer for your next night out',
+      body: 'Hi {{first_name}},\n\nAs a thank-you for coming to {{event}}, use code {{promo_code}} on your next order.' }], { kind: 'followup', enabled: false, promo: '' }),
+  ];
+}
+// the automation as a sentence, for lists
+function autoSentence(a, evName = id => id) {
+  const t = AUTO_TRIGGERS[a.trigger.type] + (TIMED_TRIGGERS.includes(a.trigger.type) ? ` (${a.trigger.hours || 0} h ${a.trigger.type === 'event.approaching' ? 'before' : 'after'})` : '');
+  const c = a.cond || {}, cs = [c.eventIds?.length && c.eventIds.map(evName).join(' / '), c.ticketTypeIds?.length && c.ticketTypeIds.length + ' ticket type(s)', c.areas?.length && c.areas.join(' / '),
+    c.prices?.length && c.prices.map(money_).join(' / ') + ' seats', c.minQty > 0 && c.minQty + '+ tickets', c.promo && 'code ' + c.promo, c.tags?.length && 'tagged ' + c.tags.join(', ')].filter(Boolean);
+  const w = a.timing?.mode === 'before' ? `${a.timing.hours} h before the event` : a.timing?.mode === 'after' ? `${a.timing.hours} h after the event` : a.timing?.mode === 'delay' ? `${a.timing.hours} h later` : '';
+  return { when: t, cond: cs.join(' · '), then: (a.actions || []).map(x => AUTO_ACTIONS[x.type] + (x.type === 'tag' || x.type === 'untag' ? ` “${x.tag}”` : '')).join(' + ') + (w ? ' · ' + w : '') };
+}
+// API keys: the key is shown once; only its SHA-256 is stored
+async function sha256hex(s) { const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)); return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join(''); }
+// UTM tags (utm_source / medium / campaign / content / term) a buyer arrived with, kept for the session and stored on the order
+const UTM_KEYS = ['source', 'medium', 'campaign', 'content', 'term'];
+const cleanUtm = u => { if (!u || typeof u !== 'object') return null; const o = {}; for (const k of UTM_KEYS) if (u[k]) o[k] = String(u[k]).trim().slice(0, 80); return Object.keys(o).length ? o : null; };
+
+/* ── DEMO server side of the Stage 8 calls (LIVE: the matching SQL functions) ── */
+const anyPerm = (keys, eventId) => { let err; for (const k of keys) { try { return need(k, eventId); } catch (e) { err = e; } } throw err; };
+const scopedTo = (me, evIds) => { if (me.owner || me.support || me.events === 'all') return; if (!evIds.length || evIds.some(id => !(me.events || []).includes(id))) throw new Error('You can only message the ticket holders of your own events'); };
+const demoPeopleFor = (st, boId, f) => segmentPeople({ orders: st.orders, tickets: st.tickets, contacts: st.contacts, waitlist: st.waitlist, credits: st.credits, accounts: (st.customers || []).map(c => c.email) }, f, boId);
+const demoPeople = (st, f) => segmentPeople({ orders: st.orders, tickets: st.tickets, contacts: st.contacts, waitlist: st.waitlist, credits: st.credits, accounts: (st.customers || []).map(c => c.email) }, f, DB._bo);
+function demoSendCampaign(c) {
+  const st = Demo.st, f = { ...emptySeg(), ...(c.filter || {}) }, cat = c.category === 'transactional' ? 'transactional' : 'marketing';
+  const ch = ['email', 'sms', 'both'].includes(c.channel) ? c.channel : 'email', chans = ch === 'both' ? ['email', 'sms'] : [ch];
+  f.eventIds = (f.eventIds || []).filter(id => st.events.some(e => e.id === id && e.box_office_id === DB._bo));
+  let me;
+  if (cat === 'transactional') {   // an event update: only to the ticket holders of the chosen events
+    if (!f.eventIds.length) throw new Error('An event update goes to the ticket holders of an event — choose the event');
+    f.eventIds.forEach(id => { me = anyPerm(['comms.email', 'comms.notify'], id); }); f.status = 'buyers';
+  } else { me = need('comms.marketing'); scopedTo(me, f.eventIds); f.eventIds.forEach(id => need('comms.marketing', id)); }
+  if (chans.includes('sms')) need('comms.sms');
+  const subject = String(c.subject || '').trim(), body = String(c.body || '').trim();
+  if (chans.includes('email') && !subject) throw new Error('Add a subject'); if (!body) throw new Error('Write the message');
+  if (chans.includes('sms') && body.length > 480 && ch === 'sms') throw new Error('Keep a text message under 480 characters');
+  const now = Date.now(), at = c.sendAt ? new Date(c.sendAt).getTime() : now;
+  if (!(at >= now - 6e4) || at > now + 366 * 864e5) throw new Error('Choose a send time in the future (within a year)');
+  const people = demoPeople(st, f), row = { id: uid(), box_office_id: DB._bo, event_id: f.eventIds[0] || null, kind: cat === 'transactional' ? 'update' : 'campaign', name: String(c.name || subject || body).slice(0, 120),
+    subject: subject.slice(0, 200), body: body.slice(0, 5000), channel: ch, category: cat, filter: f, send_at: new Date(at).toISOString(), status: at > now + 6e4 ? 'scheduled' : 'sent',
+    recipients: people.length, queued: 0, skipped: {}, created_by: DB._actor, created_at: nowIso() };
+  for (const p of people) for (const chn of chans) {
+    const to = chn === 'email' ? p.email : p.phone, why = sendGate(p.contact, chn, cat, to);
+    if (why) { row.skipped[why] = (row.skipped[why] || 0) + 1; continue; }
+    if (queueMsg(st, { box_office_id: DB._bo, event_id: row.event_id, kind: row.kind, channel: chn, category: cat, to, email: p.email, subject: row.subject, body: row.body, by: DB._actor,
+      send_at: row.send_at, campaign_id: row.id, dedupe: `cmp:${row.id}:${p.email}:${chn}` })) row.queued++;
+  }
+  st.broadcasts.push(row);
+  audit('comms.campaign', `${row.status === 'scheduled' ? 'Scheduled' : 'Sent'} ${cat === 'transactional' ? 'event update' : 'campaign'} “${row.name}” (${chans.join(' + ')}) to ${row.queued} — ${segLabel(f, id => st.events.find(e => e.id === id)?.name || id)}`, { target: row.event_id });
+  if (row.status === 'sent') demoDeliver(st);
+  return clone(row);
+}
+function cleanAutomation(st, a) {
+  const T = a.trigger?.type; if (!AUTO_TRIGGERS[T]) throw new Error('Choose a trigger');
+  const hrs = v => Math.max(0, Math.min(720, Math.round(+v || 0))), arr = v => (Array.isArray(v) ? v : []).map(x => String(x).slice(0, 80)).slice(0, 50);
+  const name = String(a.name || '').trim().slice(0, 80); if (!name) throw new Error('Name the automation');
+  const ig = id => (st.integrations || []).find(i => i.id === id && i.box_office_id === DB._bo);
+  const actions = (a.actions || []).slice(0, 8).map(x => {
+    if (!AUTO_ACTIONS[x.type]) throw new Error('Unknown action');
+    const r = { type: x.type };
+    if (x.type === 'email' || x.type === 'sms') {
+      r.category = x.category === 'marketing' ? 'marketing' : 'transactional'; r.body = String(x.body || '').trim().slice(0, x.type === 'sms' ? 480 : 5000);
+      if (x.type === 'email') { r.subject = String(x.subject || '').trim().slice(0, 200); if (!r.subject) throw new Error('Give the email a subject'); }
+      if (!r.body) throw new Error('Write the message'); if (x.link) r.link = publicUrl(x.link) || '';
+    }
+    if (x.type === 'tag' || x.type === 'untag') { r.tag = String(x.tag || '').trim().slice(0, 40); if (!r.tag) throw new Error('Name the tag'); }
+    if (x.type === 'staff') { r.to = String(x.to || '').trim().toLowerCase(); if (!EMAIL_RE.test(r.to)) throw new Error('Enter the staff email to notify'); r.subject = String(x.subject || '').slice(0, 200); r.body = String(x.body || '').slice(0, 2000); }
+    if (x.type === 'webhook' || x.type === 'crm') { const g = ig(x.integrationId); if (!g || (x.type === 'webhook') !== (g.kind === 'webhook') || (x.type === 'crm' && !INTEGRATIONS[g.kind]?.crm)) throw new Error(x.type === 'webhook' ? 'Choose a webhook (set one up under Integrations)' : 'Choose a connected CRM'); r.integrationId = g.id; }
+    return r;
+  });
+  if (!actions.length) throw new Error('Add at least one action');
+  const c = a.cond || {};
+  return { name, enabled: a.enabled !== false, trigger: { type: T, hours: TIMED_TRIGGERS.includes(T) ? hrs(a.trigger.hours) : 0 },
+    cond: { eventIds: arr(c.eventIds), ticketTypeIds: arr(c.ticketTypeIds), areas: arr(c.areas), prices: (c.prices || []).map(x => Math.round(+x)).filter(x => x >= 0).slice(0, 20),
+      minQty: Math.max(0, Math.min(100, Math.round(+c.minQty || 0))), promo: String(c.promo || '').trim().toUpperCase().slice(0, 40), tags: arr(c.tags) },
+    timing: { mode: TIMING[a.timing?.mode] ? a.timing.mode : 'now', hours: hrs(a.timing?.hours) }, actions, promo: String(a.promo || '').trim().toUpperCase().slice(0, 40) };
+}
+function demoSaveIntegration(ig, secret) {
+  const st = Demo.st, def = INTEGRATIONS[ig.kind]; need('admin.integrations'); if (!def) throw new Error('Unknown integration');
+  const prev = ig.id ? (st.integrations || []).find(x => x.id === ig.id && x.box_office_id === DB._bo) : null; if (ig.id && !prev) throw new Error('Integration not found');
+  if (prev && prev.kind !== ig.kind) throw new Error('Integration not found');
+  const config = {}; for (const [k] of def.fields) config[k] = String(ig.config?.[k] || '').trim().slice(0, 300);
+  if (ig.kind === 'webhook' || ig.kind === 'activecampaign') { config.url = publicUrl(config.url); if (!config.url) throw new Error('Use an https:// address on a public host'); }
+  if (ig.kind === 'webhook') { config.events = (ig.config?.events || []).filter(e => HOOK_EVENTS[e]); if (!config.events.length) throw new Error('Choose at least one event to send'); }
+  if (ig.kind === 'mailchimp' && !/^[a-z]{2,4}\d{1,3}$/.test(config.dc)) throw new Error('The Mailchimp data center looks like “us21” (the end of your API key)');
+  if (ig.kind === 'meta_capi' && !/^\d{6,20}$/.test(config.pixel)) throw new Error('Enter your Meta Pixel ID (numbers only)');
+  if (def.crm) config.who = ig.config?.who === 'all' ? 'all' : 'optedIn';
+  const sec = st.secrets ||= {}, row = prev || { id: uid(), box_office_id: DB._bo, kind: ig.kind, created_at: nowIso(), created_by: DB._actor, last_at: null, last_error: '' };
+  Object.assign(row, { name: String(ig.name || def.name).trim().slice(0, 80) || def.name, active: ig.active !== false, config });
+  let shown = null;
+  if (ig.kind === 'webhook' && !sec[row.id]) { shown = 'whsec_' + randCode(32).toLowerCase(); sec[row.id] = shown; }
+  else if (secret) sec[row.id] = String(secret).trim().slice(0, 400);
+  if (def.secret && !sec[row.id]) throw new Error(`Paste the ${def.secret}`);
+  row.secret_set = !!sec[row.id]; row.secret_hint = sec[row.id] ? '…' + sec[row.id].slice(-4) : '';
+  if (!prev) (st.integrations ||= []).push(row);
+  audit('admin.integrations', `${prev ? 'Updated' : 'Connected'} ${def.name} “${row.name}”`);
+  return { ...clone(row), secret: shown };
+}
+function demoContactAction(email, action, p = {}) {
+  const st = Demo.st; need('comms.consent');
+  const c = contactOf(st, DB._bo, email); if (!c) throw new Error('Enter a valid email');
+  if (action === 'tag' || action === 'untag') { tagContact(c, p.tags || p.tag, action === 'tag'); audit('comms.tags', `${action === 'tag' ? 'Tagged' : 'Untagged'} ${c.email}: ${tagsOf(p.tags || p.tag).join(', ')}`); return clone(c); }
+  if (action === 'phone') { const ph = normPhone(p.phone); if (p.phone && !ph) throw new Error('Enter a mobile number with country code'); c.phone = ph; if (!ph) c.sms_optin = false; return clone(c); }
+  const src = String(p.source || '').trim();
+  if ((action === 'optin' || action === 'sms_optin') && !src) throw new Error('Say how the customer gave consent (e.g. “signed up at the door”)');
+  consentChange(st, c, action, 'staff: ' + (src || p.reason || 'box office'), DB._actor, p.reason);
+  audit('comms.consent', `${{ optin: 'Recorded email opt-in', optout: 'Unsubscribed', sms_optin: 'Recorded text opt-in', sms_optout: 'Stopped texts', sms_start: 'Allowed texts again', suppress: 'Suppressed', unsuppress: 'Removed suppression' }[action]} for ${c.email}${src ? ' — ' + src : ''}`);
+  return clone(c);
+}
 
 const DB = {
   live: LIVE, _actor: null, _bo: null, _support: false,
@@ -1524,7 +1927,7 @@ const DB = {
       DB._bo = r.bo?.id || null; DB._support = !!r.me?.support; return r;
     }
     const st = Demo.fresh(), isSuper = st.platform.admins.includes(email);
-    if (expireOrders(st)) Demo.save();
+    if (expireOrders(st) + marketingTick(st) + demoDeliver(st)) Demo.save();   // the demo's stand-in for the every-minute scheduler
     let mine = st.members.filter(m => m.email === email && m.status === 'active');
     if (!mine.length && !isSuper) {  // demo convenience: a new email gets an admin seat on the first sample box office
       const bo = st.boxOffices[0]; mine = [{ id: uid(), box_office_id: bo.id, email, name: email.split('@')[0], perms: [...ALL_PERMS], template: 'full', events: 'all', status: 'active', created_at: nowIso(), added_by: 'demo' }];
@@ -1540,7 +1943,7 @@ const DB = {
     const m = me || memberFor(st, email, bo.id);
     if (bo.status !== 'active' && !m.support) return { super: isSuper, bos, bo: publicBo(bo), me: m, blocked: bo.status };
     if (bo.settings?.require2fa && !m.support && !st.mfa?.[email])  // nothing leaves the "server" until 2FA is set up
-      return { super: isSuper, bos, me: m, needs2fa: true, bo: publicBo(bo), events: [], orders: [], tickets: [], waitlist: [], team: [m], broadcasts: [], audit: [], seatStatus: [], seatLog: [], promos: [], tracking: [], outbox: [], orderLog: [], credits: [], custNotes: [], accounts: [], live: {} };
+      return { super: isSuper, bos, me: m, needs2fa: true, bo: publicBo(bo), events: [], orders: [], tickets: [], waitlist: [], team: [m], broadcasts: [], audit: [], seatStatus: [], seatLog: [], promos: [], tracking: [], outbox: [], orderLog: [], credits: [], custNotes: [], accounts: [], live: {}, contacts: [], consentLog: [], automations: [], integrations: [], deliveries: [], apiKeys: [] };
     const P = k => hasPerm(m, k);
     const events = st.events.filter(e => e.box_office_id === bo.id && (m.owner || m.support || m.events === 'all' || (m.events || []).includes(e.id)));
     const evIds = new Set(events.map(e => e.id));
@@ -1561,18 +1964,28 @@ const DB = {
     // door-only staff (scanner): a ticket is just where the guest belongs — no answers, codes used or purchases
     if (!P('orders.view') && !P('door.attendees')) tickets.forEach(t => { t.answers = {}; t.promo = t.tracking = t.bundle = null; t.extras = []; t.price_override = false; });
     const full = clone({ ...bo, templates: bo.templates?.length ? bo.templates : DEFAULT_TEMPLATES });
+    const seeAud = P('comms.lists') || P('customers.profiles') || P('comms.marketing') || P('comms.consent');
+    const mask = r => { if (!P('customers.emails')) { if (r.email) r.email = maskEmail(r.email); if (r.channel !== 'sms' && r.to) r.to = maskEmail(r.to); }
+      if (!P('customers.phones')) { if (r.phone) r.phone = '•••'; if (r.channel === 'sms' && r.to) r.to = '•••'; } return r; };
     return { super: isSuper, bos, me: m, bo: { ...full, branding: { ...DEFAULT_BRANDING, ...full.branding }, settings: { ...DEFAULT_SETTINGS, ...full.settings, name: bo.name } },
       events: clone(events), orders, tickets,
       waitlist: P('orders.view') || P('comms.lists') ? clone(st.waitlist.filter(w => evIds.has(w.event_id))) : [],
       team: P('admin.invite') || P('admin.perms') || P('admin.remove') ? clone(st.members.filter(x => x.box_office_id === bo.id && x.status === 'active')).map(x => ({ ...x, owner: x.email === bo.owner })) : [{ ...m }],
-      broadcasts: P('comms.email') || P('comms.notify') ? clone(st.broadcasts.filter(b => evIds.has(b.event_id))) : [],
+      broadcasts: P('comms.email') || P('comms.notify') || P('comms.marketing') ? clone(st.broadcasts.filter(b => b.box_office_id === bo.id && (!b.event_id || evIds.has(b.event_id)))) : [],
       audit: clone(st.audit.filter(a => a.box_office_id === bo.id && (P('admin.perms') || a.actor === email || (a.target && hasPerm(m, 'events.edit', a.target)))).slice(0, 1500)),
       views: Object.fromEntries([...evIds].map(id => [id, viewStats(st.views?.[id])])),
       seatStatus: clone((st.seatStatus || []).filter(r => evIds.has(r.event_id))).map(({ token, ...r }) => r),  // buyers' hold tokens never leave the server
       seatLog: P('seating.view') ? clone((st.seatLog || []).filter(r => evIds.has(r.event_id)).slice(0, 8000)) : [],
       promos: P('tickets.discounts') || P('tickets.discountsEdit') || P('finance.reports') ? clone((st.promos || []).filter(x => x.box_office_id === bo.id)) : [],
       tracking: P('tickets.tracking') || P('finance.reports') ? clone((st.tracking || []).filter(x => x.box_office_id === bo.id)) : [],
-      outbox: P('orders.view') ? clone((st.outbox || []).filter(x => x.box_office_id === bo.id)) : [],
+      outbox: P('orders.view') || P('comms.email') || P('comms.marketing') || P('comms.lists') ? clone((st.outbox || []).filter(x => x.box_office_id === bo.id).slice(-6000)).map(mask) : [],
+      // Stage 8: contacts (consent + tags; the unsubscribe token stays on the server), consent history, automations, connections, API keys
+      contacts: seeAud ? clone((st.contacts || []).filter(x => x.box_office_id === bo.id)).map(({ token, ...c }) => mask(c)) : [],
+      consentLog: seeAud ? clone((st.consentLog || []).filter(x => x.box_office_id === bo.id).slice(0, 3000)).map(mask) : [],
+      automations: P('comms.automations') || P('comms.lists') ? clone((st.automations || []).filter(x => x.box_office_id === bo.id)) : [],
+      integrations: P('admin.integrations') || P('comms.automations') ? clone((st.integrations || []).filter(x => x.box_office_id === bo.id)) : [],
+      deliveries: P('admin.integrations') ? clone((st.deliveries || []).filter(x => x.box_office_id === bo.id).slice(0, 500)) : [],
+      apiKeys: P('admin.api') ? clone((st.apiKeys || []).filter(x => x.box_office_id === bo.id)).map(({ hash, ...k }) => k) : [],
       // Stage 6: every order's change history, credits, notes on customers, who has a customer account, live event activity
       orderLog: P('orders.view') ? clone((st.orderLog || []).filter(x => x.box_office_id === bo.id && evIds.has(x.event_id)).slice(0, 5000)) : [],
       credits: P('orders.view') || P('customers.profiles') ? clone((st.credits || []).filter(x => x.box_office_id === bo.id)).map(c => ({ ...c, ...creditState(c, st.orders) })) : [],
@@ -1598,6 +2011,7 @@ const DB = {
       if (prev && !!prev.archived !== !!row.archived) need('events.publish', ev.id);
       if (!prev) audit('event.created', 'Created event “' + row.name + '”', { target: row.id });
       else if (diff.length) audit('event.updated', 'Updated “' + row.name + '”: ' + [...new Set(diff.map(d => d[0].split(' · ')[0]))].join(', '), { target: row.id, before: Object.fromEntries(diff.map(d => [d[0], d[1]])), after: Object.fromEntries(diff.map(d => [d[0], d[2]])) });
+      if (prev && diff.length && row.status === 'published') emitEvent(st, DB._bo, 'event.updated', { event_id: row.id, name: row.name, start: row.start, venue: row.venue || '', changed: [...new Set(diff.map(d => d[0].split(' · ')[0]))] });
       Demo.save(); return row;
     }
     const row = eventToRow({ ...ev, box_office_id: ev.box_office_id || DB._bo }); if (!row.id) delete row.id;
@@ -1773,16 +2187,114 @@ const DB = {
   async notifyWaitlist(eventId, message) {
     if (!LIVE) {
       need('comms.notify', eventId); const st = Demo.st, list = st.waitlist.filter(w => w.event_id === eventId && !w.notified_at), at = nowIso();
-      list.forEach(w => w.notified_at = at);
-      st.broadcasts.push({ id: uid(), box_office_id: DB._bo, event_id: eventId, subject: 'Tickets available', body: message, recipients: list.length, created_by: DB._actor, created_at: at, kind: 'waitlist' });
+      const ev = st.events.find(e => e.id === eventId), bc = { id: uid(), box_office_id: DB._bo, event_id: eventId, subject: 'Tickets available', body: message, recipients: list.length, queued: list.length, channel: 'email', category: 'transactional', status: 'sent', created_by: DB._actor, created_at: at, send_at: at, kind: 'waitlist', name: 'Waitlist: ' + (ev?.name || '') };
+      list.forEach(w => { w.notified_at = at; queueMsg(st, { box_office_id: DB._bo, event_id: eventId, kind: 'waitlist', to: w.email, email: w.email, subject: 'Tickets are available: {{event}}', body: message, by: DB._actor, campaign_id: bc.id }); });
+      st.broadcasts.push(bc); demoDeliver(st);
       audit('comms.waitlist', `Notified ${list.length} people on the waitlist`, { target: eventId }); Demo.save(); return list.length;
     }
     return must(sb.rpc('notify_waitlist', { p_event: eventId, p_message: message }));
   },
   async log(kind, summary) { if (!LIVE) { audit(kind, summary); Demo.save(); return; } await sb.from('audit_log').insert({ actor: DB._actor, box_office_id: DB._bo, kind, summary }); },
-  async addBroadcast(b) {
-    if (!LIVE) { need('comms.email', b.event_id); const row = { id: uid(), created_at: nowIso(), ...b }; Demo.st.broadcasts.push(row); audit('comms.broadcast', 'Sent “' + b.subject + '” to ' + b.recipients); Demo.save(); return row; }
-    return must(sb.from('broadcasts').insert({ ...b, box_office_id: DB._bo }).select().single());
+  /* ── Stage 8: messages, marketing, automation, integrations ── */
+  // DEMO: what the every-minute scheduler does (time-based automations + reminders, then deliver due messages). LIVE: pg_cron + the messaging Edge Function do it.
+  async runSender() { if (LIVE) return null; const st = Demo.fresh(), queued = marketingTick(st), sent = demoDeliver(st); Demo.save(); return { queued, sent }; },
+  async sendCampaign(c) {
+    if (!LIVE) { Demo.fresh(); try { return demoSendCampaign(c); } finally { Demo.save(); } }
+    return must(sb.rpc('send_campaign', { p_bo: DB._bo, p: c }));
+  },
+  async campaignAction(id, action) {   // cancel a scheduled campaign: its queued messages are cancelled
+    if (!LIVE) {
+      const st = Demo.fresh(), b = st.broadcasts.find(x => x.id === id && x.box_office_id === DB._bo); if (!b) throw new Error('Campaign not found');
+      b.category === 'transactional' ? b.event_id && anyPerm(['comms.email', 'comms.notify'], b.event_id) : need('comms.marketing');
+      if (action !== 'cancel') throw new Error('Unknown action'); if (b.status !== 'scheduled') throw new Error('Only a scheduled campaign can be cancelled');
+      let n = 0; (st.outbox || []).forEach(m => { if (m.campaign_id === id && m.status === 'queued') { m.status = 'cancelled'; m.error = 'campaign cancelled'; n++; } });
+      b.status = 'cancelled'; b.cancelled_by = DB._actor; b.cancelled_at = nowIso(); audit('comms.campaign', `Cancelled scheduled campaign “${b.name}” (${n} messages)`); Demo.save(); return clone(b);
+    }
+    return must(sb.rpc('campaign_action', { p_bo: DB._bo, p_id: id, p_action: action }));
+  },
+  async previewSegment(f) {   // how many people a filter reaches, before sending — LIVE counts on the server (the browser may not see everyone)
+    if (!LIVE) { need('comms.lists'); const people = demoPeople(Demo.fresh(), { ...emptySeg(), ...f }); return { count: people.length, email: people.filter(p => !sendGate(p.contact, 'email', 'marketing', p.email)).length, sms: people.filter(p => !sendGate(p.contact, 'sms', 'marketing', p.phone)).length, phones: people.filter(p => p.phone).length }; }
+    return must(sb.rpc('segment_count', { p_bo: DB._bo, f }));
+  },
+  async saveSegments(list) {
+    const clean = (list || []).slice(0, 100).map(x => ({ id: String(x.id || shortId('sg_')).slice(0, 40), name: String(x.name || '').trim().slice(0, 80) || 'Segment', filter: { ...emptySeg(), ...x.filter } }));
+    if (!LIVE) { need('comms.lists'); const bo = Demo.st.boxOffices.find(b => b.id === DB._bo); bo.segments = clean; audit('comms.segments', 'Saved audience segments'); Demo.save(); return clean; }
+    await must(sb.rpc('save_segments', { p_bo: DB._bo, p: clean })); return clean;
+  },
+  async saveAutomation(a) {
+    if (!LIVE) {
+      const st = Demo.fresh(); need('comms.automations'); const clean = cleanAutomation(st, a);
+      if (clean.actions.some(x => x.type === 'sms')) need('comms.sms'); if (clean.actions.some(x => x.category === 'marketing')) need('comms.marketing');
+      let row = a.id && (st.automations || []).find(x => x.id === a.id && x.box_office_id === DB._bo);
+      if (a.id && !row) throw new Error('Automation not found');
+      if (!row) (st.automations ||= []).push(row = { id: shortId('au_'), box_office_id: DB._bo, std: '', runs: 0, last_run: null, created_at: nowIso(), created_by: DB._actor });
+      Object.assign(row, clean, { kind: row.std === 'pre' ? 'reminder' : ['post', 'offer'].includes(row.std) ? 'followup' : 'automation', updated_at: nowIso() });
+      audit('comms.automation', `Saved automation “${row.name}”${row.enabled ? '' : ' (off)'}`); Demo.save(); return clone(row);
+    }
+    return must(sb.rpc('save_automation', { p_bo: DB._bo, p: a }));
+  },
+  async deleteAutomation(id) {
+    if (!LIVE) { const st = Demo.fresh(); need('comms.automations'); const a = (st.automations || []).find(x => x.id === id && x.box_office_id === DB._bo); if (!a) throw new Error('Automation not found');
+      st.automations = st.automations.filter(x => x !== a); (st.outbox || []).forEach(m => { if (m.automation_id === id && m.status === 'queued') { m.status = 'cancelled'; m.error = 'automation deleted'; } });
+      audit('comms.automation', `Deleted automation “${a.name}”`); Demo.save(); return; }
+    await must(sb.rpc('delete_automation', { p_bo: DB._bo, p_id: id }));
+  },
+  async saveIntegration(ig, secret) {
+    if (!LIVE) { Demo.fresh(); try { return demoSaveIntegration(ig, secret); } finally { Demo.save(); } }
+    return must(sb.rpc('save_integration', { p_bo: DB._bo, p: ig, p_secret: secret || null }));
+  },
+  async deleteIntegration(id) {
+    if (!LIVE) { const st = Demo.fresh(); need('admin.integrations'); const g = (st.integrations || []).find(x => x.id === id && x.box_office_id === DB._bo); if (!g) throw new Error('Integration not found');
+      st.integrations = st.integrations.filter(x => x !== g); delete (st.secrets || {})[id]; (st.deliveries || []).forEach(d => { if (d.integration_id === id && d.status === 'queued') d.status = 'cancelled'; });
+      audit('admin.integrations', `Disconnected ${INTEGRATIONS[g.kind].name} “${g.name}”`); Demo.save(); return; }
+    await must(sb.rpc('delete_integration', { p_bo: DB._bo, p_id: id }));
+  },
+  async testIntegration(id) {   // a 'ping' delivery to check the connection
+    if (!LIVE) { const st = Demo.fresh(); need('admin.integrations'); const g = (st.integrations || []).find(x => x.id === id && x.box_office_id === DB._bo); if (!g) throw new Error('Integration not found');
+      const d = { id: uid(), box_office_id: DB._bo, integration_id: g.id, kind: g.kind, event: 'ping', event_id: 'evt_' + randCode(14).toLowerCase(), payload: { type: 'ping', created: nowIso(), data: { box_office: st.boxOffices.find(b => b.id === DB._bo)?.name } }, status: 'queued', attempts: 0, created_at: nowIso(), response: '' };
+      (st.deliveries ||= []).unshift(d); demoDeliver(st); Demo.save(); return clone(d); }
+    return must(sb.rpc('test_integration', { p_bo: DB._bo, p_id: id }));
+  },
+  async contactAction(email, action, p = {}) {
+    if (!LIVE) { Demo.fresh(); try { const { token, ...c } = demoContactAction(email, action, p); return c; } finally { Demo.save(); } }
+    return must(sb.rpc('contact_action', { p_bo: DB._bo, p_email: email, p_action: action, p }));
+  },
+  async outboxAction(id, action) {   // retry a failed / held message · cancel a queued one
+    if (!LIVE) {
+      const st = Demo.fresh(), m = (st.outbox || []).find(x => x.id === id && x.box_office_id === DB._bo); if (!m) throw new Error('Message not found');
+      m.order_id ? need('orders.resend', m.event_id || undefined) : anyPerm(['comms.email', 'comms.marketing']);
+      if (action === 'cancel') { if (m.status !== 'queued') throw new Error('Only a queued message can be cancelled'); Object.assign(m, { status: 'cancelled', error: 'cancelled by ' + DB._actor }); }
+      else if (action === 'retry') { if (!['failed', 'suppressed'].includes(m.status)) throw new Error('Only a failed or held message can be retried'); Object.assign(m, { status: 'queued', send_at: nowIso(), error: '' }); demoDeliver(st); }
+      else throw new Error('Unknown action');
+      Demo.save(); return clone(m);
+    }
+    return must(sb.rpc('outbox_action', { p_bo: DB._bo, p_id: id, p_action: action }));
+  },
+  async createApiKey(name, scopes) {
+    const sc = (scopes || []).filter(x => API_SCOPES[x]); if (!sc.length) throw new Error('Choose what the key may read');
+    if (!LIVE) {
+      const st = Demo.fresh(); need('admin.api'); const key = 'set_live_' + [...crypto.getRandomValues(new Uint8Array(20))].map(b => b.toString(16).padStart(2, '0')).join(''), row = { id: uid(), box_office_id: DB._bo, name: String(name || 'API key').trim().slice(0, 80) || 'API key',
+        prefix: key.slice(0, 13), hash: await sha256hex(key), scopes: sc, created_at: nowIso(), created_by: DB._actor, last_used_at: null, revoked_at: null };
+      (st.apiKeys ||= []).push(row); audit('admin.api', `Created API key “${row.name}” (${sc.join(', ')})`); Demo.save(); const { hash, ...k } = row; return { ...clone(k), key };
+    }
+    return must(sb.rpc('create_api_key', { p_bo: DB._bo, p_name: name, p_scopes: sc }));
+  },
+  async revokeApiKey(id) {
+    if (!LIVE) { const st = Demo.fresh(); need('admin.api'); const k = (st.apiKeys || []).find(x => x.id === id && x.box_office_id === DB._bo); if (!k) throw new Error('Key not found'); k.revoked_at = nowIso(); k.revoked_by = DB._actor; audit('admin.api', `Revoked API key “${k.name}”`); Demo.save(); return; }
+    await must(sb.rpc('revoke_api_key', { p_bo: DB._bo, p_id: id }));
+  },
+  // the unsubscribe / preferences page a marketing email links to (#/unsubscribe/<token>) — anyone holding the link, no sign-in
+  async unsubInfo(token) {
+    if (!LIVE) { const st = Demo.fresh(), c = (st.contacts || []).find(x => x.token === String(token || '')); if (!c) return null; const bo = st.boxOffices.find(b => b.id === c.box_office_id);
+      return { box_office: bo?.name || '', email: maskEmail(c.email), email_on: !!(c.email_optin && !c.unsub_email_at), sms_on: !!(c.sms_optin && !c.unsub_sms_at), has_phone: !!c.phone, sms_stopped: !!c.unsub_sms_at }; }
+    return must(sb.rpc('unsub_info', { p_token: token }));
+  },
+  async unsubscribe(token, prefs) {
+    if (!LIVE) { const st = Demo.fresh(), c = (st.contacts || []).find(x => x.token === String(token || '')); if (!c) throw new Error('This link is not valid any more');
+      if (prefs.email === false) consentChange(st, c, 'optout', 'unsubscribe link', c.email); else if (prefs.email === true && !(c.email_optin && !c.unsub_email_at)) consentChange(st, c, 'optin', 'preferences page', c.email);
+      if (prefs.sms === false && !c.unsub_sms_at && c.phone) consentChange(st, c, 'sms_optout', 'unsubscribe link', c.email); else if (prefs.sms === true && c.phone && !(c.sms_optin && !c.unsub_sms_at)) consentChange(st, c, 'sms_optin', 'preferences page', c.email);
+      Demo.save(); return this.unsubInfo(token); }
+    return must(sb.rpc('unsubscribe', { p_token: token, p: prefs }));
   },
   // ── platform super admin ──
   async loadPlatform() {
@@ -1955,7 +2467,10 @@ const DB = {
       const st = Demo.st, ev = st.events.find(e => e.id === eventId);
       if (!ev || normEvent(ev).waitlistMode === 'off') throw new Error('This event has no waitlist');
       if (st.waitlist.some(w => w.event_id === eventId && w.email === email.toLowerCase())) return;
-      st.waitlist.push({ id: uid(), box_office_id: ev.box_office_id, event_id: eventId, name: name.trim(), email: email.toLowerCase(), phone: String(phone).trim().slice(0, 40), created_at: nowIso() }); Demo.save(); return;
+      const w = { id: uid(), box_office_id: ev.box_office_id, event_id: eventId, name: name.trim(), email: email.toLowerCase(), phone: String(phone).trim().slice(0, 40), created_at: nowIso() }; st.waitlist.push(w);
+      const c = contactOf(st, ev.box_office_id, w.email); if (!c.name) c.name = w.name.slice(0, 120); if (!c.phone && normPhone(w.phone)) c.phone = normPhone(w.phone);
+      emitEvent(st, ev.box_office_id, 'waitlist.signup', { event_id: eventId, name: w.name, email: w.email, phone: w.phone }, { email: w.email, name: w.name, phone: w.phone, tickets: [], eventIds: [eventId], eventId, key: w.id });
+      Demo.save(); return;
     }
     await must(sb.rpc('join_waitlist', { p_event: eventId, p_name: name, p_email: email, p_phone: phone }));
   },
@@ -2175,7 +2690,7 @@ function seedDemo() {
   const mem = (bo, email, name, template, evs = 'all') => ({ id: uid(), box_office_id: bo.id, email, name, perms: [...tpl(template)], template, events: evs, status: 'active', created_at: day(-40), added_by: bo.owner });
   const members = [
     mem(bo1, 'moishsonn@gmail.com', 'Owner', 'full'), mem(bo1, 'manager@skyline.example', 'Dana Price', 'event_manager', [ev1.id]),
-    mem(bo1, 'support@skyline.example', 'Ravi Shah', 'customer_service'), mem(bo1, 'finance@skyline.example', 'Lena Ortiz', 'finance'),
+    mem(bo1, 'support@skyline.example', 'Ravi Shah', 'customer_service'), mem(bo1, 'finance@skyline.example', 'Lena Ortiz', 'finance'), mem(bo1, 'marketing@skyline.example', 'Mia Chen', 'marketing'),
     mem(bo1, 'door@example.com', 'Door staff', 'door_staff', [ev2.id]), mem(bo1, 'scanner@example.com', 'Scanner phone', 'scanner'),
     mem(bo2, 'director@harborarts.example', 'Harbor director', 'full'), mem(bo2, 'moishsonn@gmail.com', 'Owner (guest)', 'event_manager'),
     mem(bo3, 'hello@northside.example', 'Northside owner', 'full')];
@@ -2312,6 +2827,56 @@ function seedDemo() {
     for (let i = 0; i < Math.round(n * .35); i++) { const at = past(); m[randCode(8).toLowerCase()] = { at, cart: 1 + Math.floor(Math.random() * 3), carted: at - 2e5, conv: 0 }; }
     const live = ev === ev2 ? 9 + Math.floor(Math.random() * 6) : Math.floor(Math.random() * 4);
     for (let i = 0; i < live; i++) { const at = Date.now() - Math.random() * 9e4, cart = Math.random() < .4 ? 1 + Math.floor(Math.random() * 4) : 0; m[randCode(8).toLowerCase()] = { at, cart, carted: cart ? at - 6e4 : 0, conv: 0 }; }
+  }
+  // Stage 8: what the sample box offices have sent so far, who consented (and when), standard workflows + a few custom automations,
+  // a sent and a scheduled campaign, saved segments, connections and an API key. Message history is back-dated to the orders.
+  { const UT = { newsletter: { source: 'newsletter', medium: 'email', campaign: 'winter-launch' }, instagram: { source: 'instagram', medium: 'social', campaign: 'gala-reels' }, facebook: { source: 'facebook', medium: 'paid', campaign: 'winter-launch' } };
+    for (const o of Demo.st.orders) if (UT[o.data.source] && Math.random() < .7) o.data.utm = { ...UT[o.data.source] }; }
+  { const st = Demo.st, O = id => st.orders.find(o => o.id === id), firstOrder = c => st.orders.filter(o => o.buyer_email === c.email && o.box_office_id === c.box_office_id).sort((a, b) => new Date(a.created_at) - new Date(b.created_at))[0];
+    for (const m of st.outbox || []) if (m.status === 'queued') { const o = O(m.order_id), at = o?.paid_at && new Date(o.paid_at) < new Date(o.created_at) ? o.created_at : o?.paid_at || o?.created_at || m.at;
+      Object.assign(m, { at, send_at: at, sent_at: at, status: 'sent', provider: 'demo', provider_id: 'demo_' + randCode(10).toLowerCase(), attempts: 1 }); }
+    let i = 0;
+    for (const c of st.contacts || []) {
+      const o = firstOrder(c), at = o?.created_at || day(-20); c.created_at = at; if (c.email_optin) c.email_optin_at = at;
+      if (i % 3 === 0) { c.phone = '+1555' + String(2000000 + i * 7919).slice(-7); if (i % 2 === 0) { c.sms_optin = true; c.sms_optin_at = at; c.sms_optin_src = 'checkout · order ' + (o?.ref || ''); } }
+      if (i % 17 === 5 && c.email_optin) { c.email_optin = false; c.unsub_email_at = day(-3); (st.consentLog ||= []).unshift({ id: uid(), box_office_id: c.box_office_id, email: c.email, action: 'optout', source: 'unsubscribe link', by: c.email, at: c.unsub_email_at }); }
+      if (i === 11) { c.suppressed = 'bounced'; c.suppressed_at = day(-6); (st.consentLog ||= []).unshift({ id: uid(), box_office_id: c.box_office_id, email: c.email, action: 'suppress:bounced', source: 'email provider: hard bounce', by: 'system', at: c.suppressed_at }); }
+      if (i % 9 === 2) c.tags = ['VIP']; if (c.email === 'press@example.com') c.tags = ['Press'];
+      i++;
+    }
+    for (const r of st.consentLog || []) if (r.source.startsWith('checkout')) { const c = st.contacts.find(x => x.email === r.email && x.box_office_id === r.box_office_id); if (c?.email_optin_at) r.at = c.email_optin_at; }
+    st.automations = [bo1, bo2].flatMap(stdAutomations);
+    st.automations.find(a => a.box_office_id === bo1.id && a.std === 'post').actions[0].link = 'https://forms.example.com/skyline-feedback';
+    const au = (bo, name, trigger, cond, timing, actions) => ({ id: shortId('au_'), box_office_id: bo.id, std: '', kind: 'automation', name, enabled: true, trigger, cond: { eventIds: [], ticketTypeIds: [], areas: [], prices: [], minQty: 0, promo: '', tags: [], ...cond },
+      timing, actions, runs: 0, last_run: null, created_at: day(-12), created_by: bo.owner });
+    st.automations.push(
+      au(bo1, 'VIP arrival instructions', { type: 'ticket.purchased' }, { eventIds: [ev1.id], ticketTypeIds: [vipTT.id] }, { mode: 'before', hours: 48 }, [
+        { type: 'email', category: 'transactional', subject: 'Your Premium evening at {{event}}', body: 'Hi {{first_name}},\n\nYour Premium seats include the members’ bar from {{doors}}. Use the Stage Door entrance on 8th Ave and show your tickets: {{tickets_link}}' },
+        { type: 'sms', category: 'transactional', body: '{{event}} {{date}}: Premium guests use the Stage Door on 8th Ave from {{doors}}. Tickets: {{tickets_link}}' }, { type: 'tag', tag: 'VIP' }]),
+      au(bo1, 'Parking for 2+ Stalls', { type: 'ticket.purchased' }, { eventIds: [ev1.id], ticketTypeIds: [stallsTT.id], minQty: 2 }, { mode: 'delay', hours: 1 }, [
+        { type: 'email', category: 'transactional', subject: 'Parking near {{venue}}', body: 'Hi {{first_name}}, the closest garage to {{venue}} is on 39th St. Pre-book a space from the event page: {{event_link}}' }]),
+      au(bo1, 'Come back to your seats', { type: 'cart.abandoned' }, {}, { mode: 'delay', hours: 1 }, [
+        { type: 'email', category: 'marketing', subject: 'Still thinking about {{event}}?', body: 'Hi {{first_name}}, your seats were released, but tickets for {{event}} are still on sale: {{event_link}}' }]),
+      au(bo1, 'Large order alert', { type: 'ticket.purchased' }, { minQty: 8 }, { mode: 'now', hours: 0 }, [{ type: 'staff', to: bo1.owner, subject: 'Large order', body: 'Someone just bought 8 or more tickets.' }]));
+    // a campaign sent ten days ago and one scheduled for next week
+    const sentAt = day(-10, 11), b1 = { id: uid(), box_office_id: bo1.id, event_id: null, kind: 'campaign', name: 'Winter season announcement', subject: 'Winter at Skyline Live — first look',
+      body: 'Hi {{first_name}},\n\nThe winter season is here: the Winter Orchestra Gala, Neon Nights Live and more. Early-bird prices end soon: {{event_link}}', channel: 'email', category: 'marketing',
+      filter: { ...emptySeg(), status: 'optedIn' }, send_at: sentAt, status: 'sent', recipients: 0, queued: 0, skipped: {}, created_by: bo1.owner, created_at: sentAt };
+    for (const p of demoPeopleFor(st, bo1.id, b1.filter)) { const why = sendGate(p.contact, 'email', 'marketing', p.email); if (why) { b1.skipped[why] = (b1.skipped[why] || 0) + 1; continue; }
+      queueMsg(st, { box_office_id: bo1.id, kind: 'campaign', category: 'marketing', to: p.email, email: p.email, subject: b1.subject, body: b1.body, by: bo1.owner, at: sentAt, send_at: sentAt, campaign_id: b1.id, status: 'sent', sent_at: sentAt, provider: 'demo', attempts: 1 }); b1.queued++; }
+    b1.recipients = b1.queued + Object.values(b1.skipped).reduce((a, x) => a + x, 0);
+    const nextAt = day(6, 10), b2 = { ...b1, id: uid(), name: 'Gala: last seats in the Circle', subject: 'Last Circle seats for the Winter Orchestra Gala', body: 'Hi {{first_name}}, only a few Circle seats are left for {{event}} on {{date}}: {{event_link}}',
+      event_id: ev1.id, filter: { ...emptySeg(), status: 'optedIn', tags: [] }, send_at: nextAt, status: 'scheduled', queued: 0, skipped: {}, created_at: day(-1) };
+    for (const p of demoPeopleFor(st, bo1.id, b2.filter)) { if (sendGate(p.contact, 'email', 'marketing', p.email)) continue; queueMsg(st, { box_office_id: bo1.id, event_id: ev1.id, kind: 'campaign', category: 'marketing', to: p.email, email: p.email, subject: b2.subject, body: b2.body, by: bo1.owner, send_at: nextAt, campaign_id: b2.id }); b2.queued++; }
+    b2.recipients = b2.queued; st.broadcasts.push(b1, b2);
+    bo1.segments = [{ id: 'sg_gala', name: 'Gala buyers not checked in', filter: { ...emptySeg(), eventIds: [ev1.id], checkin: 'out' } }, { id: 'sg_vip', name: 'VIP-tagged, opted in', filter: { ...emptySeg(), status: 'optedIn', tags: ['VIP'] } }];
+    st.secrets = {};
+    const ig = (bo, kind, name, config, secret) => { const r = { id: uid(), box_office_id: bo.id, kind, name, active: true, config, created_at: day(-14), created_by: bo.owner, last_at: day(-1), last_error: '', secret_set: true, secret_hint: '…' + secret.slice(-4) }; st.secrets[r.id] = secret; return r; };
+    st.integrations = [ig(bo1, 'webhook', 'Ticketing data warehouse', { url: 'https://hooks.example.com/set/skyline', events: ['payment.completed', 'ticket.cancelled', 'refund.issued', 'customer.checked_in'] }, 'whsec_' + randCode(32).toLowerCase()),
+      ig(bo1, 'mailchimp', 'Skyline newsletter', { dc: 'us21', list: 'a1b2c3d4e5', who: 'optedIn' }, 'demo-' + randCode(20).toLowerCase() + '-us21')];
+    st.deliveries = st.orders.filter(o => o.box_office_id === bo1.id && wasPaid(o)).slice(-6).map(o => ({ id: uid(), box_office_id: bo1.id, integration_id: st.integrations[0].id, kind: 'webhook', event: 'payment.completed', event_id: 'evt_' + randCode(14).toLowerCase(),
+      payload: { type: 'payment.completed', created: o.paid_at, data: hookOrder(st, o) }, status: 'delivered', attempts: 1, created_at: o.paid_at, done_at: o.paid_at, response: '200 OK' }));
+    st.apiKeys = [{ id: uid(), box_office_id: bo1.id, name: 'Website event listing', prefix: 'set_live_7k2m', hash: '0'.repeat(64), scopes: ['events:read'], created_at: day(-20), created_by: bo1.owner, last_used_at: day(0, 9), revoked_at: null }];
   }
   return Demo.st;
 }

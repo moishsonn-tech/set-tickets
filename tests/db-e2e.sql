@@ -275,6 +275,114 @@ reset role;
 -- a race: two scanners, same ticket, same instant — the conditional update lets exactly one through
 select t.ok((select count(*) from scan_log where code = :'k1' and result = 'ok') = 1, 'one ticket, two phones one after the other: accepted once');
 
+-- ══ Stage 8: messages, consent, campaigns, automations, integrations, API ══
+reset role; select t.who('');
+select t.ok((select count(*) from automations where box_office_id = 'b0000000-0000-0000-0000-000000000001' and std in ('purchase','pre','post','offer')) = 4, 'S8 a box office starts with the four standard workflows');
+set role anon; select t.who('');
+select t.err($$select * from contacts$$, 'permission denied', 'S8 buyers cannot read contacts');
+select t.err($$insert into outbox(box_office_id, kind, "to") values ('b0000000-0000-0000-0000-000000000001', 'campaign', 'x@y.z')$$, 'permission denied', 'S8 nobody writes the outbox directly');
+select place_order('{"buyer":{"name":"Opt Fan","email":"opt@mail.test","phone":"(646) 555-0123"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1,"seats":[]}],"payment":"offline","optIn":true,"smsOptIn":true,"utm":{"source":"ig","campaign":"spring","bogus":"x"}}')->>'id' as s8o1 \gset
+reset role;
+select t.ok((select email_optin and sms_optin and phone = '+16465550123' and email_optin_src like 'checkout%' from contacts where email = 'opt@mail.test'), 'S8 checkout opt-ins (email + text) recorded on the contact with their source');
+select t.ok((select count(*) from consent_log where email = 'opt@mail.test') = 2, 'S8 consent history has both opt-ins');
+select t.ok((select data->'utm' = '{"source":"ig","campaign":"spring"}'::jsonb from orders where id = :'s8o1'), 'S8 UTM tags stored on the order (known keys only)');
+set role authenticated; select t.who('owner@box.test');
+select t.err($$select save_integration('b0000000-0000-0000-0000-000000000001', '{"kind":"webhook","config":{"url":"http://hooks.example.org","events":["payment.completed"]}}')$$, 'https', 'S8 webhooks must be https');
+select t.err($$select save_integration('b0000000-0000-0000-0000-000000000001', '{"kind":"webhook","config":{"url":"https://169.254.169.254/x","events":["payment.completed"]}}')$$, 'public host', 'S8 webhooks cannot target private / metadata addresses');
+select save_integration('b0000000-0000-0000-0000-000000000001', '{"kind":"webhook","name":"WH","config":{"url":"https://hooks.example.org/set","events":["payment.completed","ticket.cancelled","order.created","waitlist.signup"]}}') as s8wh \gset
+select t.ok((:'s8wh'::jsonb)->>'secret' like 'whsec_%' and not ((:'s8wh'::jsonb) ? 'secret_hint' and (:'s8wh'::jsonb)->>'secret_hint' is null), 'S8 a new webhook returns its signing secret once');
+select t.ok(not (admin_load('b0000000-0000-0000-0000-000000000001')->>'integrations') like '%whsec_%', 'S8 admin_load never returns integration secrets');
+select save_automation('b0000000-0000-0000-0000-000000000001', '{"name":"VIP info","trigger":{"type":"ticket.purchased"},"cond":{"ticketTypeIds":["vip"]},"timing":{"mode":"before","hours":48},
+  "actions":[{"type":"email","subject":"VIP {{event}}","body":"Hi {{first_name}}"},{"type":"sms","body":"VIP door on 8th"},{"type":"tag","tag":"VIP"}]}') as s8a \gset
+select t.err($$select save_automation('b0000000-0000-0000-0000-000000000001', '{"name":"x","trigger":{"type":"ticket.purchased"},"actions":[]}')$$, 'at least one action', 'S8 an automation needs an action');
+select t.who('clerk@box.test');
+select t.err($$select save_automation('b0000000-0000-0000-0000-000000000001', '{"name":"x","trigger":{"type":"ticket.purchased"},"actions":[{"type":"tag","tag":"x"}]}')$$, 'permission', 'S8 staff without “Manage automations” cannot change them');
+select t.err($$select segment_count('b0000000-0000-0000-0000-000000000001', '{}')$$, 'permission', 'S8 audience counts need “mailing lists”');
+reset role;
+-- a VIP purchase (staff order, paid at once) → confirmation, purchase webhook, VIP email + text 48 h before, tag
+set role authenticated; select t.who('owner@box.test');
+select place_order('{"buyer":{"name":"Vera Vip","email":"vera@mail.test","phone":"+1 212 555 0199"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000001","ticketTypeId":"vip","qty":1,"seats":["B-1"]}],"payment":"manual","payMethod":"cash"}')->>'id' as s8v \gset
+reset role;
+select t.ok((select count(*) from outbox where order_id = :'s8v' and kind = 'confirmation') = 1, 'S8 one confirmation for the order');
+select t.ok((select count(*) from deliveries where event = 'payment.completed' and payload->'data'->>'id' = :'s8v') = 1 and (select count(*) from deliveries where event = 'order.created' and payload->'data'->>'id' = :'s8v') = 1, 'S8 order.created + payment.completed webhooks queued');
+select t.ok(not exists(select 1 from deliveries where payload::text like '%access_key%' or payload::text like '%platformFee%'), 'S8 webhook payloads never carry the order key or platform money');
+select t.ok((select count(*) from outbox where order_id = :'s8v' and automation_id = (:'s8a'::jsonb)->>'id' and send_at = '2099-01-01T20:00:00Z'::timestamptz - interval '48 hours') = 2, 'S8 VIP purchase → email + text scheduled 48 h before the event');
+select t.ok((select 'VIP' = any(tags) and 'Attendee: Seated Show' = any(tags) from contacts where email = 'vera@mail.test'), 'S8 tags from the automation and the standard Purchase workflow');
+select t.ok((select count(*) from automation_runs where automation_id = (:'s8a'::jsonb)->>'id') = 1, 'S8 the automation ran once');
+select emit_event('b0000000-0000-0000-0000-000000000001', 'payment.completed', '{}', order_ctx(o)) from orders o where id = :'s8v';
+select t.ok((select count(*) from outbox where order_id = :'s8v' and automation_id = (:'s8a'::jsonb)->>'id') = 2, 'S8 the same trigger never runs an automation twice');
+-- campaigns: marketing only to opted-in; event update to all holders
+set role authenticated; select t.who('owner@box.test');
+select send_campaign('b0000000-0000-0000-0000-000000000001', '{"category":"marketing","channel":"email","subject":"News","body":"Hi {{first_name}}","filter":{"status":"any"}}') as s8c \gset
+select t.ok((:'s8c'::jsonb)->>'queued' = '1' and ((:'s8c'::jsonb)->'skipped'->>'not opted in to marketing email')::int >= 3, 'S8 marketing campaign: only the opted-in contact queued, the rest counted as held back');
+select t.err($$select send_campaign('b0000000-0000-0000-0000-000000000001', '{"category":"transactional","subject":"x","body":"y","filter":{}}')$$, 'choose the event', 'S8 an event update must name its event');
+select send_campaign('b0000000-0000-0000-0000-000000000001', '{"category":"transactional","channel":"sms","body":"Doors at 7","filter":{"eventIds":["e0000000-0000-0000-0000-000000000001"]}}') as s8u \gset
+select t.ok((:'s8u'::jsonb)->>'queued' = '1' and ((:'s8u'::jsonb)->'skipped'->>'no mobile number')::int >= 1, 'S8 an event-update text reaches holders with a number; the rest are counted');
+select t.ok((segment_count('b0000000-0000-0000-0000-000000000001', '{"status":"optedIn"}')->>'count')::int = 1, 'S8 segment count: opted in');
+select t.ok((segment_count('b0000000-0000-0000-0000-000000000001', '{"eventIds":["e0000000-0000-0000-0000-000000000001"],"ticketTypeIds":["vip"]}')->>'count')::int >= 1, 'S8 segment by event + ticket type');
+reset role;
+-- the sender: claims due rows (consent re-checked), renders context, records results
+select queue_msg(jsonb_build_object('box_office_id', 'b0000000-0000-0000-0000-000000000001', 'kind', 'campaign', 'to', 'vera@mail.test', 'email', 'vera@mail.test', 'subject', 'Sneaky', 'body', 'x')) as s8m \gset
+set role service_role;
+select claim_outbox(500) as s8cl \gset
+reset role;
+select t.ok((select status from outbox where id = :'s8m') = 'suppressed', 'S8 sender: a marketing email to someone who never opted in is held back at send time');
+select t.ok(exists(select 1 from jsonb_array_elements(:'s8cl'::jsonb) x where x->'msg'->>'kind' = 'confirmation' and x->'ctx'->'order'->>'key' is not null and jsonb_array_length(x->'ctx'->'tickets') >= 1), 'S8 sender gets what it needs to render (order link, tickets)');
+select t.ok(not exists(select 1 from jsonb_array_elements(:'s8cl'::jsonb) x where (x->'msg'->>'send_at')::timestamptz > now()), 'S8 nothing is claimed before its time');
+set role service_role;
+select outbox_result(((x->'msg')->>'id')::uuid, true, 'resend', 're_' || ((x->'msg')->>'id'), null, false) from jsonb_array_elements(:'s8cl'::jsonb) x where x->'msg'->>'kind' = 'confirmation';
+select outbox_result(((x->'msg')->>'id')::uuid, false, 'resend', null, 'timeout', false) from jsonb_array_elements(:'s8cl'::jsonb) x where x->'msg'->>'kind' = 'update';
+reset role;
+select t.ok((select bool_and(status = 'sent' and sent_at is not null) from outbox where kind = 'confirmation' and provider = 'resend'), 'S8 delivered messages are marked sent');
+select t.ok((select status = 'queued' and send_at > now() from outbox where kind = 'update' and channel = 'sms' limit 1), 'S8 a failed send is retried later (back-off)');
+-- bounces, STOP, unsubscribe link
+set role service_role;
+select mail_event((select provider_id from outbox where kind = 'confirmation' and email = 'vera@mail.test' limit 1), 'bounced');
+select inbound_sms('+16465550123', 'STOP');
+reset role;
+select t.ok((select suppressed = 'bounced' from contacts where email = 'vera@mail.test'), 'S8 a hard bounce suppresses the address');
+select t.ok((select unsub_sms_at is not null and not sms_optin from contacts where email = 'opt@mail.test'), 'S8 replying STOP stops all texts');
+select token as s8tok from contacts where email = 'opt@mail.test' \gset
+set role anon; select t.who('');
+select t.ok(unsub_info(:'s8tok')->>'email' = 'o•••@m•••.test', 'S8 the preferences page shows the address masked');
+select unsubscribe(:'s8tok', '{"email":false}');
+select t.ok(unsub_info('short') is null, 'S8 a bad token shows nothing');
+reset role;
+select t.ok((select not email_optin and unsub_email_at is not null from contacts where email = 'opt@mail.test') and exists(select 1 from consent_log where email = 'opt@mail.test' and action = 'optout' and source = 'unsubscribe link'), 'S8 unsubscribe link: email marketing off, logged with its source');
+-- time-based: a show starting in 2 hours with its own 24 h reminder
+insert into events(id, box_office_id, slug, status, data) values ('e0000000-0000-0000-0000-000000000008', 'b0000000-0000-0000-0000-000000000001', 'soon', 'published',
+  jsonb_build_object('name', 'Soon Show', 'start', now() + interval '2 hours', 'currency', 'USD', 'visibility', 'public', 'timeSlots', '[]'::jsonb, 'ticketTypes', '[{"id":"g","name":"General","price":1000,"qty":50,"admits":1}]'::jsonb,
+    'emails', '{"reminders":[{"hoursBefore":24,"channel":"email","body":"See you soon"}]}'::jsonb));
+set role anon; select t.who('');
+select place_order('{"buyer":{"name":"Soon Fan","email":"soon@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000008","ticketTypeId":"g","qty":1,"seats":[]}],"payment":"offline"}')->>'id' as s8s \gset
+reset role; set role authenticated; select t.who('owner@box.test'); select order_action(:'s8s', 'markPaid', '{"method":"cash"}'); reset role;
+set role service_role; select marketing_tick(); select marketing_tick(); reset role;
+select t.ok((select count(*) from outbox where order_id = :'s8s' and kind = 'reminder') = 1, 'S8 the event''s own reminder is queued once (the standard one is skipped for it)');
+-- cancel → webhook + scheduled VIP messages dropped at send time
+set role authenticated; select t.who('owner@box.test');
+select order_action(:'s8v', 'cancel', '{"all":true,"seat":"release"}');
+reset role;
+select t.ok(exists(select 1 from deliveries where event = 'ticket.cancelled' and payload->'data'->>'order_ref' = (select ref from orders where id = :'s8v')), 'S8 ticket.cancelled webhook');
+update outbox set send_at = now() - interval '1 second' where order_id = :'s8v' and automation_id is not null;
+set role service_role; select claim_outbox(500); reset role;
+select t.ok((select bool_and(status = 'cancelled') from outbox where order_id = :'s8v' and automation_id = (:'s8a'::jsonb)->>'id'), 'S8 scheduled automation messages for a cancelled order are dropped');
+-- deliveries + API keys
+set role service_role; select claim_deliveries(100) as s8d \gset
+reset role;
+select t.ok(jsonb_array_length(:'s8d'::jsonb) >= 3 and (:'s8d'::jsonb)->0->'integration'->>'secret' like 'whsec_%', 'S8 the sender gets deliveries with their integration (server-side secret)');
+set role authenticated; select t.who('owner@box.test');
+select create_api_key('b0000000-0000-0000-0000-000000000001', 'Warehouse', '{orders:read}') as s8k \gset
+reset role;
+select t.ok((:'s8k'::jsonb)->>'key' ~ '^set_live_[0-9a-f]{40}$' and not ((:'s8k'::jsonb) ? 'hash'), 'S8 API key shown once, hash never returned');
+set role service_role;
+select api_auth(encode(sha256(convert_to((:'s8k'::jsonb)->>'key', 'UTF8')), 'hex')) as s8au \gset
+select t.ok((:'s8au'::jsonb)->>'box_office_id' = 'b0000000-0000-0000-0000-000000000001' and (:'s8au'::jsonb)->'scopes' ? 'orders:read', 'S8 the API recognises the key by its hash');
+select t.ok(jsonb_array_length(api_read('b0000000-0000-0000-0000-000000000001', 'orders', null, 10)) >= 1 and not api_read('b0000000-0000-0000-0000-000000000001', 'orders', null, 10)::text like '%access_key%', 'S8 API reads orders without private keys');
+reset role;
+set role authenticated; select t.who('owner@box.test'); select revoke_api_key('b0000000-0000-0000-0000-000000000001', ((:'s8k'::jsonb)->>'id')::uuid); reset role;
+set role service_role; select t.ok(api_auth(encode(sha256(convert_to((:'s8k'::jsonb)->>'key', 'UTF8')), 'hex')) is null, 'S8 a revoked key stops working'); reset role;
+set role anon; select t.err($$select api_auth('x')$$, 'permission denied', 'S8 the API functions are server-only'); reset role;
+
 \o
 \pset tuples_only off
 select count(*) filter (where ok) as passed, count(*) filter (where not ok) as failed from t.results;

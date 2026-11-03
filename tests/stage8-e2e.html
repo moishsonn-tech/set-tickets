@@ -1,0 +1,273 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Stage 8 — marketing, email, SMS, CRM, tracking, integrations & automation (Eli's Step 8). Run from the local server: /stage8-e2e.html (real time).
+// The database side of the same rules (consent gate, campaigns, automations, unsubscribe, sender claim/result, API keys) is checked on
+// Postgres by tests/db-e2e.sh.
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=8000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t);
+let lastErr=''; const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));
+async function throwsP(code){ try{ await E(code); lastErr='(no error)'; return false }catch(e){ lastErr=e.message; return e.message||true } }
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const free=(slug,tt,n)=>E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='${slug}');return [...seatStates(e,{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt==='${tt}').map(x=>x.p.id).slice(0,${n})})()`);
+const buy=(p)=>E(`DB.placeOrder(${JSON.stringify({buyer:{name:'Tess Test',email:'tess8@test.co',phone:''},addons:[],payment:'manual',payMethod:'cash',...p})},true)`);
+const ob=(pred)=>E(`Demo.st.outbox.filter(m=>${pred})`);
+const people=f=>E(`segmentPeople({orders:Demo.st.orders,tickets:Demo.st.tickets,contacts:Demo.st.contacts,waitlist:Demo.st.waitlist,credits:Demo.st.credits,accounts:(Demo.st.customers||[]).map(c=>c.email)},${JSON.stringify(f)},DB._bo)`);
+const contact=em=>E(`Demo.st.contacts.find(c=>c.box_office_id===DB._bo&&c.email==='${em}')`);
+const tick=()=>E('marketingTick(Demo.st)+demoDeliver(Demo.st)');
+const view=async hash=>{ W().location.hash=hash; await sleep(90); E('render()'); await sleep(40); };
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  let dl=null; W().download=(n,t)=>{dl=[n,t]};
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.noSingles=false;Demo.save()`);
+  const gala=ev('winter-orchestra-gala'), neon=ev('neon-nights-live'), prem=gala.ticketTypes.find(t=>t.name==='Premium'), stalls=gala.ticketTypes.find(t=>t.name==='Stalls');
+  await as('moishsonn@gmail.com'); const bo=E('DB._bo');
+
+  // ── sample data ──
+  ok(E(`Demo.st.orders.filter(o=>o.status==='paid'&&o.box_office_id==='${bo}').every(o=>Demo.st.outbox.filter(m=>m.order_id===o.id&&m.kind==='confirmation').length===1)`),'one confirmation per paid order, in the one outbox');
+  ok(E(`Demo.st.outbox.filter(m=>m.kind==='confirmation').every(m=>m.status==='sent'||m.status==='not sent (staff choice)')`),'sample confirmations have gone out (demo sender)');
+  ok(E(`['purchase','pre','post','offer'].every(k=>Demo.st.automations.some(a=>a.box_office_id==='${bo}'&&a.std===k))`) && !E(`Demo.st.automations.find(a=>a.box_office_id==='${bo}'&&a.std==='offer').enabled`),'§7 every box office starts with the standard workflows (next-event offer off)');
+  ok(new Date(neon.start)<=Date.now() || E(`Demo.st.outbox.some(m=>m.kind==='reminder'&&m.event_id==='${neon.id}'&&m.status==='sent')`),'§7 tonight\'s show: the pre-event reminder went to its ticket holders');
+  { const e2=E(`(()=>{const e=Demo.st.events.find(x=>x.slug==='winter-orchestra-gala');return e})()`); E(`(()=>{const e=Demo.st.events.find(x=>x.slug==='winter-orchestra-gala');e._s=e.start;e.start=new Date(Date.now()+20*36e5).toISOString();})()`); tick();
+    ok(E(`Demo.st.outbox.some(m=>m.kind==='reminder'&&m.event_id==='${gala.id}'&&m.status==='sent'&&/Coming up/.test(m.subject))`),'§7 24 h before an event: the standard reminder goes to every ticket holder');
+    E(`(()=>{const e=Demo.st.events.find(x=>x.slug==='winter-orchestra-gala');e.start=e._s;delete e._s;Demo.save()})()`); }
+  ok(E(`Demo.st.contacts.filter(c=>c.box_office_id==='${bo}').length`)>=40 && E(`(Demo.st.consentLog||[]).some(r=>r.action==='optin'&&/checkout/.test(r.source))`),'§3 every buyer has a contact; checkout opt-ins are in the consent history');
+
+  // ── §1 transactional mail never needs marketing consent ──
+  let r=await buy({buyer:{name:'Tess Test',email:'tess8@test.co',phone:'(212) 555-0188'},items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:1,seats:[]}]});
+  ok(ob(`m.order_id==='${r.id}'&&m.kind==='confirmation'`).length===1 && !contact('tess8@test.co').email_optin,'§1 confirmation queued for a buyer who did not opt in');
+  tick(); ok(ob(`m.order_id==='${r.id}'&&m.kind==='confirmation'`)[0].status==='sent','§1 …and sent (transactional)');
+  ok(contact('tess8@test.co').phone==='+12125550188','§3 contact keeps the buyer\'s mobile number (normalised)');
+
+  // ── §9 consent at checkout: email + SMS opt-in with date and source ──
+  r=await E(`DB.placeOrder({buyer:{name:'Olivia Opt',email:'olivia8@test.co',phone:'+1 646 555 0101'},items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:2,seats:[]}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'},optIn:true,smsOptIn:true,utm:{source:'instagram',medium:'social',campaign:'neon-launch',evil:'x'.repeat(300),term:'y'.repeat(300)},source:'instagram'})`);
+  let oc=contact('olivia8@test.co'), oo=E(`Demo.st.orders.find(o=>o.id==='${r.id}')`);
+  ok(oc.email_optin && oc.email_optin_at && /checkout/.test(oc.email_optin_src) && oc.sms_optin && oc.sms_optin_at,'§9 checkout records email AND text opt-in, each with date and source');
+  ok(oo.data.utm && oo.data.utm.campaign==='neon-launch' && !oo.data.utm.evil && oo.data.utm.term.length===80,'§4 UTM tags stored on the order (only the five keys, trimmed)');
+  ok(E(`(Demo.st.consentLog||[]).filter(x=>x.email==='olivia8@test.co').length`)===2,'§9 two consent-log rows (email + SMS)');
+  r=await E(`DB.placeOrder({buyer:{name:'No Phone',email:'nophone8@test.co',phone:''},items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:1,seats:[]}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'},smsOptIn:true})`);
+  ok(!E(`Demo.st.orders.find(o=>o.id==='${r.id}')`).data.smsOptIn,'§9 a text opt-in without a mobile number is not recorded');
+
+  // ── §1 recipient filters ──
+  const all=E(`Demo.st.orders.filter(o=>o.box_office_id===DB._bo&&!['expired','awaiting_payment'].includes(o.status))`), T=E(`Demo.st.tickets.filter(t=>t.box_office_id===DB._bo)`);
+  const holders=(pred,opred=()=>true)=>new Set(T.filter(t=>t.status==='valid'&&pred(t)).map(t=>all.find(o=>o.id===t.order_id)).filter(o=>o&&opred(o)).map(o=>o.buyer_email));
+  const emails=f=>new Set(people(f).map(p=>p.email)), same=(a,b)=>a.size===b.size&&[...a].every(x=>b.has(x));
+  ok(same(emails({eventIds:[gala.id]}),holders(t=>t.event_id===gala.id)),'§1 filter: event');
+  ok(same(emails({eventIds:[gala.id],ticketTypeIds:[prem.id]}),holders(t=>t.ticket_type_id===prem.id)),'§1 filter: ticket type');
+  ok(same(emails({areas:['Premium centre']}),holders(t=>t.area==='Premium centre')) && emails({areas:['Premium centre']}).size>0,'§1 filter: seating area');
+  const mid=new Date(Date.now()-10*864e5).toISOString().slice(0,10);
+  ok(same(emails({from:mid}),new Set(all.filter(o=>new Date(o.created_at)>=new Date(mid)).map(o=>o.buyer_email))),'§1 filter: purchase date');
+  const pc=all.find(o=>o.data.code)?.data.code; ok(pc && same(emails({promo:pc}),new Set(all.filter(o=>o.data.code===pc).map(o=>o.buyer_email))),'§1 filter: promo code');
+  const tc=all.find(o=>o.data.tracking)?.data.tracking; ok(tc && same(emails({tracking:tc}),new Set(all.filter(o=>o.data.tracking===tc).map(o=>o.buyer_email))),'§1 filter: tracking / referral code');
+  ok(same(emails({eventIds:[neon.id],checkin:'in'}),holders(t=>t.event_id===neon.id&&t.checked_in_at)) && same(emails({eventIds:[neon.id],checkin:'out'}),holders(t=>t.event_id===neon.id&&!t.checked_in_at)),'§1 filter: checked in / not checked in');
+  ok(people({status:'optedIn'}).every(p=>p.contact&&p.contact.email_optin&&!p.contact.unsub_email_at&&!p.contact.suppressed) && people({status:'smsOptIn'}).every(p=>p.contact.sms_optin&&p.phone),'§1 filter: customer status (opted in / text opt-in)');
+  ok(people({status:'waitlist'}).length>=0 && people({status:'refunded'}).every(p=>p.orders.some(o=>(o.data.refunded||0)+(o.data.credited||0)>0)),'§1 filter: customer status (refunded / waitlist)');
+
+  // ── §1 campaigns: marketing reaches opted-in only; scheduled; cancel ──
+  let c=await E(`DB.sendCampaign({category:'marketing',channel:'email',subject:'Spring preview',body:'Hi {{first_name}} — {{event_link}}',filter:{status:'any'}})`);
+  const cm=ob(`m.campaign_id==='${c.id}'`);
+  ok(c.queued>0 && cm.every(m=>{const k=E(`Demo.st.contacts.find(x=>x.email==='${m.email}'&&x.box_office_id===DB._bo)`);return k&&k.email_optin&&!k.unsub_email_at&&!k.suppressed}),'§9 a marketing campaign to “everyone” only queues opted-in contacts');
+  ok(Object.values(c.skipped).reduce((a,x)=>a+x,0)>0 && c.status==='sent' && cm.every(m=>m.status==='sent'),'§1 the rest are counted as held back; sent now');
+  const later=new Date(Date.now()+864e5).toISOString();
+  c=await E(`DB.sendCampaign({category:'transactional',channel:'email',subject:'Doors at 6:30',body:'Doors open at 6:30 tonight.',filter:{eventIds:['${neon.id}']},sendAt:'${later}'})`);
+  ok(c.status==='scheduled' && c.queued===holders(t=>t.event_id===neon.id).size,'§1 scheduled event update queued for every ticket holder (opted in or not)');
+  tick(); ok(ob(`m.campaign_id==='${c.id}'`).every(m=>m.status==='queued'),'§1 nothing goes out before its time');
+  E(`Demo.st.outbox.filter(m=>m.campaign_id==='${c.id}').slice(0,3).forEach(m=>m.send_at=new Date(Date.now()-1000).toISOString())`); tick();
+  ok(ob(`m.campaign_id==='${c.id}'&&m.status==='sent'`).length===3,'§1 …and goes out once due');
+  await E(`DB.campaignAction('${c.id}','cancel')`); ok(ob(`m.campaign_id==='${c.id}'&&m.status==='cancelled'`).length===c.queued-3,'§1 cancelling a scheduled campaign cancels what has not gone yet');
+  ok(await throwsP(`DB.sendCampaign({category:'transactional',subject:'x',body:'y',filter:{}})`),'§1 an event update must name its event');
+
+  // ── §2 texts ──
+  c=await E(`DB.sendCampaign({category:'marketing',channel:'sms',body:'Flash sale tonight: {{event_link}}',filter:{status:'any'}})`);
+  ok(ob(`m.campaign_id==='${c.id}'`).every(m=>m.channel==='sms'&&/^\+\d+$/.test(m.to)&&E(`Demo.st.contacts.find(x=>x.email==='${m.email}'&&x.box_office_id===DB._bo)`).sms_optin),'§2 marketing texts only to text opt-ins, to their mobile number');
+  ok(E(`MailTpl.render({kind:'campaign',channel:'sms',category:'marketing',body:'Hi'},{bo:{name:'Skyline Live'}},{appUrl:'https://x/'}).sms`).endsWith('Reply STOP to opt out.'),'§2 marketing texts end with the STOP line');
+  c=await E(`DB.sendCampaign({category:'transactional',channel:'sms',body:'Venue change: we moved to Hall B.',filter:{eventIds:['${neon.id}']}})`);
+  ok(c.queued>=1 && ob(`m.campaign_id==='${c.id}'&&m.email==='tess8@test.co'`).length===1,'§2 a venue-change text reaches ticket holders with a mobile number (no marketing opt-in needed)');
+  ok(Object.keys(c.skipped).includes('no mobile number'),'§2 holders without a number are counted, not texted');
+  await E(`DB.contactAction('tess8@test.co','sms_optout',{})`);
+  const q1=E(`queueMsg(Demo.st,{box_office_id:DB._bo,kind:'update',channel:'sms',to:'+12125550188',email:'tess8@test.co',body:'Doors moved'})`); tick();
+  ok(E(`Demo.st.outbox.find(m=>m.id==='${q1.id}')`).status==='suppressed' && /STOP/.test(E(`Demo.st.outbox.find(m=>m.id==='${q1.id}')`).error),'§2/§9 after STOP, no texts at all — re-checked at send time');
+
+  // ── §6 automation builder — Eli's example: VIP purchase → 48 h before → email + text ──
+  const vip=E(`Demo.st.automations.find(a=>a.name==='VIP arrival instructions')`);
+  let seats=free('winter-orchestra-gala',prem.id,1);
+  r=await buy({buyer:{name:'Vera Vip',email:'vera8@test.co',phone:'+16465550142'},items:[{eventId:gala.id,ticketTypeId:prem.id,qty:1,seats}]});
+  let vm=ob(`m.automation_id==='${vip.id}'&&m.order_id==='${r.id}'`); const at48=new Date(new Date(gala.start).getTime()-48*36e5).toISOString();
+  ok(vm.length===2 && vm.some(m=>m.channel==='email') && vm.some(m=>m.channel==='sms') && vm.every(m=>m.send_at===at48),'§6 VIP purchase → VIP instructions by email AND text, scheduled 48 h before the event');
+  ok(contact('vera8@test.co').tags.includes('VIP') && contact('vera8@test.co').tags.includes('Attendee: Winter Orchestra Gala'),'§6/§7 tags added (VIP + the event audience)');
+  seats=free('winter-orchestra-gala',stalls.id,1);
+  r=await buy({buyer:{name:'Sam Stalls',email:'sam8@test.co',phone:''},items:[{eventId:gala.id,ticketTypeId:stalls.id,qty:1,seats}]});
+  ok(ob(`m.automation_id==='${vip.id}'&&m.order_id==='${r.id}'`).length===0,'§6 conditions: a Stalls ticket does not get the VIP instructions');
+  const park=E(`Demo.st.automations.find(a=>a.name==='Parking for 2+ Stalls')`);
+  ok(ob(`m.automation_id==='${park.id}'&&m.order_id==='${r.id}'`).length===0,'§6 quantity: one Stalls ticket — no parking offer');
+  seats=free('winter-orchestra-gala',stalls.id,2);
+  r=await buy({buyer:{name:'Pat Pair',email:'pat8@test.co',phone:''},items:[{eventId:gala.id,ticketTypeId:stalls.id,qty:2,seats}]});
+  const pm=ob(`m.automation_id==='${park.id}'&&m.order_id==='${r.id}'`);
+  ok(pm.length===1 && Math.abs(new Date(pm[0].send_at)-Date.now()-36e5)<6e4,'§6 quantity: two Stalls → parking email, an hour later');
+  // runs once per trigger
+  E(`emitEvent(Demo.st,DB._bo,'payment.completed',hookOrder(Demo.st,Demo.st.orders.find(o=>o.id==='${r.id}')),orderCtx(Demo.st,Demo.st.orders.find(o=>o.id==='${r.id}')))`);
+  ok(ob(`m.automation_id==='${park.id}'&&m.order_id==='${r.id}'`).length===1,'§6 the same trigger never runs an automation twice');
+  // a scheduled automation email for an order that is cancelled before it goes → cancelled, not sent
+  const vipOrder=vm[0].order_id; await E(`DB.orderAction('${vipOrder}','cancel',{all:true,seat:'release'})`);
+  E(`Demo.st.outbox.filter(m=>m.automation_id==='${vip.id}'&&m.order_id==='${vipOrder}').forEach(m=>m.send_at=new Date(Date.now()-1000).toISOString())`); tick();
+  ok(ob(`m.automation_id==='${vip.id}'&&m.order_id==='${vipOrder}'`).every(m=>m.status==='cancelled'),'§6 a ticket-based message for a cancelled order is dropped at send time');
+
+  // more triggers + actions: build automations through the real save path
+  const hook=await E(`DB.saveIntegration({kind:'webhook',name:'All events',config:{url:'https://hooks.example.org/set',events:Object.keys(HOOK_EVENTS)}})`);
+  const save=a=>E(`DB.saveAutomation(${JSON.stringify(a)})`);
+  const mk=(name,type,acts,o={})=>save({name,trigger:{type,hours:o.hours||0},cond:o.cond||{},timing:{mode:'now',hours:0},actions:acts});
+  const aC=await mk('On cancel','ticket.cancelled',[{type:'staff',to:'boxoffice@skyline.example',subject:'Cancellation',body:''}]);
+  const aR=await mk('On refund','refund.issued',[{type:'webhook',integrationId:hook.id}]);
+  const aW=await mk('On waitlist','waitlist.joined',[{type:'email',subject:'You are on the list for {{event}}',body:'We will email you.'}]);
+  const aI=await mk('On check-in','checked_in',[{type:'tag',tag:'Came: {{event}}'}]);
+  const aP=await mk('On promo','promo.used',[{type:'tag',tag:'Promo buyer'}],{cond:{promo:'WELCOME10'}});
+  const aN=await mk('No-show','no_show',[{type:'email',subject:'We missed you',body:'Sorry we missed you at {{event}}.'}],{hours:2});
+  const aE=await mk('Thanks','event.ended',[{type:'email',subject:'Thanks!',body:'Thanks for coming.'}],{hours:1});
+  ok(aC.id && aR.id && aW.id && aI.id && aP.id && aN.id && aE.id,'§6 automations save for every trigger type');
+  ok(await throwsP(`DB.saveAutomation({name:'x',trigger:{type:'ticket.purchased'},actions:[]})`) && await throwsP(`DB.saveAutomation({name:'x',trigger:{type:'nope'},actions:[{type:'email',subject:'a',body:'b'}]})`)
+    && await throwsP(`DB.saveAutomation({name:'x',trigger:{type:'ticket.purchased'},actions:[{type:'staff',to:'not-an-email'}]})`),'§6 invalid automations are refused (no action / unknown trigger / bad staff email)');
+  const po=E(`Demo.st.orders.find(o=>o.status==='paid'&&o.box_office_id===DB._bo&&Demo.st.tickets.filter(t=>t.order_id===o.id&&t.status==='valid').length>=2)`);
+  const ptk=E(`Demo.st.tickets.filter(t=>t.order_id==='${po.id}'&&t.status==='valid')`);
+  await E(`DB.orderAction('${po.id}','cancel',{tickets:['${ptk[0].id}'],seat:'release',refund:{mode:'tickets',to:'cash'}})`);
+  ok(ob(`m.automation_id==='${aC.id}'&&m.kind==='staff'&&m.to==='boxoffice@skyline.example'`).length===1,'§6 ticket cancelled → staff notified');
+  ok(E(`Demo.st.deliveries.some(d=>d.integration_id==='${hook.id}'&&d.event==='automation'&&d.payload.automation==='On refund')`),'§6 refund issued → webhook triggered');
+  const wev=E(`Demo.st.events.find(e=>e.box_office_id===DB._bo&&normEvent(e).waitlistMode!=='off'&&e.status==='published')`);
+  await E(`DB.joinWaitlist('${wev.id}','Wendy Wait','wendy8@test.co','')`);
+  ok(ob(`m.automation_id==='${aW.id}'&&m.email==='wendy8@test.co'`).length===1 && !!contact('wendy8@test.co'),'§6 added to a waitlist → email (and a contact)');
+  const nt=E(`Demo.st.tickets.find(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&!t.checked_in_at)`);
+  await E(`DB.checkin('${nt.code}',false,'${neon.id}',{})`);
+  const nbuyer=E(`Demo.st.orders.find(o=>o.id==='${nt.order_id}').buyer_email`);
+  ok(contact(nbuyer).tags.includes('Came: Neon Nights Live'),'§6 checked in → tag');
+  r=await E(`DB.placeOrder({buyer:{name:'Wes Welcome',email:'wes8@test.co',phone:''},items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:1,seats:[]}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'},code:'WELCOME10'})`);
+  ok(contact('wes8@test.co').tags.includes('Promo buyer'),'§6 promo code used → tag');
+  // cart abandoned: an unpaid card checkout runs out of time
+  const ab=E(`Demo.st.automations.find(a=>a.name==='Come back to your seats')`);
+  r=await E(`DB.placeOrder({buyer:{name:'Abby Andon',email:'abby8@test.co',phone:''},items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:1,seats:[]}],addons:[],payment:'card'})`);
+  E(`Demo.st.orders.find(o=>o.id==='${r.id}').expires_at=new Date(Date.now()-1000).toISOString(); expireOrders(Demo.st)`);
+  const am=ob(`m.automation_id==='${ab.id}'&&m.email==='abby8@test.co'`);
+  ok(am.length===1 && am[0].category==='marketing','§6 cart abandoned → follow-up queued (marketing)');
+  E(`Demo.st.outbox.filter(m=>m.automation_id==='${ab.id}'&&m.email==='abby8@test.co').forEach(m=>m.send_at=new Date(Date.now()-1000).toISOString())`); tick();
+  ok(ob(`m.automation_id==='${ab.id}'&&m.email==='abby8@test.co'`)[0].status==='suppressed','§9 …held back because that buyer never opted in to marketing');
+  // timed: event ended (thank you, no-show) — move tonight's show into the past
+  E(`(()=>{const e=Demo.st.events.find(x=>x.id==='${neon.id}');e.start=new Date(Date.now()-16*36e5).toISOString();e.end=new Date(Date.now()-13*36e5).toISOString();})()`);
+  tick();
+  const comeOrders=new Set(E(`Demo.st.tickets.filter(t=>t.event_id==='${neon.id}'&&t.status==='valid'&&t.checked_in_at).map(t=>t.order_id)`));
+  const thanks=ob(`m.automation_id==='${aE.id}'`), noshow=ob(`m.automation_id==='${aN.id}'`);
+  ok(thanks.length===new Set(E(`Demo.st.tickets.filter(t=>t.event_id==='${neon.id}'&&t.status==='valid').map(t=>t.order_id)`)).size,'§6 event ended → one thank-you per order');
+  ok(noshow.length>0 && noshow.every(m=>!comeOrders.has(m.order_id)),'§6 customer did not attend → only orders nobody checked in for');
+  ok(ob(`m.kind==='followup'&&m.event_id==='${neon.id}'`).length>0,'§7 post-event: the standard thank-you / feedback email');
+  const n1=E(`Demo.st.outbox.length`); tick(); ok(E(`Demo.st.outbox.length`)===n1,'§6 the scheduler never repeats a step');
+  // next-event offer: switch it on with a code
+  const offer=E(`Demo.st.automations.find(a=>a.box_office_id===DB._bo&&a.std==='offer')`);
+  await E(`DB.saveAutomation({...Demo.st.automations.find(a=>a.id==='${offer.id}'),enabled:true,promo:'WELCOME10',trigger:{type:'event.ended',hours:4}})`); tick();
+  const om=ob(`m.automation_id==='${offer.id}'`)[0];
+  ok(om && om.category==='marketing' && E(`MailTpl.render(Demo.st.outbox.find(m=>m.id==='${om.id}'),{bo:{name:'Skyline'}},{appUrl:'https://x/'}).html`).includes('WELCOME10'),'§7 next-event offer: marketing email carrying the promo code');
+  ok(await throwsP(`DB.deleteAutomation('${aN.id}')`)===false && !E(`Demo.st.automations.some(a=>a.id==='${aN.id}')`),'§6 automations can be deleted');
+
+  // ── §8 webhooks: every event type, signed payload, no secrets ──
+  const kinds=E(`[...new Set(Demo.st.deliveries.filter(d=>d.integration_id==='${hook.id}').map(d=>d.event))]`);
+  seats=free('winter-orchestra-gala',stalls.id,1); r=await buy({buyer:{name:'Hugo Hook',email:'hugo8@test.co',phone:''},items:[{eventId:gala.id,ticketTypeId:stalls.id,qty:1,seats}]});
+  const s2=free('winter-orchestra-gala',stalls.id,1), ht=E(`Demo.st.tickets.find(t=>t.order_id==='${r.id}'&&t.status==='valid')`);
+  await E(`DB.orderAction('${r.id}','change',{changes:[{ticket:'${ht.id}',seat:'${s2[0]}'}],settle:'waive'})`).catch(e=>{lastErr=e.message});
+  await E(`DB.saveEvent({...Demo.st.events.find(e=>e.id==='${gala.id}'),venue:'Grand Lyric Theatre — Hall B'})`);
+  const kinds2=E(`[...new Set(Demo.st.deliveries.filter(d=>d.integration_id==='${hook.id}').map(d=>d.event))]`);
+  const want=['order.created','payment.completed','ticket.issued','ticket.cancelled','refund.issued','seat.changed','cart.expired','waitlist.signup','customer.checked_in','event.updated'];
+  ok(want.every(k=>kinds2.includes(k)),'§8 webhook events: '+want.filter(k=>kinds2.includes(k)).length+'/10 fired ('+want.filter(k=>!kinds2.includes(k)).join(', ')+')');
+  const pay=E(`JSON.stringify(Demo.st.deliveries.filter(d=>d.integration_id==='${hook.id}'&&d.event==='payment.completed').map(d=>d.payload))`);
+  ok(!/access_key|attempt_key|platformFee|processingFee/.test(pay) && /"ref"/.test(pay),'§8 webhook payloads carry the order, never its private key or the platform\'s money');
+  ok(E(`Demo.st.deliveries.filter(d=>d.integration_id==='${hook.id}').every(d=>d.status==='delivered'||d.status==='queued')`),'§8 deliveries are recorded (demo: not posted)');
+  ok(hook.secret && /^whsec_/.test(hook.secret) && !E(`JSON.stringify(Demo.st.integrations)+JSON.stringify(S.adm.integrations)`).includes('whsec_'),'§8 the webhook signing secret is shown once, never sent back');
+  ok(await throwsP(`DB.saveIntegration({kind:'webhook',config:{url:'http://hooks.example.org',events:['payment.completed']}})`) && await throwsP(`DB.saveIntegration({kind:'webhook',config:{url:'https://localhost/x',events:['payment.completed']}})`)
+    && await throwsP(`DB.saveIntegration({kind:'webhook',config:{url:'https://192.168.1.10/x',events:['payment.completed']}})`) && await throwsP(`DB.saveIntegration({kind:'webhook',config:{url:'https://10.0.0.5/x',events:['payment.completed']}})`)
+    && await throwsP(`DB.saveIntegration({kind:'webhook',config:{url:'https://169.254.169.254/latest',events:['payment.completed']}})`),'§8 webhook URLs must be https on a public host (no http, localhost, private or metadata IPs)');
+  ok(await throwsP(`DB.saveIntegration({kind:'webhook',config:{url:'https://ok.example.org',events:[]}})`),'§8 a webhook needs at least one event');
+  const t1=await E(`DB.testIntegration('${hook.id}')`); ok(t1.event==='ping' && t1.status==='delivered','§8 “Test” sends a ping delivery');
+  // API keys
+  const key=await E(`DB.createApiKey('Warehouse',['orders:read','events:read'])`);
+  ok(/^set_live_[0-9a-f]{40}$/.test(key.key) && E(`Demo.st.apiKeys.find(k=>k.id==='${key.id}').hash`)===await E(`sha256hex('${key.key}')`),'§8 API key: shown once, only its SHA-256 is stored');
+  ok(!E(`JSON.stringify(S.adm.apiKeys)`).includes('"hash"') && await throwsP(`DB.createApiKey('x',[])`),'§8 the back office never receives key hashes; a key needs a scope');
+  await E(`DB.revokeApiKey('${key.id}')`); ok(!!E(`Demo.st.apiKeys.find(k=>k.id==='${key.id}').revoked_at`),'§8 keys can be revoked');
+
+  // ── §5 external CRMs ──
+  ok(await throwsP(`DB.saveIntegration({kind:'mailchimp',config:{dc:'us21',list:'abc'}})`) && await throwsP(`DB.saveIntegration({kind:'mailchimp',config:{dc:'nope',list:'abc'}},'k-us21')`),'§5 Mailchimp needs its API key and a data center');
+  const mc=await E(`DB.saveIntegration({kind:'hubspot',name:'HubSpot CRM',config:{who:'optedIn'}},'pat-na1-secret-token-1234')`);
+  ok(mc.secret_hint==='…1234' && !E(`JSON.stringify(Demo.st.integrations)`).includes('pat-na1-secret'),'§5 CRM token stored server-side; only the last 4 are shown');
+  r=await E(`DB.placeOrder({buyer:{name:'Cara Crm',email:'cara8@test.co',phone:''},items:[{eventId:'${gala.id}',ticketTypeId:'${stalls.id}',qty:1,seats:${JSON.stringify(free('winter-orchestra-gala',stalls.id,1))}}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'},optIn:true})`);
+  ok(E(`Demo.st.deliveries.some(d=>d.integration_id==='${mc.id}'&&d.event==='payment.completed'&&d.payload.data.email==='cara8@test.co')`),'§5 a purchase is sent to the connected CRM');
+  const capi=await E(`DB.saveIntegration({kind:'meta_capi',config:{pixel:'1234567890'}},'EAAB-token')`);
+  r=await E(`DB.placeOrder({buyer:{name:'Mo Meta',email:'mo8@test.co',phone:''},items:[{eventId:'${gala.id}',ticketTypeId:'${stalls.id}',qty:1,seats:${JSON.stringify(free('winter-orchestra-gala',stalls.id,1))}}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/34',cvc:'123'}})`);
+  ok(E(`Demo.st.deliveries.some(d=>d.integration_id==='${capi.id}'&&d.payload.data.id==='${r.id}')`),'§4 Meta Conversions API gets the purchase (event id = order id, for de-duplication)');
+
+  // ── §4 pixels & attribution ──
+  E(`window._px=[]; window.fbq=(...a)=>_px.push(a); _pixels=true; pix('Purchase',{value:4500,currency:'USD',id:'ord-1',ref:'SET-1'})`);
+  const px=E('_px')[0]; ok(px[0]==='track' && px[1]==='Purchase' && px[2].value===45 && px[3].eventID==='ord-1','§4 browser pixel purchase carries value and the order id');
+  E(`delete window.fbq; _pixels=false; localStorage.removeItem('set_px'); location.hash='#/'`); await sleep(120); E(`S.settings.pixels={meta:'123456789',consent:true}; loadPixels()`);
+  ok(!!W().document.getElementById('pxBanner') && !W().fbq,'§4/§9 with the consent setting, pixels wait for the visitor (cookie banner)');
+  W().document.querySelector('[data-action="pxNo"]').click(); ok(!W().document.getElementById('pxBanner') && !W().fbq,'§9 “No thanks” keeps pixels off');
+  E(`S.settings.pixels={}`);
+  W().location.hash='#/e/neon-nights-live?utm_source=newsletter&utm_medium=email&utm_campaign=fall'; await sleep(120);
+  ok(JSON.parse(W().sessionStorage.getItem('set_utm')).campaign==='fall' && W().sessionStorage.getItem('set_src')==='newsletter','§4 UTM tags from a link are kept for the visit');
+  await E('reloadAdmin()'); await view('#/admin/marketing/tracking'); const at=E('attribution()');
+  ok(at.rows.some(x=>x.k==='instagram'&&x.orders>0) && at.camps.some(x=>x.k==='neon-launch'),'§4 traffic source → purchase and UTM campaign reports');
+  ok(has('Traffic source') && has('Campaign link builder') && has('Promo-code attribution'),'§4 tracking page: sources, link builder, promo attribution');
+
+  // ── §9 unsubscribe page, suppression, staff consent ──
+  const tok=E(`Demo.st.contacts.find(c=>c.email==='olivia8@test.co').token`);
+  W().location.hash='#/unsubscribe/'+tok; await until(()=>has('Email & text preferences'));
+  ok(has('o•••@t•••.co') && !has('olivia8@test.co'),'§9 the preferences page shows the address masked');
+  E(`S.ui.unsub={email:false,sms:true}`); await E('A.unsubSave()'); await sleep(40);
+  oc=contact('olivia8@test.co'); ok(!oc.email_optin && oc.unsub_email_at && oc.sms_optin && has('Saved'),'§9 unsubscribe from email, keep texts');
+  ok(E(`Demo.st.consentLog.some(r=>r.email==='olivia8@test.co'&&r.action==='optout'&&r.source==='unsubscribe link')`),'§9 the unsubscribe is in the consent history with its source');
+  await as('moishsonn@gmail.com');
+  c=await E(`DB.sendCampaign({category:'marketing',subject:'Hi',body:'News',filter:{status:'any'}})`);
+  ok(!ob(`m.campaign_id==='${c.id}'`).some(m=>m.email==='olivia8@test.co'),'§9 …and gets no more marketing email');
+  const ord=E(`Demo.st.orders.find(o=>o.buyer_email==='olivia8@test.co')`); await E(`DB.orderAction('${ord.id}','resend',{kind:'tickets'})`); tick();
+  ok(ob(`m.order_id==='${ord.id}'&&m.kind==='tickets'`)[0].status==='sent','§9 …but still gets her tickets (transactional stays separate)');
+  await E(`DB.contactAction('olivia8@test.co','suppress',{reason:'manual'})`); await E(`DB.orderAction('${ord.id}','resend',{kind:'tickets'})`); tick();
+  ok(ob(`m.order_id==='${ord.id}'&&m.kind==='tickets'`).some(m=>m.status==='suppressed'&&/suppressed/.test(m.error)),'§9 a suppressed address gets nothing at all');
+  ok(await throwsP(`DB.contactAction('olivia8@test.co','optin',{})`),'§9 recording an opt-in needs its source');
+  await E(`DB.contactAction('olivia8@test.co','unsuppress',{})`); await E(`DB.contactAction('olivia8@test.co','optin',{source:'signed up at the door'})`);
+  oc=contact('olivia8@test.co'); ok(oc.email_optin && /door/.test(oc.email_optin_src) && !oc.suppressed,'§9 staff can record consent (with source) and lift a suppression');
+  await E(`DB.contactAction('olivia8@test.co','tag',{tags:'Member, VIP'})`); ok(contact('olivia8@test.co').tags.includes('Member'),'§3 customer tags');
+  ok(people({tags:['Member']}).some(p=>p.email==='olivia8@test.co'),'§3 segments by tag');
+
+  // ── message rendering: escaped, unsubscribe only on marketing ──
+  const ctx={bo:{name:'Skyline <Live>',branding:{ink:'red;background:url(x)'}},order:{id:'o1',key:'k1',ref:'SET-1',buyer:{name:'<img src=x onerror=alert(1)> Eve'},events:[{id:'e1',name:'Gala'}]},tickets:[{event_id:'e1',type:'<b>VIP</b>',row:'A',seat:'1',code:'ABC'}],contact:{token:'tok123'}};
+  const h1=E(`MailTpl.render({kind:'confirmation',channel:'email',category:'transactional'},${JSON.stringify(ctx)},{appUrl:'https://app.example/'}).html`);
+  ok(!h1.includes('<img src=x') && h1.includes('&lt;b&gt;VIP') && !h1.includes('url(x)') && h1.includes('#/order/o1/k1'),'emails escape every value (names, ticket types, colours) and link to the order');
+  const h2=E(`MailTpl.render({kind:'campaign',channel:'email',category:'marketing',subject:'Hi {{first_name}}',body:'Visit https://a.example/?x=1&y=<2>'},${JSON.stringify(ctx)},{appUrl:'https://app.example/'})`);
+  ok(h2.html.includes('#/unsubscribe/tok123') && !h1.includes('/unsubscribe/'),'marketing emails carry the unsubscribe link; transactional ones don\'t');
+  ok(!h2.html.includes('<2>'),'staff-written text is escaped too');
+
+  // ── permissions & masking ──
+  await as('support@skyline.example');
+  ok(await throwsP(`DB.sendCampaign({category:'marketing',subject:'x',body:'y',filter:{}})`),'customer service cannot send marketing');
+  ok(await throwsP(`DB.saveAutomation({name:'x',trigger:{type:'ticket.purchased'},actions:[{type:'email',subject:'a',body:'b'}]})`),'…or change automations');
+  await as('marketing@skyline.example');
+  ok((await E(`DB.sendCampaign({category:'marketing',subject:'From marketing',body:'Hello',filter:{status:'optedIn'}})`)).queued>0,'the Marketing template can send campaigns');
+  ok(await throwsP(`DB.saveIntegration({kind:'webhook',config:{url:'https://a.example.org',events:['payment.completed']}})`) && E('S.adm.integrations.every(g=>!("secret" in g))'),'…but cannot change integrations, and never sees secrets');
+  await as('manager@skyline.example');
+  ok(E('S.adm.outbox.length')>0 && E('S.adm.outbox.filter(m=>m.channel!=="sms").every(m=>m.to.includes("•••"))'),'staff without “view email addresses” see masked addresses in the outbox');
+  await as('scanner@example.com');
+  ok(E('S.adm.contacts.length===0 && S.adm.outbox.length===0 && S.adm.automations.length===0 && S.adm.integrations.length===0 && S.adm.apiKeys.length===0'),'scanner staff see no contacts, messages, automations or connections');
+  await as('moishsonn@gmail.com');
+
+  // ── the back-office pages render ──
+  for (const [h,t] of [['#/admin/marketing','How sending works'],['#/admin/marketing/campaigns','New campaign'],['#/admin/marketing/automations','Standard workflows'],['#/admin/marketing/audience','Consent history'],
+    ['#/admin/marketing/messages','Every kind'],['#/admin/marketing/integrations','API keys'],['#/admin/customers/'+encodeURIComponent('olivia8@test.co'),'Marketing & consent']]) { await view(h); ok(has(t),'page renders: '+h); }
+  await view('#/admin/marketing/audience'); E(`S.ui.aud.filter.status='optedIn'`); E('render()'); W().document.querySelector('[data-action="audExport"]').click();
+  ok(dl && dl[0]==='audience.csv' && /Email opt-in date/.test(dl[1]) && dl[1].split('\n').length-1===people({status:'optedIn'}).length,'§3 export the segment with consent columns');
+  E(`S.ui.aud.name='Opted in'`); await E('A.segSave()'); ok(E(`Demo.st.boxOffices.find(b=>b.id===DB._bo).segments.some(s=>s.name==='Opted in')`),'§3 save a segment');
+  await view('#/admin/marketing/campaigns'); E(`S.ui.cmp=newCampaign({subject:'UI send',body:'Hello {{first_name}}'})`); E('render()');
+  ok(has('Preview for') && W().document.querySelector('iframe.mail-pv'),'campaign composer shows a live preview');
+  await E('A.cmpSend()'); ok(E(`Demo.st.broadcasts.some(b=>b.subject==='UI send'&&b.queued>0)`),'campaign sent from the composer');
+  await view('#/admin/event/'+gala.id+'/emails'); E(`S.ui.bc={ev:'${gala.id}',subject:'Parking update',body:'Use the 39th St garage.',channel:'email',sendAt:''}`); await E('A.broadcast()');
+  ok(E(`Demo.st.broadcasts.some(b=>b.subject==='Parking update'&&b.category==='transactional'&&b.queued>0)`),'event page: message ticket holders');
+  log('DONE');
+}catch(e){log('ERROR '+e.message+'\n'+e.stack)}})();
+</script></body></html>

@@ -84,14 +84,34 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   (default on for table / booth) → 4th `meta` element → `tickets.unit`; `sec.hideRow` leaves the row off. `seatLines()` = the big door display.
   Scanner staff template = `door.scan` + `door.checkin` only (back office shows `ScannerHome`). Event tab "Door & check-in" (`EdDoor`).
   DEMO multi-device: `Demo.fresh()` updates `Demo.st` in place, and order / credit / place-order actions refresh first.
+- **Marketing, messages & automation (Stage 8):** ONE outbox (`outbox`) for everything sent — confirmations, resends, ticket changes,
+  refunds, staff messages, reminders, event updates, campaigns, waitlist notices, automation emails / texts, staff notifications. Rows have
+  `channel` email|sms, `category` transactional|marketing|staff, `send_at`, `require_valid` (drop if the order no longer has valid tickets),
+  `dedupe`. Queue with `queueMsg()` / SQL `queue_msg()` (`queueMail()` / `queue_mail()` for an order). Consent + tags live on `contacts`
+  (one per box office + email; `orderContact()` / `order_contact()` records checkout opt-ins), every change via `consentChange()` /
+  `consent_change()` → `consentLog` / `consent_log`. `sendGate()` / `send_gate()` decides at queue time AND again at send time:
+  transactional → everyone unless suppressed; marketing → opted in, not unsubscribed; texts → a number and no STOP (marketing texts need
+  their own opt-in). Segments = filters (`emptySeg()`; `segmentPeople()` / `segment_people()`; saved in `box_offices.segments`). Campaigns
+  are `broadcasts` rows expanded into outbox rows by `sendCampaign()` / `send_campaign()` (event updates = category transactional, must name
+  events). `emitEvent()` / `emit_event()` is the one place outside systems hear about things: webhook / CRM / Meta CAPI `deliveries` rows +
+  matching `automations` (`runAutomation()` / `run_automation()`, once per key via `autoRuns` / `automation_runs`). Time triggers
+  (event approaching / ended / no-show) + the event's own reminders run in `marketingTick()` / `marketing_tick()` (pg_cron every minute;
+  DEMO runs it on each back-office load). Standard workflows = automations with `std` (purchase / pre / post / offer). The sender is the
+  `messaging` Edge Function (`claim_outbox` → render with `mailtpl.js` → Resend / Twilio → `outbox_result`; `claim_deliveries` →
+  `delivery_result`; STOP replies, bounces, one-click unsubscribe). `frontend/mailtpl.js` is the ONE renderer for app previews and the
+  function — keep `supabase/functions/_shared/mailtpl.js` a byte-identical copy (db-e2e.sh checks). Read-only API = `api` Edge Function +
+  `api_keys` (SHA-256 only). Pixels (GA4 / Meta / TikTok, optional consent banner) in `loadPixels()` / `pix()`; UTM tags → `order.data.utm`.
+  Marketing page `#/admin/marketing/<tab>`; buyer preferences page `#/unsubscribe/<token>`.
 - **Money is integer cents everywhere.**
-- **Not yet wired:** the payments Edge Function is written but not deployed (no Supabase project yet; needs Stripe keys in
-  Supabase secrets + pg_cron for `expire_orders()`); outbound email/SMS (confirmations are queued in `outbox`, not sent); Apple Wallet passes.
+- **Not yet wired:** the payments, messaging and api Edge Functions are written but not deployed (no Supabase project yet; need
+  Stripe / Resend / Twilio keys in Supabase secrets + pg_cron for `expire_orders()` and `marketing_tick()`; the messaging function sends
+  nothing until `EMAIL_LIVE=1`); Apple Wallet passes.
 
 ## Run locally
 `cd frontend && python3 -m http.server 8765` → http://localhost:8765 (organizer side: /#/admin).
 Tests: copy `tests/*.html` into `frontend/`, open via the local server (headless Chrome `--dump-dom` works), then delete the copies.
 Stage 5's and 6's suites use PBKDF2 (real CPU time), so run them in real time (poll their `#out` for `DONE`), not with `--virtual-time-budget`.
+The database checks also compare the two `mailtpl.js` copies.
 Database rules for real: `bash tests/db-e2e.sh` applies `supabase/schema.sql` to a scratch Postgres (with `tests/supabase-stub.sql` standing in
 for Supabase's auth schema and roles) and runs `tests/db-e2e.sql` as buyers, staff, customers and the service role. A throwaway Postgres:
 `pip install pgserver` (bundles the binaries) — see the script header.

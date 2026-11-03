@@ -17,4 +17,5 @@ race() { "$PSQL" -At -d $DB -c "set role authenticated" -c "select set_config('r
   -c "begin" -c "select checkin('$K', false, 'e0000000-0000-0000-0000-000000000003', '{\"device\":\"race-$1\"}'::jsonb)->>'result'" -c "select pg_sleep(1)" -c "commit" 2>&1 | grep -E '^(ok|already)$'; }
 R=$( (race 1 & race 2 & race 3 & wait) | sort | tr '\n' ' ')
 [ "$R" = "already already ok " ] && echo "PASS three phones scan one ticket at the same instant: accepted exactly once ($R)" || echo "FAIL concurrent scans: $R"
-
+# Stage 8: the app's previews and the messaging Edge Function render with the same template file
+cmp -s frontend/mailtpl.js supabase/functions/_shared/mailtpl.js && echo "PASS mailtpl.js: the app and the Edge Function use identical copies" || echo "FAIL mailtpl.js copies differ (cp frontend/mailtpl.js supabase/functions/_shared/)"

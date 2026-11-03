@@ -138,7 +138,8 @@ const order=(slug,seats,extra='')=>{ const e=ev(slug); return `DB.placeOrder({bu
   // email + ticket PDF layout
   const o=E(`S.adm.orders.find(o=>o.data.lines.some(l=>l.seats&&l.seats.length===2)&&o.status==='paid'&&S.adm.tickets.filter(t=>t.order_id===o.id&&t.status==='valid').length===2)`);
   E(`A.emailPv({dataset:{id:'${o.id}'}})`); await sleep(40);
-  ok(W().document.querySelectorAll('.email-pv .em-ev tbody tr').length===2 && W().document.querySelector('.email-pv').textContent.includes('one ticket per page'),'one confirmation email per order, listing every ticket with area/row/seat');
+  { const d=(W().document.querySelector('iframe.mail-pv')||{}).srcdoc||'';   // Stage 8: the preview is the real email (mailtpl.js)
+    ok((d.match(/border-top:1px solid #eef0f3/g)||[]).length===2 && d.includes('Ticket type / Area') && d.includes('<th>Row</th>') && d.includes('View &amp; download your tickets'),'one confirmation email per order, listing every ticket with area/row/seat'); }
   E('closeModal()');
 
   // ── builder: levels, booths, standing, mirror, rows, seats, background, preview ──

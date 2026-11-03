@@ -107,3 +107,23 @@ Test with Stripe's test cards first (4242 4242 4242 4242); switch to live keys o
 Each box office already has a branded link (`#/b/<slug>`). A custom domain (tickets.theirvenue.com) needs production hosting that can
 issue certificates per domain (e.g. Cloudflare for SaaS / Vercel domains) pointing at the same site — planned with Stage 10's hosting.
 The box office saves the domain under Branding today; it shows "Not connected yet" until then.
+
+## SET — sending email & texts (Stage 8)
+Nothing is sent until every step below is done AND `EMAIL_LIVE=1` is set — until then the sender marks messages "sending is switched off".
+1. **Email (Resend):** create a Resend account, add and verify the sending domain (DNS records Resend shows you). Then, in your own
+   terminal (never in chat):
+   `supabase secrets set RESEND_API_KEY=re_… MAIL_FROM="SET Tickets <tickets@your-domain>" APP_URL=https://your-site/ CRON_SECRET=<long random string>`
+2. **Texts (optional, Twilio):** buy a number (or create a Messaging Service), register it for A2P 10DLC in the US, then
+   `supabase secrets set TWILIO_ACCOUNT_SID=AC… TWILIO_AUTH_TOKEN=… TWILIO_FROM=+1…` (or `TWILIO_MESSAGING_SERVICE_SID=MG…`).
+   In Twilio, set the number's "A message comes in" webhook to `https://<project>.functions.supabase.co/messaging?inbound=twilio`
+   (STOP / START replies).
+3. Deploy: `supabase functions deploy messaging --no-verify-jwt` and `supabase functions deploy api --no-verify-jwt`
+   (copy `frontend/mailtpl.js` to `supabase/functions/_shared/` first if it changed — the tests check they match).
+4. Resend → Webhooks → add `https://<project>.functions.supabase.co/messaging?events=resend` for `email.bounced`, `email.complained`;
+   put its signing secret in `RESEND_WEBHOOK_SECRET`. Hard bounces and spam complaints then suppress the address.
+5. Schedule (pg_cron + pg_net, Database → Extensions):
+   `select cron.schedule('set-marketing-tick', '* * * * *', 'select marketing_tick()');`
+   `select cron.schedule('set-send', '* * * * *', $$select net.http_post('https://<project>.functions.supabase.co/messaging', '{"action":"run"}'::jsonb, '{}'::jsonb, '{"Content-Type":"application/json","x-cron-secret":"<CRON_SECRET>"}'::jsonb)$$);`
+6. Test by sending yourself an event update from a test box office, then set `supabase secrets set EMAIL_LIVE=1`.
+Box offices connect their own CRMs / webhooks / Meta Conversions API under Marketing → Integrations; their keys are stored in the
+database (server-side only, never returned to the browser).

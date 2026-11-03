@@ -853,6 +853,12 @@ begin
   if p_email !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'Enter a valid email'; end if;
   insert into waitlist(box_office_id, event_id, name, email, phone) values (e.box_office_id, p_event, left(trim(p_name),120), left(lower(trim(p_email)),200), left(trim(coalesce(p_phone,'')),40))
     on conflict (event_id, email) do nothing;
+  if found then
+    perform contact_upsert(e.box_office_id, p_email, p_name, p_phone);
+    perform emit_event(e.box_office_id, 'waitlist.signup', jsonb_build_object('event_id', p_event, 'name', trim(p_name), 'email', lower(trim(p_email)), 'phone', coalesce(p_phone, '')),
+      jsonb_build_object('email', lower(trim(p_email)), 'name', trim(p_name), 'phone', coalesce(p_phone, ''), 'tickets', '[]'::jsonb, 'eventIds', jsonb_build_array(p_event), 'eventId', p_event,
+        'key', (select id from waitlist where event_id = p_event and email = lower(trim(p_email)))));
+  end if;
 end $$;
 -- One direct-link-only (or public) event by its URL. Hidden / scheduled / archived events return nothing.
 create or replace function event_by_slug(p_slug text) returns jsonb language sql stable security definer set search_path = public as $$
@@ -1083,7 +1089,10 @@ begin
       'total', total, 'refunded', 0, 'faceValue', q->'faceValue', 'code', promo->>'code', 'promo', case when promo is null then null else jsonb_build_object('id', promo->>'id', 'code', promo_code) end,
       'tracking', tracking, 'payment', case when total = 0 then case when coalesce((q->>'credit')::bigint, 0) > 0 then 'credit' else 'free' end else p->>'payment' end,
       'credit', case when coalesce((q->>'credit')::bigint, 0) > 0 then jsonb_build_object('id', cr.id, 'code', cr.code, 'amount', (q->>'credit')::bigint) end, 'answers', coalesce(p->'answers','{}'), 'ticketAnswers', coalesce(p->'ticketAnswers','{}'),
-      'optIn', coalesce((p->>'optIn')::boolean, false), 'source', p->>'source', 'currency', q->'currency', 'platformFee', q->'platformFee') || case when is_comp then '{"comp":true}'::jsonb else '{}'::jsonb end)
+      'optIn', coalesce((p->>'optIn')::boolean, false), 'smsOptIn', coalesce((p->>'smsOptIn')::boolean, false) and norm_phone(p->'buyer'->>'phone') is not null,
+      'source', p->>'source', 'utm', (select nullif(jsonb_object_agg(uk.n, left(p->'utm'->>uk.n, 80)), '{}'::jsonb) from unnest(array['source','medium','campaign','content','term']) uk(n)
+        where jsonb_typeof(p->'utm') = 'object' and coalesce(p->'utm'->>uk.n, '') <> ''),
+      'currency', q->'currency', 'platformFee', q->'platformFee') || case when is_comp then '{"comp":true}'::jsonb else '{}'::jsonb end)
     returning id, access_key into oid, okey;
   -- the order holds its seats itself now (paid → tickets; unpaid → reserved until paid or expired), so the buyer's seat holds go
   for l in select v from jsonb_array_elements(q->'lines') v where jsonb_array_length(coalesce(v->'seats','[]')) > 0 loop
@@ -1091,6 +1100,8 @@ begin
       and (seat_status.status = 'checkout' or (manual and seat_status.status = 'held'));
   end loop;
   if tok is not null then delete from seat_status y where y.status = 'checkout' and y.token = tok; end if;
+  perform emit_event((select box_office_id from orders where id = oid), 'order.created', (select hook_order(oo) from orders oo where oo.id = oid));
+  if status = 'pending' then perform order_contact(oid); end if;
   if status = 'paid' then perform issue_order_tickets(oid, coalesce(nullif(me_email(), ''), email)); end if;
   if manual and coalesce((p->>'send')::boolean, true) = false then update outbox set status = 'not sent (staff choice)' where order_id = oid and kind = 'confirmation'; end if;
   return jsonb_build_object('id', oid, 'key', okey, 'ref', oref, 'status', status, 'total', total,
@@ -1173,7 +1184,10 @@ begin
       end loop;
     end if;
   end loop;
-  insert into outbox(box_office_id, order_id, kind, "to") values (o.box_office_id, o.id, 'confirmation', o.buyer_email) on conflict do nothing;
+  perform queue_mail(o, 'confirmation', '', '', 'system');   -- ONE per order (unique index); transactional — never held back for marketing consent
+  perform order_contact(o.id);
+  perform emit_event(o.box_office_id, 'ticket.issued', jsonb_build_object('order_ref', o.ref, 'tickets', hook_order(o)->'tickets'));
+  perform emit_event(o.box_office_id, 'payment.completed', hook_order(o), order_ctx(o));
 end $$;
 -- the k-th ticket's answers to that event's per-ticket questions
 create or replace function ticket_answers(o orders, p_event text, k int) returns jsonb language sql stable security definer set search_path = public as $$
@@ -1233,6 +1247,7 @@ begin
           'Checkout ' || o.ref || ' expired unpaid — seat released', 'system', o.ref);
       end loop;
     end loop;
+    perform emit_event(o.box_office_id, 'cart.expired', hook_order(o), order_ctx(o, '{}') || jsonb_build_object('eventId', o.event_ids[1]));
   end loop;
   perform set_config('set.system', '', true); return n;
 end $$;
@@ -1565,6 +1580,7 @@ begin
       case when (res->>'net')::bigint > 0 then ' · upgrade ' || money_txt((res->>'net')::bigint) || ' — ' || case res->>'settle' when 'collect' then 'collected' when 'due' then 'added to the balance due' else 'no charge' end
            when (res->>'net')::bigint < 0 then ' · downgrade ' || money_txt(-(res->>'net')::bigint) || ' — ' || case when res ? 'refund' then refund_text(res->'refund') else 'no refund' end else '' end), by_, p->>'note', res);
     if coalesce((p->>'notify')::boolean, true) then perform queue_mail(o, 'updated', 'Your updated tickets', 'Your tickets have changed. Your new tickets are attached — the old ones no longer work.', by_); end if;
+    perform emit_event(o.box_office_id, 'seat.changed', jsonb_build_object('order_ref', o.ref, 'email', o.buyer_email, 'changes', res->'tickets', 'net', res->'net'));
   elsif p_action = 'cancel' then
     if o.status <> 'paid' then raise exception 'Only paid orders can be changed'; end if;
     select count(*) into n_live from tickets where order_id = o.id and status = 'valid';
@@ -1585,6 +1601,10 @@ begin
     if coalesce((p->>'notify')::boolean, true) then perform queue_mail(o, 'cancelled', case when all_ then 'Your order was cancelled' else 'Some of your tickets were cancelled' end,
       case when r is not null then 'A refund of ' || money_txt((r->>'amount')::bigint) || ' has been issued.' else '' end, by_); end if;
     res := jsonb_build_object('cancelled', coalesce(array_length(codes, 1), 0), 'refund', r);
+    perform emit_event(o.box_office_id, 'ticket.cancelled', jsonb_build_object('order_ref', o.ref, 'email', o.buyer_email, 'tickets', (select coalesce(jsonb_agg(id), '[]') from tickets where order_id = o.id and code = any(codes)), 'all', all_),
+      order_ctx(o, array(select id from tickets where order_id = o.id and code = any(codes))) || jsonb_build_object('key', o.id || ':c' || (select count(*) from order_log where order_id = o.id)));
+    if r is not null then perform emit_event(o.box_office_id, 'refund.issued', jsonb_build_object('order_ref', o.ref, 'email', o.buyer_email, 'amount', r->'amount', 'to', r->'to'),
+      order_ctx(o, array(select id from tickets where order_id = o.id and code = any(codes))) || jsonb_build_object('key', o.id || ':r' || (select count(*) from order_log where order_id = o.id))); end if;
   elsif p_action = 'refund' then
     if not was_paid(o) then raise exception 'Nothing has been paid on this order'; end if;
     if coalesce((p->>'cancel')::boolean, false) and p->>'mode' in ('full','tickets') and not has_perm(o.box_office_id, case when p->>'mode' = 'full' then 'orders.cancel' else 'orders.cancelTicket' end, ev) then
@@ -1600,6 +1620,11 @@ begin
     if coalesce((p->>'notify')::boolean, true) then perform queue_mail(o, 'refund', 'Your refund', 'We''ve issued a refund of ' || money_txt((r->>'amount')::bigint)
       || case when r ? 'credit' then ' as credit — use code ' || (r->>'credit') || ' on your next order' else '' end || '.', by_); end if;
     res := jsonb_build_object('refund', r);
+    perform emit_event(o.box_office_id, 'refund.issued', jsonb_build_object('order_ref', o.ref, 'email', o.buyer_email, 'amount', r->'amount', 'to', r->'to'),
+      order_ctx(o) || jsonb_build_object('key', o.id || ':r' || (select count(*) from order_log where order_id = o.id)));
+    if coalesce(array_length(codes, 1), 0) > 0 then perform emit_event(o.box_office_id, 'ticket.cancelled', jsonb_build_object('order_ref', o.ref, 'email', o.buyer_email,
+      'tickets', (select coalesce(jsonb_agg(id), '[]') from tickets where order_id = o.id and code = any(codes)), 'all', p->>'mode' = 'full'),
+      order_ctx(o, array(select id from tickets where order_id = o.id and code = any(codes))) || jsonb_build_object('key', o.id || ':c' || (select count(*) from order_log where order_id = o.id))); end if;
   elsif p_action = 'collect' then
     amt := greatest(0, round(coalesce(nullif(p->>'amount','')::numeric, 0)))::bigint; if amt <= 0 then raise exception 'Enter the amount received'; end if;
     if coalesce(p->>'method','') not in ('cash','terminal','check','transfer','other') then raise exception 'Choose how it was paid'; end if;
@@ -1890,6 +1915,9 @@ begin
     update tickets set checked_in_at = now(), checkin = jsonb_build_object('entrance', coalesce(en->>'name', ''), 'device', dev, 'device_name', coalesce(dv.name, ''), 'by', me_email(), 'manual', manual)
       where id = t.id and checked_in_at is null returning * into t;
     if found then res := 'ok';
+      perform emit_event(bo, 'customer.checked_in', jsonb_build_object('ticket_id', t.id, 'event_id', t.event_id, 'order_ref', (select ref from orders where id = t.order_id),
+        'email', (select buyer_email from orders where id = t.order_id), 'entrance', coalesce(en->>'name', ''), 'at', t.checked_in_at),
+        (select order_ctx(x, array[t.id]) from orders x where x.id = t.order_id) || jsonb_build_object('key', t.id));
     else select * into t from tickets where code = c; res := 'already'; extra := extra || jsonb_build_object('first', coalesce(t.checkin, '{}') || jsonb_build_object('at', t.checked_in_at)); end if;
   end if;
   insert into scan_log(box_office_id, event_id, slot_id, ticket_id, code, result, entrance, device, device_name, by, manual, override)
@@ -1975,7 +2003,8 @@ begin
   if b.status <> 'active' and not (p_support and sup) then return res || jsonb_build_object('blocked', b.status); end if;
   if coalesce((b.settings->>'require2fa')::boolean, false) and coalesce(auth.jwt() ->> 'aal', '') <> 'aal2' and not (p_support and sup) then
     return res || jsonb_build_object('needs2fa', true, 'events', '[]'::jsonb, 'orders', '[]'::jsonb, 'tickets', '[]'::jsonb, 'waitlist', '[]'::jsonb, 'team', jsonb_build_array(me), 'broadcasts', '[]'::jsonb, 'audit', '[]'::jsonb, 'seatStatus', '[]'::jsonb, 'seatLog', '[]'::jsonb, 'promos', '[]'::jsonb, 'tracking', '[]'::jsonb, 'outbox', '[]'::jsonb,
-      'orderLog', '[]'::jsonb, 'credits', '[]'::jsonb, 'custNotes', '[]'::jsonb, 'accounts', '[]'::jsonb, 'live', '{}'::jsonb); end if;
+      'orderLog', '[]'::jsonb, 'credits', '[]'::jsonb, 'custNotes', '[]'::jsonb, 'accounts', '[]'::jsonb, 'live', '{}'::jsonb,
+      'contacts', '[]'::jsonb, 'consentLog', '[]'::jsonb, 'automations', '[]'::jsonb, 'integrations', '[]'::jsonb, 'deliveries', '[]'::jsonb, 'apiKeys', '[]'::jsonb); end if;
   select coalesce(array_agg(e.id), '{}') into evs from events e where e.box_office_id = b.id and (has_perm(b.id, 'events.view', e.id) or has_perm(b.id, 'door.scan', e.id));
   P_names := has_perm(b.id, 'customers.names'); P_emails := has_perm(b.id, 'customers.emails'); P_phones := has_perm(b.id, 'customers.phones'); P_money := has_perm(b.id, 'finance.totals');
   P_proc := has_perm(b.id, 'finance.processing'); P_fees := has_perm(b.id, 'finance.fees');
@@ -2008,10 +2037,13 @@ begin
     'team', case when has_perm(b.id, 'admin.invite') or has_perm(b.id, 'admin.perms') or has_perm(b.id, 'admin.remove')
       then coalesce((select jsonb_agg(to_jsonb(x) - 'all_events' - 'event_ids' || jsonb_build_object('owner', x.email = b.owner, 'events', case when x.all_events then to_jsonb('all'::text) else to_jsonb(x.event_ids) end))
         from members x where x.box_office_id = b.id and x.status = 'active'), '[]') else jsonb_build_array(me) end,
-    'broadcasts', coalesce((select jsonb_agg(to_jsonb(x)) from broadcasts x where x.event_id = any(evs) and (has_perm(b.id, 'comms.email') or has_perm(b.id, 'comms.notify'))), '[]'),
+    'broadcasts', coalesce((select jsonb_agg(to_jsonb(x)) from broadcasts x where x.box_office_id = b.id and (x.event_id is null or x.event_id = any(evs))
+      and (has_perm(b.id, 'comms.email') or has_perm(b.id, 'comms.notify') or has_perm(b.id, 'comms.marketing'))), '[]'),
     'audit', coalesce((select jsonb_agg(to_jsonb(a) order by a.at desc) from (select * from audit_log a where a.box_office_id = b.id
         and (has_perm(b.id, 'admin.perms') or a.actor = em or (a.target is not null and has_perm(b.id, 'events.edit', a.target))) order by a.at desc limit 1500) a), '[]'),
-    'outbox', case when has_perm(b.id, 'orders.view') then coalesce((select jsonb_agg(to_jsonb(x)) from outbox x where x.box_office_id = b.id), '[]') else '[]' end,
+    'outbox', case when has_perm(b.id, 'orders.view') or has_perm(b.id, 'comms.email') or has_perm(b.id, 'comms.marketing') or has_perm(b.id, 'comms.lists') then coalesce((select jsonb_agg(to_jsonb(x) - 'locked_until'
+        || case when P_emails then '{}'::jsonb else jsonb_build_object('email', mask_email(x.email), 'to', case when x.channel = 'sms' then x."to" else mask_email(x."to") end) end
+        || case when P_phones or x.channel <> 'sms' then '{}'::jsonb else '{"to":"•••"}'::jsonb end) from (select * from outbox y where y.box_office_id = b.id order by y.at desc limit 6000) x), '[]') else '[]' end,
     'seatStatus', coalesce((select jsonb_agg(to_jsonb(x) - 'token') from seat_status x where x.event_id = any(evs)
         and not (x.status = 'checkout' and x.expires_at <= now())), '[]'),
     'seatLog', case when has_perm(b.id, 'seating.view') then coalesce((select jsonb_agg(to_jsonb(l) order by l.at desc) from (select * from seat_log l
@@ -2033,7 +2065,19 @@ begin
           count(distinct visitor) filter (where at >= now() - interval '10 minutes') now10,
           (select jsonb_object_agg(k, c) from (select coalesce(src,'direct') k, count(*) c from event_views x where x.event_id = ev.event_id group by 1) q) bysrc,
           (select jsonb_object_agg(k, jsonb_build_object('views', c, 'unique', u)) from (select ref k, count(*) c, count(distinct visitor) u from event_views x where x.event_id = ev.event_id and ref is not null group by 1) q) byref
-        from event_views ev where event_id = any(evs) group by event_id) v), '{}'));
+        from event_views ev where event_id = any(evs) group by event_id) v), '{}'))
+  -- Stage 8: contacts (consent + tags; the unsubscribe token stays here), consent history, automations, connections (never their secrets), deliveries, API keys (never the hash)
+  || jsonb_build_object(
+    'contacts', case when has_perm(b.id, 'comms.lists') or has_perm(b.id, 'customers.profiles') or has_perm(b.id, 'comms.marketing') or has_perm(b.id, 'comms.consent') then coalesce((select jsonb_agg(to_jsonb(c) - 'token'
+        || case when P_emails then '{}'::jsonb else jsonb_build_object('email', mask_email(c.email)) end || case when P_phones or c.phone is null then '{}'::jsonb else '{"phone":"•••"}'::jsonb end)
+      from contacts c where c.box_office_id = b.id), '[]') else '[]' end,
+    'consentLog', case when has_perm(b.id, 'comms.lists') or has_perm(b.id, 'customers.profiles') or has_perm(b.id, 'comms.marketing') or has_perm(b.id, 'comms.consent') then coalesce((select jsonb_agg(to_jsonb(x)
+        || case when P_emails then '{}'::jsonb else jsonb_build_object('email', mask_email(x.email)) end order by x.at desc) from (select * from consent_log y where y.box_office_id = b.id order by y.at desc limit 3000) x), '[]') else '[]' end,
+    'automations', case when has_perm(b.id, 'comms.automations') or has_perm(b.id, 'comms.lists') then coalesce((select jsonb_agg(to_jsonb(a) order by a.created_at) from automations a where a.box_office_id = b.id), '[]') else '[]' end,
+    'integrations', case when has_perm(b.id, 'admin.integrations') or has_perm(b.id, 'comms.automations') then coalesce((select jsonb_agg(to_jsonb(g) - 'secret' || jsonb_build_object('secret_set', g.secret is not null) order by g.created_at)
+      from integrations g where g.box_office_id = b.id), '[]') else '[]' end,
+    'deliveries', case when has_perm(b.id, 'admin.integrations') then coalesce((select jsonb_agg(to_jsonb(d) - 'locked_until' order by d.created_at desc) from (select * from deliveries y where y.box_office_id = b.id order by y.created_at desc limit 500) d), '[]') else '[]' end,
+    'apiKeys', case when has_perm(b.id, 'admin.api') then coalesce((select jsonb_agg(to_jsonb(k) - 'hash' order by k.created_at) from api_keys k where k.box_office_id = b.id), '[]') else '[]' end);
 end $$;
 
 create or replace function transfer_ownership(p_bo uuid, p_email text) returns void language plpgsql security definer set search_path = public as $$
@@ -2143,6 +2187,675 @@ revoke execute on function new_box_office(text,text,text,text,text,text), log_ac
 grant execute on function confirm_payment(uuid,jsonb), record_payment_attempt(uuid,jsonb), expire_orders(), finish_refund(uuid,text,jsonb) to service_role;
 -- pg_cron (enable it in Supabase → Database → Extensions): release unpaid card checkouts every minute
 -- select cron.schedule('set-expire-checkouts', '* * * * *', 'select expire_orders()');
+
+-- ══════════════ Stage 8: messages, marketing, automation, integrations, API ══════════════
+-- ONE outbox for everything sent (confirmations … campaigns, reminders, automation emails / texts, staff notifications). Rows are queued
+-- with send_at; the `messaging` Edge Function claims due rows (claim_outbox, which re-checks consent), renders and sends them, and reports
+-- back (outbox_result). Consent + tags are on contacts (one per box office + email), every change in consent_log. emit_event() is the one
+-- place outside systems hear about things (deliveries → webhooks / CRMs) and runs matching automations. Mirrors the Stage 8 block in data.js.
+alter table outbox add column if not exists event_id uuid, add column if not exists channel text not null default 'email', add column if not exists category text not null default 'transactional',
+  add column if not exists email text, add column if not exists send_at timestamptz not null default now(), add column if not exists attempts int not null default 0, add column if not exists error text,
+  add column if not exists provider text, add column if not exists provider_id text, add column if not exists sent_at timestamptz, add column if not exists campaign_id uuid,
+  add column if not exists automation_id text, add column if not exists dedupe text, add column if not exists require_valid boolean not null default false,
+  add column if not exists vars jsonb not null default '{}', add column if not exists locked_until timestamptz;
+update outbox set email = lower("to") where email is null and channel = 'email';
+alter table outbox drop constraint if exists outbox_channel_check; alter table outbox add constraint outbox_channel_check check (channel in ('email','sms'));
+alter table outbox drop constraint if exists outbox_category_check; alter table outbox add constraint outbox_category_check check (category in ('transactional','marketing','staff'));
+create unique index if not exists outbox_dedupe on outbox(dedupe) where dedupe is not null;
+create index if not exists outbox_due on outbox(send_at) where status = 'queued';
+create index if not exists outbox_bo on outbox(box_office_id, at desc);
+create index if not exists outbox_provider on outbox(provider_id) where provider_id is not null;
+-- campaigns (and event updates / waitlist notices) are broadcasts rows; their messages are outbox rows with campaign_id
+alter table broadcasts add column if not exists kind text not null default 'update', add column if not exists name text, add column if not exists channel text not null default 'email',
+  add column if not exists category text not null default 'transactional', add column if not exists filter jsonb not null default '{}', add column if not exists send_at timestamptz default now(),
+  add column if not exists status text not null default 'sent', add column if not exists queued int not null default 0, add column if not exists skipped jsonb not null default '{}',
+  add column if not exists cancelled_by text, add column if not exists cancelled_at timestamptz;
+alter table box_offices add column if not exists segments jsonb not null default '[]';
+create table if not exists contacts (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id) on delete cascade, email text not null, name text, phone text,
+  email_optin boolean not null default false, email_optin_at timestamptz, email_optin_src text, sms_optin boolean not null default false, sms_optin_at timestamptz, sms_optin_src text,
+  unsub_email_at timestamptz, unsub_sms_at timestamptz, suppressed text check (suppressed in ('bounced','complaint','manual')), suppressed_at timestamptz, tags text[] not null default '{}',
+  token text not null unique default (replace(gen_random_uuid()::text, '-', '') || replace(gen_random_uuid()::text, '-', '')), created_at timestamptz not null default now(), updated_at timestamptz not null default now(), unique (box_office_id, email));
+create index if not exists contacts_phone on contacts(phone) where phone is not null;
+create table if not exists consent_log (id bigint generated always as identity primary key, box_office_id uuid not null references box_offices(id) on delete cascade, email text not null,
+  action text not null, source text, by text, at timestamptz not null default now());
+create index if not exists consent_log_bo on consent_log(box_office_id, at desc);
+create table if not exists automations (id text primary key, box_office_id uuid not null references box_offices(id) on delete cascade, std text not null default '', kind text not null default 'automation',
+  name text not null, enabled boolean not null default true, trigger jsonb not null, cond jsonb not null default '{}', timing jsonb not null default '{}', actions jsonb not null default '[]', promo text,
+  runs int not null default 0, last_run timestamptz, created_at timestamptz not null default now(), created_by text, updated_at timestamptz);
+create table if not exists automation_runs (automation_id text not null, key text not null, at timestamptz not null default now(), primary key (automation_id, key));
+create table if not exists integrations (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id) on delete cascade, kind text not null, name text not null,
+  active boolean not null default true, config jsonb not null default '{}', secret text, secret_hint text, created_at timestamptz not null default now(), created_by text, last_at timestamptz, last_error text);
+create table if not exists deliveries (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id) on delete cascade,
+  integration_id uuid references integrations(id) on delete cascade, kind text not null, event text not null, event_id text not null, payload jsonb not null, status text not null default 'queued',
+  attempts int not null default 0, next_at timestamptz not null default now(), locked_until timestamptz, created_at timestamptz not null default now(), done_at timestamptz, response text);
+create index if not exists deliveries_due on deliveries(next_at) where status = 'queued';
+create index if not exists deliveries_bo on deliveries(box_office_id, created_at desc);
+create table if not exists api_keys (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id) on delete cascade, name text not null, prefix text not null,
+  hash text not null unique, scopes text[] not null, created_at timestamptz not null default now(), created_by text, last_used_at timestamptz, revoked_at timestamptz, revoked_by text);
+create table if not exists api_usage (key_id uuid not null references api_keys(id) on delete cascade, minute timestamptz not null, n int not null default 0, primary key (key_id, minute));
+-- read only through admin_load() (masked by permission) and the RPCs below; nobody selects these tables directly
+alter table contacts enable row level security; alter table consent_log enable row level security; alter table automations enable row level security;
+alter table automation_runs enable row level security; alter table integrations enable row level security; alter table deliveries enable row level security;
+alter table api_keys enable row level security; alter table api_usage enable row level security;
+revoke all on contacts, consent_log, automations, automation_runs, integrations, deliveries, api_keys, api_usage from anon, authenticated;
+revoke insert, update, delete on outbox, broadcasts from anon, authenticated;
+drop policy if exists broadcasts_insert on broadcasts;
+
+create or replace function norm_phone(p text) returns text language sql immutable as $$
+  select case when length(d) < 7 then null when s like '+%' then '+' || d when length(d) = 10 then '+1' || d when length(d) = 11 and left(d, 1) = '1' then '+' || d else '+' || d end
+  from (select trim(coalesce(p, '')) s, regexp_replace(coalesce(p, ''), '\D', '', 'g') d) x $$;
+create or replace function mask_email(e text) returns text language sql immutable as $$ select regexp_replace(coalesce(e, ''), '^(.)[^@]*@(.)[^.]*(\..+)$', '\1•••@\2•••\3') $$;
+-- only https URLs on public hosts (no localhost / private IP literals); the Edge Function re-checks the resolved address before posting
+create or replace function safe_url(u text) returns text language plpgsql immutable as $$
+declare h text;
+begin
+  u := trim(coalesce(u, ''));
+  if u !~* '^https://[^/?#@\s]+([/?#]\S*)?$' then return null; end if;
+  h := lower(regexp_replace(substring(u from '^https://([^/?#]+)'), ':\d+$', ''));
+  h := trim(both '[]' from h);
+  if h = 'localhost' or h like '%.localhost' or h like '%.local' or h like '%.internal' or (position('.' in h) = 0 and position(':' in h) = 0) then return null; end if;
+  if h ~ '^(0|10|127)\.' or h ~ '^169\.254\.' or h ~ '^192\.168\.' or h ~ '^172\.(1[6-9]|2\d|3[01])\.' or h ~ '^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.' or h ~ '^\d+$'
+     or (position(':' in h) > 0 and h ~ '^(::1?|f[cd]|fe80)') then return null; end if;
+  return u;
+end $$;
+
+create or replace function contact_upsert(p_bo uuid, p_email text, p_name text default '', p_phone text default '') returns contacts language plpgsql security definer set search_path = public as $$
+declare c contacts%rowtype; em text := lower(trim(coalesce(p_email, '')));
+begin
+  if em !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then return null; end if;
+  insert into contacts(box_office_id, email, name, phone) values (p_bo, em, left(nullif(trim(coalesce(p_name, '')), ''), 120), norm_phone(p_phone))
+    on conflict (box_office_id, email) do update set name = coalesce(left(nullif(trim(coalesce(p_name, '')), ''), 120), contacts.name),
+      phone = coalesce(norm_phone(p_phone), contacts.phone), updated_at = now()
+    returning * into c;
+  return c;
+end $$;
+-- optin | optout (email marketing) · sms_optin | sms_optout (STOP: no texts at all) | sms_start · suppress | unsuppress (all email)
+create or replace function consent_change(p_id uuid, p_action text, p_source text, p_by text, p_extra text default '') returns boolean language plpgsql security definer set search_path = public as $$
+declare c contacts%rowtype;
+begin
+  select * into c from contacts where id = p_id for update;
+  if p_action = 'optin' then update contacts set email_optin = true, email_optin_at = now(), email_optin_src = left(p_source, 160), unsub_email_at = null, updated_at = now() where id = p_id;
+  elsif p_action = 'optout' then if not c.email_optin and c.unsub_email_at is not null then return false; end if; update contacts set email_optin = false, unsub_email_at = now(), updated_at = now() where id = p_id;
+  elsif p_action = 'sms_optin' then if c.phone is null then raise exception 'No mobile number on file'; end if;
+    update contacts set sms_optin = true, sms_optin_at = now(), sms_optin_src = left(p_source, 160), unsub_sms_at = null, updated_at = now() where id = p_id;
+  elsif p_action = 'sms_optout' then if c.unsub_sms_at is not null then return false; end if; update contacts set sms_optin = false, unsub_sms_at = now(), updated_at = now() where id = p_id;
+  elsif p_action = 'sms_start' then if c.unsub_sms_at is null then return false; end if; update contacts set unsub_sms_at = null, updated_at = now() where id = p_id;
+  elsif p_action = 'suppress' then update contacts set suppressed = case when p_extra in ('bounced','complaint') then p_extra else 'manual' end, suppressed_at = now(), updated_at = now() where id = p_id;
+  elsif p_action = 'unsuppress' then if c.suppressed is null then return false; end if; update contacts set suppressed = null, suppressed_at = null, updated_at = now() where id = p_id;
+  else raise exception 'Unknown consent change'; end if;
+  insert into consent_log(box_office_id, email, action, source, by) values (c.box_office_id, c.email,
+    case when p_action = 'suppress' then 'suppress:' || case when p_extra in ('bounced','complaint') then p_extra else 'manual' end else p_action end, left(coalesce(p_source, ''), 160), coalesce(nullif(p_by, ''), 'system'));
+  return true;
+end $$;
+-- an order's buyer → their contact + the consent they gave at checkout
+create or replace function order_contact(p_order uuid) returns void language plpgsql security definer set search_path = public as $$
+declare o orders%rowtype; c contacts%rowtype; src text;
+begin
+  select * into o from orders where id = p_order;
+  c := contact_upsert(o.box_office_id, o.buyer_email, o.data->'buyer'->>'name', o.data->'buyer'->>'phone'); if c.id is null then return; end if;
+  src := 'checkout · order ' || o.ref;
+  if coalesce((o.data->>'optIn')::boolean, false) and not c.email_optin then perform consent_change(c.id, 'optin', src, o.buyer_email); end if;
+  if coalesce((o.data->>'smsOptIn')::boolean, false) and c.phone is not null and not c.sms_optin then perform consent_change(c.id, 'sms_optin', src, o.buyer_email); end if;
+end $$;
+-- may this message go to this person? '' = yes, otherwise why it is held back (mirrors sendGate)
+create or replace function send_gate(c contacts, p_channel text, p_category text, p_to text) returns text language sql stable as $$
+  select case when p_category = 'staff' then ''
+    when p_channel = 'sms' then case when coalesce(p_to, '') = '' then 'no mobile number' when c.unsub_sms_at is not null then 'replied STOP to texts'
+      when p_category = 'marketing' and not coalesce(c.sms_optin, false) then 'not opted in to marketing texts' else '' end
+    when c.suppressed is not null then 'address suppressed (' || c.suppressed || ')'
+    when p_category = 'marketing' and not (coalesce(c.email_optin, false) and c.unsub_email_at is null) then case when c.unsub_email_at is not null then 'unsubscribed from marketing' else 'not opted in to marketing email' end
+    else '' end $$;
+create or replace function queue_msg(p jsonb) returns uuid language plpgsql security definer set search_path = public as $$
+declare mid uuid; ch text := coalesce(nullif(p->>'channel', ''), 'email'); k text := coalesce(nullif(p->>'kind', ''), 'message'); t text;
+begin
+  t := case when ch = 'sms' then norm_phone(p->>'to') else lower(trim(coalesce(p->>'to', p->>'email', ''))) end;
+  insert into outbox(box_office_id, order_id, event_id, kind, channel, category, "to", email, subject, body, by, send_at, campaign_id, automation_id, dedupe, require_valid, vars)
+  values ((p->>'box_office_id')::uuid, nullif(p->>'order_id', '')::uuid, nullif(p->>'event_id', '')::uuid, k, ch,
+    coalesce(nullif(p->>'category', ''), case when k = 'campaign' then 'marketing' when k = 'staff' then 'staff' else 'transactional' end), coalesce(t, ''),
+    lower(coalesce(nullif(p->>'email', ''), case when ch = 'email' then t end, '')), left(coalesce(p->>'subject', ''), 200), left(coalesce(p->>'body', ''), 5000), coalesce(p->>'by', 'system'),
+    coalesce(nullif(p->>'send_at', '')::timestamptz, now()), nullif(p->>'campaign_id', '')::uuid, nullif(p->>'automation_id', ''), nullif(p->>'dedupe', ''), coalesce((p->>'require_valid')::boolean, false), coalesce(p->'vars', '{}'))
+  on conflict do nothing returning id into mid;
+  return mid;
+end $$;
+create or replace function queue_mail(o orders, p_kind text, p_subject text, p_body text, p_by text) returns uuid language sql security definer set search_path = public as $$
+  select queue_msg(jsonb_build_object('box_office_id', o.box_office_id, 'order_id', o.id, 'event_id', o.event_ids[1], 'kind', p_kind, 'to', o.buyer_email, 'email', o.buyer_email,
+    'subject', p_subject, 'body', p_body, 'by', p_by)) $$;
+
+/* ── events out ── */
+create or replace function hook_order(o orders) returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('id', o.id, 'ref', o.ref, 'status', o.status, 'email', o.buyer_email, 'name', coalesce(o.data->'buyer'->>'name', ''), 'phone', coalesce(o.data->'buyer'->>'phone', ''),
+    'total', o.data->'total', 'currency', coalesce(o.data->>'currency', 'USD'), 'promo', o.data->>'code', 'tracking', o.data->>'tracking', 'utm', o.data->'utm', 'created_at', o.created_at, 'paid_at', o.paid_at,
+    'event_ids', to_jsonb(o.event_ids), 'tickets', coalesce((select jsonb_agg(jsonb_build_object('id', t.id, 'code_last4', right(t.code, 4), 'event_id', t.event_id, 'ticket_type_id', t.ticket_type_id,
+      'area', t.area, 'row', t."row", 'seat', t.seat_label, 'status', t.status, 'face', t.face, 'paid', t.paid)) from tickets t where t.order_id = o.id), '[]')) $$;
+create or replace function order_ctx(o orders, p_tickets uuid[] default null) returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('email', o.buyer_email, 'name', coalesce(o.data->'buyer'->>'name', ''), 'phone', coalesce(o.data->'buyer'->>'phone', ''), 'order_id', o.id, 'ref', o.ref,
+    'promo', coalesce(o.data->>'code', ''), 'key', o.id::text, 'eventIds', to_jsonb(o.event_ids),
+    'tickets', coalesce((select jsonb_agg(jsonb_build_object('event_id', t.event_id, 'slot_id', coalesce(t.slot_id, ''), 'ticket_type_id', t.ticket_type_id, 'area', coalesce(t.area, ''), 'face', t.face,
+      'checked_in_at', t.checked_in_at)) from tickets t where t.order_id = o.id and (case when p_tickets is null then t.status = 'valid' else t.id = any(p_tickets) end)), '[]')) $$;
+create or replace function ev_start(e events, p_slot text) returns timestamptz language sql stable as $$
+  select coalesce((select (s->>'start')::timestamptz from jsonb_array_elements(coalesce(e.data->'timeSlots', '[]')) s where s->>'id' = p_slot), (e.data->>'start')::timestamptz) $$;
+create or replace function ev_end(e events, p_slot text) returns timestamptz language sql stable as $$
+  select coalesce((select coalesce(nullif(s->>'end', ''), s->>'start')::timestamptz from jsonb_array_elements(coalesce(e.data->'timeSlots', '[]')) s where s->>'id' = p_slot),
+    nullif(e.data->>'end', '')::timestamptz, ev_start(e, p_slot) + interval '3 hours') $$;
+-- matching tickets (null = conditions not met): events, ticket types, seating areas, price levels, quantity, promo code, customer tags (mirrors autoMatch)
+create or replace function auto_match(a automations, ctx jsonb) returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare c jsonb := a.cond; tks jsonb; tkcond boolean;
+begin
+  tkcond := jsonb_array_length(coalesce(c->'ticketTypeIds', '[]')) > 0 or jsonb_array_length(coalesce(c->'areas', '[]')) > 0 or jsonb_array_length(coalesce(c->'prices', '[]')) > 0 or coalesce((c->>'minQty')::int, 0) > 0;
+  if coalesce(c->>'promo', '') <> '' and upper(coalesce(ctx->>'promo', '')) <> upper(c->>'promo') then return null; end if;
+  if jsonb_array_length(coalesce(c->'tags', '[]')) > 0 and not exists(select 1 from contacts k where k.box_office_id = a.box_office_id and k.email = ctx->>'email'
+     and k.tags @> array(select jsonb_array_elements_text(c->'tags'))) then return null; end if;
+  if jsonb_array_length(coalesce(ctx->'tickets', '[]')) = 0 then
+    if tkcond or (jsonb_array_length(coalesce(c->'eventIds', '[]')) > 0 and not exists(select 1 from jsonb_array_elements_text(coalesce(ctx->'eventIds', '[]')) e where c->'eventIds' ? e)) then return null; end if;
+    return '[]';
+  end if;
+  select coalesce(jsonb_agg(t), '[]') into tks from jsonb_array_elements(ctx->'tickets') t
+    where (jsonb_array_length(coalesce(c->'eventIds', '[]')) = 0 or c->'eventIds' ? (t->>'event_id')) and (jsonb_array_length(coalesce(c->'ticketTypeIds', '[]')) = 0 or c->'ticketTypeIds' ? (t->>'ticket_type_id'))
+      and (jsonb_array_length(coalesce(c->'areas', '[]')) = 0 or c->'areas' ? (t->>'area')) and (jsonb_array_length(coalesce(c->'prices', '[]')) = 0 or c->'prices' @> jsonb_build_array((t->>'face')::bigint));
+  if jsonb_array_length(tks) = 0 or jsonb_array_length(tks) < greatest(1, coalesce((c->>'minQty')::int, 0)) then return null; end if;
+  return tks;
+end $$;
+create or replace function run_automation(p_auto text, ctx jsonb, p_key text) returns int language plpgsql security definer set search_path = public as $$
+declare a automations%rowtype; tks jsonb; ev events%rowtype; evid uuid; slot text; send timestamptz; tb boolean; c contacts%rowtype; x jsonb; i int := 0; ig integrations%rowtype; tagv text;
+begin
+  select * into a from automations where id = p_auto; tks := auto_match(a, ctx); if tks is null then return 0; end if;
+  insert into automation_runs(automation_id, key) values (a.id, p_key) on conflict do nothing; if not found then return 0; end if;
+  evid := coalesce(nullif(tks->0->>'event_id', ''), nullif(ctx->>'eventId', ''), nullif(ctx->'eventIds'->>0, ''))::uuid; slot := coalesce(tks->0->>'slot_id', '');
+  if evid is not null then select * into ev from events where id = evid; end if;
+  send := case when a.timing->>'mode' = 'before' and ev.id is not null then greatest(now(), ev_start(ev, slot) - make_interval(hours => coalesce((a.timing->>'hours')::int, 0)))
+    when a.timing->>'mode' = 'after' and ev.id is not null then greatest(now(), ev_end(ev, slot) + make_interval(hours => coalesce((a.timing->>'hours')::int, 0)))
+    when a.timing->>'mode' = 'delay' then now() + make_interval(hours => coalesce((a.timing->>'hours')::int, 0)) else now() end;
+  tb := a.trigger->>'type' in ('ticket.purchased', 'promo.used', 'event.approaching', 'event.ended', 'checked_in');
+  c := contact_upsert(a.box_office_id, ctx->>'email', ctx->>'name', ctx->>'phone');
+  for x in select v from jsonb_array_elements(a.actions) v loop
+    if x->>'type' in ('email', 'sms', 'staff') then
+      perform queue_msg(jsonb_build_object('box_office_id', a.box_office_id, 'order_id', ctx->>'order_id', 'event_id', evid, 'automation_id', a.id, 'by', 'automation: ' || a.name, 'send_at', send,
+        'require_valid', tb and x->>'type' <> 'staff' and ctx->>'order_id' is not null, 'dedupe', format('auto:%s:%s:%s:%s', a.id, p_key, x->>'type', i), 'kind', case when x->>'type' = 'staff' then 'staff' else a.kind end,
+        'vars', jsonb_build_object('promo_code', coalesce(a.promo, ''), 'link', coalesce(x->>'link', ''))) ||
+        case x->>'type' when 'email' then jsonb_build_object('channel', 'email', 'category', coalesce(x->>'category', 'transactional'), 'to', ctx->>'email', 'email', ctx->>'email', 'subject', x->>'subject', 'body', x->>'body')
+          when 'sms' then jsonb_build_object('channel', 'sms', 'category', coalesce(x->>'category', 'transactional'), 'to', coalesce(c.phone, ctx->>'phone'), 'email', ctx->>'email', 'body', x->>'body')
+          else jsonb_build_object('channel', 'email', 'category', 'staff', 'to', x->>'to', 'email', x->>'to', 'subject', coalesce(nullif(x->>'subject', ''), 'Automation “' || a.name || '”'),
+            'body', concat_ws(E'\n\n', nullif(x->>'body', ''), format('%s <%s>%s%s', ctx->>'name', ctx->>'email', case when ctx->>'ref' is not null then ' · order ' || (ctx->>'ref') else '' end,
+              case when ev.id is not null then ' · ' || (ev.data->>'name') else '' end))) end);
+    elsif x->>'type' in ('tag', 'untag') and c.id is not null then
+      tagv := replace(replace(x->>'tag', '{{event}}', coalesce(ev.data->>'name', '')), '{{ event }}', coalesce(ev.data->>'name', ''));
+      update contacts set tags = case when x->>'type' = 'tag' then array(select distinct unnest(tags || array[left(trim(tagv), 40)])) else array_remove(tags, left(trim(tagv), 40)) end, updated_at = now() where id = c.id;
+    elsif x->>'type' in ('webhook', 'crm') then
+      select * into ig from integrations where id = nullif(x->>'integrationId', '')::uuid and box_office_id = a.box_office_id and active;
+      if found then insert into deliveries(box_office_id, integration_id, kind, event, event_id, payload) values (a.box_office_id, ig.id, ig.kind, 'automation', 'evt_' || lower(rand_code(14)),
+        jsonb_build_object('type', 'automation', 'automation', a.name, 'trigger', a.trigger->>'type', 'created', now(), 'data', jsonb_build_object('email', ctx->>'email', 'name', ctx->>'name', 'phone', coalesce(ctx->>'phone', ''),
+          'order_ref', ctx->>'ref', 'event_id', evid, 'tags', (select to_jsonb(tags) from contacts where id = c.id)))); end if;
+    end if;
+    i := i + 1;
+  end loop;
+  update automations set runs = runs + 1, last_run = now() where id = a.id;
+  return 1;
+end $$;
+-- webhooks / CRM syncs / Meta Conversions API for this event, then the automations it triggers (mirrors emitEvent)
+create or replace function emit_event(p_bo uuid, p_type text, p_data jsonb, p_ctx jsonb default null) returns void language plpgsql security definer set search_path = public as $$
+declare eid text := 'evt_' || lower(rand_code(14)); a automations%rowtype; trig text;
+begin
+  insert into deliveries(box_office_id, integration_id, kind, event, event_id, payload)
+    select p_bo, g.id, g.kind, p_type, eid, jsonb_build_object('id', eid, 'type', p_type, 'created', now(), 'data', p_data) from integrations g
+    where g.box_office_id = p_bo and g.active and case when g.kind = 'webhook' then coalesce(g.config->'events', '[]') ? p_type
+      when g.kind in ('mailchimp', 'hubspot', 'activecampaign', 'constantcontact') then p_type in ('payment.completed', 'waitlist.signup') when g.kind = 'meta_capi' then p_type = 'payment.completed' else false end;
+  if p_ctx is null then return; end if;
+  for trig in select unnest(case p_type when 'payment.completed' then array['ticket.purchased', 'promo.used'] when 'ticket.cancelled' then array['ticket.cancelled'] when 'refund.issued' then array['refund.issued']
+      when 'waitlist.signup' then array['waitlist.joined'] when 'customer.checked_in' then array['checked_in'] when 'cart.expired' then array['cart.abandoned'] else array[]::text[] end) loop
+    if trig = 'promo.used' and coalesce(p_ctx->>'promo', '') = '' then continue; end if;
+    for a in select * from automations where box_office_id = p_bo and enabled and trigger->>'type' = trig loop
+      perform run_automation(a.id, p_ctx, p_type || ':' || coalesce(p_ctx->>'key', eid));
+    end loop;
+  end loop;
+end $$;
+-- every minute (pg_cron): the event's own reminders + automations for events approaching / ended / no-shows (mirrors marketingTick)
+create or replace function marketing_tick() returns int language plpgsql security definer set search_path = public as $$
+declare ev events%rowtype; r record; a automations%rowtype; rem jsonb; i int; n int := 0; st timestamptz; en timestamptz; fire timestamptz; ch text; ctx jsonb; o orders%rowtype;
+begin
+  for ev in select * from events e where e.status = 'published' and not coalesce((e.data->>'archived')::boolean, false)
+      and (jsonb_array_length(coalesce(e.data->'emails'->'reminders', '[]')) > 0 or exists(select 1 from automations x where x.box_office_id = e.box_office_id and x.enabled
+        and x.trigger->>'type' in ('event.approaching', 'event.ended', 'no_show'))) loop
+    for r in select t.order_id, coalesce(t.slot_id, '') slot, array_agg(t.id) ids, bool_or(t.checked_in_at is not null) came from tickets t where t.event_id = ev.id and t.status = 'valid' group by 1, 2 loop
+      select * into o from orders where id = r.order_id; st := ev_start(ev, r.slot); en := ev_end(ev, r.slot); i := 0;
+      for rem in select v from jsonb_array_elements(coalesce(ev.data->'emails'->'reminders', '[]')) v loop
+        if now() >= st - make_interval(hours => coalesce((rem->>'hoursBefore')::int, 0)) and now() < st then
+          foreach ch in array case when rem->>'channel' = 'email' then array['email'] when rem->>'channel' = 'both' then array['email', 'sms'] else array['sms'] end loop
+            if queue_msg(jsonb_build_object('box_office_id', o.box_office_id, 'order_id', o.id, 'event_id', ev.id, 'kind', 'reminder', 'channel', ch, 'to', case when ch = 'email' then o.buyer_email else o.data->'buyer'->>'phone' end,
+                'email', o.buyer_email, 'subject', 'Reminder: {{event}} — {{date}}', 'body', coalesce(rem->>'body', ''), 'require_valid', true, 'dedupe', format('rem:%s:%s:%s:%s:%s', ev.id, r.slot, i, o.id, ch))) is not null then n := n + 1; end if;
+          end loop;
+        end if;
+        i := i + 1;
+      end loop;
+      for a in select * from automations x where x.box_office_id = ev.box_office_id and x.enabled and x.trigger->>'type' in ('event.approaching', 'event.ended', 'no_show') loop
+        if a.std = 'pre' and jsonb_array_length(coalesce(ev.data->'emails'->'reminders', '[]')) > 0 then continue; end if;
+        fire := case when a.trigger->>'type' = 'event.approaching' then st - make_interval(hours => coalesce((a.trigger->>'hours')::int, 0)) else en + make_interval(hours => coalesce((a.trigger->>'hours')::int, 0)) end;
+        if now() < fire or (case when a.trigger->>'type' = 'event.approaching' then now() >= st else now() >= fire + interval '2 days' end) then continue; end if;
+        if a.trigger->>'type' = 'no_show' and r.came then continue; end if;
+        ctx := order_ctx(o, r.ids) || jsonb_build_object('eventId', ev.id);
+        n := n + run_automation(a.id, ctx, format('%s:%s:%s:%s', a.trigger->>'type', ev.id, r.slot, o.id));
+      end loop;
+    end loop;
+  end loop;
+  return n;
+end $$;
+
+/* ── segments (mirrors segmentPeople) ── */
+create or replace function segment_people(p_bo uuid, f jsonb) returns table(email text, name text, phone text) language plpgsql stable security definer set search_path = public as $$
+declare evs text[] := array(select jsonb_array_elements_text(coalesce(f->'eventIds', '[]'))); tts text[] := array(select jsonb_array_elements_text(coalesce(f->'ticketTypeIds', '[]')));
+  ars text[] := array(select jsonb_array_elements_text(coalesce(f->'areas', '[]'))); tg text[] := array(select jsonb_array_elements_text(coalesce(f->'tags', '[]')));
+  ck text := coalesce(nullif(f->>'checkin', ''), 'any'); sts text := coalesce(nullif(f->>'status', ''), 'any'); fr timestamptz := nullif(f->>'from', '')::timestamptz;
+  til timestamptz := case when nullif(f->>'to', '') is null then null when length(f->>'to') <= 10 then (f->>'to')::date + interval '1 day' - interval '1 second' else (f->>'to')::timestamptz end;
+  pr text := upper(nullif(f->>'promo', '')); trk text := upper(nullif(f->>'tracking', ''));
+  tkf boolean := cardinality(evs) > 0 or cardinality(tts) > 0 or cardinality(ars) > 0 or ck <> 'any'; orf boolean := fr is not null or til is not null or pr is not null or trk is not null;
+begin
+  return query
+  with ords as (select o.* from orders o where o.box_office_id = p_bo and o.status not in ('expired', 'awaiting_payment')),
+    okord as (select o.id, o.buyer_email from ords o where (fr is null or o.created_at >= fr) and (til is null or o.created_at <= til)
+      and (pr is null or upper(coalesce(o.data->>'code', '')) = pr) and (trk is null or upper(coalesce(o.data->>'tracking', '')) = trk)),
+    oktk as (select distinct k.buyer_email em from okord k join tickets t on t.order_id = k.id where t.status = 'valid' and (cardinality(evs) = 0 or t.event_id::text = any(evs))
+      and (cardinality(tts) = 0 or t.ticket_type_id = any(tts)) and (cardinality(ars) = 0 or t.area = any(ars)) and (ck = 'any' or (ck = 'in') = (t.checked_in_at is not null))),
+    people as (select lower(o.buyer_email) em from ords o union select lower(w.email) from waitlist w where w.box_office_id = p_bo union select c.email from contacts c where c.box_office_id = p_bo),
+    info as (select p.em, k.id cid, k.email_optin, k.unsub_email_at, k.suppressed, k.sms_optin, k.unsub_sms_at, k.tags,
+      coalesce(k.name, (select o.data->'buyer'->>'name' from ords o where o.buyer_email = p.em order by o.created_at desc limit 1), (select w.name from waitlist w where w.box_office_id = p_bo and w.email = p.em limit 1)) nm,
+      coalesce(k.phone, (select norm_phone(o.data->'buyer'->>'phone') from ords o where o.buyer_email = p.em and norm_phone(o.data->'buyer'->>'phone') is not null order by o.created_at desc limit 1)) ph,
+      exists(select 1 from ords o where o.buyer_email = p.em) has_orders, exists(select 1 from waitlist w where w.box_office_id = p_bo and w.email = p.em) on_wl
+      from people p left join contacts k on k.box_office_id = p_bo and k.email = p.em)
+  select i.em, i.nm::text, i.ph::text from info i
+  where case when sts = 'waitlist' then exists(select 1 from waitlist w where w.box_office_id = p_bo and w.email = i.em and (cardinality(evs) = 0 or w.event_id::text = any(evs)))
+      else (not tkf or i.em in (select em from oktk)) and (tkf or not orf or i.em in (select buyer_email from okord)) and (sts <> 'buyers' or i.has_orders) end
+    and (sts <> 'optedIn' or (coalesce(i.email_optin, false) and i.unsub_email_at is null and i.suppressed is null))
+    and (sts <> 'smsOptIn' or (coalesce(i.sms_optin, false) and i.unsub_sms_at is null and i.ph is not null))
+    and (sts <> 'account' or exists(select 1 from auth.users u where lower(u.email) = i.em and u.email_confirmed_at is not null))
+    and (sts <> 'refunded' or exists(select 1 from ords o where o.buyer_email = i.em and coalesce((o.data->>'refunded')::bigint, 0) + coalesce((o.data->>'credited')::bigint, 0) > 0))
+    and (sts <> 'credit' or exists(select 1 from credits c where c.box_office_id = p_bo and c.email = i.em and (credit_state(c)->>'status') = 'active'))
+    and (sts <> 'unsubscribed' or i.unsub_email_at is not null or i.suppressed is not null or i.unsub_sms_at is not null)
+    and (cardinality(tg) = 0 or coalesce(i.tags, '{}') @> tg)
+    and (not (tkf or orf) or i.has_orders or i.on_wl);
+end $$;
+create or replace function segment_count(p_bo uuid, f jsonb) returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if not has_perm(p_bo, 'comms.lists') then raise exception 'You don''t have permission to do that'; end if;
+  return (select jsonb_build_object('count', count(*), 'phones', count(*) filter (where s.phone is not null),
+    'email', count(*) filter (where send_gate(k, 'email', 'marketing', s.email) = ''), 'sms', count(*) filter (where send_gate(k, 'sms', 'marketing', s.phone) = ''))
+    from segment_people(p_bo, f) s left join contacts k on k.box_office_id = p_bo and k.email = s.email);
+end $$;
+create or replace function save_segments(p_bo uuid, p jsonb) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not has_perm(p_bo, 'comms.lists') then raise exception 'You don''t have permission to do that'; end if;
+  if jsonb_typeof(p) <> 'array' or jsonb_array_length(p) > 100 then raise exception 'Too many segments'; end if;
+  update box_offices set segments = p where id = p_bo; perform log_action(p_bo, 'comms.segments', 'Saved audience segments');
+end $$;
+
+/* ── campaigns ── */
+create or replace function send_campaign(p_bo uuid, p jsonb) returns jsonb language plpgsql security definer set search_path = public as $$
+declare f jsonb := coalesce(p->'filter', '{}'); cat text := case when p->>'category' = 'transactional' then 'transactional' else 'marketing' end;
+  ch text := case when p->>'channel' in ('email', 'sms', 'both') then p->>'channel' else 'email' end; chans text[]; evs uuid[]; e uuid; subj text := trim(coalesce(p->>'subject', ''));
+  body text := trim(coalesce(p->>'body', '')); at_ timestamptz := coalesce(nullif(p->>'sendAt', '')::timestamptz, now()); b broadcasts%rowtype; s record; k contacts%rowtype; c text; why text;
+  q int := 0; sk jsonb := '{}'; n int := 0;
+begin
+  chans := case when ch = 'both' then array['email', 'sms'] else array[ch] end;
+  evs := array(select x::uuid from jsonb_array_elements_text(coalesce(f->'eventIds', '[]')) x where exists(select 1 from events v where v.id = x::uuid and v.box_office_id = p_bo));
+  f := f || jsonb_build_object('eventIds', to_jsonb(evs));
+  if cat = 'transactional' then
+    if cardinality(evs) = 0 then raise exception 'An event update goes to the ticket holders of an event — choose the event'; end if;
+    foreach e in array evs loop if not (has_perm(p_bo, 'comms.email', e) or has_perm(p_bo, 'comms.notify', e)) then raise exception 'You don''t have permission to do that'; end if; end loop;
+    f := f || '{"status":"buyers"}';
+  else
+    if not has_perm(p_bo, 'comms.marketing') then raise exception 'You don''t have permission to do that'; end if;
+    if not exists(select 1 from members m join box_offices x on x.id = m.box_office_id where m.box_office_id = p_bo and m.email = me_email() and (m.all_events or x.owner = m.email)) and not is_super() then
+      if cardinality(evs) = 0 or exists(select 1 from unnest(evs) z where not has_perm(p_bo, 'comms.marketing', z)) then raise exception 'You can only message the ticket holders of your own events'; end if;
+    end if;
+  end if;
+  if 'sms' = any(chans) and not has_perm(p_bo, 'comms.sms') then raise exception 'You don''t have permission to send text messages'; end if;
+  if 'email' = any(chans) and subj = '' then raise exception 'Add a subject'; end if; if body = '' then raise exception 'Write the message'; end if;
+  if ch = 'sms' and length(body) > 480 then raise exception 'Keep a text message under 480 characters'; end if;
+  if at_ < now() - interval '1 minute' or at_ > now() + interval '366 days' then raise exception 'Choose a send time in the future (within a year)'; end if;
+  insert into broadcasts(box_office_id, event_id, kind, name, subject, body, channel, category, filter, send_at, status, recipients, created_by)
+    values (p_bo, evs[1], case when cat = 'transactional' then 'update' else 'campaign' end, left(coalesce(nullif(trim(p->>'name'), ''), nullif(subj, ''), body), 120), left(subj, 200), left(body, 5000), ch, cat, f, at_,
+      case when at_ > now() + interval '1 minute' then 'scheduled' else 'sent' end, 0, me_email()) returning * into b;
+  for s in select * from segment_people(p_bo, f) loop
+    n := n + 1; select * into k from contacts where box_office_id = p_bo and email = s.email;
+    foreach c in array chans loop
+      why := send_gate(k, c, cat, case when c = 'email' then s.email else s.phone end);
+      if why <> '' then sk := jsonb_set(sk, array[why], to_jsonb(coalesce((sk->>why)::int, 0) + 1)); continue; end if;
+      if queue_msg(jsonb_build_object('box_office_id', p_bo, 'event_id', evs[1], 'kind', b.kind, 'channel', c, 'category', cat, 'to', case when c = 'email' then s.email else s.phone end, 'email', s.email,
+        'subject', b.subject, 'body', b.body, 'by', me_email(), 'send_at', at_, 'campaign_id', b.id, 'dedupe', format('cmp:%s:%s:%s', b.id, s.email, c))) is not null then q := q + 1; end if;
+    end loop;
+  end loop;
+  update broadcasts set recipients = n, queued = q, skipped = sk where id = b.id returning * into b;
+  perform log_action(p_bo, 'comms.campaign', format('%s %s “%s” (%s) to %s', case when b.status = 'scheduled' then 'Scheduled' else 'Sent' end, case when cat = 'transactional' then 'event update' else 'campaign' end,
+    b.name, array_to_string(chans, ' + '), q), null, null, evs[1]);
+  return to_jsonb(b);
+end $$;
+create or replace function campaign_action(p_bo uuid, p_id uuid, p_action text) returns jsonb language plpgsql security definer set search_path = public as $$
+declare b broadcasts%rowtype; n int;
+begin
+  select * into b from broadcasts where id = p_id and box_office_id = p_bo for update; if not found then raise exception 'Campaign not found'; end if;
+  if not (case when b.category = 'transactional' then has_perm(p_bo, 'comms.email', b.event_id) or has_perm(p_bo, 'comms.notify', b.event_id) else has_perm(p_bo, 'comms.marketing') end) then
+    raise exception 'You don''t have permission to do that'; end if;
+  if p_action <> 'cancel' then raise exception 'Unknown action'; end if;
+  if b.status <> 'scheduled' then raise exception 'Only a scheduled campaign can be cancelled'; end if;
+  update outbox set status = 'cancelled', error = 'campaign cancelled' where campaign_id = p_id and status = 'queued'; get diagnostics n = row_count;
+  update broadcasts set status = 'cancelled', cancelled_by = me_email(), cancelled_at = now() where id = p_id returning * into b;
+  perform log_action(p_bo, 'comms.campaign', format('Cancelled scheduled campaign “%s” (%s messages)', b.name, n));
+  return to_jsonb(b);
+end $$;
+-- the waitlist notice now really goes out: one transactional email per person (they asked to hear)
+create or replace function notify_waitlist(p_event uuid, p_message text) returns int language plpgsql security definer set search_path = public as $$
+declare e events%rowtype; n int := 0; w waitlist%rowtype; b uuid;
+begin
+  select * into e from events where id = p_event;
+  if not has_perm(e.box_office_id, 'comms.notify', p_event) then raise exception 'You don''t have permission to do that'; end if;
+  insert into broadcasts(box_office_id, event_id, kind, name, subject, body, channel, category, status, recipients, created_by)
+    values (e.box_office_id, p_event, 'waitlist', 'Waitlist: ' || (e.data->>'name'), 'Tickets available', p_message, 'email', 'transactional', 'sent', 0, me_email()) returning id into b;
+  for w in update waitlist set notified_at = now() where event_id = p_event and notified_at is null returning * loop
+    n := n + 1; perform queue_msg(jsonb_build_object('box_office_id', e.box_office_id, 'event_id', p_event, 'kind', 'waitlist', 'to', w.email, 'email', w.email, 'subject', 'Tickets are available: {{event}}',
+      'body', p_message, 'by', me_email(), 'campaign_id', b));
+  end loop;
+  update broadcasts set recipients = n, queued = n where id = b;
+  perform log_action(e.box_office_id, 'comms.waitlist', format('Notified %s people on the waitlist', n), null, null, p_event);
+  return n;
+end $$;
+
+/* ── automations ── */
+create or replace function save_automation(p_bo uuid, p jsonb) returns jsonb language plpgsql security definer set search_path = public as $$
+declare a automations%rowtype; t text := p->'trigger'->>'type'; acts jsonb := '[]'; x jsonb; r jsonb; nm text := left(trim(coalesce(p->>'name', '')), 80); g integrations%rowtype;
+  hrs int := least(720, greatest(0, coalesce(round((p->'trigger'->>'hours')::numeric), 0)))::int; mode text := coalesce(p->'timing'->>'mode', 'now');
+begin
+  if not has_perm(p_bo, 'comms.automations') then raise exception 'You don''t have permission to do that'; end if;
+  if t is null or t not in ('ticket.purchased', 'ticket.cancelled', 'refund.issued', 'waitlist.joined', 'event.approaching', 'checked_in', 'no_show', 'cart.abandoned', 'promo.used', 'event.ended') then raise exception 'Choose a trigger'; end if;
+  if nm = '' then raise exception 'Name the automation'; end if;
+  if mode not in ('now', 'before', 'after', 'delay') then mode := 'now'; end if;
+  for x in select v from jsonb_array_elements(coalesce(p->'actions', '[]')) with ordinality z(v, k) where k <= 8 loop
+    r := jsonb_build_object('type', x->>'type');
+    if x->>'type' in ('email', 'sms') then
+      r := r || jsonb_build_object('category', case when x->>'category' = 'marketing' then 'marketing' else 'transactional' end, 'body', left(trim(coalesce(x->>'body', '')), case when x->>'type' = 'sms' then 480 else 5000 end));
+      if x->>'type' = 'email' then r := r || jsonb_build_object('subject', left(trim(coalesce(x->>'subject', '')), 200)); if r->>'subject' = '' then raise exception 'Give the email a subject'; end if; end if;
+      if r->>'body' = '' then raise exception 'Write the message'; end if;
+      if coalesce(x->>'link', '') <> '' then r := r || jsonb_build_object('link', coalesce(safe_url(x->>'link'), '')); end if;
+      if x->>'type' = 'sms' and not has_perm(p_bo, 'comms.sms') then raise exception 'You don''t have permission to send text messages'; end if;
+      if r->>'category' = 'marketing' and not has_perm(p_bo, 'comms.marketing') then raise exception 'You don''t have permission to send marketing'; end if;
+    elsif x->>'type' in ('tag', 'untag') then r := r || jsonb_build_object('tag', left(trim(coalesce(x->>'tag', '')), 40)); if r->>'tag' = '' then raise exception 'Name the tag'; end if;
+    elsif x->>'type' = 'staff' then
+      if lower(trim(coalesce(x->>'to', ''))) !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'Enter the staff email to notify'; end if;
+      r := r || jsonb_build_object('to', lower(trim(x->>'to')), 'subject', left(coalesce(x->>'subject', ''), 200), 'body', left(coalesce(x->>'body', ''), 2000));
+    elsif x->>'type' in ('webhook', 'crm') then
+      select * into g from integrations where id = nullif(x->>'integrationId', '')::uuid and box_office_id = p_bo;
+      if not found or (x->>'type' = 'webhook') <> (g.kind = 'webhook') or (x->>'type' = 'crm' and g.kind not in ('mailchimp', 'hubspot', 'activecampaign', 'constantcontact')) then
+        raise exception '%', case when x->>'type' = 'webhook' then 'Choose a webhook (set one up under Integrations)' else 'Choose a connected CRM' end; end if;
+      r := r || jsonb_build_object('integrationId', g.id);
+    else raise exception 'Unknown action'; end if;
+    acts := acts || jsonb_build_array(r);
+  end loop;
+  if jsonb_array_length(acts) = 0 then raise exception 'Add at least one action'; end if;
+  if nullif(p->>'id', '') is not null then select * into a from automations where id = p->>'id' and box_office_id = p_bo; if not found then raise exception 'Automation not found'; end if; end if;
+  insert into automations(id, box_office_id, name, enabled, trigger, cond, timing, actions, promo, kind, created_by, updated_at)
+    values (coalesce(a.id, 'au_' || lower(rand_code(8))), p_bo, nm, coalesce((p->>'enabled')::boolean, true),
+      jsonb_build_object('type', t, 'hours', case when t in ('event.approaching', 'event.ended', 'no_show') then hrs else 0 end),
+      jsonb_build_object('eventIds', coalesce(p->'cond'->'eventIds', '[]'), 'ticketTypeIds', coalesce(p->'cond'->'ticketTypeIds', '[]'), 'areas', coalesce(p->'cond'->'areas', '[]'),
+        'prices', coalesce(p->'cond'->'prices', '[]'), 'minQty', least(100, greatest(0, coalesce((p->'cond'->>'minQty')::int, 0))), 'promo', upper(left(trim(coalesce(p->'cond'->>'promo', '')), 40)), 'tags', coalesce(p->'cond'->'tags', '[]')),
+      jsonb_build_object('mode', mode, 'hours', least(720, greatest(0, coalesce(round((p->'timing'->>'hours')::numeric), 0)))::int), acts, upper(left(trim(coalesce(p->>'promo', '')), 40)),
+      case when a.std = 'pre' then 'reminder' when a.std in ('post', 'offer') then 'followup' else 'automation' end, me_email(), now())
+    on conflict (id) do update set name = excluded.name, enabled = excluded.enabled, trigger = excluded.trigger, cond = excluded.cond, timing = excluded.timing, actions = excluded.actions,
+      promo = excluded.promo, updated_at = now()
+    returning * into a;
+  perform log_action(p_bo, 'comms.automation', format('Saved automation “%s”%s', a.name, case when a.enabled then '' else ' (off)' end));
+  return to_jsonb(a);
+end $$;
+create or replace function delete_automation(p_bo uuid, p_id text) returns void language plpgsql security definer set search_path = public as $$
+declare a automations%rowtype;
+begin
+  if not has_perm(p_bo, 'comms.automations') then raise exception 'You don''t have permission to do that'; end if;
+  delete from automations where id = p_id and box_office_id = p_bo returning * into a; if not found then raise exception 'Automation not found'; end if;
+  update outbox set status = 'cancelled', error = 'automation deleted' where automation_id = p_id and status = 'queued';
+  perform log_action(p_bo, 'comms.automation', format('Deleted automation “%s”', a.name));
+end $$;
+-- the standard workflows every box office starts with (Purchase · Pre-event reminder · Post-event thank you · Next-event offer, off)
+create or replace function std_automations(p_bo uuid) returns void language sql security definer set search_path = public as $$
+  insert into automations(id, box_office_id, std, kind, name, enabled, trigger, timing, actions, cond) values
+    ('au_purchase_' || p_bo, p_bo, 'purchase', 'automation', 'Purchase', true, '{"type":"ticket.purchased","hours":0}', '{"mode":"now","hours":0}', '[{"type":"tag","tag":"Attendee: {{event}}"}]', '{}'),
+    ('au_pre_' || p_bo, p_bo, 'pre', 'reminder', 'Pre-event reminder', true, '{"type":"event.approaching","hours":24}', '{"mode":"now","hours":0}',
+      jsonb_build_array(jsonb_build_object('type', 'email', 'category', 'transactional', 'subject', 'Coming up: {{event}} — {{date}}', 'body', E'Hi {{first_name}},\n\n{{event}} is coming up on {{date}} at {{time}} — {{venue}}. Doors open {{doors}}.\n\nYour tickets: {{tickets_link}}\n\nSee you there!')), '{}'),
+    ('au_post_' || p_bo, p_bo, 'post', 'followup', 'Post-event thank you', true, '{"type":"event.ended","hours":12}', '{"mode":"now","hours":0}',
+      jsonb_build_array(jsonb_build_object('type', 'email', 'category', 'transactional', 'subject', 'Thanks for coming to {{event}}', 'body', E'Hi {{first_name}},\n\nThank you for joining us at {{event}}. We would love to hear how it went — it takes a minute: {{link}}', 'link', '')), '{}'),
+    ('au_offer_' || p_bo, p_bo, 'offer', 'followup', 'Next-event offer', false, '{"type":"event.ended","hours":48}', '{"mode":"now","hours":0}',
+      jsonb_build_array(jsonb_build_object('type', 'email', 'category', 'marketing', 'subject', 'A thank-you offer for your next night out', 'body', E'Hi {{first_name}},\n\nAs a thank-you for coming to {{event}}, use code {{promo_code}} on your next order.')), '{}')
+  on conflict (id) do nothing $$;
+create or replace function box_offices_std() returns trigger language plpgsql security definer set search_path = public as $$ begin perform std_automations(new.id); return new; end $$;
+drop trigger if exists box_offices_std on box_offices;
+create trigger box_offices_std after insert on box_offices for each row execute function box_offices_std();
+do $$ begin perform std_automations(id) from box_offices; end $$;
+
+/* ── integrations, consent, outbox, API keys ── */
+create or replace function save_integration(p_bo uuid, p jsonb, p_secret text default null) returns jsonb language plpgsql security definer set search_path = public as $$
+declare g integrations%rowtype; k text := p->>'kind'; cfg jsonb := '{}'; shown text; nm text;
+begin
+  if not has_perm(p_bo, 'admin.integrations') then raise exception 'You don''t have permission to do that'; end if;
+  if k not in ('webhook', 'mailchimp', 'hubspot', 'activecampaign', 'constantcontact', 'meta_capi') then raise exception 'Unknown integration'; end if;
+  if nullif(p->>'id', '') is not null then select * into g from integrations where id = (p->>'id')::uuid and box_office_id = p_bo and kind = k; if not found then raise exception 'Integration not found'; end if; end if;
+  if k in ('webhook', 'activecampaign') then cfg := jsonb_build_object('url', safe_url(p->'config'->>'url')); if cfg->>'url' is null then raise exception 'Use an https:// address on a public host'; end if; end if;
+  if k = 'webhook' then cfg := cfg || jsonb_build_object('events', (select coalesce(jsonb_agg(e), '[]') from jsonb_array_elements_text(coalesce(p->'config'->'events', '[]')) e
+      where e in ('order.created', 'payment.completed', 'ticket.issued', 'ticket.cancelled', 'refund.issued', 'seat.changed', 'cart.expired', 'waitlist.signup', 'customer.checked_in', 'event.updated')));
+    if jsonb_array_length(cfg->'events') = 0 then raise exception 'Choose at least one event to send'; end if; end if;
+  if k = 'mailchimp' then if coalesce(p->'config'->>'dc', '') !~ '^[a-z]{2,4}\d{1,3}$' then raise exception 'The Mailchimp data center looks like “us21” (the end of your API key)'; end if;
+    cfg := jsonb_build_object('dc', p->'config'->>'dc', 'list', left(coalesce(p->'config'->>'list', ''), 60)); end if;
+  if k in ('activecampaign', 'constantcontact') then cfg := cfg || jsonb_build_object('list', left(coalesce(p->'config'->>'list', ''), 60)); end if;
+  if k = 'meta_capi' then if coalesce(p->'config'->>'pixel', '') !~ '^\d{6,20}$' then raise exception 'Enter your Meta Pixel ID (numbers only)'; end if;
+    cfg := jsonb_build_object('pixel', p->'config'->>'pixel', 'test', left(coalesce(p->'config'->>'test', ''), 40)); end if;
+  if k in ('mailchimp', 'hubspot', 'activecampaign', 'constantcontact') then cfg := cfg || jsonb_build_object('who', case when p->'config'->>'who' = 'all' then 'all' else 'optedIn' end); end if;
+  nm := left(coalesce(nullif(trim(p->>'name'), ''), k), 80);
+  if g.id is null then
+    if k = 'webhook' then shown := 'whsec_' || replace(gen_random_uuid()::text, '-', '') || left(replace(gen_random_uuid()::text, '-', ''), 16); p_secret := shown; end if;
+    if coalesce(p_secret, '') = '' then raise exception 'Paste the API key / access token'; end if;
+    insert into integrations(box_office_id, kind, name, active, config, secret, secret_hint, created_by) values (p_bo, k, nm, coalesce((p->>'active')::boolean, true), cfg, left(p_secret, 400), '…' || right(p_secret, 4), me_email()) returning * into g;
+  else
+    update integrations set name = nm, active = coalesce((p->>'active')::boolean, true), config = cfg, secret = coalesce(nullif(left(p_secret, 400), ''), secret),
+      secret_hint = case when coalesce(p_secret, '') <> '' then '…' || right(p_secret, 4) else secret_hint end where id = g.id returning * into g;
+  end if;
+  perform log_action(p_bo, 'admin.integrations', format('Saved %s “%s”', k, g.name));
+  return to_jsonb(g) - 'secret' || jsonb_build_object('secret_set', g.secret is not null, 'secret', shown);
+end $$;
+create or replace function delete_integration(p_bo uuid, p_id uuid) returns void language plpgsql security definer set search_path = public as $$
+declare g integrations%rowtype;
+begin
+  if not has_perm(p_bo, 'admin.integrations') then raise exception 'You don''t have permission to do that'; end if;
+  delete from integrations where id = p_id and box_office_id = p_bo returning * into g; if not found then raise exception 'Integration not found'; end if;
+  perform log_action(p_bo, 'admin.integrations', format('Disconnected %s “%s”', g.kind, g.name));
+end $$;
+create or replace function test_integration(p_bo uuid, p_id uuid) returns jsonb language plpgsql security definer set search_path = public as $$
+declare g integrations%rowtype; d deliveries%rowtype;
+begin
+  if not has_perm(p_bo, 'admin.integrations') then raise exception 'You don''t have permission to do that'; end if;
+  select * into g from integrations where id = p_id and box_office_id = p_bo; if not found then raise exception 'Integration not found'; end if;
+  insert into deliveries(box_office_id, integration_id, kind, event, event_id, payload) values (p_bo, g.id, g.kind, 'ping', 'evt_' || lower(rand_code(14)),
+    jsonb_build_object('type', 'ping', 'created', now(), 'data', jsonb_build_object('box_office', (select name from box_offices where id = p_bo)))) returning * into d;
+  return to_jsonb(d);
+end $$;
+create or replace function contact_action(p_bo uuid, p_email text, p_action text, p jsonb default '{}') returns jsonb language plpgsql security definer set search_path = public as $$
+declare c contacts%rowtype; src text := trim(coalesce(p->>'source', '')); t text[];
+begin
+  if not has_perm(p_bo, 'comms.consent') then raise exception 'You don''t have permission to do that'; end if;
+  c := contact_upsert(p_bo, p_email); if c.id is null then raise exception 'Enter a valid email'; end if;
+  if p_action in ('tag', 'untag') then
+    t := array(select distinct left(trim(x), 40) from unnest(string_to_array(coalesce(p->>'tags', p->>'tag', ''), ',')) x where trim(x) <> '');
+    update contacts set tags = case when p_action = 'tag' then array(select distinct unnest(tags || t)) else array(select unnest(tags) except select unnest(t)) end, updated_at = now() where id = c.id;
+    perform log_action(p_bo, 'comms.tags', format('%s %s: %s', case when p_action = 'tag' then 'Tagged' else 'Untagged' end, c.email, array_to_string(t, ', ')));
+  elsif p_action = 'phone' then
+    if coalesce(p->>'phone', '') <> '' and norm_phone(p->>'phone') is null then raise exception 'Enter a mobile number with country code'; end if;
+    update contacts set phone = norm_phone(p->>'phone'), sms_optin = sms_optin and norm_phone(p->>'phone') is not null, updated_at = now() where id = c.id;
+  else
+    if p_action in ('optin', 'sms_optin') and src = '' then raise exception 'Say how the customer gave consent (e.g. “signed up at the door”)'; end if;
+    perform consent_change(c.id, p_action, 'staff: ' || coalesce(nullif(src, ''), nullif(p->>'reason', ''), 'box office'), me_email(), p->>'reason');
+    perform log_action(p_bo, 'comms.consent', format('%s for %s%s', p_action, c.email, case when src <> '' then ' — ' || src else '' end));
+  end if;
+  return (select to_jsonb(x) - 'token' from contacts x where x.id = c.id);
+end $$;
+create or replace function outbox_action(p_bo uuid, p_id uuid, p_action text) returns jsonb language plpgsql security definer set search_path = public as $$
+declare m outbox%rowtype;
+begin
+  select * into m from outbox where id = p_id and box_office_id = p_bo for update; if not found then raise exception 'Message not found'; end if;
+  if not (case when m.order_id is not null then has_perm(p_bo, 'orders.resend', m.event_id) else has_perm(p_bo, 'comms.email') or has_perm(p_bo, 'comms.marketing') end) then raise exception 'You don''t have permission to do that'; end if;
+  if p_action = 'cancel' then if m.status <> 'queued' then raise exception 'Only a queued message can be cancelled'; end if; update outbox set status = 'cancelled', error = 'cancelled by ' || me_email() where id = p_id;
+  elsif p_action = 'retry' then if m.status not in ('failed', 'suppressed') then raise exception 'Only a failed or held message can be retried'; end if; update outbox set status = 'queued', send_at = now(), error = null where id = p_id;
+  else raise exception 'Unknown action'; end if;
+  return (select to_jsonb(x) from outbox x where x.id = p_id);
+end $$;
+create or replace function create_api_key(p_bo uuid, p_name text, p_scopes text[]) returns jsonb language plpgsql security definer set search_path = public as $$
+declare k text := 'set_live_' || replace(gen_random_uuid()::text, '-', '') || left(replace(gen_random_uuid()::text, '-', ''), 8); r api_keys%rowtype; sc text[] := array(select s from unnest(p_scopes) s where s in ('events:read', 'orders:read', 'tickets:read', 'customers:read'));
+begin
+  if not has_perm(p_bo, 'admin.api') then raise exception 'You don''t have permission to do that'; end if;
+  if cardinality(sc) = 0 then raise exception 'Choose what the key may read'; end if;
+  insert into api_keys(box_office_id, name, prefix, hash, scopes, created_by) values (p_bo, left(coalesce(nullif(trim(p_name), ''), 'API key'), 80), left(k, 13), encode(sha256(convert_to(k, 'UTF8')), 'hex'), sc, me_email()) returning * into r;
+  perform log_action(p_bo, 'admin.api', format('Created API key “%s” (%s)', r.name, array_to_string(sc, ', ')));
+  return to_jsonb(r) - 'hash' || jsonb_build_object('key', k);   -- shown once; only the hash is kept
+end $$;
+create or replace function revoke_api_key(p_bo uuid, p_id uuid) returns void language plpgsql security definer set search_path = public as $$
+declare r api_keys%rowtype;
+begin
+  if not has_perm(p_bo, 'admin.api') then raise exception 'You don''t have permission to do that'; end if;
+  update api_keys set revoked_at = now(), revoked_by = me_email() where id = p_id and box_office_id = p_bo and revoked_at is null returning * into r; if not found then raise exception 'Key not found'; end if;
+  perform log_action(p_bo, 'admin.api', format('Revoked API key “%s”', r.name));
+end $$;
+-- the preferences page a marketing email links to (anyone holding the link; no sign-in)
+create or replace function unsub_info(p_token text) returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('box_office', b.name, 'email', mask_email(c.email), 'email_on', c.email_optin and c.unsub_email_at is null, 'sms_on', c.sms_optin and c.unsub_sms_at is null,
+    'has_phone', c.phone is not null, 'sms_stopped', c.unsub_sms_at is not null) from contacts c join box_offices b on b.id = c.box_office_id where c.token = p_token and length(p_token) >= 24 $$;
+create or replace function unsubscribe(p_token text, p jsonb) returns jsonb language plpgsql security definer set search_path = public as $$
+declare c contacts%rowtype;
+begin
+  select * into c from contacts where token = p_token and length(p_token) >= 24; if not found then raise exception 'This link is not valid any more'; end if;
+  if (p->>'email')::boolean is false then perform consent_change(c.id, 'optout', 'unsubscribe link', c.email);
+  elsif (p->>'email')::boolean and not (c.email_optin and c.unsub_email_at is null) then perform consent_change(c.id, 'optin', 'preferences page', c.email); end if;
+  if (p->>'sms')::boolean is false and c.unsub_sms_at is null and c.phone is not null then perform consent_change(c.id, 'sms_optout', 'unsubscribe link', c.email);
+  elsif (p->>'sms')::boolean and c.phone is not null and not (c.sms_optin and c.unsub_sms_at is null) then perform consent_change(c.id, 'sms_optin', 'preferences page', c.email); end if;
+  return unsub_info(p_token);
+end $$;
+
+/* ── the sender (messaging Edge Function, service role only) ── */
+-- what an email / text needs to be rendered: box office branding, the event, the order (incl. its private ticket link) and its valid tickets
+create or replace function msg_context(m outbox) returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('bo', jsonb_build_object('id', b.id, 'name', b.name, 'slug', b.slug, 'branding', b.branding, 'mail', coalesce(b.settings->'mail', '{}'), 'domain', b.branding->>'domain'),
+    'event', (select jsonb_build_object('id', e.id, 'slug', e.slug, 'name', e.data->>'name', 'start', e.data->>'start', 'end', e.data->>'end', 'doors', e.data->>'doors', 'venue', e.data->>'venue',
+        'address', e.data->>'address', 'timezone', e.data->>'timezone', 'confirmation', e.data->'emails'->>'confirmation', 'timeSlots', e.data->'timeSlots') from events e where e.id = coalesce(m.event_id, o.event_ids[1])),
+    'order', case when o.id is null then null else jsonb_build_object('id', o.id, 'key', o.access_key, 'ref', o.ref, 'total', o.data->'total', 'currency', o.data->'currency', 'buyer', o.data->'buyer',
+      'events', (select jsonb_agg(jsonb_build_object('id', e.id, 'name', e.data->>'name', 'start', e.data->>'start', 'venue', e.data->>'venue', 'address', e.data->>'address',
+        'confirmation', e.data->'emails'->>'confirmation')) from events e where e.id = any(o.event_ids))) end,
+    'tickets', coalesce((select jsonb_agg(jsonb_build_object('event_id', t.event_id, 'slot_id', t.slot_id, 'type', (select tt->>'name' from events e, jsonb_array_elements(e.data->'ticketTypes') tt where e.id = t.event_id and tt->>'id' = t.ticket_type_id),
+        'area', t.area, 'row', t."row", 'seat', coalesce(t.seat_label, t.seat), 'unit', t.unit, 'code', t.code, 'holder', t.holder) order by t.issued_at) from tickets t where t.order_id = o.id and t.status = 'valid'), '[]'),
+    'contact', (select jsonb_build_object('name', c.name, 'token', c.token) from contacts c where c.box_office_id = m.box_office_id and c.email = m.email))
+  from box_offices b left join orders o on o.id = m.order_id where b.id = m.box_office_id $$;
+create or replace function claim_outbox(p_limit int default 50) returns jsonb language plpgsql security definer set search_path = public as $$
+declare m outbox%rowtype; k contacts%rowtype; why text; out jsonb := '[]';
+begin
+  update outbox set status = 'queued', locked_until = null where status = 'sending' and locked_until < now();   -- a sender that died mid-run
+  for m in select * from outbox where status = 'queued' and send_at <= now() order by send_at limit least(greatest(p_limit, 1), 500) for update skip locked loop
+    if m.require_valid and m.order_id is not null and not exists(select 1 from tickets t where t.order_id = m.order_id and t.status = 'valid' and (m.event_id is null or t.event_id = m.event_id)) then
+      update outbox set status = 'cancelled', error = 'the order has no valid tickets any more', attempts = attempts + 1 where id = m.id; continue; end if;
+    select * into k from contacts where box_office_id = m.box_office_id and email = m.email;
+    why := send_gate(k, m.channel, m.category, m."to");
+    if why <> '' then update outbox set status = 'suppressed', error = why, attempts = attempts + 1 where id = m.id; continue; end if;
+    update outbox set status = 'sending', attempts = attempts + 1, locked_until = now() + interval '5 minutes' where id = m.id returning * into m;
+    out := out || jsonb_build_array(jsonb_build_object('msg', to_jsonb(m), 'ctx', msg_context(m)));
+  end loop;
+  return out;
+end $$;
+-- the provider's answer: sent · retry later (back-off 2, 4, 8, 16 min) · failed after 5 attempts or a permanent error
+create or replace function outbox_result(p_id uuid, p_ok boolean, p_provider text, p_provider_id text, p_error text default null, p_permanent boolean default false) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if p_ok then update outbox set status = 'sent', sent_at = now(), provider = p_provider, provider_id = p_provider_id, error = null, locked_until = null where id = p_id;
+  else update outbox set status = case when p_permanent or attempts >= 5 then 'failed' else 'queued' end, error = left(p_error, 500), provider = p_provider, locked_until = null,
+    send_at = now() + make_interval(mins => power(2, least(attempts, 6))::int) where id = p_id; end if;
+end $$;
+create or replace function claim_deliveries(p_limit int default 50) returns jsonb language plpgsql security definer set search_path = public as $$
+declare d deliveries%rowtype; g integrations%rowtype; out jsonb := '[]';
+begin
+  update deliveries set locked_until = null where status = 'queued' and locked_until < now();
+  for d in select * from deliveries where status = 'queued' and next_at <= now() and (locked_until is null) order by next_at limit least(greatest(p_limit, 1), 200) for update skip locked loop
+    select * into g from integrations where id = d.integration_id;
+    if not found or not g.active then update deliveries set status = 'cancelled', response = 'integration off or removed' where id = d.id; continue; end if;
+    update deliveries set attempts = attempts + 1, locked_until = now() + interval '5 minutes' where id = d.id returning * into d;
+    out := out || jsonb_build_array(jsonb_build_object('delivery', to_jsonb(d), 'integration', to_jsonb(g),
+      'contact', case when d.payload->'data'->>'email' is null then null else (select to_jsonb(c) - 'token' from contacts c where c.box_office_id = d.box_office_id and c.email = lower(d.payload->'data'->>'email')) end));
+  end loop;
+  return out;
+end $$;
+create or replace function delivery_result(p_id uuid, p_ok boolean, p_response text, p_permanent boolean default false) returns void language plpgsql security definer set search_path = public as $$
+declare d deliveries%rowtype;
+begin
+  update deliveries set status = case when p_ok then 'delivered' when p_permanent or attempts >= 6 then 'failed' else 'queued' end, response = left(p_response, 500), locked_until = null,
+    done_at = case when p_ok then now() end, next_at = case when p_ok then next_at else now() + make_interval(mins => power(2, least(attempts, 8))::int) end where id = p_id returning * into d;
+  update integrations set last_at = now(), last_error = case when p_ok then '' else left(p_response, 300) end where id = d.integration_id;
+end $$;
+-- inbound texts: STOP / START keywords (carrier rules) — every contact with that number
+create or replace function inbound_sms(p_from text, p_body text) returns int language plpgsql security definer set search_path = public as $$
+declare c contacts%rowtype; n int := 0; w text := upper(trim(coalesce(p_body, '')));
+begin
+  for c in select * from contacts where phone = norm_phone(p_from) loop
+    if w in ('STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT') then if consent_change(c.id, 'sms_optout', 'replied ' || w, p_from) then n := n + 1; end if;
+    elsif w in ('START', 'UNSTOP', 'YES') then if consent_change(c.id, 'sms_start', 'replied ' || w, p_from) then n := n + 1; end if; end if;
+  end loop;
+  return n;
+end $$;
+-- email provider events: hard bounce / spam complaint → suppress the address
+create or replace function mail_event(p_provider_id text, p_type text) returns void language plpgsql security definer set search_path = public as $$
+declare m outbox%rowtype; c contacts%rowtype;
+begin
+  select * into m from outbox where provider_id = p_provider_id; if not found or p_type not in ('bounced', 'complaint') then return; end if;
+  c := contact_upsert(m.box_office_id, m.email); if c.id is null then return; end if;
+  if c.suppressed is null then perform consent_change(c.id, 'suppress', 'email provider: ' || case when p_type = 'bounced' then 'hard bounce' else 'spam complaint' end, 'system', p_type); end if;
+  update outbox set status = 'failed', error = p_type where id = m.id;
+end $$;
+-- the read-only API: a key's hash → its box office + scopes (rate limited to 120 calls a minute)
+create or replace function api_auth(p_hash text) returns jsonb language plpgsql security definer set search_path = public as $$
+declare k api_keys%rowtype; n int;
+begin
+  select * into k from api_keys where hash = p_hash and revoked_at is null; if not found then return null; end if;
+  insert into api_usage(key_id, minute, n) values (k.id, date_trunc('minute', now()), 1) on conflict (key_id, minute) do update set n = api_usage.n + 1 returning api_usage.n into n;
+  update api_keys set last_used_at = now() where id = k.id and (last_used_at is null or last_used_at < now() - interval '1 minute');
+  delete from api_usage where key_id = k.id and minute < now() - interval '1 hour';
+  return jsonb_build_object('key_id', k.id, 'box_office_id', k.box_office_id, 'scopes', to_jsonb(k.scopes), 'limited', n > 120);
+end $$;
+create or replace function api_read(p_bo uuid, p_resource text, p_since timestamptz default null, p_limit int default 100) returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare lim int := least(greatest(coalesce(p_limit, 100), 1), 500);
+begin
+  return case p_resource
+    when 'events' then (select coalesce(jsonb_agg(jsonb_build_object('id', e.id, 'slug', e.slug, 'status', e.status, 'name', e.data->>'name', 'start', e.data->>'start', 'end', e.data->>'end', 'venue', e.data->>'venue',
+        'ticket_types', (select jsonb_agg(jsonb_build_object('id', t->>'id', 'name', t->>'name', 'price', t->'price', 'qty', t->'qty')) from jsonb_array_elements(e.data->'ticketTypes') t), 'created_at', e.created_at)), '[]')
+      from (select * from events e where e.box_office_id = p_bo and (p_since is null or e.created_at >= p_since) order by e.created_at limit lim) e)
+    when 'orders' then (select coalesce(jsonb_agg(hook_order(o) order by o.created_at), '[]') from (select * from orders o where o.box_office_id = p_bo and o.status not in ('awaiting_payment', 'expired')
+      and (p_since is null or o.created_at >= p_since) order by o.created_at limit lim) o)
+    when 'tickets' then (select coalesce(jsonb_agg(jsonb_build_object('id', t.id, 'order_id', t.order_id, 'event_id', t.event_id, 'ticket_type_id', t.ticket_type_id, 'area', t.area, 'row', t."row", 'seat', t.seat_label,
+        'status', t.status, 'face', t.face, 'paid', t.paid, 'comp', t.comp, 'checked_in_at', t.checked_in_at, 'issued_at', t.issued_at) order by t.issued_at), '[]')
+      from (select * from tickets t where t.box_office_id = p_bo and (p_since is null or t.touched_at >= p_since) order by t.issued_at limit lim) t)
+    when 'customers' then (select coalesce(jsonb_agg(to_jsonb(c) - 'token' - 'id' order by c.created_at), '[]') from (select * from contacts c where c.box_office_id = p_bo and (p_since is null or c.updated_at >= p_since) order by c.created_at limit lim) c)
+    else null end;
+end $$;
+-- outside systems hear when a published event changes (date, venue, …)
+create or replace function events_hook() returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'published' and old.data is distinct from new.data then
+    perform emit_event(new.box_office_id, 'event.updated', jsonb_build_object('event_id', new.id, 'name', new.data->>'name', 'start', new.data->>'start', 'venue', new.data->>'venue')); end if;
+  return new;
+end $$;
+drop trigger if exists events_hook on events;
+create trigger events_hook after update on events for each row execute function events_hook();
+
+grant execute on function unsub_info(text), unsubscribe(text,jsonb) to anon, authenticated;
+grant execute on function send_campaign(uuid,jsonb), campaign_action(uuid,uuid,text), segment_count(uuid,jsonb), save_segments(uuid,jsonb), save_automation(uuid,jsonb), delete_automation(uuid,text),
+  save_integration(uuid,jsonb,text), delete_integration(uuid,uuid), test_integration(uuid,uuid), contact_action(uuid,text,text,jsonb), outbox_action(uuid,uuid,text),
+  create_api_key(uuid,text,text[]), revoke_api_key(uuid,uuid) to authenticated;
+revoke execute on function send_campaign(uuid,jsonb), campaign_action(uuid,uuid,text), segment_count(uuid,jsonb), save_segments(uuid,jsonb), save_automation(uuid,jsonb), delete_automation(uuid,text),
+  save_integration(uuid,jsonb,text), delete_integration(uuid,uuid), test_integration(uuid,uuid), contact_action(uuid,text,text,jsonb), outbox_action(uuid,uuid,text),
+  create_api_key(uuid,text,text[]), revoke_api_key(uuid,uuid) from anon, public;
+revoke execute on function contact_upsert(uuid,text,text,text), consent_change(uuid,text,text,text,text), order_contact(uuid), send_gate(contacts,text,text,text), queue_msg(jsonb), queue_mail(orders,text,text,text,text),
+  hook_order(orders), order_ctx(orders,uuid[]), auto_match(automations,jsonb), run_automation(text,jsonb,text), emit_event(uuid,text,jsonb,jsonb), marketing_tick(), segment_people(uuid,jsonb),
+  std_automations(uuid), msg_context(outbox), claim_outbox(int), outbox_result(uuid,boolean,text,text,text,boolean), claim_deliveries(int), delivery_result(uuid,boolean,text,boolean),
+  inbound_sms(text,text), mail_event(text,text), api_auth(text), api_read(uuid,text,timestamptz,int) from anon, authenticated, public;
+-- the messaging + api Edge Functions (service role) and pg_cron
+grant execute on function marketing_tick(), claim_outbox(int), outbox_result(uuid,boolean,text,text,text,boolean), claim_deliveries(int), delivery_result(uuid,boolean,text,boolean),
+  inbound_sms(text,text), mail_event(text,text), api_auth(text), api_read(uuid,text,timestamptz,int), expire_orders() to service_role;
+-- pg_cron: select cron.schedule('set-marketing-tick', '* * * * *', 'select marketing_tick()');
+--          + call the messaging function every minute (SETUP.md → "SET — sending email & texts")
 
 -- Stage 4 migration: per-event discount codes become box-office promo codes (targeted at their event).
 insert into promos(id, box_office_id, code, data)
