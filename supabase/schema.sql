@@ -12,7 +12,11 @@
 create extension if not exists pgcrypto;
 
 create table if not exists platform_settings (id int primary key default 1 check (id = 1), data jsonb not null default '{}');
-insert into platform_settings (id, data) values (1, '{"name":"SET","publicRegistration":false,"feePct":1,"feeFixed":25,"plans":""}') on conflict (id) do nothing;
+insert into platform_settings (id, data) values (1, '{"name":"SET","publicRegistration":false,"feePct":1,"feeFixed":25}') on conflict (id) do nothing;
+-- Stage 10 defaults (plans = the configurable money model; processors on/off; where custom domains point)
+update platform_settings set data = jsonb_build_object('planList', '[{"id":"pay","name":"Pay as you go","monthly":0,"feePct":"","feeFixed":"","blurb":"No monthly fee — the platform fee on each paid ticket only."},
+  {"id":"pro","name":"Pro","monthly":4900,"feePct":0.5,"feeFixed":15,"blurb":"A lower per-ticket fee for regular sellers."},{"id":"venue","name":"Venue","monthly":19900,"feePct":0,"feeFixed":10,"blurb":"For venues with shows every week."}]'::jsonb,
+  'defaultPlan', 'pay', 'gatewaysOff', '[]'::jsonb, 'domainTarget', 'domains.set-tickets.app', 'appHosts', '[]'::jsonb, 'invoiceDays', 14, 'autoApprove', false) || data - 'plans' where id = 1;
 create table if not exists platform_admins (email text primary key, created_at timestamptz default now());
 
 create table if not exists box_offices (
@@ -198,6 +202,130 @@ create or replace function event_live(e events) returns boolean language sql sta
     and (nullif(e.data->>'publishAt','') is null or (e.data->>'publishAt')::timestamptz <= now())
     and exists(select 1 from box_offices b where b.id = e.box_office_id and b.status = 'active') $$;
 
+-- ═══ Stage 10 core: tables + helpers used by the functions below (mirrors the Stage 10 block in data.js) ═══════════════════════════════════
+alter table events add column if not exists controls jsonb not null default '{}';    -- emergency controls; only event_control() changes it
+alter table box_offices add column if not exists plan text, add column if not exists domain jsonb, add column if not exists mail_domain jsonb;
+create table if not exists rate_hits (key text not null, at timestamptz not null default now());
+create index if not exists rate_hits_key on rate_hits(key, at);
+create table if not exists queue_entries (event_id uuid not null references events(id) on delete cascade, token text not null, joined_at timestamptz not null default now(),
+  admit_at timestamptz not null, primary key (event_id, token));
+create index if not exists queue_entries_admit on queue_entries(event_id, admit_at);
+create table if not exists bans (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id) on delete cascade, email text not null,
+  reason text not null, by text, at timestamptz not null default now(), removed_at timestamptz, removed_by text);
+create unique index if not exists bans_active on bans(box_office_id, email) where removed_at is null;
+create table if not exists support_messages (id uuid primary key default gen_random_uuid(), box_office_id uuid not null references box_offices(id) on delete cascade, event_id uuid references events(id) on delete set null,
+  name text, email text not null, ref text, subject text, body text not null, routed_to text not null, team text, status text not null default 'open' check (status in ('open','answered','closed')),
+  at timestamptz not null default now(), replies jsonb not null default '[]', handled_by text, handled_at timestamptz);
+create index if not exists support_bo on support_messages(box_office_id, at desc);
+create table if not exists versions (id uuid primary key default gen_random_uuid(), box_office_id uuid references box_offices(id) on delete cascade, kind text not null,
+  target uuid not null, sections text[] not null, snapshot jsonb not null, by text, at timestamptz not null default now());
+create index if not exists versions_target on versions(target, at desc);
+create table if not exists policy_texts (version text primary key, kind text not null, title text, text text not null, first_at timestamptz not null default now());
+create table if not exists error_log (id bigint generated always as identity primary key, at timestamptz not null default now(), source text not null, "where" text, message text not null,
+  stack text, url text, box_office_id uuid, actor text, ip text);
+create index if not exists error_log_at on error_log(at desc);
+create table if not exists incidents (id uuid primary key default gen_random_uuid(), kind text not null, title text not null, severity text not null default 'minor', status text not null default 'open',
+  started_at timestamptz not null default now(), ended_at timestamptz, events uuid[] not null default '{}', cause text, resolution text, updates jsonb not null default '[]', by text, created_at timestamptz not null default now());
+create table if not exists platform_invoices (id uuid primary key default gen_random_uuid(), number text unique not null, box_office_id uuid not null references box_offices(id), period text not null,
+  lines jsonb not null, total bigint not null, info jsonb not null default '{}', status text not null default 'open' check (status in ('open','paid','void')),
+  issued_at timestamptz not null default now(), due_at timestamptz, paid_at timestamptz, note text, handled_by text, by text);
+create unique index if not exists platform_invoices_once on platform_invoices(box_office_id, period) where status <> 'void';
+create table if not exists backup_runs (id bigint generated always as identity primary key, at timestamptz not null default now(), kind text not null default 'database',
+  size_bytes bigint, ok boolean not null, verified_at timestamptz, note text);
+create table if not exists pay_attempts (id bigint generated always as identity primary key, at timestamptz not null default now(), box_office_id uuid, order_id uuid, ok boolean not null);
+create index if not exists pay_attempts_at on pay_attempts(at desc);
+alter table seat_status add column if not exists ip text;   -- who is holding seats in checkout (per-address cap)
+alter table rate_hits enable row level security; alter table queue_entries enable row level security; alter table bans enable row level security;
+alter table support_messages enable row level security; alter table versions enable row level security; alter table policy_texts enable row level security;
+alter table error_log enable row level security; alter table incidents enable row level security; alter table platform_invoices enable row level security;
+alter table backup_runs enable row level security; alter table pay_attempts enable row level security;
+-- no policies: these are read through admin_load() / platform_overview() and written by the functions below only
+
+-- the caller's address as the API gateway saw it (Supabase passes the request headers to PostgREST)
+create or replace function client_ip() returns text language sql stable as $$
+  select coalesce(nullif(trim(split_part(coalesce(nullif(current_setting('request.headers', true), '')::json->>'x-forwarded-for', ''), ',', 1)), ''), 'local') $$;
+-- a sliding-window rate limit: true = allowed (and counted), false = over the limit
+create or replace function rate_hit(p_key text, p_max int, p_secs int) returns boolean language plpgsql security definer set search_path = public as $$
+declare n int;
+begin
+  if random() < 0.01 then delete from rate_hits where at < now() - interval '1 day'; end if;
+  select count(*) into n from rate_hits where key = p_key and at > now() - make_interval(secs => p_secs);
+  if n >= p_max then return false; end if;
+  insert into rate_hits(key) values (p_key); return true;
+end $$;
+-- policy version = FNV-1a of the text (same as fnv() in data.js)
+create or replace function fnv(p text) returns text language plpgsql immutable as $$
+declare h bigint := 2166136261; b int; bytes bytea := convert_to(coalesce(p, ''), 'UTF8');
+begin
+  for i in 0 .. length(bytes) - 1 loop b := get_byte(bytes, i); h := ((h # b) * 16777619) % 4294967296; end loop;
+  return lpad(to_hex(h), 8, '0');
+end $$;
+create or replace function control_block(e events, what text) returns text language sql stable as $$
+  select case when what = 'scan' then case when coalesce((e.controls->>'scanPaused')::boolean, false) then 'Scanning is stopped for this event' else '' end
+    when coalesce((e.controls->>'maintenance')::boolean, false) then coalesce(nullif(e.controls->>'message', ''), 'This event is being updated — please check back in a few minutes.')
+    when coalesce((e.controls->>'salesPaused')::boolean, false) then coalesce(nullif(e.controls->>'message', ''), 'Ticket sales are paused right now — please check back shortly.')
+    when what = 'checkout' and coalesce((e.controls->>'checkoutPaused')::boolean, false) then 'Checkout is paused for a moment — please try again shortly.' else '' end $$;
+create or replace function cart_minutes(e events) returns int language sql immutable as $$
+  select least(120, greatest(1, round(coalesce(nullif(e.data->>'cartMinutes', '')::numeric, 10))))::int $$;
+-- per-showtime and per-seating-area sale windows
+create or replace function window_msg(e events, slot jsonb, area text) returns text language sql stable as $$
+  select case when nullif(slot->>'salesStart', '') is not null and (slot->>'salesStart')::timestamptz > now() then 'Tickets for that showtime go on sale ' || (slot->>'salesStart')
+    when nullif(slot->>'salesEnd', '') is not null and (slot->>'salesEnd')::timestamptz <= now() then 'Sales for that showtime have ended'
+    when coalesce(area, '') <> '' and nullif(e.data->'areaSales'->area->>'from', '') is not null and (e.data->'areaSales'->area->>'from')::timestamptz > now() then area || ' goes on sale ' || (e.data->'areaSales'->area->>'from')
+    when coalesce(area, '') <> '' and nullif(e.data->'areaSales'->area->>'until', '') is not null and (e.data->'areaSales'->area->>'until')::timestamptz <= now() then area || ' sales have ended'
+    else '' end $$;
+-- booking-fee rules: seating area → ticket type → event → box office
+create or replace function has_rule(r jsonb) returns boolean language sql immutable as $$
+  select r is not null and jsonb_typeof(r) = 'object' and (coalesce(r->>'pct', '') <> '' or coalesce(r->>'fixed', '') <> '' or coalesce(r->>'payer', '') <> '') $$;
+create or replace function fee_set(st jsonb, r jsonb) returns jsonb language sql immutable as $$
+  select case when not has_rule(r) then st else st || jsonb_build_object('feePct', coalesce(nullif(r->>'pct', '')::numeric, (st->>'feePct')::numeric, 0),
+    'feeFixed', coalesce(nullif(r->>'fixed', '')::numeric, (st->>'feeFixed')::numeric, 0),
+    'feeMode', case r->>'payer' when 'organizer' then 'absorb' when 'buyer' then 'buyer' else coalesce(st->>'feeMode', 'buyer') end) end $$;
+create or replace function fee_rule(e events, tt jsonb, p_seat text) returns jsonb language sql stable as $$
+  select case when p_seat is not null and coalesce((e.data->'seating'->>'enabled')::boolean, false) and has_rule(e.data->'fees'->'areas'->(e.data->'seating'->'meta'->p_seat->>0)) then e.data->'fees'->'areas'->(e.data->'seating'->'meta'->p_seat->>0)
+    when has_rule(tt->'fee') then tt->'fee' when has_rule(e.data->'fees') then e.data->'fees' end $$;
+create or replace function rule_key(r jsonb) returns text language sql immutable as $$
+  select case when r is null then '' else concat_ws('/', coalesce(r->>'pct', ''), coalesce(r->>'fixed', ''), coalesce(r->>'payer', '')) end $$;
+-- the plan a box office is on (plan beats the platform default; the box office's own platform_fee beats both)
+create or replace function plan_of(pl jsonb, p_plan text) returns jsonb language sql immutable as $$
+  select coalesce((select x from jsonb_array_elements(coalesce(pl->'planList', '[]')) x where x->>'id' = coalesce(p_plan, pl->>'defaultPlan', 'pay')),
+    (select x from jsonb_array_elements(coalesce(pl->'planList', '[]')) x limit 1), '{}') $$;
+create or replace function ptrim(p text) returns text language sql immutable as $$ select btrim(coalesce(p, ''), E' \t\r\n') $$;
+-- the policies a cart must accept (box office's, replaced per event when the event has its own; plus event-specific policies)
+create or replace function policies_for(b box_offices, p_events uuid[]) returns jsonb language sql stable security definer set search_path = public as $$
+  with evs as (select e.id, e.data, o from unnest(p_events) with ordinality u(id, o) join events e on e.id = u.id),
+  kinds as (select * from (values (1, 'terms', 'terms', 'Terms & conditions', b.settings->>'terms'), (2, 'refund', 'refundPolicy', 'Refund policy', b.branding->>'refundPolicy'),
+                                   (3, 'privacy', 'privacyPolicy', 'Privacy policy', b.branding->>'privacyPolicy')) k(n, kind, evkey, title, botext)),
+  rows_ as (
+    select k.n, e.o, k.kind, e.id ev, (e.data->>'name') || ' — ' || k.title title, ptrim(e.data->>k.evkey) txt from kinds k join evs e on coalesce(ptrim(e.data->>k.evkey), '') <> ''
+    union all select k.n, 1000000, k.kind, null, k.title, ptrim(k.botext) from kinds k
+      where coalesce(ptrim(k.botext), '') <> '' and ((select count(*) from evs e where coalesce(ptrim(e.data->>k.evkey), '') <> '') < (select count(*) from evs) or not exists(select 1 from evs))
+    union all select 4, e.o, 'event', e.id, (e.data->>'name') || ' — Event policies', ptrim(e.data->>'policies') from evs e where coalesce(ptrim(e.data->>'policies'), '') <> '')
+  select coalesce(jsonb_agg(jsonb_build_object('kind', kind, 'eventId', ev, 'title', title, 'text', txt, 'version', fnv(txt)) order by n, o), '[]') from rows_ $$;
+create or replace function policy_check(req jsonb, acc jsonb) returns jsonb language plpgsql immutable as $$
+declare r jsonb;
+begin
+  for r in select * from jsonb_array_elements(coalesce(req, '[]')) loop
+    if not exists(select 1 from jsonb_array_elements(coalesce(acc, '[]')) a where a->>'kind' = r->>'kind' and coalesce(a->>'eventId', '') = coalesce(r->>'eventId', '') and a->>'version' = r->>'version') then
+      return jsonb_build_object('error', case when exists(select 1 from jsonb_array_elements(coalesce(acc, '[]')) a where a->>'kind' = r->>'kind' and coalesce(a->>'eventId', '') = coalesce(r->>'eventId', ''))
+        then 'The ' || lower(r->>'title') || ' changed while you were checking out — please read and accept it again' else 'Please accept the ' || lower(r->>'title') end); end if;
+  end loop;
+  return jsonb_build_object('accepted', (select coalesce(jsonb_agg(jsonb_build_object('kind', r2->>'kind', 'eventId', r2->'eventId', 'version', r2->>'version', 'at', now())), '[]') from jsonb_array_elements(coalesce(req, '[]')) r2));
+end $$;
+-- the checkout form: the strictest of the box office's and every event's (phone / address off < optional < required)
+create or replace function checkout_for(st jsonb, p_events uuid[]) returns jsonb language sql stable security definer set search_path = public as $$
+  with ck as (select coalesce(st->'checkout', '{}') c), r(k, v) as (values ('off', 0), ('optional', 1), ('required', 2))
+  select jsonb_build_object(
+    'phone', (select k from r where v = greatest((select v from r where k = coalesce((select c->>'phone' from ck), 'optional')), coalesce((select max(r2.v) from events e join r r2 on r2.k = e.data->'checkout'->>'phone' where e.id = any(p_events)), 0))),
+    'address', (select k from r where v = greatest((select v from r where k = coalesce((select c->>'address' from ck), 'off')), coalesce((select max(r2.v) from events e join r r2 on r2.k = e.data->'checkout'->>'address' where e.id = any(p_events)), 0)))) $$;
+-- what an order contains, for duplicate detection: event | ticket type or package | showtime = quantity (products ignored)
+create or replace function line_sig(p jsonb) returns text language sql immutable as $$
+  select coalesce(string_agg(k || '=' || n, ',' order by k collate "C"), '') from (select concat_ws('|', l->>'eventId', coalesce(l->>'ticketTypeId', l->>'bundleId'), coalesce(l->>'slotId', '')) k, sum((l->>'qty')::int) n
+    from jsonb_array_elements(coalesce(p, '[]')) l where coalesce(l->>'kind', '') <> 'addon' group by 1) z $$;
+create or replace function queue_pass(e events, p_token text) returns boolean language sql stable security definer set search_path = public as $$
+  select exists(select 1 from queue_entries q where q.event_id = e.id and q.token = coalesce(p_token, '') and q.admit_at <= now()
+    and now() <= q.admit_at + make_interval(mins => greatest(5, coalesce(nullif(e.data->'queue'->>'passMinutes', '')::int, 30)))) $$;
+
 -- ── Row-level security ─────────────────────────────────────────────────────────
 alter table platform_settings enable row level security; alter table platform_admins enable row level security;
 alter table box_offices enable row level security; alter table members enable row level security;
@@ -209,7 +337,9 @@ create policy platform_read on platform_settings for select using (is_super());
 create policy platform_admins_read on platform_admins for select using (is_super());
 create or replace view platform_public with (security_invoker = false) as
   select data->>'name' as name, coalesce((data->>'publicRegistration')::boolean, false) as "publicRegistration",
-    coalesce((data->>'feePct')::numeric, 0) as "feePct", coalesce((data->>'feeFixed')::bigint, 0) as "feeFixed", coalesce(data->>'feePayer', 'organizer') as "feePayer" from platform_settings where id = 1;
+    coalesce((data->>'feePct')::numeric, 0) as "feePct", coalesce((data->>'feeFixed')::bigint, 0) as "feeFixed", coalesce(data->>'feePayer', 'organizer') as "feePayer",
+    coalesce(data->'gatewaysOff', '[]') as "gatewaysOff", coalesce(data->'appHosts', '[]') as "appHosts", coalesce(data->'planList', '[]') as "planList", coalesce(data->>'defaultPlan', 'pay') as "defaultPlan"
+    from platform_settings where id = 1;
 
 create policy bo_public on box_offices for select using (status = 'active' or is_member(id));
 create policy bo_update on box_offices for update using (has_perm(id, 'admin.settings')) with check (has_perm(id, 'admin.settings'));
@@ -295,6 +425,30 @@ end $$;
 drop trigger if exists members_guard on members;
 create trigger members_guard before insert or update on members for each row execute function members_guard();
 
+-- Stage 10 versions: a snapshot of each save with the groups that changed (mirrors EVENT_SECTIONS / BO_SECTIONS in data.js); 40 kept per target
+create or replace function add_version(p_bo uuid, p_kind text, p_target uuid, a jsonb, b jsonb) returns void language plpgsql security definer set search_path = public as $$
+declare secs text[] := '{}'; g record; snap jsonb;
+begin
+  if p_kind = 'event' then
+    for g in select * from (values ('details', array['name','status','start','end','allDay','timezone','venue','address','online','onlineUrl','summary','description','image','category','capacity','visibility','publishAt','salesStart','salesEnd','timeSlots','contact','areaSales','cartMinutes','queue','entrances','waitlistMode']),
+      ('seating', array['seating']), ('pricing', array['ticketTypes','addons','bundles','upsells','fees','taxPct']), ('checkout', array['questions','checkout','page','donation']),
+      ('emails', array['emails']), ('policies', array['terms','refundPolicy','privacyPolicy','policies','instructions'])) v(k, keys) loop
+      if exists(select 1 from unnest(g.keys) k where case when k = 'seating' then (a->'seating') - 'bg' - 'index' - 'meta' - 'rows' is distinct from (b->'seating') - 'bg' - 'index' - 'meta' - 'rows'
+          else (a->k) is distinct from (b->k) end) then secs := secs || g.k; end if;
+    end loop;
+    snap := b || jsonb_build_object('seating', coalesce(b->'seating', '{}') - 'bg' - 'index' - 'meta' - 'rows');
+  else
+    if (a->'settings') - 'checkout' - 'questions' - 'terms' - 'mail' is distinct from (b->'settings') - 'checkout' - 'questions' - 'terms' - 'mail' then secs := secs || 'settings'::text; end if;
+    if jsonb_build_array(a->'settings'->'checkout', a->'settings'->'questions') is distinct from jsonb_build_array(b->'settings'->'checkout', b->'settings'->'questions') then secs := secs || 'checkout'::text; end if;
+    if (a->'settings'->'mail') is distinct from (b->'settings'->'mail') then secs := secs || 'emails'::text; end if;
+    if jsonb_build_array(a->'settings'->'terms', a->'branding'->'refundPolicy', a->'branding'->'privacyPolicy') is distinct from jsonb_build_array(b->'settings'->'terms', b->'branding'->'refundPolicy', b->'branding'->'privacyPolicy') then secs := secs || 'policies'::text; end if;
+    if (a->'branding') - 'refundPolicy' - 'privacyPolicy' is distinct from (b->'branding') - 'refundPolicy' - 'privacyPolicy' then secs := secs || 'branding'::text; end if;
+    snap := b;
+  end if;
+  if coalesce(array_length(secs, 1), 0) = 0 then return; end if;
+  insert into versions(box_office_id, kind, target, sections, snapshot, by) values (p_bo, p_kind, p_target, secs, snap, coalesce(nullif(me_email(), ''), 'system'));
+  delete from versions where target = p_target and id not in (select id from versions where target = p_target order by at desc limit 40);
+end $$;
 -- Box offices: status/owner/slug ownership are platform-only (changed through the RPCs, which set set_config('set.platform','1')).
 create or replace function box_offices_guard() returns trigger language plpgsql security definer set search_path = public as $$
 begin
@@ -308,6 +462,10 @@ begin
       case when new.name is distinct from old.name then 'name' end, case when new.slug is distinct from old.slug then 'slug' end,
       case when new.branding is distinct from old.branding then 'branding' end, case when new.settings is distinct from old.settings then 'settings' end)); end if;
   if new.templates is distinct from old.templates then perform log_action(new.id, 'team.templates', 'Edited permission templates'); end if;
+  if (new.plan is distinct from old.plan or new.domain is distinct from old.domain or new.mail_domain is distinct from old.mail_domain) and coalesce(current_setting('set.platform', true), '') <> '1'
+     and coalesce(auth.jwt() ->> 'role', '') <> 'service_role' then raise exception 'Plan and domains change only through their own settings'; end if;
+  if new.settings is distinct from old.settings or new.branding is distinct from old.branding then
+    perform add_version(new.id, 'settings', new.id, jsonb_build_object('settings', old.settings, 'branding', old.branding), jsonb_build_object('settings', new.settings, 'branding', new.branding)); end if;
   return new;
 end $$;
 drop trigger if exists box_offices_guard on box_offices;
@@ -323,8 +481,9 @@ create or replace function price_sig(d jsonb) returns jsonb language sql immutab
 create or replace function events_guard() returns trigger language plpgsql security definer set search_path = public as $$
 declare b jsonb := '{}'; a jsonb := '{}'; k text;
 begin
-  if tg_op = 'INSERT' then perform log_action(new.box_office_id, 'event.created', 'Created event “' || (new.data->>'name') || '”', null, null, new.id); return new; end if;
+  if tg_op = 'INSERT' then perform log_action(new.box_office_id, 'event.created', 'Created event “' || (new.data->>'name') || '”', null, null, new.id); new.controls := '{}'; return new; end if;
   if new.box_office_id <> old.box_office_id then raise exception 'Events cannot move between box offices'; end if;
+  if new.controls is distinct from old.controls and coalesce(current_setting('set.controls', true), '') <> '1' then new.controls := old.controls; end if;   -- only event_control()
   if (new.status <> old.status or (new.data->'archived') is distinct from (old.data->'archived')) and not has_perm(new.box_office_id, 'events.publish', new.id) then
     raise exception 'You don''t have permission to publish, cancel or archive events'; end if;
   if price_sig(new.data) is distinct from price_sig(old.data) and not has_perm(new.box_office_id, 'tickets.pricing', new.id) then
@@ -356,6 +515,7 @@ begin
   end if;
   if (new.secrets->>'password' <> '') is distinct from (old.secrets->>'password' <> '') then b := b || jsonb_build_object('Password', old.secrets->>'password' <> ''); a := a || jsonb_build_object('Password', new.secrets->>'password' <> ''); end if;
   if a <> '{}' then perform log_action(new.box_office_id, 'event.updated', 'Updated “' || (new.data->>'name') || '”: ' || (select string_agg(x, ', ') from jsonb_object_keys(a) x), b, a, new.id); end if;
+  perform add_version(new.box_office_id, 'event', new.id, old.data, new.data);   -- Stage 10 version history
   new.updated_at := now(); return new;
 end $$;
 drop trigger if exists events_guard on events;
@@ -456,13 +616,20 @@ begin
 end $$;
 -- A buyer's 10-minute hold while they check out. p_token = a random id from their browser.
 create or replace function hold_seats(p_event uuid, p_slot text, p_seats text[], p_token text) returns jsonb language plpgsql security definer set search_path = public as $$
-declare e events%rowtype; s text; blk text; gaps text[]; exp timestamptz := now() + interval '10 minutes';
+declare e events%rowtype; s text; blk text; gaps text[]; exp timestamptz; v_ip text := client_ip();
 begin
   select * into e from events where id = p_event;
   if not found or not event_live(e) then raise exception 'Event is not on sale'; end if;
   if not coalesce((e.data->'seating'->>'enabled')::boolean, false) then return null; end if;
   if coalesce(length(p_token), 0) not between 8 and 64 then raise exception 'bad token'; end if;
+  -- Stage 10: emergency controls, the waiting room, and hold abuse (calls per token and per address; seats held per address across every token)
+  if control_block(e, 'sales') <> '' then raise exception '%', control_block(e, 'sales'); end if;
+  if coalesce((e.data->'queue'->>'on')::boolean, false) and not queue_pass(e, p_token) then raise exception 'Please wait for your turn in the waiting room'; end if;
+  if not rate_hit('hold:' || p_token, 60, 60) or not rate_hit('holdip:' || v_ip, 120, 60) then raise exception 'Too many seat changes — please wait a moment'; end if;
   if coalesce(array_length(p_seats, 1), 0) > 10 then raise exception 'Maximum 10 seats per order'; end if;
+  if v_ip <> 'local' and (select count(*) from seat_status x where x.status = 'checkout' and x.ip = v_ip and x.token <> p_token and x.expires_at > now()) + coalesce(array_length(p_seats, 1), 0) > 40 then
+    raise exception 'Too many seats are being held from your connection — finish or cancel another checkout first'; end if;
+  exp := now() + make_interval(mins => cart_minutes(e));   -- the event's own basket timeout
   perform pg_advisory_xact_lock(hashtext(e.id::text));
   foreach s in array coalesce(p_seats, '{}') loop
     if not seat_free(e, p_slot, s, p_token) then
@@ -474,8 +641,8 @@ begin
     if array_length(gaps, 1) > 0 then raise exception 'Please don''t leave a single empty seat next to your selection (%). Move over one seat, or include it.', (select string_agg(seat_text(e, g), '; ') from unnest(gaps) g); end if;
   end if;
   delete from seat_status where event_id = e.id and status = 'checkout' and token = p_token;
-  insert into seat_status(box_office_id, event_id, slot_id, seat, status, by, expires_at, token)
-    select e.box_office_id, e.id, coalesce(p_slot,''), x, 'checkout', 'buyer', exp, p_token from unnest(coalesce(p_seats, '{}')) x;
+  insert into seat_status(box_office_id, event_id, slot_id, seat, status, by, expires_at, token, ip)
+    select e.box_office_id, e.id, coalesce(p_slot,''), x, 'checkout', 'buyer', exp, p_token, v_ip from unnest(coalesce(p_seats, '{}')) x;
   return jsonb_build_object('expires', exp);
 end $$;
 create or replace function release_seats(p_event uuid, p_token text) returns void language sql security definer set search_path = public as $$
@@ -721,6 +888,7 @@ declare
   lines jsonb := '[]'; seen jsonb := '{}'; avs jsonb := '{}'; k text; adm int; sold int; inorder int; n int; i int; j int; per int;
   tts text[]; tf bigint[]; face bigint; unit bigint; uf bigint; ovr boolean; subtotal bigint; disc bigint; fdisc bigint; fee bigint; tax bigint; donation bigint; err text := '';
   paidtk int; pfee bigint := 0; sfee bigint; pre bigint; pfx bigint := 0; proc bigint; cr bigint; pf jsonb := coalesce(st->'platform', '{}'); cd jsonb := coalesce(st->'card', '{}');
+  rl jsonb; ofees jsonb := '[]'; ofee bigint := 0; xf jsonb; xb bigint; xt int; amt bigint; tof boolean := coalesce((st->>'taxOnFees')::boolean, false); per_ev boolean; pass boolean;
 begin
   for it in select * from jsonb_array_elements(coalesce(p->'items','[]')) loop
     select * into ev from events where id = (it->>'eventId')::uuid;
@@ -735,7 +903,8 @@ begin
       tf := array(select list_price((select x from jsonb_array_elements(ev.data->'ticketTypes') x where x->>'id' = t), it->>'slotId') from unnest(tts) with ordinality u(t, o) order by o);
       adds := (select coalesce(jsonb_agg(jsonb_build_object('addonId', a->>'id', 'name', a->>'name', 'qty', greatest(1, coalesce((x->>'qty')::int, 1)), 'face', greatest(0, round(coalesce((a->>'price')::numeric, 0)))::bigint) order by o), '[]')
         from jsonb_array_elements(coalesce(b->'addons','[]')) with ordinality y(x, o) join jsonb_array_elements(coalesce(ev.data->'addons','[]')) a on a->>'id' = x->>'addonId');
-      unit := greatest(0, round(coalesce((b->>'price')::numeric, 0)))::bigint; uf := fee_of(unit, greatest(per, 1), st);
+      unit := greatest(0, round(coalesce((b->>'price')::numeric, 0)))::bigint;
+      uf := fee_of(unit, greatest(per, 1), fee_set(st, case when has_rule(b->'fee') then b->'fee' when has_rule(ev.data->'fees') then ev.data->'fees' end));
       lines := lines || jsonb_build_array(base || jsonb_build_object('kind', 'bundle', 'bundleId', b->>'id', 'name', b->>'name', 'qty', n, 'unit', unit, 'face', unit, 'perCopy', per,
         'tts', to_jsonb(tts), 'tfaces', to_jsonb(tf), 'addons', adds, 'seats', coalesce(it->'seats','[]'), 'admits', 1, 'unitFee', uf, 'fee', n * uf,
         'value', coalesce((select sum(x) from unnest(tf) x), 0) + n * coalesce((select sum((a->>'face')::bigint * (a->>'qty')::int) from jsonb_array_elements(adds) a), 0)));
@@ -749,10 +918,10 @@ begin
     br := (select x from jsonb_array_elements(coalesce(tt->'breaks','[]')) x where coalesce((x->>'min')::int, 0) > 1 and inorder >= (x->>'min')::int order by (x->>'min')::int desc limit 1);
     ovr := p_manual and coalesce(it->>'price','') <> '';
     i := 0;
-    while i < n loop  -- a phase can end inside one order: one line per run of equal prices
-      pr := unit_price(tt, it->>'slotId', sold + i * adm, br); j := i + 1;
-      while j < n and unit_price(tt, it->>'slotId', sold + j * adm, br) = pr loop j := j + 1; end loop;
-      face := (pr->>'price')::bigint; unit := case when ovr then greatest(0, round((it->>'price')::numeric))::bigint else face end; uf := fee_of(unit, 1, st);
+    while i < n loop  -- a phase can end inside one order: one line per run of equal prices (and equal booking-fee rule — Stage 10)
+      pr := unit_price(tt, it->>'slotId', sold + i * adm, br); j := i + 1; rl := fee_rule(ev, tt, it->'seats'->>(i * adm));
+      while j < n and unit_price(tt, it->>'slotId', sold + j * adm, br) = pr and rule_key(fee_rule(ev, tt, it->'seats'->>(j * adm))) = rule_key(rl) loop j := j + 1; end loop;
+      face := (pr->>'price')::bigint; unit := case when ovr then greatest(0, round((it->>'price')::numeric))::bigint else face end; uf := fee_of(unit, 1, fee_set(st, rl));
       lines := lines || jsonb_build_array(base || jsonb_build_object('kind', 'ticket', 'ticketTypeId', tt->>'id', 'name', tt->>'name',
         'seats', coalesce((select jsonb_agg(s order by o) from jsonb_array_elements(coalesce(it->'seats','[]')) with ordinality z(s, o) where o > i * adm and o <= j * adm), '[]'),
         'qty', j - i, 'unit', unit, 'face', face, 'admits', adm, 'unitFee', uf, 'fee', (j - i) * uf)
@@ -765,7 +934,8 @@ begin
     tt := (select x from jsonb_array_elements(coalesce(ev.data->'addons','[]')) x where x->>'id' = ad->>'addonId');
     if tt is null or coalesce((ad->>'qty')::int, 0) < 1 then continue; end if;
     unit := greatest(0, round(coalesce((tt->>'price')::numeric, 0)))::bigint;
-    lines := lines || jsonb_build_array(jsonb_build_object('kind', 'addon', 'eventId', ev.id, 'eventName', ev.data->>'name', 'addonId', tt->>'id', 'name', tt->>'name', 'qty', (ad->>'qty')::int, 'unit', unit, 'face', unit, 'unitFee', 0, 'fee', 0));
+    uf := case when has_rule(tt->'fee') then fee_of(unit, 0, fee_set(st, tt->'fee')) else 0 end;   -- products carry a booking fee only when they set one
+    lines := lines || jsonb_build_array(jsonb_build_object('kind', 'addon', 'eventId', ev.id, 'eventName', ev.data->>'name', 'addonId', tt->>'id', 'name', tt->>'name', 'qty', (ad->>'qty')::int, 'unit', unit, 'face', unit, 'unitFee', uf, 'fee', (ad->>'qty')::int * uf));
   end loop;
   subtotal := (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int), 0) from jsonb_array_elements(lines) l);
   if p_promo is not null then r := apply_promo(lines, p_promo, subtotal); lines := r->'lines'; err := r->>'err'; end if;
@@ -779,12 +949,41 @@ begin
              from jsonb_array_elements(lines) l where (l->>'unit')::bigint > 0);
   if subtotal - disc > 0 then pfee := round((subtotal - disc) * coalesce((pf->>'pct')::numeric, 0) / 100) + paidtk * coalesce((pf->>'fixed')::bigint, 0); end if;
   sfee := case when pf->>'payer' = 'buyer' then pfee else 0 end;
-  tax := round((subtotal - disc + case when coalesce((st->>'taxOnFees')::boolean, false) then fee + sfee else 0 end) * coalesce((st->>'taxPct')::numeric, 0) / 100);
-  pre := subtotal - disc + fee + sfee + tax + donation;
+  -- Stage 10: other fees an event adds (mandatory, or optional ones the buyer ticked — p.optFees), per ticket or per order
+  for ev in select e.* from events e where e.id in (select distinct (l->>'eventId')::uuid from jsonb_array_elements(lines) l) loop
+    xb := (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int - coalesce((l->>'disc')::bigint, 0)), 0) from jsonb_array_elements(lines) l where l->>'eventId' = ev.id::text);
+    xt := (select coalesce(sum(case when (l->>'unit')::bigint > 0 then case l->>'kind' when 'ticket' then (l->>'qty')::int * coalesce(nullif((l->>'admits')::int, 0), 1) when 'bundle' then (l->>'qty')::int * (l->>'perCopy')::int else 0 end else 0 end), 0)
+      from jsonb_array_elements(lines) l where l->>'eventId' = ev.id::text);
+    if xb <= 0 then continue; end if;
+    for xf in select * from jsonb_array_elements(coalesce(ev.data->'fees'->'extra', '[]')) loop
+      if coalesce((xf->>'optional')::boolean, false) and not coalesce(p->'optFees', '[]') ? (xf->>'id') then continue; end if;
+      amt := round(xb * coalesce(nullif(xf->>'pct', '')::numeric, 0) / 100) + case when xf->>'per' = 'order' then 1 else xt end * greatest(0, round(coalesce(nullif(xf->>'fixed', '')::numeric, 0)))::bigint;
+      if amt > 0 then ofees := ofees || jsonb_build_array(jsonb_build_object('id', xf->>'id', 'eventId', ev.id, 'name', left(coalesce(xf->>'name', 'Fee'), 60), 'amount', amt)
+        || case when coalesce((xf->>'optional')::boolean, false) then '{"optional":true}'::jsonb else '{}'::jsonb end); end if;
+    end loop;
+  end loop;
+  ofee := (select coalesce(sum((x2->>'amount')::bigint), 0) from jsonb_array_elements(ofees) x2);
+  -- tax: one rate for the order, unless an event sets its own — then each event's part at its rate (the service fee at the box office's)
+  per_ev := exists(select 1 from events e where e.id in (select (l->>'eventId')::uuid from jsonb_array_elements(lines) l) and coalesce(e.data->>'taxPct', '') <> '');
+  if not per_ev then
+    tax := round((subtotal - disc + case when tof then fee + sfee + ofee else 0 end) * coalesce((st->>'taxPct')::numeric, 0) / 100);
+  else
+    tax := (select coalesce(sum(round((
+        (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int - coalesce((l->>'disc')::bigint, 0)), 0) from jsonb_array_elements(lines) l where l->>'eventId' = e.id::text)
+        + case when tof then (select coalesce(sum((l->>'fee')::bigint - coalesce((l->>'feeDisc')::bigint, 0)), 0) from jsonb_array_elements(lines) l where l->>'eventId' = e.id::text)
+            + (select coalesce(sum((x2->>'amount')::bigint), 0) from jsonb_array_elements(ofees) x2 where x2->>'eventId' = e.id::text) else 0 end)
+        * coalesce(nullif(e.data->>'taxPct', '')::numeric, (st->>'taxPct')::numeric, 0) / 100)), 0)
+      from events e where e.id in (select distinct (l->>'eventId')::uuid from jsonb_array_elements(lines) l))
+      + case when tof then round(sfee * coalesce((st->>'taxPct')::numeric, 0) / 100) else 0 end;
+  end if;
+  pre := subtotal - disc + fee + sfee + ofee + tax + donation;
+  -- card processing passed to the buyer: the box office's choice, unless every event in the cart says otherwise
+  pass := coalesce((select bool_and(case e.data->'fees'->>'passProcessing' when 'yes' then true when 'no' then false else coalesce((cd->>'pass')::boolean, false) end)
+    from events e where e.id in (select (l->>'eventId')::uuid from jsonb_array_elements(lines) l)), coalesce((cd->>'pass')::boolean, false));
   cr := least(greatest(0, coalesce((p->>'creditAvail')::bigint, 0)), pre);   -- Stage 6: a credit pays first (set by place_order, never by the buyer)
   if p->>'payment' = 'card' and pre - cr > 0 then pfx := round((pre - cr) * coalesce((cd->>'pct')::numeric, 0) / 100) + coalesce((cd->>'fixed')::bigint, 0); end if;
-  proc := case when coalesce((cd->>'pass')::boolean, false) then pfx else 0 end;
-  return jsonb_build_object('lines', lines, 'subtotal', subtotal, 'discount', disc, 'feeDiscount', fdisc, 'fee', fee, 'serviceFee', sfee, 'tax', tax, 'donation', donation,
+  proc := case when pass then pfx else 0 end;
+  return jsonb_build_object('lines', lines, 'subtotal', subtotal, 'discount', disc, 'feeDiscount', fdisc, 'fee', fee, 'serviceFee', sfee, 'otherFees', ofees, 'otherFee', ofee, 'tax', tax, 'donation', donation,
     'ticketsTotal', (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int), 0) from jsonb_array_elements(lines) l where l->>'kind' in ('ticket','bundle')),
     'addonsTotal', (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int), 0) from jsonb_array_elements(lines) l where l->>'kind' = 'addon'),
     'processing', proc, 'processingFee', pfx, 'platformFee', pfee, 'credit', cr, 'total', pre - cr + proc, 'promoErr', err,
@@ -805,6 +1004,7 @@ begin
     slot := (select x from jsonb_array_elements(ev.data->'timeSlots') x where x->>'id' = it->>'slotId');
     if slot is null then raise exception 'Pick a time slot'; end if;
     if not manual and (coalesce((slot->>'hidden')::boolean, false) or coalesce((slot->>'unavailable')::boolean, false) or coalesce((slot->>'soldOut')::boolean, false)) then raise exception 'That showtime is not available'; end if;
+    if not manual and window_msg(ev, slot, '') <> '' then raise exception '%', window_msg(ev, slot, ''); end if;   -- Stage 10: per-showtime sale window
     sk := 'sl:' || ev.id || (slot->>'id'); pend := pend || jsonb_build_object(sk, coalesce((pend->>sk)::int, 0) + n);
     if coalesce((slot->>'capacity')::int, 0) > 0 and coalesce((av->'slots'->>(slot->>'id'))::int, 0) + (pend->>sk)::int > (slot->>'capacity')::int then raise exception 'That time slot is full'; end if;
   end if;
@@ -818,6 +1018,7 @@ begin
     if av->'seats' ? key or coalesce(pend->'seats','[]') ? (ev.id || key) then raise exception '% was just taken', seat_text(ev, s); end if;
     blk := seat_blocker(ev.id, coalesce(it->>'slotId',''), s, tok, manual);   -- staff may sell a seat they're holding
     if blk is not null then raise exception '% %', seat_text(ev, s), case when blk = 'checkout' then 'is being held by another buyer — try again in a few minutes' else 'is unavailable' end; end if;
+    if not manual and window_msg(ev, null, ev.data->'seating'->'meta'->s->>0) <> '' then raise exception '%', window_msg(ev, null, ev.data->'seating'->'meta'->s->>0); end if;   -- per-area window
     pend := pend || jsonb_build_object('seats', coalesce(pend->'seats','[]') || to_jsonb(ev.id || key));
     pend := jsonb_set(pend, array[mk, 'areas'], coalesce(pend->mk->'areas','[]') || to_jsonb(coalesce(ev.data->'seating'->'meta'->s->>0, '')));
   end loop;
@@ -866,7 +1067,7 @@ begin
 end $$;
 -- One direct-link-only (or public) event by its URL. Hidden / scheduled / archived events return nothing.
 create or replace function event_by_slug(p_slug text) returns jsonb language sql stable security definer set search_path = public as $$
-  select jsonb_build_object('id', e.id, 'box_office_id', e.box_office_id, 'slug', e.slug, 'status', e.status, 'data', e.data, 'created_at', e.created_at)
+  select jsonb_build_object('id', e.id, 'box_office_id', e.box_office_id, 'slug', e.slug, 'status', e.status, 'data', e.data, 'controls', e.controls, 'created_at', e.created_at)
   from events e where e.slug = p_slug and event_live(e);
 $$;
 drop function if exists track_view(uuid, text, text);
@@ -916,6 +1117,7 @@ declare
   bo box_offices%rowtype; email text := lower(trim(coalesce(p->'buyer'->>'email',''))); seated boolean; tts text[]; pos jsonb; gaps text[]; all_seats text[]; with_t boolean;
   f jsonb; err text; promo jsonb; promo_code text; tracking text; q jsonb; status text; total bigint; prev orders%rowtype; cr credits%rowtype; cap bigint;
   oid uuid; okey uuid; oref text; l jsonb; c int; u int; j int; adm int; per int; d bigint; w bigint[]; fs bigint[]; ps bigint[]; ds bigint[]; extras jsonb; by_ text;
+  req jsonb; acc jsonb := '[]'; ckf jsonb; flags jsonb := '[]'; nrec int; blocked text; pl jsonb := (select data from platform_settings where id = 1);
 begin
   p := p - 'creditAvail';   -- only this function decides how much credit applies
   if coalesce(trim(p->'buyer'->>'name'),'') = '' then raise exception 'Name is required'; end if;
@@ -943,6 +1145,8 @@ begin
       if nullif(ev.data->>'salesStart','') is not null and (ev.data->>'salesStart')::timestamptz > now() then raise exception 'Tickets go on sale %', ev.data->>'salesStart'; end if;
       if nullif(ev.data->>'salesEnd','') is not null and (ev.data->>'salesEnd')::timestamptz < now() then raise exception 'Sales have ended'; end if;
       if coalesce(ev.secrets->>'password','') <> '' and coalesce(p->'unlock'->>(ev.id::text),'') <> ev.secrets->>'password' then raise exception 'This event needs a password'; end if;
+      blocked := control_block(ev, 'checkout'); if blocked <> '' then raise exception '%', blocked; end if;   -- Stage 10 emergency controls
+      if coalesce((ev.data->'queue'->>'on')::boolean, false) and not queue_pass(ev, tok) then raise exception 'Please join the waiting room for this event first'; end if;
     end if;
   end loop;
 
@@ -1027,6 +1231,20 @@ begin
     if coalesce((tt->>'qty')::int, 0) > 0 and n + (pend->>k)::int > (tt->>'qty')::int then raise exception 'Only % % left', greatest(0, (tt->>'qty')::int - n), tt->>'name'; end if;
   end loop;
 
+  -- Stage 10 abuse protection: honeypot, banned customers, request rate (per address), order velocity (per email) → stop; the rest → review flags
+  if not manual then
+    if coalesce(p->'bot'->>'hp', '') <> '' then raise exception 'Checkout failed — please try again'; end if;
+    if exists(select 1 from bans z where z.box_office_id = bo.id and z.email = lower(trim(coalesce(p->'buyer'->>'email',''))) and z.removed_at is null) then
+      perform log_action(bo.id, 'fraud.banned', 'Blocked an order from banned customer ' || email); raise exception 'We can''t take this order. Please contact the box office.'; end if;
+    if not rate_hit('order:' || client_ip(), 20, 60) then raise exception 'Too many checkout attempts — please wait a minute and try again'; end if;
+    select count(*) into nrec from orders z where z.box_office_id = bo.id and z.buyer_email = email and order_counts(z) and z.created_at > now() - interval '1 hour';
+    if nrec >= 15 then raise exception 'Too many orders from this email in a short time — please contact the box office'; end if;
+    if (select count(*) from orders z where z.box_office_id = bo.id and z.buyer_email = email and z.created_at > now() - interval '1 hour') >= 2 then flags := flags || '"velocity"'; end if;
+    if exists(select 1 from orders z where z.box_office_id = bo.id and z.buyer_email = email and z.status = 'paid' and z.created_at > now() - interval '15 minutes'
+      and line_sig(z.data->'lines') = line_sig(p->'items')) then flags := flags || '"duplicate"'; end if;
+    if (select coalesce(sum((i2->>'qty')::int), 0) from jsonb_array_elements(coalesce(p->'items','[]')) i2) >= 20 then flags := flags || '"bulk"'; end if;
+    if coalesce((p->'bot'->>'wd')::boolean, false) or (coalesce((p->'bot'->>'ms')::numeric, 0) > 0 and (p->'bot'->>'ms')::numeric < 2500) then flags := flags || '"bot"'; end if;
+  end if;
   -- promo / tracking code — one box office, one code namespace; a stale tracking link never blocks a sale
   if coalesce(p->>'code','') <> '' and not is_comp then
     f := find_code(bo.id, p->>'code');
@@ -1064,12 +1282,22 @@ begin
       (select coalesce(jsonb_object_agg(e, n2), '{}') from (select ln->>'eventId' e, sum(case when ln->>'kind' = 'ticket' then (ln->>'qty')::int * coalesce(nullif((ln->>'admits')::int, 0), 1)
         when ln->>'kind' = 'bundle' then jsonb_array_length(coalesce(ln->'tts','[]')) else 0 end) n2 from jsonb_array_elements(q->'lines') ln group by 1) z));
     if err <> '' then raise exception '%', err; end if;
+    -- Stage 10: the event's checkout form (strictest of box office + events) and the current policies, accepted at their current versions
+    ckf := checkout_for(st, ev_ids);
+    if ckf->>'phone' = 'required' and norm_phone(p->'buyer'->>'phone') is null then raise exception 'A mobile number is required'; end if;
+    if ckf->>'address' = 'required' and coalesce(trim(p->'buyer'->>'address'), '') = '' then raise exception 'An address is required'; end if;
+    req := policies_for(bo, ev_ids); f := policy_check(req, p->'accepted');
+    if f ? 'error' then raise exception '%', f->>'error'; end if;
+    acc := f->'accepted';
+    insert into policy_texts(version, kind, title, text) select r2->>'version', r2->>'kind', r2->>'title', r2->>'text' from jsonb_array_elements(req) r2 on conflict do nothing;
+    if coalesce((p->>'donation')::numeric, 0) > 0 and (not coalesce((st->>'donations')::boolean, true)
+       or exists(select 1 from events e where e.id = any(ev_ids) and coalesce((e.data->'donation'->>'off')::boolean, false))) then raise exception 'Donations are not offered for this event'; end if;
   end if;
   if is_comp then  -- complimentary: real ticket type + face value kept, $0 collected
     if not manual then raise exception 'not allowed'; end if;
     foreach x in array ev_ids::text[] loop if not has_perm(bo.id, 'tickets.comps', x::uuid) then raise exception 'You don''t have permission to issue complimentary tickets'; end if; end loop;
     q := q || jsonb_build_object('lines', (select coalesce(jsonb_agg(ln || '{"unit":0,"fee":0,"unitFee":0,"comp":true}'::jsonb order by o), '[]') from jsonb_array_elements(q->'lines') with ordinality z(ln, o)),
-      'subtotal', 0, 'ticketsTotal', 0, 'addonsTotal', 0, 'discount', 0, 'feeDiscount', 0, 'fee', 0, 'serviceFee', 0, 'tax', 0, 'donation', 0, 'processing', 0, 'processingFee', 0, 'platformFee', 0, 'total', 0);
+      'subtotal', 0, 'ticketsTotal', 0, 'addonsTotal', 0, 'discount', 0, 'feeDiscount', 0, 'fee', 0, 'serviceFee', 0, 'otherFee', 0, 'otherFees', '[]'::jsonb, 'tax', 0, 'donation', 0, 'processing', 0, 'processingFee', 0, 'platformFee', 0, 'total', 0);
   end if;
   total := (q->>'total')::bigint;
   -- how it's paid: free and staff orders are paid now; a card checkout waits for the processor (tickets only after it confirms); pay-later reserves
@@ -1077,6 +1305,8 @@ begin
     if p->>'payment' = 'card' then
       if coalesce((st->'payments'->>'card')::boolean, true) = false or coalesce(bo.gateway->>'status','') <> 'connected'
          or not exists(select 1 from payment_accounts a where a.box_office_id = bo.id and a.status = 'connected') then raise exception 'Card payments are not set up for this box office yet'; end if;
+      if coalesce((bo.gateway->>'disabled')::boolean, false) then raise exception 'Card payments are paused by the box office right now'; end if;   -- emergency: processor off
+      if coalesce(pl->'gatewaysOff', '[]') ? (bo.gateway->>'provider') then raise exception 'Card payments are paused right now — please try again shortly'; end if;
     elsif p->>'payment' = 'offline' then
       if coalesce((st->'payments'->>'offline')::boolean, true) = false then raise exception 'Pay later is not available for this box office'; end if;
     else raise exception 'Choose a payment method'; end if;
@@ -1089,7 +1319,9 @@ begin
          when manual and total > 0 then jsonb_build_object('provider', 'manual', 'method', case when p->>'payMethod' in ('cash','terminal','check','transfer','other') then p->>'payMethod' else 'other' end,
            'ref', left(coalesce(p->>'payRef',''), 80), 'by', me_email()) end,
     jsonb_build_object('buyer', p->'buyer', 'lines', q->'lines', 'subtotal', q->'subtotal', 'ticketsTotal', q->'ticketsTotal', 'addonsTotal', q->'addonsTotal', 'discount', q->'discount',
-      'feeDiscount', q->'feeDiscount', 'fee', q->'fee', 'serviceFee', q->'serviceFee', 'tax', q->'tax', 'donation', q->'donation', 'processing', q->'processing', 'processingFee', q->'processingFee',
+      'feeDiscount', q->'feeDiscount', 'fee', q->'fee', 'serviceFee', q->'serviceFee', 'otherFee', coalesce(q->'otherFee', '0'), 'otherFees', coalesce(q->'otherFees', '[]'), 'tax', q->'tax', 'donation', q->'donation',
+      'donationFor', case when coalesce((q->>'donation')::bigint, 0) > 0 then coalesce((select e.data->'donation'->>'purpose' from events e where e.id = any(ev_ids) and coalesce(e.data->'donation'->>'purpose', '') <> '' limit 1), nullif(st->>'donationPurpose', ''), '') end,
+      'processing', q->'processing', 'processingFee', q->'processingFee', 'accepted', acc, 'flags', flags,
       'total', total, 'refunded', 0, 'faceValue', q->'faceValue', 'code', promo->>'code', 'promo', case when promo is null then null else jsonb_build_object('id', promo->>'id', 'code', promo_code) end,
       'tracking', tracking, 'payment', case when total = 0 then case when coalesce((q->>'credit')::bigint, 0) > 0 then 'credit' else 'free' end else p->>'payment' end,
       'credit', case when coalesce((q->>'credit')::bigint, 0) > 0 then jsonb_build_object('id', cr.id, 'code', cr.code, 'amount', (q->>'credit')::bigint) end, 'answers', coalesce(p->'answers','{}'), 'ticketAnswers', coalesce(p->'ticketAnswers','{}'),
@@ -1116,8 +1348,8 @@ end $$;
 -- what quote() needs for one box office: its settings + the platform fee (per-box-office override) + its processor's card rate
 create or replace function pricing_settings(b box_offices) returns jsonb language sql stable security definer set search_path = public as $$
   select coalesce(b.settings, '{}') || jsonb_build_object(
-    'platform', jsonb_build_object('pct', coalesce(nullif(b.platform_fee->>'pct','')::numeric, (pl.data->>'feePct')::numeric, 0),
-                                   'fixed', coalesce(nullif(b.platform_fee->>'fixed','')::bigint, (pl.data->>'feeFixed')::bigint, 0),
+    'platform', jsonb_build_object('pct', coalesce(nullif(b.platform_fee->>'pct','')::numeric, nullif(plan_of(pl.data, b.plan)->>'feePct', '')::numeric, (pl.data->>'feePct')::numeric, 0),
+                                   'fixed', coalesce(nullif(b.platform_fee->>'fixed','')::bigint, nullif(plan_of(pl.data, b.plan)->>'feeFixed', '')::numeric::bigint, (pl.data->>'feeFixed')::bigint, 0),
                                    'payer', coalesce(nullif(b.platform_fee->>'payer',''), pl.data->>'feePayer', 'organizer')),
     'card', jsonb_build_object('pct', coalesce((a.data->>'pct')::numeric, case a.provider when 'stripe' then 2.9 else 0 end),
                                'fixed', coalesce((a.data->>'fixed')::bigint, case a.provider when 'stripe' then 30 else 0 end),
@@ -1207,6 +1439,7 @@ begin
   select * into o from orders where id = p_order for update;
   if not found then raise exception 'Order not found'; end if;
   if o.status = 'paid' then return 'already'; end if;
+  insert into pay_attempts(box_office_id, order_id, ok) values (o.box_office_id, o.id, true);   -- payment-attempt monitoring (Stage 10)
   if coalesce((p->>'amount')::bigint, -1) <> (o.data->>'total')::bigint then
     update orders set payment = coalesce(payment, '{}') || jsonb_build_object('mismatch', p) where id = o.id; return 'mismatch'; end if;
   if o.status in ('cancelled','refunded') then clash := true;
@@ -1236,9 +1469,16 @@ create or replace function reserved_units_of(o orders) returns table(ev text, tt
   from jsonb_array_elements(o.data->'lines') l, generate_series(1, case when l->>'kind' = 'ticket' then (l->>'qty')::int * coalesce(nullif((l->>'admits')::int, 0), 1)
     when l->>'kind' = 'bundle' then jsonb_array_length(coalesce(l->'tts','[]')) else 0 end) g $$;
 -- a declined / failed attempt (webhook): recorded on the order; the buyer may retry until the checkout expires
-create or replace function record_payment_attempt(p_order uuid, p jsonb) returns void language sql security definer set search_path = public as $$
+create or replace function record_payment_attempt(p_order uuid, p jsonb) returns void language plpgsql security definer set search_path = public as $$
+declare o orders%rowtype;
+begin
   update orders set payment = jsonb_set(coalesce(payment, '{}'), '{attempts}', coalesce(payment->'attempts', '[]') || jsonb_build_array(p || jsonb_build_object('at', now())))
-  where id = p_order and status = 'awaiting_payment' $$;
+  where id = p_order and status = 'awaiting_payment' returning * into o;
+  if not found then return; end if;
+  insert into pay_attempts(box_office_id, order_id, ok) values (o.box_office_id, o.id, coalesce((p->>'ok')::boolean, false));   -- payment-attempt monitoring (Stage 10)
+  if (select count(*) from jsonb_array_elements(o.payment->'attempts') a where not coalesce((a->>'ok')::boolean, false)) >= 3 and not coalesce(o.data->'flags', '[]') ? 'declines' then
+    update orders set data = jsonb_set(data, '{flags}', coalesce(data->'flags', '[]') || '"declines"') where id = o.id; end if;
+end $$;
 -- card checkouts that ran out of time release their seats / stock (run by pg_cron every minute; availability ignores them anyway)
 create or replace function expire_orders() returns int language plpgsql security definer set search_path = public as $$
 declare n int := 0; o orders%rowtype; l jsonb; s text;
@@ -1332,6 +1572,7 @@ begin
   insert into credits(box_office_id, code, email, name, amount, event_id, expires, source_order, source_ref, note, issued_by)
     values (p_bo, cd, em, left(coalesce(p->>'name', p_order.data->'buyer'->>'name', ''), 120), amt, nullif(p->>'eventId','')::uuid, nullif(p->>'expires','')::timestamptz,
       p_order.id, p_order.ref, left(coalesce(p->>'note', ''), 300), p_by) returning * into c;
+  perform emit_event(p_bo, 'credit.issued', jsonb_build_object('credit', c.code, 'email', c.email, 'amount', c.amount, 'event_id', c.event_id, 'expires', c.expires, 'order_ref', c.source_ref));
   return c;
 end $$;
 -- how much a refund request comes to. mode: full | tickets (+ their booking-fee share when fees) | fees | percent | amount
@@ -1561,7 +1802,8 @@ begin
     when 'collect' then has_perm(o.box_office_id, 'orders.edit', ev) when 'addAddon' then has_perm(o.box_office_id, 'orders.edit', ev) when 'removeAddon' then has_perm(o.box_office_id, 'orders.edit', ev)
     when 'customer' then has_perm(o.box_office_id, 'orders.customer', ev) when 'holder' then has_perm(o.box_office_id, 'orders.customer', ev)
     when 'note' then has_perm(o.box_office_id, 'orders.edit', ev) when 'message' then has_perm(o.box_office_id, 'comms.email', ev) when 'resend' then has_perm(o.box_office_id, 'orders.resend', ev)
-    when 'reissue' then has_perm(o.box_office_id, 'orders.edit', ev) when 'chargeback' then has_perm(o.box_office_id, 'orders.refund', ev) when 'cancel' then true else null end;
+    when 'reissue' then has_perm(o.box_office_id, 'orders.edit', ev) when 'chargeback' then has_perm(o.box_office_id, 'orders.refund', ev) when 'cancel' then true
+    when 'review' then has_perm(o.box_office_id, 'orders.edit', ev) else null end;
   if perm_ok is null then raise exception 'Unknown order action'; end if;
   if not perm_ok then raise exception 'You don''t have permission to do that'; end if;
   perform set_config('set.system', '1', true);   -- this function checks and logs the change itself
@@ -1687,6 +1929,10 @@ begin
     perform order_log_add(o, 'holder', format('ticket %s now in the name of %s (was %s)', t.code, nm, t.holder), by_, p->>'note', jsonb_build_object('ticket', t.code), jsonb_build_object('holder', t.holder), jsonb_build_object('holder', nm));
   elsif p_action = 'chargeback' then   -- Stage 9: a card dispute (the processor's webhook records them too, through record_dispute())
     res := record_chargeback(o.id, p, by_);
+  elsif p_action = 'review' then   -- Stage 10: a flagged order was looked at — genuine or fraud; the flags stay on record
+    if jsonb_array_length(coalesce(o.data->'flags', '[]')) = 0 then raise exception 'This order has no flags'; end if;
+    update orders set data = data || jsonb_build_object('review', jsonb_build_object('result', case when p->>'result' = 'fraud' then 'fraud' else 'ok' end, 'by', by_, 'at', now(), 'note', left(coalesce(p->>'note', ''), 300))) where id = o.id;
+    perform order_log_add(o, 'review', case when p->>'result' = 'fraud' then 'Flagged order confirmed as fraud' else 'Flags reviewed — order is genuine' end, by_, p->>'note', jsonb_build_object('flags', o.data->'flags'));
   elsif p_action = 'note' then
     body := trim(coalesce(p->>'body','')); if body = '' then raise exception 'Write a note'; end if;
     perform order_log_add(o, 'note', left(body, 500), by_, '');
@@ -1901,7 +2147,8 @@ begin
         name = case when d.renamed or coalesce(p->>'deviceName', '') = '' then d.name else left(p->>'deviceName', 60) end
       returning * into dv;
   end if;
-  res := case when coalesce(dv.disabled, false) then 'device_off' when t.id is null then 'unknown' when p_event is not null and t.event_id <> p_event then 'wrong_event' end;
+  res := case when coalesce(dv.disabled, false) then 'device_off' when p_event is not null and not p_undo and control_block(ev, 'scan') <> '' then 'paused'   -- Stage 10: scanning stopped
+    when t.id is null then 'unknown' when p_event is not null and t.event_id <> p_event then 'wrong_event' end;
   if res is null then
     if not has_perm(bo, case when p_undo then 'door.undo' else 'door.checkin' end, t.event_id) then raise exception 'You don''t have permission to do that'; end if;
     select * into o from orders where id = t.order_id; select * into te from events where id = t.event_id;
@@ -2094,7 +2341,20 @@ begin
     'expenseFinal', case when has_perm(b.id, 'finance.reports') or has_perm(b.id, 'finance.expenses') then coalesce((select jsonb_object_agg(x.event_id, jsonb_build_object('by', x.final_by, 'at', x.final_at)) from expense_status x
         where x.final and x.event_id = any(evs)), '{}') else '{}' end,
     'payouts', case when has_perm(b.id, 'finance.payouts') then coalesce((select jsonb_agg(to_jsonb(x) order by x.arrival_at desc) from payouts x where x.box_office_id = b.id), '[]') else '[]' end,
-    'procTx', case when has_perm(b.id, 'finance.payouts') then coalesce((select jsonb_agg(to_jsonb(x) order by x.at) from (select * from processor_tx y where y.box_office_id = b.id order by y.at desc limit 20000) x), '[]') else '[]' end);
+    'procTx', case when has_perm(b.id, 'finance.payouts') then coalesce((select jsonb_agg(to_jsonb(x) order by x.at) from (select * from processor_tx y where y.box_office_id = b.id order by y.at desc limit 20000) x), '[]') else '[]' end)
+  -- Stage 10: version history, banned customers, customer-service inbox, the platform's invoices + plans, accepted policy texts
+  || jsonb_build_object(
+    'versions', coalesce((select jsonb_agg(to_jsonb(v) order by v.at desc) from (select * from versions y where y.box_office_id = b.id
+        and (case when y.kind = 'event' then y.target = any(evs) and has_perm(b.id, 'events.edit', y.target) else has_perm(b.id, 'admin.settings') end) order by y.at desc limit 400) v), '[]'),
+    'bans', case when has_perm(b.id, 'customers.ban') or has_perm(b.id, 'customers.profiles') then coalesce((select jsonb_agg(to_jsonb(x) || case when P_emails then '{}'::jsonb else jsonb_build_object('email', mask_email(x.email)) end order by x.at desc)
+        from bans x where x.box_office_id = b.id), '[]') else '[]' end,
+    'inbox', case when has_perm(b.id, 'customers.inbox') then coalesce((select jsonb_agg(to_jsonb(x) || case when P_emails then '{}'::jsonb else jsonb_build_object('email', mask_email(x.email)) end order by x.at desc)
+        from (select * from support_messages y where y.box_office_id = b.id and (y.event_id is null or y.event_id = any(evs)) order by y.at desc limit 500) x), '[]') else '[]' end,
+    'invoices', case when has_perm(b.id, 'admin.settings') then coalesce((select jsonb_agg(to_jsonb(x) order by x.issued_at desc) from platform_invoices x where x.box_office_id = b.id), '[]') else '[]' end,
+    'plans', coalesce((select data->'planList' from platform_settings where id = 1), '[]'),
+    'platform', (select jsonb_build_object('feePct', data->'feePct', 'feeFixed', data->'feeFixed', 'feePayer', data->'feePayer', 'domainTarget', data->'domainTarget', 'defaultPlan', data->'defaultPlan') from platform_settings where id = 1),
+    'policyTexts', case when has_perm(b.id, 'orders.view') then coalesce((select jsonb_object_agg(p.version, jsonb_build_object('kind', p.kind, 'title', p.title, 'text', p.text, 'first_at', p.first_at)) from policy_texts p
+        where exists(select 1 from orders o, jsonb_array_elements(coalesce(o.data->'accepted', '[]')) a where o.box_office_id = b.id and a->>'version' = p.version)), '{}') else '{}' end);
 end $$;
 
 create or replace function transfer_ownership(p_bo uuid, p_email text) returns void language plpgsql security definer set search_path = public as $$
@@ -2125,7 +2385,22 @@ begin
         'staff', (select count(*) from members m where m.box_office_id = b.id and m.status = 'active'),
         'lastSale', (select max(created_at) from orders o where o.box_office_id = b.id)))) from box_offices b), '[]'),
     'audit', coalesce((select jsonb_agg(to_jsonb(a)) from (select * from audit_log order by at desc limit 600) a), '[]'),
-    'orders', coalesce((select jsonb_agg(jsonb_build_object('box_office_id', box_office_id, 'status', status, 'created_at', created_at, 'total', (data->>'total')::bigint, 'platformFee', coalesce((data->>'platformFee')::bigint, 0))) from orders), '[]'));
+    'orders', coalesce((select jsonb_agg(jsonb_build_object('box_office_id', box_office_id, 'status', status, 'created_at', created_at, 'paid_at', paid_at, 'total', (data->>'total')::bigint, 'platformFee', coalesce((data->>'platformFee')::bigint, 0),
+        'provider', payment->>'provider', 'marked', payment ? 'markedPaidBy')) from orders), '[]'))
+  -- Stage 10: every event, every staff member, risk, incidents, errors, invoices and system health
+  || jsonb_build_object(
+    'events', coalesce((select jsonb_agg(jsonb_build_object('id', e.id, 'box_office_id', e.box_office_id, 'bo', b.name, 'name', e.data->>'name', 'slug', e.slug, 'start', e.data->>'start', 'status', e.status,
+        'archived', coalesce((e.data->>'archived')::boolean, false), 'visibility', e.data->>'visibility', 'controls', e.controls,
+        'tickets', (select count(*) from tickets t where t.event_id = e.id and t.status = 'valid')) order by e.data->>'start') from events e join box_offices b on b.id = e.box_office_id), '[]'),
+    'staff', coalesce((select jsonb_agg(jsonb_build_object('email', m.email, 'name', m.name, 'box_office_id', m.box_office_id, 'bo', b.name, 'template', m.template, 'owner', b.owner = m.email,
+        'last', (select max(at) from audit_log a where a.actor = m.email and a.kind = 'auth.login'))) from members m join box_offices b on b.id = m.box_office_id where m.status = 'active'), '[]'),
+    'flagged', coalesce((select jsonb_agg(jsonb_build_object('id', o.id, 'ref', o.ref, 'box_office_id', o.box_office_id, 'bo', b.name, 'email', mask_email(o.buyer_email), 'flags', o.data->'flags', 'total', o.data->'total',
+        'status', o.status, 'created_at', o.created_at, 'review', o.data->'review') order by o.created_at desc) from orders o join box_offices b on b.id = o.box_office_id where jsonb_array_length(coalesce(o.data->'flags', '[]')) > 0), '[]'),
+    'bans', (select count(*) from bans where removed_at is null),
+    'incidents', coalesce((select jsonb_agg(to_jsonb(i) order by i.started_at desc) from incidents i), '[]'),
+    'errors', coalesce((select jsonb_agg(to_jsonb(x) - 'ip' order by x.at desc) from (select * from error_log order by at desc limit 300) x), '[]'),
+    'invoices', coalesce((select jsonb_agg(to_jsonb(x) || jsonb_build_object('bo_name', b.name) order by x.issued_at desc) from platform_invoices x join box_offices b on b.id = x.box_office_id), '[]'),
+    'health', platform_health());
 end $$;
 
 create or replace function platform_save(p jsonb) returns void language plpgsql security definer set search_path = public as $$
@@ -2718,10 +2993,13 @@ begin
   return (select to_jsonb(x) from outbox x where x.id = p_id);
 end $$;
 create or replace function create_api_key(p_bo uuid, p_name text, p_scopes text[]) returns jsonb language plpgsql security definer set search_path = public as $$
-declare k text := 'set_live_' || replace(gen_random_uuid()::text, '-', '') || left(replace(gen_random_uuid()::text, '-', ''), 8); r api_keys%rowtype; sc text[] := array(select s from unnest(p_scopes) s where s in ('events:read', 'orders:read', 'tickets:read', 'customers:read'));
+declare k text := 'set_live_' || replace(gen_random_uuid()::text, '-', '') || left(replace(gen_random_uuid()::text, '-', ''), 8); r api_keys%rowtype; sc text[] := array(select s from unnest(p_scopes) s where s in ('events:read', 'orders:read', 'tickets:read', 'customers:read', 'seating:read', 'checkins:read', 'products:read', 'finance:read', 'reports:read'));
 begin
   if not has_perm(p_bo, 'admin.api') then raise exception 'You don''t have permission to do that'; end if;
   if cardinality(sc) = 0 then raise exception 'Choose what the key may read'; end if;
+  -- Stage 10: a key can't read more than its creator may
+  if exists(select 1 from unnest(sc) x where not has_perm(p_bo, case x when 'events:read' then 'events.view' when 'orders:read' then 'orders.view' when 'tickets:read' then 'tickets.view' when 'customers:read' then 'customers.profiles'
+    when 'seating:read' then 'seating.view' when 'checkins:read' then 'door.log' when 'products:read' then 'events.view' else 'finance.reports' end)) then raise exception 'You can''t give a key access you don''t have yourself'; end if;
   insert into api_keys(box_office_id, name, prefix, hash, scopes, created_by) values (p_bo, left(coalesce(nullif(trim(p_name), ''), 'API key'), 80), left(k, 13), encode(sha256(convert_to(k, 'UTF8')), 'hex'), sc, me_email()) returning * into r;
   perform log_action(p_bo, 'admin.api', format('Created API key “%s” (%s)', r.name, array_to_string(sc, ', ')));
   return to_jsonb(r) - 'hash' || jsonb_build_object('key', k);   -- shown once; only the hash is kept
@@ -2751,12 +3029,13 @@ end $$;
 /* ── the sender (messaging Edge Function, service role only) ── */
 -- what an email / text needs to be rendered: box office branding, the event, the order (incl. its private ticket link) and its valid tickets
 create or replace function msg_context(m outbox) returns jsonb language sql stable security definer set search_path = public as $$
-  select jsonb_build_object('bo', jsonb_build_object('id', b.id, 'name', b.name, 'slug', b.slug, 'branding', b.branding, 'mail', coalesce(b.settings->'mail', '{}'), 'domain', b.branding->>'domain'),
+  select jsonb_build_object('bo', jsonb_build_object('id', b.id, 'name', b.name, 'slug', b.slug, 'branding', b.branding, 'mail', coalesce(b.settings->'mail', '{}'), 'domain', b.domain->>'host',
+      'mailDomain', case when b.mail_domain->>'status' = 'verified' then b.mail_domain->>'domain' end, 'terms', b.settings->>'terms'),
     'event', (select jsonb_build_object('id', e.id, 'slug', e.slug, 'name', e.data->>'name', 'start', e.data->>'start', 'end', e.data->>'end', 'doors', e.data->>'doors', 'venue', e.data->>'venue',
         'address', e.data->>'address', 'timezone', e.data->>'timezone', 'confirmation', e.data->'emails'->>'confirmation', 'timeSlots', e.data->'timeSlots') from events e where e.id = coalesce(m.event_id, o.event_ids[1])),
     'order', case when o.id is null then null else jsonb_build_object('id', o.id, 'key', o.access_key, 'ref', o.ref, 'total', o.data->'total', 'currency', o.data->'currency', 'buyer', o.data->'buyer',
       'events', (select jsonb_agg(jsonb_build_object('id', e.id, 'name', e.data->>'name', 'start', e.data->>'start', 'venue', e.data->>'venue', 'address', e.data->>'address',
-        'confirmation', e.data->'emails'->>'confirmation')) from events e where e.id = any(o.event_ids))) end,
+        'confirmation', e.data->'emails'->>'confirmation', 'email', e.data->'emails'->'confirm', 'policies', e.data->>'policies', 'contact', e.data->'contact')) from events e where e.id = any(o.event_ids))) end,
     'tickets', coalesce((select jsonb_agg(jsonb_build_object('event_id', t.event_id, 'slot_id', t.slot_id, 'type', (select tt->>'name' from events e, jsonb_array_elements(e.data->'ticketTypes') tt where e.id = t.event_id and tt->>'id' = t.ticket_type_id),
         'area', t.area, 'row', t."row", 'seat', coalesce(t.seat_label, t.seat), 'unit', t.unit, 'code', t.code, 'holder', t.holder) order by t.issued_at) from tickets t where t.order_id = o.id and t.status = 'valid'), '[]'),
     'contact', (select jsonb_build_object('name', c.name, 'token', c.token) from contacts c where c.box_office_id = m.box_office_id and c.email = m.email))
@@ -2782,6 +3061,11 @@ begin
   if p_ok then update outbox set status = 'sent', sent_at = now(), provider = p_provider, provider_id = p_provider_id, error = null, locked_until = null where id = p_id;
   else update outbox set status = case when p_permanent or attempts >= 5 then 'failed' else 'queued' end, error = left(p_error, 500), provider = p_provider, locked_until = null,
     send_at = now() + make_interval(mins => power(2, least(attempts, 6))::int) where id = p_id; end if;
+  -- Stage 10 failed-email notifications: once a day per box office, staff hear that emails failed (Marketing → Messages has the details + Retry)
+  perform queue_msg(jsonb_build_object('box_office_id', m.box_office_id, 'to', coalesce(nullif(b.settings->'mail'->>'alerts', ''), nullif(b.settings->>'contactEmail', ''), b.owner), 'kind', 'staff', 'category', 'staff',
+      'dedupe', 'mailfail:' || m.box_office_id || ':' || current_date, 'by', 'system', 'subject', 'Some emails could not be delivered',
+      'body', 'Emails failed to send today. See Marketing → Messages (filter: Failed) to check the address and retry.'))
+    from outbox m join box_offices b on b.id = m.box_office_id where m.id = p_id and m.status = 'failed' and m.category <> 'staff';
 end $$;
 create or replace function claim_deliveries(p_limit int default 50) returns jsonb language plpgsql security definer set search_path = public as $$
 declare d deliveries%rowtype; g integrations%rowtype; out jsonb := '[]';
@@ -2830,7 +3114,11 @@ begin
   insert into api_usage(key_id, minute, n) values (k.id, date_trunc('minute', now()), 1) on conflict (key_id, minute) do update set n = api_usage.n + 1 returning api_usage.n into n;
   update api_keys set last_used_at = now() where id = k.id and (last_used_at is null or last_used_at < now() - interval '1 minute');
   delete from api_usage where key_id = k.id and minute < now() - interval '1 hour';
-  return jsonb_build_object('key_id', k.id, 'box_office_id', k.box_office_id, 'scopes', to_jsonb(k.scopes), 'limited', n > 120);
+  -- Stage 10: a key is only as strong as its creator — each scope needs the creator's own permission, checked again on every call
+  return jsonb_build_object('key_id', k.id, 'box_office_id', k.box_office_id, 'limited', n > 120, 'scopes', coalesce((select jsonb_agg(sc) from unnest(k.scopes) sc
+    where exists(select 1 from members m join box_offices b on b.id = m.box_office_id where m.box_office_id = k.box_office_id and m.email = k.created_by and m.status = 'active' and b.status = 'active'
+      and (b.owner = m.email or (case sc when 'events:read' then 'events.view' when 'orders:read' then 'orders.view' when 'tickets:read' then 'tickets.view' when 'customers:read' then 'customers.profiles'
+        when 'seating:read' then 'seating.view' when 'checkins:read' then 'door.log' when 'products:read' then 'events.view' when 'finance:read' then 'finance.reports' when 'reports:read' then 'finance.reports' end) = any(m.perms)))), '[]'));
 end $$;
 create or replace function api_read(p_bo uuid, p_resource text, p_since timestamptz default null, p_limit int default 100) returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare lim int := least(greatest(coalesce(p_limit, 100), 1), 500);
@@ -2845,6 +3133,23 @@ begin
         'status', t.status, 'face', t.face, 'paid', t.paid, 'comp', t.comp, 'checked_in_at', t.checked_in_at, 'issued_at', t.issued_at) order by t.issued_at), '[]')
       from (select * from tickets t where t.box_office_id = p_bo and (p_since is null or t.touched_at >= p_since) order by t.issued_at limit lim) t)
     when 'customers' then (select coalesce(jsonb_agg(to_jsonb(c) - 'token' - 'id' order by c.created_at), '[]') from (select * from contacts c where c.box_office_id = p_bo and (p_since is null or c.updated_at >= p_since) order by c.created_at limit lim) c)
+    -- Stage 10 resources
+    when 'seating' then (select coalesce(jsonb_agg(jsonb_build_object('event_id', e.id, 'name', e.data->>'name', 'seats', (select count(*) from jsonb_object_keys(coalesce(e.data->'seating'->'meta', '{}'))),
+        'sold', (select count(*) from tickets t where t.event_id = e.id and t.status = 'valid' and t.seat is not null),
+        'statuses', (select coalesce(jsonb_agg(jsonb_build_object('seat', s.seat, 'slot_id', s.slot_id, 'status', s.status)), '[]') from seat_status s where s.event_id = e.id and s.status <> 'checkout'),
+        'created_at', e.created_at)), '[]') from (select * from events e where e.box_office_id = p_bo and coalesce((e.data->'seating'->>'enabled')::boolean, false) and (p_since is null or e.updated_at >= p_since) order by e.created_at limit lim) e)
+    when 'checkins' then (select coalesce(jsonb_agg(jsonb_build_object('at', x.at, 'event_id', x.event_id, 'ticket_id', x.ticket_id, 'result', x.result, 'entrance', x.entrance, 'device', x.device_name, 'manual', x.manual) order by x.at), '[]')
+      from (select * from scan_log x where x.box_office_id = p_bo and (p_since is null or x.at >= p_since) order by x.at limit lim) x)
+    when 'products' then (select coalesce(jsonb_agg(jsonb_build_object('event_id', e.id, 'event', e.data->>'name', 'products', coalesce(e.data->'addons', '[]'), 'packages', coalesce(e.data->'bundles', '[]'), 'created_at', e.created_at)), '[]')
+      from (select * from events e where e.box_office_id = p_bo and (p_since is null or e.updated_at >= p_since) order by e.created_at limit lim) e)
+    when 'finance' then (select coalesce(jsonb_agg(jsonb_build_object('order_id', o.id, 'ref', o.ref, 'status', o.status, 'paid_at', o.paid_at, 'money', order_money(o),
+        'breakdown', jsonb_build_object('tickets', o.data->'ticketsTotal', 'products', o.data->'addonsTotal', 'discount', o.data->'discount', 'fee', o.data->'fee', 'otherFee', o.data->'otherFee', 'tax', o.data->'tax',
+          'donation', o.data->'donation', 'processing', o.data->'processing', 'total', o.data->'total'), 'created_at', o.created_at) order by o.created_at), '[]')
+      from (select * from orders o where o.box_office_id = p_bo and o.status not in ('awaiting_payment', 'expired') and (p_since is null or o.created_at >= p_since) order by o.created_at limit lim) o)
+    when 'reports' then (select coalesce(jsonb_agg(jsonb_build_object('event_id', e.id, 'name', e.data->>'name', 'start', e.data->>'start',
+        'tickets', (select count(*) from tickets t where t.event_id = e.id and t.status = 'valid'), 'checked_in', (select count(*) from tickets t where t.event_id = e.id and t.status = 'valid' and t.checked_in_at is not null),
+        'face', (select coalesce(sum(t.face), 0) from tickets t where t.event_id = e.id and t.status = 'valid'), 'collected', (select coalesce(sum(t.paid + t.fee + t.tax), 0) from tickets t where t.event_id = e.id and t.status <> 'replaced'),
+        'created_at', e.created_at)), '[]') from (select * from events e where e.box_office_id = p_bo and (p_since is null or e.created_at >= p_since) order by e.created_at limit lim) e)
     else null end;
 end $$;
 -- outside systems hear when a published event changes (date, venue, …)
@@ -3101,3 +3406,264 @@ update events set secrets = secrets - 'discounts' where secrets ? 'discounts';
 
 -- First platform owner. Create box offices from #/platform after signing in.
 insert into platform_admins(email) values ('moishsonn@gmail.com') on conflict do nothing;
+
+-- ═══ Stage 10: platform owner, security, infrastructure, event controls (see the Stage 10 block in data.js for the browser side) ═══════════
+-- emergency controls: pause sales / checkout / scanning, maintenance mode — immediate, audited, nothing else about the event changes
+create or replace function event_control(p_event uuid, p jsonb) returns jsonb language plpgsql security definer set search_path = public as $$
+declare e events%rowtype; c jsonb; k text; what text := '';
+begin
+  select * into e from events where id = p_event for update; if not found then raise exception 'Event not found'; end if;
+  if not has_perm(e.box_office_id, 'events.controls', e.id) then raise exception 'You don''t have permission to do that (events.controls)'; end if;
+  c := e.controls;
+  foreach k in array array['salesPaused','checkoutPaused','scanPaused','maintenance'] loop
+    if p ? k then c := c || jsonb_build_object(k, coalesce((p->>k)::boolean, false));
+      if coalesce((e.controls->>k)::boolean, false) <> coalesce((p->>k)::boolean, false) then what := what || case when what = '' then '' else ', ' end || case when (p->>k)::boolean then '' else 'Undo: ' end || k; end if; end if;
+  end loop;
+  c := c || jsonb_build_object('message', left(coalesce(p->>'message', e.controls->>'message', ''), 300), 'at', now(), 'by', me_email());
+  perform set_config('set.controls', '1', true);
+  update events set controls = c where id = e.id;
+  perform log_action(e.box_office_id, 'event.controls', '“' || (e.data->>'name') || '”: ' || coalesce(nullif(what, ''), 'control message updated'), e.controls, c, e.id);
+  return c;
+end $$;
+-- waiting room: join (or check) — first come first served, `rate` people a minute, each pass lasts passMinutes
+create or replace function queue_status(p_event uuid, p_token text) returns jsonb language plpgsql security definer set search_path = public as $$
+declare e events%rowtype; q queue_entries%rowtype; gap interval; pass interval; last timestamptz; ahead int;
+begin
+  select * into e from events where id = p_event; if not found or not event_live(e) then raise exception 'Event not found'; end if;
+  if not coalesce((e.data->'queue'->>'on')::boolean, false) then return '{"on":false,"admitted":true}'; end if;
+  if coalesce(length(p_token), 0) not between 8 and 64 then raise exception 'bad token'; end if;
+  if not rate_hit('queue:' || p_token, 40, 60) or not rate_hit('queueip:' || client_ip(), 400, 60) then raise exception 'Slow down — your place is saved'; end if;
+  gap := make_interval(secs => 60.0 / greatest(1, coalesce(nullif(e.data->'queue'->>'rate', '')::numeric, 60)));
+  pass := make_interval(mins => greatest(5, coalesce(nullif(e.data->'queue'->>'passMinutes', '')::int, 30)));
+  perform pg_advisory_xact_lock(hashtext('queue:' || e.id));
+  select * into q from queue_entries where event_id = e.id and token = p_token;
+  if found and now() > q.admit_at + pass then delete from queue_entries where event_id = e.id and token = p_token; q := null; end if;   -- pass used up → back of the line
+  if q.token is null then
+    select max(admit_at) into last from queue_entries where event_id = e.id;
+    insert into queue_entries(event_id, token, admit_at) values (e.id, p_token, greatest(now(), coalesce(last, '-infinity') + gap)) returning * into q;
+  end if;
+  select count(*) into ahead from queue_entries where event_id = e.id and admit_at > now() and admit_at < q.admit_at;
+  return jsonb_build_object('on', true, 'admitted', q.admit_at <= now(), 'position', case when q.admit_at <= now() then 0 else ahead + 1 end, 'admit', q.admit_at, 'until', q.admit_at + pass,
+    'waiting', (select count(*) from queue_entries where event_id = e.id and admit_at > now()), 'joined', q.joined_at, 'message', coalesce(e.data->'queue'->>'message', ''),
+    'progress', case when q.admit_at <= now() then 1 else least(.99, greatest(0, extract(epoch from now() - q.joined_at) / greatest(1, extract(epoch from q.admit_at - q.joined_at)))) end);
+end $$;
+-- "Contact organizer": routed to the event's own contact / team, else the box office; staff get an email, the message lands in Customers → Inbox
+create or replace function contact_organizer(p_event uuid, p_bo uuid, p jsonb) returns jsonb language plpgsql security definer set search_path = public as $$
+declare e events%rowtype; b box_offices%rowtype; em text := lower(trim(coalesce(p->>'email', ''))); dest text; team text; sid uuid;
+begin
+  if p_event is not null then select * into e from events where id = p_event; end if;
+  select * into b from box_offices where id = coalesce(e.box_office_id, p_bo) and status = 'active'; if not found then raise exception 'Box office not found'; end if;
+  if coalesce(trim(p->>'name'), '') = '' or em !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'Enter your name and a valid email'; end if;
+  if length(trim(coalesce(p->>'body', ''))) < 5 then raise exception 'Write your message'; end if;
+  if not rate_hit('contact:' || em, 5, 3600) or not rate_hit('contactip:' || client_ip(), 20, 3600) then raise exception 'You''ve sent several messages already — the team will reply by email'; end if;
+  dest := lower(coalesce(nullif(e.data->'contact'->>'email', ''), nullif(b.settings->>'contactEmail', ''), b.owner));
+  team := coalesce(nullif(e.data->'contact'->>'team', ''), nullif(e.data->'contact'->>'name', ''), 'Box office');
+  insert into support_messages(box_office_id, event_id, name, email, ref, subject, body, routed_to, team)
+    values (b.id, e.id, left(trim(p->>'name'), 120), em, upper(left(trim(coalesce(p->>'ref', '')), 20)), left(trim(coalesce(p->>'subject', '')), 150), left(trim(p->>'body'), 4000), dest, team) returning id into sid;
+  perform queue_msg(jsonb_build_object('box_office_id', b.id, 'event_id', e.id, 'to', dest, 'kind', 'staff', 'category', 'staff', 'by', 'customer',
+    'subject', 'Customer message: ' || coalesce(nullif(trim(p->>'subject'), ''), e.data->>'name', b.name),
+    'body', format(E'From %s <%s>%s%s\n\n%s\n\nReply in SET (Customers → Inbox) or by email.', trim(p->>'name'), em, case when coalesce(p->>'ref', '') <> '' then ' · order ' || upper(p->>'ref') else '' end,
+      case when e.id is not null then ' · ' || (e.data->>'name') else '' end, left(trim(p->>'body'), 4000))));
+  return jsonb_build_object('routed', team);
+end $$;
+create or replace function support_action(p_id uuid, p_action text, p jsonb default '{}') returns void language plpgsql security definer set search_path = public as $$
+declare r support_messages%rowtype; v_body text := trim(coalesce(p->>'body', ''));
+begin
+  select * into r from support_messages where id = p_id for update; if not found or not has_perm(r.box_office_id, 'customers.inbox', r.event_id) then raise exception 'Message not found'; end if;
+  if p_action = 'reply' then
+    if v_body = '' then raise exception 'Write a reply'; end if;
+    if not has_perm(r.box_office_id, 'comms.email', r.event_id) then raise exception 'You don''t have permission to email customers'; end if;
+    perform queue_msg(jsonb_build_object('box_office_id', r.box_office_id, 'event_id', r.event_id, 'to', r.email, 'kind', 'message', 'category', 'transactional', 'by', me_email(), 'subject', 'Re: ' || coalesce(nullif(r.subject, ''), 'your message'), 'body', v_body));
+    update support_messages set replies = replies || jsonb_build_array(jsonb_build_object('at', now(), 'by', me_email(), 'body', left(v_body, 4000))), status = 'answered', handled_by = me_email(), handled_at = now() where id = r.id;
+  elsif p_action in ('close', 'reopen') then update support_messages set status = case when p_action = 'close' then 'closed' else 'open' end, handled_by = me_email(), handled_at = now() where id = r.id;
+  else raise exception 'Unknown action'; end if;
+  perform log_action(r.box_office_id, 'customers.inbox', format('Customer message from %s: %s', r.email, p_action), null, null, r.event_id);
+end $$;
+-- banned customers: can't buy from this box office (staff see the reason, the buyer sees "contact the box office")
+create or replace function ban_customer(p_bo uuid, p_email text, p_reason text) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not has_perm(p_bo, 'customers.ban') then raise exception 'You don''t have permission to ban customers'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Give a reason (only staff see it)'; end if;
+  if exists(select 1 from bans where box_office_id = p_bo and email = lower(trim(p_email)) and removed_at is null) then raise exception 'Already banned'; end if;
+  insert into bans(box_office_id, email, reason, by) values (p_bo, lower(trim(p_email)), left(trim(p_reason), 500), me_email());
+  perform log_action(p_bo, 'customers.ban', 'Banned ' || lower(trim(p_email)) || ' from buying', null, jsonb_build_object('reason', p_reason));
+end $$;
+create or replace function unban_customer(p_id uuid) returns void language plpgsql security definer set search_path = public as $$
+declare b bans%rowtype;
+begin
+  select * into b from bans where id = p_id and removed_at is null; if not found or not has_perm(b.box_office_id, 'customers.ban') then raise exception 'Ban not found'; end if;
+  update bans set removed_at = now(), removed_by = me_email() where id = p_id;
+  perform log_action(b.box_office_id, 'customers.ban', 'Removed the ban on ' || b.email);
+end $$;
+-- the exact policy text a buyer accepted (by version), for staff who can see orders
+create or replace function policy_texts(p_bo uuid, p_versions text[]) returns jsonb language sql stable security definer set search_path = public as $$
+  select case when has_perm(p_bo, 'orders.view') then coalesce((select jsonb_object_agg(version, jsonb_build_object('kind', kind, 'title', title, 'text', text, 'first_at', first_at)) from policy_texts where version = any(p_versions)), '{}') else '{}' end $$;
+-- error log: the browser reports its own errors (rate-limited); Edge Functions report theirs (service role)
+create or replace function log_client_error(p jsonb) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not rate_hit('err:' || client_ip(), 30, 60) then return; end if;
+  insert into error_log(source, "where", message, stack, url, box_office_id, actor, ip)
+  values ('client', left(coalesce(p->>'where', 'app'), 20), left(coalesce(p->>'message', 'error'), 300), left(p->>'stack', 1500), left(p->>'url', 120),
+    case when (p->>'bo') ~ '^[0-9a-f-]{36}$' and is_member((p->>'bo')::uuid) then (p->>'bo')::uuid end, nullif(me_email(), ''), client_ip());
+  if random() < 0.01 then delete from error_log where at < now() - interval '90 days'; end if;
+end $$;
+create or replace function log_error(p_source text, p_where text, p_message text, p_bo uuid default null) returns void language sql security definer set search_path = public as $$
+  insert into error_log(source, "where", message, box_office_id) values (left(p_source, 20), left(p_where, 20), left(p_message, 500), p_bo) $$;
+-- incidents (super admin): outages and failures with start, end, affected events, cause and resolution
+create or replace function save_incident(p jsonb) returns jsonb language plpgsql security definer set search_path = public as $$
+declare r incidents%rowtype; st text := case when coalesce(p->>'ended_at', '') <> '' or p->>'status' = 'resolved' then 'resolved' else 'open' end;
+begin
+  if not is_super() then raise exception 'Platform super admins only'; end if;
+  if coalesce(p->>'kind', '') not in ('outage','checkout','payment','email','scanner','api','system') then raise exception 'Pick what kind of incident'; end if;
+  if coalesce(trim(p->>'title'), '') = '' then raise exception 'Give the incident a title'; end if;
+  if coalesce(p->>'id', '') <> '' then
+    update incidents set kind = p->>'kind', title = left(trim(p->>'title'), 150), severity = case when p->>'severity' = 'major' then 'major' else 'minor' end,
+      events = coalesce((select array_agg(x::uuid) from jsonb_array_elements_text(coalesce(p->'events', '[]')) x), '{}'), cause = left(p->>'cause', 2000), resolution = left(p->>'resolution', 2000),
+      started_at = coalesce(nullif(p->>'started_at', '')::timestamptz, started_at), status = st, ended_at = case when st = 'resolved' then coalesce(nullif(p->>'ended_at', '')::timestamptz, ended_at, now()) end,
+      updates = updates || case when coalesce(p->>'update', '') <> '' then jsonb_build_array(jsonb_build_object('at', now(), 'by', me_email(), 'text', left(p->>'update', 1000))) else '[]' end
+    where id = (p->>'id')::uuid returning * into r;
+  else
+    insert into incidents(kind, title, severity, events, cause, resolution, started_at, ended_at, status, by, updates)
+    values (p->>'kind', left(trim(p->>'title'), 150), case when p->>'severity' = 'major' then 'major' else 'minor' end, coalesce((select array_agg(x::uuid) from jsonb_array_elements_text(coalesce(p->'events', '[]')) x), '{}'),
+      left(p->>'cause', 2000), left(p->>'resolution', 2000), coalesce(nullif(p->>'started_at', '')::timestamptz, now()), case when st = 'resolved' then coalesce(nullif(p->>'ended_at', '')::timestamptz, now()) end, st, me_email(),
+      case when coalesce(p->>'update', '') <> '' then jsonb_build_array(jsonb_build_object('at', now(), 'by', me_email(), 'text', left(p->>'update', 1000))) else '[]' end) returning * into r;
+  end if;
+  perform log_action(null, 'platform.incident', format('Incident “%s”: %s', r.title, r.status));
+  return to_jsonb(r);
+end $$;
+-- plans & billing (SaaS)
+create or replace function set_plan(p_bo uuid, p_plan text) returns void language plpgsql security definer set search_path = public as $$
+declare b box_offices%rowtype; pl jsonb := (select data from platform_settings where id = 1);
+begin
+  select * into b from box_offices where id = p_bo; if not found then raise exception 'Box office not found'; end if;
+  if not is_super() and b.owner <> me_email() then raise exception 'Only the owner can change the plan'; end if;
+  if not exists(select 1 from jsonb_array_elements(coalesce(pl->'planList', '[]')) x where x->>'id' = p_plan) then raise exception 'Unknown plan'; end if;
+  perform set_config('set.platform', '1', true);
+  update box_offices set plan = p_plan where id = p_bo;
+  perform log_action(p_bo, 'billing.plan', format('%s: plan %s → %s', b.name, coalesce(b.plan, pl->>'defaultPlan', 'pay'), p_plan), jsonb_build_object('plan', b.plan), jsonb_build_object('plan', p_plan));
+end $$;
+-- what one box office owes the platform for one month: its plan + platform fees on paid orders a processor did NOT collect automatically
+create or replace function billing_for(b box_offices, p_period text) returns jsonb language sql stable security definer set search_path = public as $$
+  with pl as (select data from platform_settings where id = 1),
+  paid as (select o.*, coalesce((o.data->>'platformFee')::bigint, 0) fee, o.payment->>'provider' in ('stripe','demo') and o.payment->>'markedPaidBy' is null auto from orders o
+    where o.box_office_id = b.id and (o.paid_at is not null or o.status in ('paid','refunded')) and to_char(coalesce(o.paid_at, o.created_at), 'YYYY-MM') = p_period and coalesce((o.data->>'platformFee')::bigint, 0) > 0)
+  select jsonb_build_object('period', p_period, 'plan', plan_of((select data from pl), b.plan), 'subscription', coalesce((plan_of((select data from pl), b.plan)->>'monthly')::bigint, 0),
+    'autoFees', coalesce((select sum(fee) from paid where auto), 0), 'autoOrders', (select count(*) from paid where auto),
+    'owedFees', coalesce((select sum(fee) from paid where not auto), 0), 'owedOrders', (select count(*) from paid where not auto),
+    'due', coalesce((plan_of((select data from pl), b.plan)->>'monthly')::bigint, 0) + coalesce((select sum(fee) from paid where not auto), 0)) $$;
+create or replace function billing_run(p_period text) returns int language plpgsql security definer set search_path = public as $$
+declare b box_offices%rowtype; x jsonb; n int := 0; num text; pl jsonb := (select data from platform_settings where id = 1);
+begin
+  if not is_super() and coalesce(auth.jwt() ->> 'role', '') <> 'service_role' then raise exception 'Platform super admins only'; end if;
+  if p_period !~ '^\d{4}-\d{2}$' then raise exception 'Pick a month'; end if;
+  for b in select * from box_offices where status in ('active','suspended') loop
+    if exists(select 1 from platform_invoices where box_office_id = b.id and period = p_period and status <> 'void') then continue; end if;
+    x := billing_for(b, p_period); if (x->>'due')::bigint <= 0 then continue; end if;
+    num := 'SET-' || replace(p_period, '-', '') || '-' || lpad(((select count(*) from platform_invoices) + 1)::text, 4, '0');
+    insert into platform_invoices(number, box_office_id, period, lines, total, info, due_at, by) values (num, b.id, p_period,
+      (case when (x->>'subscription')::bigint > 0 then jsonb_build_array(jsonb_build_object('label', (x->'plan'->>'name') || ' plan — ' || p_period, 'amount', (x->>'subscription')::bigint)) else '[]' end)
+      || case when (x->>'owedFees')::bigint > 0 then jsonb_build_array(jsonb_build_object('label', format('Platform fees on %s order(s) not paid through Stripe (cash, check, invoice, other)', x->>'owedOrders'), 'amount', (x->>'owedFees')::bigint)) else '[]' end,
+      (x->>'due')::bigint, jsonb_build_object('autoFees', x->'autoFees', 'autoOrders', x->'autoOrders'), now() + make_interval(days => coalesce((pl->>'invoiceDays')::int, 14)), coalesce(nullif(me_email(), ''), 'system'));
+    perform queue_msg(jsonb_build_object('box_office_id', b.id, 'to', b.owner, 'kind', 'staff', 'category', 'staff', 'by', 'system', 'subject', coalesce(pl->>'name', 'SET') || ' invoice ' || num,
+      'body', format('Your invoice for %s is ready: $%s. See Settings → Plan & billing.', p_period, to_char((x->>'due')::bigint / 100.0, 'FM999999990.00'))));
+    n := n + 1;
+  end loop;
+  perform log_action(null, 'billing.run', format('Billing run %s: %s invoice(s)', p_period, n));
+  return n;
+end $$;
+create or replace function invoice_action(p_id uuid, p_action text, p_note text default '') returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_super() then raise exception 'Platform super admins only'; end if;
+  if p_action not in ('paid','void','open') then raise exception 'Unknown action'; end if;
+  update platform_invoices set status = p_action, paid_at = case when p_action = 'paid' then now() end, note = left(p_note, 300), handled_by = me_email() where id = p_id;
+  if not found then raise exception 'Invoice not found'; end if;
+  perform log_action((select box_office_id from platform_invoices where id = p_id), 'billing.invoice', format('Invoice %s: %s', (select number from platform_invoices where id = p_id), p_action));
+end $$;
+-- custom domains: the box office sets one, the domains Edge Function verifies its DNS (domain_result); bo_by_domain() tells the site which box office it is
+create or replace function save_domain(p_bo uuid, p_host text) returns jsonb language plpgsql security definer set search_path = public as $$
+declare h text := lower(trim(coalesce(p_host, ''))); d jsonb; b box_offices%rowtype;
+begin
+  if not has_perm(p_bo, 'admin.settings') then raise exception 'You don''t have permission to do that'; end if;
+  select * into b from box_offices where id = p_bo;
+  if h <> '' and h !~ '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$' then raise exception 'Enter a domain like tickets.yourvenue.com'; end if;
+  if h <> '' and exists(select 1 from box_offices where id <> p_bo and domain->>'host' = h) then raise exception 'That domain is already used by another box office'; end if;
+  d := case when h = '' then null else jsonb_build_object('host', h, 'token', case when b.domain->>'host' = h then b.domain->>'token' else lower(rand_code(16)) end, 'status', 'pending', 'checked_at', null) end;
+  perform set_config('set.platform', '1', true);
+  update box_offices set domain = d where id = p_bo;
+  perform log_action(p_bo, 'settings.domain', case when h = '' then 'Custom domain removed' else 'Custom domain set to ' || h end);
+  return d;
+end $$;
+create or replace function domain_result(p_bo uuid, p_kind text, p jsonb) returns void language plpgsql security definer set search_path = public as $$
+begin   -- service role only (the domains Edge Function)
+  perform set_config('set.platform', '1', true);
+  if p_kind = 'site' then update box_offices set domain = domain || p || jsonb_build_object('checked_at', now()) where id = p_bo;
+  else update box_offices set mail_domain = coalesce(mail_domain, '{}') || p || jsonb_build_object('checked_at', now()) where id = p_bo; end if;
+  perform log_action(p_bo, 'settings.domain', format('%s domain check: %s', case when p_kind = 'site' then 'Custom' else 'Sending' end, coalesce(p->>'status', '?')));
+end $$;
+create or replace function bo_by_domain(p_host text) returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('id', id, 'slug', slug) from box_offices where domain->>'host' = lower(p_host) and domain->>'status' = 'verified' and status = 'active' limit 1 $$;
+-- system health for the super admin: one status per part of the platform from what happened recently, plus open incidents
+create or replace function platform_health() returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare s jsonb; att int; bad int; fm int; stuck int; fh int; lb timestamptz; errs jsonb; inc jsonb;
+begin
+  if not is_super() then raise exception 'Platform super admins only'; end if;
+  select count(*), count(*) filter (where not ok) into att, bad from pay_attempts where at > now() - interval '1 hour';
+  select count(*) into fm from outbox where status = 'failed' and at > now() - interval '1 day';
+  select count(*) into stuck from outbox where status = 'queued' and send_at < now() - interval '15 minutes';
+  select count(*) into fh from deliveries where status = 'failed' and created_at > now() - interval '1 day';
+  select max(at) into lb from backup_runs where ok;
+  select coalesce(jsonb_object_agg(w, n), '{}') into errs from (select "where" w, count(*) n from error_log where at > now() - interval '15 minutes' group by 1) z;
+  select coalesce(jsonb_agg(to_jsonb(i)), '[]') into inc from incidents i where status <> 'resolved';
+  s := jsonb_build_object('web', case when coalesce((errs->>'app')::int, 0) > 20 then 'degraded' else 'ok' end, 'pages', case when coalesce((errs->>'event')::int, 0) > 5 then 'degraded' else 'ok' end,
+    'checkout', case when coalesce((errs->>'checkout')::int, 0) > 5 then 'degraded' else 'ok' end, 'payments', case when att >= 5 and bad::numeric / att > .5 then 'degraded' else 'ok' end,
+    'scanner', case when coalesce((errs->>'scan')::int, 0) > 5 then 'degraded' else 'ok' end, 'email', case when stuck > 20 or fm > 50 then 'degraded' else 'ok' end,
+    'sms', 'ok', 'api', case when coalesce((errs->>'api')::int, 0) > 10 then 'degraded' else 'ok' end, 'integrations', case when fh > 20 then 'degraded' else 'ok' end,
+    'backups', case when lb is null or lb < now() - interval '26 hours' then 'degraded' else 'ok' end);
+  select s || coalesce(jsonb_object_agg(part, st), '{}') into s from (
+    select part, case when bool_or(kind = 'outage' or severity = 'major') then 'down' else 'degraded' end st
+    from (select i->>'kind' kind, i->>'severity' severity, case i->>'kind' when 'checkout' then 'checkout' when 'payment' then 'payments' when 'email' then 'email' when 'scanner' then 'scanner' when 'api' then 'api' else 'web' end part
+          from jsonb_array_elements(inc) i) z group by part) y;
+  return jsonb_build_object('parts', s, 'failedPayments', bad, 'attempts', att, 'failedMail', (select coalesce(jsonb_agg(jsonb_build_object('at', at, 'kind', kind, 'channel', channel, 'error', error, 'box_office_id', box_office_id)), '[]')
+      from (select * from outbox where status = 'failed' and at > now() - interval '1 day' order by at desc limit 50) z), 'stuck', stuck,
+    'failedHooks', (select coalesce(jsonb_agg(jsonb_build_object('created_at', created_at, 'event', event, 'response', response, 'box_office_id', box_office_id)), '[]') from (select * from deliveries where status = 'failed' and created_at > now() - interval '1 day' order by created_at desc limit 50) z),
+    'lastBackup', lb, 'open', inc);
+end $$;
+grant execute on function event_control(uuid,jsonb), support_action(uuid,text,jsonb), ban_customer(uuid,text,text), unban_customer(uuid), policy_texts(uuid,text[]), save_incident(jsonb), set_plan(uuid,text),
+  billing_run(text), invoice_action(uuid,text,text), save_domain(uuid,text), platform_health() to authenticated;
+revoke execute on function event_control(uuid,jsonb), support_action(uuid,text,jsonb), ban_customer(uuid,text,text), unban_customer(uuid), policy_texts(uuid,text[]), save_incident(jsonb), set_plan(uuid,text),
+  billing_run(text), invoice_action(uuid,text,text), save_domain(uuid,text), platform_health() from anon, public;
+grant execute on function queue_status(uuid,text), contact_organizer(uuid,uuid,jsonb), log_client_error(jsonb), bo_by_domain(text) to anon, authenticated;
+revoke execute on function rate_hit(text,int,int), add_version(uuid,text,uuid,jsonb,jsonb), billing_for(box_offices,text), domain_result(uuid,text,jsonb), log_error(text,text,text,uuid) from anon, authenticated, public;
+grant execute on function domain_result(uuid,text,jsonb), log_error(text,text,text,uuid), billing_run(text) to service_role;
+revoke all on rate_hits, queue_entries, bans, support_messages, versions, policy_texts, error_log, incidents, platform_invoices, backup_runs, pay_attempts from anon, authenticated;
+-- Stage 10 lockdown: nobody reads orders, tickets, money or customer tables directly any more — the app reads them through admin_load() / the RPCs,
+-- which mask names, emails, phones, prices, fees and tax by permission. (Door-list staff could select ticket prices straight from the table before.)
+revoke select on orders, tickets, order_log, credits, customer_notes, waitlist, outbox, event_views, seat_log, promos, tracking_codes, broadcasts, payment_accounts from anon, authenticated;
+-- events: the emergency-control column is written by event_control() only; staff save everything else as before
+revoke insert, update on events from authenticated;
+grant insert (id, box_office_id, slug, status, data, secrets, updated_at), update (box_office_id, slug, status, data, secrets, updated_at) on events to authenticated;
+grant select (controls) on events to anon;
+-- self-serve organizer sign-up (SaaS): plan choice + the platform's organizer terms; pending until a super admin approves, unless auto-approve is on
+create or replace function register_organizer(p jsonb) returns jsonb language plpgsql security definer set search_path = public as $$
+declare pl jsonb := (select data from platform_settings where id = 1); r jsonb; v_plan text := coalesce(nullif(p->>'plan', ''), pl->>'defaultPlan', 'pay');
+begin
+  if not coalesce((pl->>'publicRegistration')::boolean, false) then raise exception 'Registration is closed'; end if;
+  if not coalesce((p->>'agree')::boolean, false) then raise exception 'Please accept the organizer terms'; end if;
+  if not exists(select 1 from jsonb_array_elements(coalesce(pl->'planList', '[]')) x where x->>'id' = v_plan) then raise exception 'Unknown plan'; end if;
+  if not rate_hit('register:' || client_ip(), 3, 3600) then raise exception 'Too many sign-ups from your connection — try again later'; end if;
+  r := new_box_office(p->>'name', p->>'slug', p->>'owner', p->>'ownerName', case when coalesce((pl->>'autoApprove')::boolean, false) then 'active' else 'pending' end, 'self-registration') - 'templates';
+  perform set_config('set.platform', '1', true);
+  update box_offices set plan = v_plan, settings = settings || jsonb_build_object('contactPhone', left(coalesce(p->>'phone', ''), 40)) where id = (r->>'id')::uuid;
+  return r || jsonb_build_object('plan', v_plan, 'status', (select status from box_offices where id = (r->>'id')::uuid));
+end $$;
+grant execute on function register_organizer(jsonb) to anon, authenticated;
+-- emergency: pause / resume card payments for one box office without disconnecting its processor account
+create or replace function pause_gateway(p_bo uuid, p_on boolean) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not has_perm(p_bo, 'admin.payments') then raise exception 'You don''t have permission to do that'; end if;
+  if not exists(select 1 from box_offices where id = p_bo and gateway is not null) then raise exception 'No processor connected'; end if;
+  perform set_config('set.platform', '1', true);
+  update box_offices set gateway = gateway || jsonb_build_object('disabled', p_on) where id = p_bo;
+  perform log_action(p_bo, 'settings.payments', case when p_on then 'Card payments paused' else 'Card payments resumed' end);
+end $$;
+grant execute on function pause_gateway(uuid,boolean) to authenticated; revoke execute on function pause_gateway(uuid,boolean) from anon, public;

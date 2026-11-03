@@ -73,6 +73,7 @@ export const CRM = {
   } },
   activecampaign: { async sync({ integration: g, contact: c }) {
     const [f, l] = nameParts(c.name), H = { 'Api-Token': g.secret, 'Content-Type': 'application/json' };
+    if (!/\.api-us\d+\.com$|\.activehosted\.com$/.test(new URL(g.config.url).hostname) || !(await publicHost(g.config.url))) throw new Err('the ActiveCampaign API URL must be your https://<account>.api-us1.com address', true);   // Stage 10: SSRF guard
     const r = JSON.parse(await ok(await fetch(g.config.url.replace(/\/$/, '') + '/api/3/contact/sync', { method: 'POST', headers: H, body: JSON.stringify({ contact: { email: c.email, firstName: f, lastName: l, phone: c.phone || '' } }) }), 'ActiveCampaign'));
     if (g.config.list && r.contact?.id) await ok(await fetch(g.config.url.replace(/\/$/, '') + '/api/3/contactLists', { method: 'POST', headers: H,
       body: JSON.stringify({ contactList: { list: g.config.list, contact: r.contact.id, status: c.email_optin && !c.unsub_email_at ? 1 : 2 } }) }), 'ActiveCampaign list');

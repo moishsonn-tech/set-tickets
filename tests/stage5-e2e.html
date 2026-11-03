@@ -1,8 +1,12 @@
 <!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Stage 10: a checkout now records which policy versions the buyer accepted. The UI sends them itself; direct DB.placeOrder calls in
+// this older suite accept the current ones (acceptAll), so these checks keep testing what they were written for. Its many orders from one
+// browser stand for many different buyers, so the demo's per-browser checkout rate limit is reset for them.
+function acceptAll(w){try{if(w&&w.eval&&w.eval('typeof DB==="object"&&!DB._acc'))w.eval(`(()=>{const po=DB.placeOrder;DB.placeOrder=function(p,t){for(const k in RL)delete RL[k];if(p&&p.accepted===undefined&&!t){const st=Demo.st,ids=[...new Set([...(p.items||[]),...(p.addons||[])].map(i=>i.eventId))],evs=ids.map(id=>st.events.find(e=>e.id===id)).filter(Boolean),bo=st.boxOffices.find(b=>b.id===(evs[0]&&evs[0].box_office_id));p={...p,accepted:policiesFor(bo,evs).map(({kind,eventId,version})=>({kind,eventId,version}))}}return po.call(this,p,t)};DB._acc=1})()`)}catch(e){}return w}
 // Stage 5 — box office website, event pages, checkout, questions, payment gateways, fees & taxes, customer accounts, backend separation,
 // payment failures, confirmation (Eli's Step 5). Run from the local server: /stage5-e2e.html
 const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
-const f=document.getElementById('f'); const W=()=>f.contentWindow; const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const f=document.getElementById('f'); const W=()=>acceptAll(f.contentWindow); const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
 const until=async(fn,ms=6000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
 const has=t=>W().document.body.textContent.includes(t);
 const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));

@@ -3,4 +3,5 @@
 window.SET_CONFIG = {
   supabaseUrl: '',
   supabaseAnonKey: '',
+  env: '',   // 'staging' on the test site: shows a "Test environment" ribbon (Stage 10)
 };

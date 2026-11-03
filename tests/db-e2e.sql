@@ -15,6 +15,22 @@ end $$;
 create function t.who(p_email text) returns void language sql security definer as $$
   select set_config('request.jwt.claims', case when p_email = '' then '{}' else json_build_object('email', p_email, 'sub', (select id from auth.users where email = p_email))::text end, false) $$;
 grant execute on all functions in schema t to public;
+-- Stage 10 locked these tables (the app reads them only through admin_load / RPCs); the checks below read them through these owner views
+create view t.orders as select * from public.orders;
+create view t.tickets as select * from public.tickets;
+create view t.order_log as select * from public.order_log;
+create view t.credits as select * from public.credits;
+create view t.customer_notes as select * from public.customer_notes;
+create view t.waitlist as select * from public.waitlist;
+create view t.outbox as select * from public.outbox;
+create view t.event_views as select * from public.event_views;
+create view t.seat_log as select * from public.seat_log;
+create view t.promos as select * from public.promos;
+create view t.tracking_codes as select * from public.tracking_codes;
+create view t.broadcasts as select * from public.broadcasts;
+create view t.payment_accounts as select * from public.payment_accounts;
+create view t.versions_v as select * from public.versions; create view t.support_v as select * from public.support_messages; create view t.bans_v as select * from public.bans;
+grant select on all tables in schema t to public;
 \o /dev/null
 
 -- ── set-up: one box office (owner, a clerk who may change seats but not refund), a seated event and a general-admission event ──
@@ -47,9 +63,9 @@ select t.err($$update orders set status = 'cancelled'$$, 'permission denied', 'a
 select t.err($$select order_action('$$ || :'o1' || $$', 'markPaid', '{}')$$, 'permission denied|not found', 'a buyer cannot run staff order actions');
 reset role;
 set role service_role;
-select t.ok(confirm_payment(((:'r2'::jsonb)->>'id')::uuid, json_build_object('amount', (select (data->>'total')::bigint from orders where id = ((:'r2'::jsonb)->>'id')::uuid), 'ref', 'pi_test_1', 'provider', 'stripe')::jsonb) = 'issued', 'processor confirms the card payment → tickets issued');
+select t.ok(confirm_payment(((:'r2'::jsonb)->>'id')::uuid, json_build_object('amount', (select (data->>'total')::bigint from t.orders where id = ((:'r2'::jsonb)->>'id')::uuid), 'ref', 'pi_test_1', 'provider', 'stripe')::jsonb) = 'issued', 'processor confirms the card payment → tickets issued');
 reset role;
-select t.ok((select count(*) from tickets where order_id = ((:'r2'::jsonb)->>'id')::uuid and status = 'valid') = 2, 'card order has its 2 tickets');
+select t.ok((select count(*) from t.tickets where order_id = ((:'r2'::jsonb)->>'id')::uuid and status = 'valid') = 2, 'card order has its 2 tickets');
 
 -- ── staff: direct writes are blocked; everything goes through order_action ──
 set role authenticated; select t.who('clerk@box.test');
@@ -58,76 +74,76 @@ select t.err($$update tickets set status = 'cancelled'$$, 'permission denied', '
 select t.err($$select order_action('$$ || :'o1' || $$', 'markPaid', '{}')$$, 'permission', 'clerk without orders.edit cannot mark paid');
 select t.who('owner@box.test');
 select t.ok(order_action(:'o1', 'markPaid', '{"method":"cash"}')->>'status' = 'paid', 'owner marks the reservation paid');
-select t.ok((select count(*) from tickets where order_id = :'o1' and status = 'valid') = 2, 'marking paid issued 2 tickets');
-select t.ok((select count(*) from order_log where order_id = :'o1' and kind = 'paid') = 1, 'mark-paid is in the order history');
+select t.ok((select count(*) from t.tickets where order_id = :'o1' and status = 'valid') = 2, 'marking paid issued 2 tickets');
+select t.ok((select count(*) from t.order_log where order_id = :'o1' and kind = 'paid') = 1, 'mark-paid is in the order history');
 
 -- move one ticket to another Standard seat (no price difference) → old ticket replaced, new one issued
-select id as t1, code as c1 from tickets where order_id = :'o1' and seat = 'A-1' \gset
+select id as t1, code as c1 from t.tickets where order_id = :'o1' and seat = 'A-1' \gset
 select t.who('clerk@box.test');
 select order_action(:'o1', 'change', json_build_object('changes', json_build_array(json_build_object('ticket', :'t1', 'seat', 'A-5')), 'note', 'wanted the aisle')::jsonb) as ch1 \gset
 reset role;
-select t.ok((select status from tickets where id = :'t1') = 'replaced' and (select count(*) from tickets where order_id = :'o1' and seat = 'A-5' and status = 'valid' and replaces = :'t1') = 1, 'move: old ticket replaced, new ticket on A-5');
-select t.ok((select code from tickets where replaces = :'t1') <> :'c1', 'move: the new ticket has a new code');
-select t.ok((select count(*) from seat_log where seat in ('A-1','A-5') and action = 'moved') = 2, 'move: both seats have history');
-select t.ok((select data->'tickets'->0->'from'->>'seat' from order_log where order_id = :'o1' and kind = 'change') like '%Seat 1%', 'change log keeps the original seat');
-select t.ok((select count(*) from outbox where order_id = :'o1' and kind = 'updated') = 1, 'updated tickets queued for the customer');
+select t.ok((select status from t.tickets where id = :'t1') = 'replaced' and (select count(*) from t.tickets where order_id = :'o1' and seat = 'A-5' and status = 'valid' and replaces = :'t1') = 1, 'move: old ticket replaced, new ticket on A-5');
+select t.ok((select code from t.tickets where replaces = :'t1') <> :'c1', 'move: the new ticket has a new code');
+select t.ok((select count(*) from t.seat_log where seat in ('A-1','A-5') and action = 'moved') = 2, 'move: both seats have history');
+select t.ok((select data->'tickets'->0->'from'->>'seat' from t.order_log where order_id = :'o1' and kind = 'change') like '%Seat 1%', 'change log keeps the original seat');
+select t.ok((select count(*) from t.outbox where order_id = :'o1' and kind = 'updated') = 1, 'updated tickets queued for the customer');
 set role authenticated; select t.who('owner@box.test');
 select t.ok(checkin(:'c1', false, null)->>'result' = 'replaced', 'the replaced ticket no longer gets in (scanner says “replaced”)');
 
 -- upgrade to VIP: $50 more, clerk cannot refund but can collect? (needs orders.edit) → owner collects in cash
 select t.who('clerk@box.test');
-select t.err($$select order_action('$$ || :'o1' || $$', 'change', '{"changes":[{"ticket":"$$ || (select id from tickets where order_id = :'o1' and seat = 'A-2') || $$","seat":"B-1"}],"settle":"collect","method":"cash"}')$$, 'permission', 'clerk cannot collect money for an upgrade');
+select t.err($$select order_action('$$ || :'o1' || $$', 'change', '{"changes":[{"ticket":"$$ || (select id from t.tickets where order_id = :'o1' and seat = 'A-2') || $$","seat":"B-1"}],"settle":"collect","method":"cash"}')$$, 'permission', 'clerk cannot collect money for an upgrade');
 select t.who('owner@box.test');
-select t.err($$select order_action('$$ || :'o1' || $$', 'change', '{"changes":[{"ticket":"$$ || (select id from tickets where order_id = :'o1' and seat = 'A-2') || $$","seat":"B-1"}]}')$$, 'difference', 'upgrade asks how to settle the difference');
-select order_action(:'o1', 'change', json_build_object('changes', json_build_array(json_build_object('ticket', (select id from tickets where order_id = :'o1' and seat = 'A-2' and status = 'valid'), 'seat', 'B-1')), 'settle', 'collect', 'method', 'cash')::jsonb) as up \gset
+select t.err($$select order_action('$$ || :'o1' || $$', 'change', '{"changes":[{"ticket":"$$ || (select id from t.tickets where order_id = :'o1' and seat = 'A-2') || $$","seat":"B-1"}]}')$$, 'difference', 'upgrade asks how to settle the difference');
+select order_action(:'o1', 'change', json_build_object('changes', json_build_array(json_build_object('ticket', (select id from t.tickets where order_id = :'o1' and seat = 'A-2' and status = 'valid'), 'seat', 'B-1')), 'settle', 'collect', 'method', 'cash')::jsonb) as up \gset
 select t.ok((:'up'::jsonb)->>'net' = '5000', 'upgrade difference = $50 (old $50 → new $100)');
-select t.ok((select (data->>'extraPaid')::bigint from orders where id = :'o1') = 5000, 'the $50 collected is recorded on the order');
-select t.ok((select paid from tickets where order_id = :'o1' and seat = 'B-1' and status = 'valid') = 10000, 'the VIP ticket now shows $100 paid');
-select t.err($$select order_action('$$ || :'o1' || $$', 'change', '{"changes":[{"ticket":"$$ || (select id from tickets where order_id = :'o1' and seat = 'A-5') || $$","seat":"A-3"}]}')$$, 'free', 'cannot move onto a sold seat');
+select t.ok((select (data->>'extraPaid')::bigint from t.orders where id = :'o1') = 5000, 'the $50 collected is recorded on the order');
+select t.ok((select paid from t.tickets where order_id = :'o1' and seat = 'B-1' and status = 'valid') = 10000, 'the VIP ticket now shows $100 paid');
+select t.err($$select order_action('$$ || :'o1' || $$', 'change', '{"changes":[{"ticket":"$$ || (select id from t.tickets where order_id = :'o1' and seat = 'A-5') || $$","seat":"A-3"}]}')$$, 'free', 'cannot move onto a sold seat');
 
 -- downgrade back to Standard with a refund of the difference (processor refund → processing)
-select order_action(:'o1', 'change', json_build_object('changes', json_build_array(json_build_object('ticket', (select id from tickets where order_id = :'o1' and seat = 'B-1' and status = 'valid'), 'seat', 'A-1')),
+select order_action(:'o1', 'change', json_build_object('changes', json_build_array(json_build_object('ticket', (select id from t.tickets where order_id = :'o1' and seat = 'B-1' and status = 'valid'), 'seat', 'A-1')),
   'downgrade', 'credit')::jsonb) as down \gset
 select t.ok((:'down'::jsonb)->>'net' = '-5000' and (:'down'::jsonb)->'refund'->>'credit' like 'CR-%', 'downgrade $50 → issued as a credit code');
-select t.ok((select (data->>'credited')::bigint from orders where id = :'o1') = 5000, 'credited amount recorded on the order');
+select t.ok((select (data->>'credited')::bigint from t.orders where id = :'o1') = 5000, 'credited amount recorded on the order');
 
 -- refunds on the card order: one ticket + its booking fee, to the card → processing until the processor confirms
 select t.who('clerk@box.test');
 select t.err($$select order_action('$$ || ((:'r2'::jsonb)->>'id') || $$', 'refund', '{"mode":"full"}')$$, 'permission', 'clerk cannot refund');
 select t.who('owner@box.test');
-select order_action(((:'r2'::jsonb)->>'id')::uuid, 'refund', json_build_object('mode', 'tickets', 'tickets', json_build_array((select id from tickets where order_id = ((:'r2'::jsonb)->>'id')::uuid and seat = 'A-3')), 'fees', true, 'to', 'original', 'cancel', true, 'seat', 'hold')::jsonb) as rf \gset
+select order_action(((:'r2'::jsonb)->>'id')::uuid, 'refund', json_build_object('mode', 'tickets', 'tickets', json_build_array((select id from t.tickets where order_id = ((:'r2'::jsonb)->>'id')::uuid and seat = 'A-3')), 'fees', true, 'to', 'original', 'cancel', true, 'seat', 'hold')::jsonb) as rf \gset
 select t.ok((:'rf'::jsonb)->'refund'->>'amount' = '5100', 'refund = ticket $50 + its $1 booking fee');
 select t.ok((:'rf'::jsonb)->'refund'->>'status' = 'processing', 'a card refund waits for the processor');
 reset role;
-select t.ok((select status from tickets where order_id = ((:'r2'::jsonb)->>'id')::uuid and seat = 'A-3') = 'cancelled', 'the refunded ticket was cancelled');
+select t.ok((select status from t.tickets where order_id = ((:'r2'::jsonb)->>'id')::uuid and seat = 'A-3') = 'cancelled', 'the refunded ticket was cancelled');
 select t.ok(exists(select 1 from seat_status where seat = 'A-3' and status = 'held'), 'its seat was kept held');
 set role service_role;
 select finish_refund(((:'r2'::jsonb)->>'id')::uuid, (:'rf'::jsonb)->'refund'->>'id', '{"ok":false,"error":"card expired"}');
 reset role;
-select t.ok((select (data->>'refunded')::bigint from orders where id = ((:'r2'::jsonb)->>'id')::uuid) = 0, 'a refund the processor refused is reversed (still refundable)');
+select t.ok((select (data->>'refunded')::bigint from t.orders where id = ((:'r2'::jsonb)->>'id')::uuid) = 0, 'a refund the processor refused is reversed (still refundable)');
 set role authenticated; select t.who('owner@box.test');
 select t.err($$select order_action('$$ || ((:'r2'::jsonb)->>'id') || $$', 'refund', '{"mode":"amount","amount":999999}')$$, 'at most', 'cannot refund more than was collected');
 select order_action(((:'r2'::jsonb)->>'id')::uuid, 'refund', '{"mode":"percent","pct":10,"to":"cash"}') as rp \gset
 select t.ok(((:'rp'::jsonb)->'refund'->>'amount')::bigint > 0 and (:'rp'::jsonb)->'refund'->>'status' = 'done', '10% refund in cash, recorded');
-select t.ok((select status from orders where id = ((:'r2'::jsonb)->>'id')::uuid) = 'paid', 'refund without cancelling keeps the order paid');
+select t.ok((select status from t.orders where id = ((:'r2'::jsonb)->>'id')::uuid) = 'paid', 'refund without cancelling keeps the order paid');
 
 -- products: add one (balance due), remove it with a refund
 select t.ok(order_action(:'o1', 'addAddon', '{"eventId":"e0000000-0000-0000-0000-000000000001","addonId":"park","qty":2,"settle":"due"}')->>'status' = 'paid', 'add a product to a paid order');
 reset role;
-select t.ok((select (data->>'due')::bigint from orders where id = :'o1') = 2000, 'balance due $20 for the added parking');
+select t.ok((select (data->>'due')::bigint from t.orders where id = :'o1') = 2000, 'balance due $20 for the added parking');
 select t.ok((select availability('e0000000-0000-0000-0000-000000000001')->'ad'->>'park') = '3', 'product stock counts the added parking (1 + 2)');
 set role authenticated; select t.who('owner@box.test');
 select order_action(:'o1', 'collect', '{"amount":2000,"method":"terminal"}');
 reset role;
-select t.ok((select (data->>'due')::bigint from orders where id = :'o1') = 0, 'payment recorded clears the balance due');
+select t.ok((select (data->>'due')::bigint from t.orders where id = :'o1') = 0, 'payment recorded clears the balance due');
 set role authenticated; select t.who('owner@box.test');
-select order_action(:'o1', 'removeAddon', json_build_object('line', (select n - 1 from orders o, jsonb_array_elements(o.data->'lines') with ordinality z(l, n) where o.id = :'o1' and l->>'kind' = 'addon' limit 1), 'qty', 1, 'refund', true, 'to', 'cash')::jsonb);
+select order_action(:'o1', 'removeAddon', json_build_object('line', (select n - 1 from t.orders o, jsonb_array_elements(o.data->'lines') with ordinality z(l, n) where o.id = :'o1' and l->>'kind' = 'addon' limit 1), 'qty', 1, 'refund', true, 'to', 'cash')::jsonb);
 reset role;
 select t.ok((select availability('e0000000-0000-0000-0000-000000000001')->'ad'->>'park') = '2', 'removing a product gives the stock back');
 
 -- customer + holder + notes + messages + resend
 set role authenticated; select t.who('clerk@box.test');
-select order_action(:'o1', 'holder', json_build_object('ticket', (select id from tickets where order_id = :'o1' and status = 'valid' limit 1), 'name', 'Friend Two')::jsonb);
+select order_action(:'o1', 'holder', json_build_object('ticket', (select id from t.tickets where order_id = :'o1' and status = 'valid' limit 1), 'name', 'Friend Two')::jsonb);
 select order_action(:'o1', 'customer', '{"phone":"555-0101"}');
 select t.err($$select order_action('$$ || :'o1' || $$', 'message', '{"subject":"Hi","body":"x"}')$$, 'permission', 'clerk without comms.email cannot message customers');
 select t.who('owner@box.test');
@@ -135,20 +151,20 @@ select order_action(:'o1', 'message', '{"subject":"Doors at 7","body":"See you t
 select order_action(:'o1', 'resend', '{"kind":"tickets"}');
 select order_action(:'o1', 'note', '{"body":"VIP friend of the artist"}');
 reset role;
-select t.ok((select count(*) from outbox where order_id = :'o1' and kind in ('message','tickets')) = 2, 'message + resend are queued and listed on the order');
-select t.ok((select count(*) from order_log where order_id = :'o1') >= 9, 'every change is in the order history');
-select t.ok((select before->>'phone' from order_log where order_id = :'o1' and kind = 'customer') = '' and (select data->'buyer'->>'phone' from orders where id = :'o1') = '555-0101', 'customer edit keeps the old details in the history');
+select t.ok((select count(*) from t.outbox where order_id = :'o1' and kind in ('message','tickets')) = 2, 'message + resend are queued and listed on the order');
+select t.ok((select count(*) from t.order_log where order_id = :'o1') >= 9, 'every change is in the order history');
+select t.ok((select before->>'phone' from t.order_log where order_id = :'o1' and kind = 'customer') = '' and (select data->'buyer'->>'phone' from t.orders where id = :'o1') = '555-0101', 'customer edit keeps the old details in the history');
 
 -- cancel the rest of the order, keeping seats blocked, no refund
 set role authenticated; select t.who('owner@box.test');
 select order_action(:'o1', 'cancel', '{"all":true,"seat":"block","refund":null}');
 reset role;
-select t.ok((select count(*) from tickets where order_id = :'o1' and status = 'valid') = 0, 'cancel whole order voids every ticket');
-select t.ok((select status from orders where id = :'o1') = 'cancelled', 'cancelled without refund → status cancelled');
+select t.ok((select count(*) from t.tickets where order_id = :'o1' and status = 'valid') = 0, 'cancel whole order voids every ticket');
+select t.ok((select status from t.orders where id = :'o1') = 'cancelled', 'cancelled without refund → status cancelled');
 select t.ok((select count(*) from seat_status where status = 'blocked' and note like 'Kept from cancelled order%') = 2, 'its seats were kept blocked');
 
 -- credits: the downgrade credit pays part of a new order; revoking stops it
-select code as crc from credits where source_order = :'o1' \gset
+select code as crc from t.credits where source_order = :'o1' \gset
 set role anon; select t.who('');
 select t.ok((check_credit('b0000000-0000-0000-0000-000000000001', :'crc')->>'remaining')::bigint = 5000, 'a guest can check a credit code (value only)');
 select place_order(json_build_object('buyer', json_build_object('name', 'Fan One', 'email', 'fan@mail.test'), 'items', json_build_array(json_build_object('eventId', 'e0000000-0000-0000-0000-000000000002', 'ticketTypeId', 'ga', 'qty', 1)),
@@ -157,7 +173,7 @@ select t.ok((:'rc'::jsonb)->>'total' = '0' and (:'rc'::jsonb)->>'status' = 'paid
 select t.ok((check_credit('b0000000-0000-0000-0000-000000000001', :'crc')->>'remaining')::bigint = 5000 - 2100, 'credit balance goes down by what was used');
 reset role;
 set role authenticated; select t.who('owner@box.test');
-select credit_action('b0000000-0000-0000-0000-000000000001', 'revoke', json_build_object('id', (select id from credits where code = :'crc'))::jsonb);
+select credit_action('b0000000-0000-0000-0000-000000000001', 'revoke', json_build_object('id', (select id from t.credits where code = :'crc'))::jsonb);
 set role anon; select t.who('');
 select t.err($$select place_order('{"buyer":{"name":"X","email":"x@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"offline","credit":"$$ || :'crc' || $$"}')$$, 'cancelled', 'a revoked credit cannot be used');
 -- account credit: only the signed-in, confirmed owner of the email
@@ -172,11 +188,11 @@ select t.ok(not exists(select 1 from jsonb_array_elements(my_orders()->'tickets'
 
 -- reading: RLS + admin_load
 select t.who('clerk@box.test');
-select t.ok((select count(*) from order_log) > 0 and (select count(*) from credits) > 0, 'clerk (orders.view) reads order history and credits');
-select t.ok((select count(*) from customer_notes) = 0, 'notes need customers.profiles');
+select t.ok((select count(*) from t.order_log) > 0 and (select count(*) from t.credits) > 0, 'clerk (orders.view) reads order history and credits');
+select t.err($$select count(*) from customer_notes$$, 'permission denied', 'notes are never read directly (admin_load gives them to customers.profiles only)');
 select t.err($$select customer_note('b0000000-0000-0000-0000-000000000001', 'fan@mail.test', 'x')$$, 'permission', 'clerk cannot write customer notes');
 select t.who('fan@mail.test');
-select t.ok((select count(*) from orders) = 0 and (select count(*) from order_log) = 0 and (select count(*) from credits) = 0, 'a customer cannot read orders, history or credits directly');
+select t.err($$select count(*) from orders$$, 'permission denied', 'a customer cannot read orders directly'); select t.err($$select count(*) from order_log$$, 'permission denied', 'a customer cannot read order history directly'); select t.err($$select count(*) from credits$$, 'permission denied', 'a customer cannot read credits directly');
 select t.who('owner@box.test');
 select customer_note('b0000000-0000-0000-0000-000000000001', 'fan@mail.test', 'Prefers the aisle');
 reset role; set role anon; select t.who('');
@@ -191,7 +207,7 @@ select t.ok((:'al'::jsonb)->'live'->'e0000000-0000-0000-0000-000000000002'->>'no
 select t.err($$select seat_action('e0000000-0000-0000-0000-000000000001', '', 'move', array['A-4'], '{"to":"B-2"}')$$, 'different price level', 'inventory move to a different price level is refused');
 select seat_action('e0000000-0000-0000-0000-000000000001', '', 'move', array['A-4'], '{"to":"A-2"}');
 reset role;
-select t.ok((select count(*) from tickets where seat = 'A-4' and status = 'replaced') = 1 and (select count(*) from tickets where seat = 'A-2' and status = 'valid') = 1, 'inventory move replaces the ticket and keeps history');
+select t.ok((select count(*) from t.tickets where seat = 'A-4' and status = 'replaced') = 1 and (select count(*) from t.tickets where seat = 'A-2' and status = 'valid') = 1, 'inventory move replaces the ticket and keeps history');
 
 -- ── Stage 7: scanning — door view, duplicates across devices, wrong event / entrance, reissue, cancel / refund, devices, scan history ──
 insert into auth.users(email, email_confirmed_at) values ('scan@box.test', now()), ('door@box.test', now());
@@ -208,13 +224,13 @@ select place_order('{"buyer":{"name":"Bo Xer","email":"box@mail.test","phone":"(
 reset role; set role authenticated; select t.who('owner@box.test');
 select order_action(:'o7', 'markPaid', '{"method":"cash"}');
 reset role;
-select code as k1 from tickets where order_id = :'o7' and seat = 'BX4-1' \gset
-select code as k2 from tickets where order_id = :'o7' and seat = 'BX4-2' \gset
-select code as k3 from tickets where order_id = :'o7' and seat = 'BX4-3' \gset
-select code as kf from tickets where order_id = :'o7' and seat = 'F-A1' \gset
-select ref as ref7 from orders where id = :'o7' \gset
-select t.ok((select unit = 'Box 4' and coalesce("row", '') = '' and seat_label = '1' and area = 'Boxes' from tickets where code = :'k1'), 'box seat ticket: area Boxes, Box 4, no row, seat 1');
-select t.ok((select count(distinct code) = 4 and bool_and(code ~ '^[A-Z0-9]{10}$') from tickets where order_id = :'o7'), 'every ticket has its own random 10-character code (the QR holds only this)');
+select code as k1 from t.tickets where order_id = :'o7' and seat = 'BX4-1' \gset
+select code as k2 from t.tickets where order_id = :'o7' and seat = 'BX4-2' \gset
+select code as k3 from t.tickets where order_id = :'o7' and seat = 'BX4-3' \gset
+select code as kf from t.tickets where order_id = :'o7' and seat = 'F-A1' \gset
+select ref as ref7 from t.orders where id = :'o7' \gset
+select t.ok((select unit = 'Box 4' and coalesce("row", '') = '' and seat_label = '1' and area = 'Boxes' from t.tickets where code = :'k1'), 'box seat ticket: area Boxes, Box 4, no row, seat 1');
+select t.ok((select count(distinct code) = 4 and bool_and(code ~ '^[A-Z0-9]{10}$') from t.tickets where order_id = :'o7'), 'every ticket has its own random 10-character code (the QR holds only this)');
 set role authenticated; select t.who('scan@box.test');
 select checkin(:'k1', false, 'e0000000-0000-0000-0000-000000000003', '{"device":"dev-a","deviceName":"Door phone 1","entrance":"main"}') as s1 \gset
 select t.ok((:'s1'::jsonb)->>'result' = 'ok' and (:'s1'::jsonb)->'ticket'->>'unit' = 'Box 4' and (:'s1'::jsonb)->'ticket'->>'seat_label' = '1' and (:'s1'::jsonb)->'ticket'->>'type' = 'Box seat', 'scanner: VALID with Box 4 · Seat 1');
@@ -240,16 +256,16 @@ select t.ok(checkin(:'k2', false, 'e0000000-0000-0000-0000-000000000003', '{"man
 select t.ok(checkin(:'k2', true, 'e0000000-0000-0000-0000-000000000003', '{"device":"dev-c"}')->>'result' = 'undone', 'door lead can undo a check-in');
 -- reissue: new QR, old one dead at once
 select t.who('owner@box.test');
-select order_action(:'o7', 'reissue', json_build_object('tickets', json_build_array((select id from tickets where code = :'k3')))::jsonb) as ri \gset
+select order_action(:'o7', 'reissue', json_build_object('tickets', json_build_array((select id from t.tickets where code = :'k3')))::jsonb) as ri \gset
 reset role; set role authenticated; select t.who('scan@box.test');
 select t.ok(checkin(:'k3', false, 'e0000000-0000-0000-0000-000000000003', '{}')->>'result' = 'replaced', 'reissue: the old QR code is rejected as replaced');
 select t.ok(checkin((:'ri'::jsonb)->'codes'->>0, false, 'e0000000-0000-0000-0000-000000000003', '{}')->>'result' = 'ok' and checkin((:'ri'::jsonb)->'codes'->>0, false, 'e0000000-0000-0000-0000-000000000003', '{}')->'ticket'->>'unit' = 'Box 4', 'reissue: the new code scans, same seat');
 reset role;
-select t.ok((select count(*) from outbox where order_id = :'o7' and kind = 'tickets') = 1 and (select count(*) from order_log where order_id = :'o7' and kind = 'reissue') = 1, 'reissue is in the order history and the updated tickets are queued');
+select t.ok((select count(*) from t.outbox where order_id = :'o7' and kind = 'tickets') = 1 and (select count(*) from t.order_log where order_id = :'o7' and kind = 'reissue') = 1, 'reissue is in the order history and the updated tickets are queued');
 -- cancelled / refunded tickets: rejected at once
 set role authenticated; select t.who('owner@box.test');
-select t.ok(checkin((select code from tickets where order_id = ((:'r2'::jsonb)->>'id')::uuid and seat = 'A-3' and status = 'cancelled' limit 1), false, 'e0000000-0000-0000-0000-000000000001', '{}')->>'result' = 'cancelled', 'a cancelled ticket is rejected as cancelled');
-reset role; select id as t2 from tickets where code = :'k2' \gset
+select t.ok(checkin((select code from t.tickets where order_id = ((:'r2'::jsonb)->>'id')::uuid and seat = 'A-3' and status = 'cancelled' limit 1), false, 'e0000000-0000-0000-0000-000000000001', '{}')->>'result' = 'cancelled', 'a cancelled ticket is rejected as cancelled');
+reset role; select id as t2 from t.tickets where code = :'k2' \gset
 set role authenticated; select t.who('owner@box.test');
 select order_action(:'o7', 'refund', json_build_object('mode', 'tickets', 'tickets', json_build_array(:'t2'), 'to', 'cash', 'cancel', true, 'seat', 'release')::jsonb);
 select t.ok(checkin(:'k2', false, 'e0000000-0000-0000-0000-000000000003', '{}')->>'result' = 'refunded', 'a refunded ticket is rejected as refunded');
@@ -285,7 +301,7 @@ select place_order('{"buyer":{"name":"Opt Fan","email":"opt@mail.test","phone":"
 reset role;
 select t.ok((select email_optin and sms_optin and phone = '+16465550123' and email_optin_src like 'checkout%' from contacts where email = 'opt@mail.test'), 'S8 checkout opt-ins (email + text) recorded on the contact with their source');
 select t.ok((select count(*) from consent_log where email = 'opt@mail.test') = 2, 'S8 consent history has both opt-ins');
-select t.ok((select data->'utm' = '{"source":"ig","campaign":"spring"}'::jsonb from orders where id = :'s8o1'), 'S8 UTM tags stored on the order (known keys only)');
+select t.ok((select data->'utm' = '{"source":"ig","campaign":"spring"}'::jsonb from t.orders where id = :'s8o1'), 'S8 UTM tags stored on the order (known keys only)');
 set role authenticated; select t.who('owner@box.test');
 select t.err($$select save_integration('b0000000-0000-0000-0000-000000000001', '{"kind":"webhook","config":{"url":"http://hooks.example.org","events":["payment.completed"]}}')$$, 'https', 'S8 webhooks must be https');
 select t.err($$select save_integration('b0000000-0000-0000-0000-000000000001', '{"kind":"webhook","config":{"url":"https://169.254.169.254/x","events":["payment.completed"]}}')$$, 'public host', 'S8 webhooks cannot target private / metadata addresses');
@@ -303,14 +319,14 @@ reset role;
 set role authenticated; select t.who('owner@box.test');
 select place_order('{"buyer":{"name":"Vera Vip","email":"vera@mail.test","phone":"+1 212 555 0199"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000001","ticketTypeId":"vip","qty":1,"seats":["B-1"]}],"payment":"manual","payMethod":"cash"}')->>'id' as s8v \gset
 reset role;
-select t.ok((select count(*) from outbox where order_id = :'s8v' and kind = 'confirmation') = 1, 'S8 one confirmation for the order');
+select t.ok((select count(*) from t.outbox where order_id = :'s8v' and kind = 'confirmation') = 1, 'S8 one confirmation for the order');
 select t.ok((select count(*) from deliveries where event = 'payment.completed' and payload->'data'->>'id' = :'s8v') = 1 and (select count(*) from deliveries where event = 'order.created' and payload->'data'->>'id' = :'s8v') = 1, 'S8 order.created + payment.completed webhooks queued');
 select t.ok(not exists(select 1 from deliveries where payload::text like '%access_key%' or payload::text like '%platformFee%'), 'S8 webhook payloads never carry the order key or platform money');
-select t.ok((select count(*) from outbox where order_id = :'s8v' and automation_id = (:'s8a'::jsonb)->>'id' and send_at = '2099-01-01T20:00:00Z'::timestamptz - interval '48 hours') = 2, 'S8 VIP purchase → email + text scheduled 48 h before the event');
+select t.ok((select count(*) from t.outbox where order_id = :'s8v' and automation_id = (:'s8a'::jsonb)->>'id' and send_at = '2099-01-01T20:00:00Z'::timestamptz - interval '48 hours') = 2, 'S8 VIP purchase → email + text scheduled 48 h before the event');
 select t.ok((select 'VIP' = any(tags) and 'Attendee: Seated Show' = any(tags) from contacts where email = 'vera@mail.test'), 'S8 tags from the automation and the standard Purchase workflow');
 select t.ok((select count(*) from automation_runs where automation_id = (:'s8a'::jsonb)->>'id') = 1, 'S8 the automation ran once');
-select emit_event('b0000000-0000-0000-0000-000000000001', 'payment.completed', '{}', order_ctx(o)) from orders o where id = :'s8v';
-select t.ok((select count(*) from outbox where order_id = :'s8v' and automation_id = (:'s8a'::jsonb)->>'id') = 2, 'S8 the same trigger never runs an automation twice');
+select emit_event('b0000000-0000-0000-0000-000000000001', 'payment.completed', '{}', order_ctx(o)) from public.orders o where id = :'s8v';
+select t.ok((select count(*) from t.outbox where order_id = :'s8v' and automation_id = (:'s8a'::jsonb)->>'id') = 2, 'S8 the same trigger never runs an automation twice');
 -- campaigns: marketing only to opted-in; event update to all holders
 set role authenticated; select t.who('owner@box.test');
 select send_campaign('b0000000-0000-0000-0000-000000000001', '{"category":"marketing","channel":"email","subject":"News","body":"Hi {{first_name}}","filter":{"status":"any"}}') as s8c \gset
@@ -326,18 +342,18 @@ select queue_msg(jsonb_build_object('box_office_id', 'b0000000-0000-0000-0000-00
 set role service_role;
 select claim_outbox(500) as s8cl \gset
 reset role;
-select t.ok((select status from outbox where id = :'s8m') = 'suppressed', 'S8 sender: a marketing email to someone who never opted in is held back at send time');
+select t.ok((select status from t.outbox where id = :'s8m') = 'suppressed', 'S8 sender: a marketing email to someone who never opted in is held back at send time');
 select t.ok(exists(select 1 from jsonb_array_elements(:'s8cl'::jsonb) x where x->'msg'->>'kind' = 'confirmation' and x->'ctx'->'order'->>'key' is not null and jsonb_array_length(x->'ctx'->'tickets') >= 1), 'S8 sender gets what it needs to render (order link, tickets)');
 select t.ok(not exists(select 1 from jsonb_array_elements(:'s8cl'::jsonb) x where (x->'msg'->>'send_at')::timestamptz > now()), 'S8 nothing is claimed before its time');
 set role service_role;
 select outbox_result(((x->'msg')->>'id')::uuid, true, 'resend', 're_' || ((x->'msg')->>'id'), null, false) from jsonb_array_elements(:'s8cl'::jsonb) x where x->'msg'->>'kind' = 'confirmation';
 select outbox_result(((x->'msg')->>'id')::uuid, false, 'resend', null, 'timeout', false) from jsonb_array_elements(:'s8cl'::jsonb) x where x->'msg'->>'kind' = 'update';
 reset role;
-select t.ok((select bool_and(status = 'sent' and sent_at is not null) from outbox where kind = 'confirmation' and provider = 'resend'), 'S8 delivered messages are marked sent');
-select t.ok((select status = 'queued' and send_at > now() from outbox where kind = 'update' and channel = 'sms' limit 1), 'S8 a failed send is retried later (back-off)');
+select t.ok((select bool_and(status = 'sent' and sent_at is not null) from t.outbox where kind = 'confirmation' and provider = 'resend'), 'S8 delivered messages are marked sent');
+select t.ok((select status = 'queued' and send_at > now() from t.outbox where kind = 'update' and channel = 'sms' limit 1), 'S8 a failed send is retried later (back-off)');
 -- bounces, STOP, unsubscribe link
 set role service_role;
-select mail_event((select provider_id from outbox where kind = 'confirmation' and email = 'vera@mail.test' limit 1), 'bounced');
+select mail_event((select provider_id from t.outbox where kind = 'confirmation' and email = 'vera@mail.test' limit 1), 'bounced');
 select inbound_sms('+16465550123', 'STOP');
 reset role;
 select t.ok((select suppressed = 'bounced' from contacts where email = 'vera@mail.test'), 'S8 a hard bounce suppresses the address');
@@ -357,15 +373,15 @@ set role anon; select t.who('');
 select place_order('{"buyer":{"name":"Soon Fan","email":"soon@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000008","ticketTypeId":"g","qty":1,"seats":[]}],"payment":"offline"}')->>'id' as s8s \gset
 reset role; set role authenticated; select t.who('owner@box.test'); select order_action(:'s8s', 'markPaid', '{"method":"cash"}'); reset role;
 set role service_role; select marketing_tick(); select marketing_tick(); reset role;
-select t.ok((select count(*) from outbox where order_id = :'s8s' and kind = 'reminder') = 1, 'S8 the event''s own reminder is queued once (the standard one is skipped for it)');
+select t.ok((select count(*) from t.outbox where order_id = :'s8s' and kind = 'reminder') = 1, 'S8 the event''s own reminder is queued once (the standard one is skipped for it)');
 -- cancel → webhook + scheduled VIP messages dropped at send time
 set role authenticated; select t.who('owner@box.test');
 select order_action(:'s8v', 'cancel', '{"all":true,"seat":"release"}');
 reset role;
-select t.ok(exists(select 1 from deliveries where event = 'ticket.cancelled' and payload->'data'->>'order_ref' = (select ref from orders where id = :'s8v')), 'S8 ticket.cancelled webhook');
+select t.ok(exists(select 1 from deliveries where event = 'ticket.cancelled' and payload->'data'->>'order_ref' = (select ref from t.orders where id = :'s8v')), 'S8 ticket.cancelled webhook');
 update outbox set send_at = now() - interval '1 second' where order_id = :'s8v' and automation_id is not null;
 set role service_role; select claim_outbox(500); reset role;
-select t.ok((select bool_and(status = 'cancelled') from outbox where order_id = :'s8v' and automation_id = (:'s8a'::jsonb)->>'id'), 'S8 scheduled automation messages for a cancelled order are dropped');
+select t.ok((select bool_and(status = 'cancelled') from t.outbox where order_id = :'s8v' and automation_id = (:'s8a'::jsonb)->>'id'), 'S8 scheduled automation messages for a cancelled order are dropped');
 -- deliveries + API keys
 set role service_role; select claim_deliveries(100) as s8d \gset
 reset role;
@@ -391,19 +407,19 @@ insert into events(id, box_office_id, slug, status, data) values ('e0000000-0000
 set role anon; select t.who('');
 select place_order('{"buyer":{"name":"Money Fan","email":"money@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000009","ticketTypeId":"m","qty":3,"seats":[]}],"addons":[{"eventId":"e0000000-0000-0000-0000-000000000009","addonId":"prog","qty":1}],"payment":"card"}')->>'id' as s9o \gset
 reset role; set role service_role;
-select confirm_payment(:'s9o', json_build_object('amount', (select (data->>'total')::bigint from orders where id = :'s9o'), 'ref', 'pi_s9', 'provider', 'stripe', 'fee', 397)::jsonb);
+select confirm_payment(:'s9o', json_build_object('amount', (select (data->>'total')::bigint from t.orders where id = :'s9o'), 'ref', 'pi_s9', 'provider', 'stripe', 'fee', 397)::jsonb);
 reset role;
-select t.ok((select sum(fee) from tickets where order_id = :'s9o') = (select (data->>'fee')::bigint + coalesce((data->>'serviceFee')::bigint, 0) from orders where id = :'s9o') and (select sum(fee) from tickets where order_id = :'s9o') > 0,
+select t.ok((select sum(fee) from t.tickets where order_id = :'s9o') = (select (data->>'fee')::bigint + coalesce((data->>'serviceFee')::bigint, 0) from t.orders where id = :'s9o') and (select sum(fee) from t.tickets where order_id = :'s9o') > 0,
   'S9 the tickets share the order''s booking fee exactly');
-select t.ok((select sum(tax) from tickets where order_id = :'s9o') > 0 and (select sum(tax) from tickets where order_id = :'s9o') < (select (data->>'tax')::bigint from orders where id = :'s9o'),
+select t.ok((select sum(tax) from t.tickets where order_id = :'s9o') > 0 and (select sum(tax) from t.tickets where order_id = :'s9o') < (select (data->>'tax')::bigint from t.orders where id = :'s9o'),
   'S9 tickets carry their part of the sales tax; the product keeps the rest');
-select t.ok((select sum(proc) from tickets where order_id = :'s9o') between 1 and 396, 'S9 tickets carry their part of the card processing fee');
-select t.ok((select bool_and(fee > 0 and tax > 0 and proc > 0) from tickets where order_id = :'s9o'), 'S9 every ticket has its own booking fee, tax and processing share');
+select t.ok((select sum(proc) from t.tickets where order_id = :'s9o') between 1 and 396, 'S9 tickets carry their part of the card processing fee');
+select t.ok((select bool_and(fee > 0 and tax > 0 and proc > 0) from t.tickets where order_id = :'s9o'), 'S9 every ticket has its own booking fee, tax and processing share');
 -- refund one ticket as credit → that ticket shows the credit; a chargeback; a clerk can't record one
 set role authenticated; select t.who('owner@box.test');
-select order_action(:'s9o', 'refund', json_build_object('mode', 'tickets', 'tickets', (select jsonb_agg(id) from (select id from tickets where order_id = :'s9o' limit 1) x), 'to', 'credit')::jsonb);
+select order_action(:'s9o', 'refund', json_build_object('mode', 'tickets', 'tickets', (select jsonb_agg(id) from (select id from t.tickets where order_id = :'s9o' limit 1) x), 'to', 'credit')::jsonb);
 reset role;
-select t.ok((select count(*) from tickets where order_id = :'s9o' and credited > 0 and credited = refunded) = 1, 'S9 a refund as credit is recorded on the ticket as credit');
+select t.ok((select count(*) from t.tickets where order_id = :'s9o' and credited > 0 and credited = refunded) = 1, 'S9 a refund as credit is recorded on the ticket as credit');
 set role authenticated; select t.who('clerk@box.test');
 select t.err($$select order_action('$$ || :'s9o' || $$', 'chargeback', '{"amount":1000}')$$, 'permission', 'S9 a clerk without “Issue refunds” cannot record a chargeback');
 select t.who('owner@box.test');
@@ -411,22 +427,22 @@ select t.err($$select order_action('$$ || :'s9o' || $$', 'chargeback', '{"amount
 select order_action(:'s9o', 'chargeback', '{"amount":1000,"reason":"fraudulent"}');
 reset role;
 select t.ok((order_money(o)->>'chargedBack')::bigint = 1000 and (order_money(o)->>'refundable')::bigint = (order_money(o)->>'collected')::bigint - (order_money(o)->>'credited')::bigint - 1000, 'S9 an open chargeback reduces what can still be refunded')
-  from orders o where id = :'s9o';
+  from public.orders o where id = :'s9o';
 set role authenticated; select t.who('owner@box.test');
-select order_action(:'s9o', 'chargeback', json_build_object('id', (select data->'chargebacks'->0->>'id' from orders where id = :'s9o'), 'status', 'won')::jsonb);
+select order_action(:'s9o', 'chargeback', json_build_object('id', (select data->'chargebacks'->0->>'id' from t.orders where id = :'s9o'), 'status', 'won')::jsonb);
 reset role;
-select t.ok((order_money(o)->>'chargedBack')::bigint = 0 and o.data->'chargebacks'->0->>'status' = 'won', 'S9 a won chargeback gives the money back') from orders o where id = :'s9o';
-select t.ok(exists(select 1 from order_log where order_id = :'s9o' and kind = 'chargeback'), 'S9 chargebacks are in the order''s change history');
+select t.ok((order_money(o)->>'chargedBack')::bigint = 0 and o.data->'chargebacks'->0->>'status' = 'won', 'S9 a won chargeback gives the money back') from public.orders o where id = :'s9o';
+select t.ok(exists(select 1 from t.order_log where order_id = :'s9o' and kind = 'chargeback'), 'S9 chargebacks are in the order''s change history');
 -- the processor's side: charge, dispute (webhook, twice), payout
 set role service_role;
-select record_processor_tx(json_build_object('id', 'ch_s9', 'payment', 'pi_s9', 'type', 'charge', 'amount', (select (data->>'total')::bigint from orders where id = :'s9o'), 'fee', 397, 'app_fee', 0, 'account', 'acct_test')::jsonb);
+select record_processor_tx(json_build_object('id', 'ch_s9', 'payment', 'pi_s9', 'type', 'charge', 'amount', (select (data->>'total')::bigint from t.orders where id = :'s9o'), 'fee', 397, 'app_fee', 0, 'account', 'acct_test')::jsonb);
 select record_processor_tx('{"id":"ch_s9","payment":"pi_s9","type":"charge","amount":1,"account":"acct_test"}');
 select record_dispute('{"id":"dp_s9","payment":"pi_s9","amount":500,"reason":"duplicate","status":"open","provider":"stripe"}');
 select record_dispute('{"id":"dp_s9","payment":"pi_s9","amount":500,"reason":"duplicate","status":"open","provider":"stripe"}');
 select record_payout('{"id":"po_s9","account":"acct_test","amount":9000,"status":"paid","arrival":"2099-01-03T00:00:00Z","tx":["pi_s9"],"provider":"stripe"}');
 reset role;
 select t.ok((select count(*) from processor_tx where id = 'ch_s9') = 1 and (select amount from processor_tx where id = 'ch_s9') > 1, 'S9 processor transactions are recorded once (a repeated webhook changes nothing)');
-select t.ok((select count(*) from orders o, jsonb_array_elements(o.data->'chargebacks') c where o.id = :'s9o' and c->>'id' = 'dp_s9') = 1 and exists(select 1 from processor_tx where id = 'dp:dp_s9' and amount = -500),
+select t.ok((select count(*) from t.orders o, jsonb_array_elements(o.data->'chargebacks') c where o.id = :'s9o' and c->>'id' = 'dp_s9') = 1 and exists(select 1 from processor_tx where id = 'dp:dp_s9' and amount = -500),
   'S9 a processor dispute opens one chargeback on the order + a processor transaction');
 select t.ok((select status from payouts where id = 'po_s9') = 'paid' and (select bool_and(payout_id = 'po_s9') from processor_tx where payment = 'pi_s9'), 'S9 a paid payout links the transactions it carried');
 set role anon; select t.err($$select record_payout('{"id":"x","account":"acct_test","amount":1,"status":"paid"}')$$, 'permission denied', 'S9 payouts can only be written by the processor (service role)'); reset role;
@@ -453,9 +469,9 @@ select t.ok(jsonb_array_length((:'s9al'::jsonb)->'payouts') >= 1 and jsonb_array
 select t.ok(exists(select 1 from audit_log where kind = 'finance.expense' and target = 'e0000000-0000-0000-0000-000000000009'), 'S9 expense changes are in the activity log');
 -- reissue keeps a ticket's money
 set role authenticated; select t.who('owner@box.test');
-select order_action(:'s9o', 'reissue', json_build_object('tickets', (select jsonb_agg(id) from (select id from tickets where order_id = :'s9o' and status = 'valid' and credited = 0 limit 1) x))::jsonb);
+select order_action(:'s9o', 'reissue', json_build_object('tickets', (select jsonb_agg(id) from (select id from t.tickets where order_id = :'s9o' and status = 'valid' and credited = 0 limit 1) x))::jsonb);
 reset role;
-select t.ok((select sum(fee) from tickets where order_id = :'s9o' and status <> 'replaced') = (select (data->>'fee')::bigint + coalesce((data->>'serviceFee')::bigint, 0) from orders where id = :'s9o'), 'S9 a reissued ticket keeps its fee, tax and processing share');
+select t.ok((select sum(fee) from t.tickets where order_id = :'s9o' and status <> 'replaced') = (select (data->>'fee')::bigint + coalesce((data->>'serviceFee')::bigint, 0) from t.orders where id = :'s9o'), 'S9 a reissued ticket keeps its fee, tax and processing share');
 -- data ownership
 set role authenticated; select t.who('clerk@box.test');
 select t.err($$select export_box_office('b0000000-0000-0000-0000-000000000001')$$, 'owner', 'S9 staff without both export permissions can''t download everything');
@@ -464,7 +480,7 @@ select t.who('owner@box.test');
 select export_box_office('b0000000-0000-0000-0000-000000000001') as s9x \gset
 select t.who('root@platform.test'); select platform_export() as s9p \gset
 reset role;
-select t.ok(jsonb_array_length((:'s9x'::jsonb)->'orders') = (select count(*) from orders where box_office_id = 'b0000000-0000-0000-0000-000000000001') and not (:'s9x')::text like '%access_key%'
+select t.ok(jsonb_array_length((:'s9x'::jsonb)->'orders') = (select count(*) from t.orders where box_office_id = 'b0000000-0000-0000-0000-000000000001') and not (:'s9x')::text like '%access_key%'
   and jsonb_array_length((:'s9x'::jsonb)->'expenses') = 3, 'S9 the owner downloads every order (no private keys), ticket and expense');
 select t.ok(jsonb_array_length((:'s9p'::jsonb)->'box_offices') >= 1 and not (:'s9p')::text like '%buyer_email%', 'S9 platform export: box offices and order money, no customer contact data');
 set role authenticated; select t.who('root@platform.test'); select set_box_office_status('b0000000-0000-0000-0000-000000000001', 'suspended'); select t.who('owner@box.test');
@@ -472,6 +488,145 @@ select t.ok(jsonb_array_length(export_box_office('b0000000-0000-0000-0000-000000
 reset role;
 set role authenticated; select t.who('root@platform.test'); select set_box_office_status('b0000000-0000-0000-0000-000000000001', 'active'); reset role;
 update box_offices set settings = settings - 'taxPct' where id = 'b0000000-0000-0000-0000-000000000001';
+
+-- ═══ Stage 10: grants & RLS denials per role, emergency controls, waiting room, abuse limits, bans, policies, fees, versions, billing, health ═══
+delete from rate_hits;
+update box_offices set settings = settings || '{"feePct":0,"feeFixed":100,"taxPct":5}' where id = 'b0000000-0000-0000-0000-000000000001';
+insert into members(box_office_id, email, name, perms) values ('b0000000-0000-0000-0000-000000000001', 'gate@box.test', 'Gate', '{door.scan,door.checkin,door.attendees}');
+insert into auth.users(email, email_confirmed_at) values ('gate@box.test', now()), ('other-owner@box2.test', now());
+insert into box_offices(id, slug, name, status, owner, settings) values ('b0000000-0000-0000-0000-000000000002', 'other-box', 'Other Box', 'active', 'other-owner@box2.test', '{}');
+insert into members(box_office_id, email, name, perms) values ('b0000000-0000-0000-0000-000000000002', 'other-owner@box2.test', 'Other', '{}');
+insert into events(id, box_office_id, slug, status, data) values ('e0000000-0000-0000-0000-000000000010', 'b0000000-0000-0000-0000-000000000001', 'fest-ten', 'published', '{
+  "name":"Fest Ten","start":"2099-03-01T20:00:00Z","currency":"USD","visibility":"link","timeSlots":[],"taxPct":10,
+  "ticketTypes":[{"id":"gen","name":"General","price":4000,"qty":100,"admits":1,"fee":{"pct":"","fixed":300,"payer":""}}],"addons":[],
+  "fees":{"passProcessing":"no","extra":[{"id":"fx1","name":"Facility fee","pct":"","fixed":200,"per":"ticket","optional":false},{"id":"fx2","name":"Protection","pct":5,"fixed":"","per":"order","optional":true}]},
+  "terms":"Fest terms v1","checkout":{"phone":"required"},"donation":{"purpose":"Music fund"},"contact":{"email":"fest@box.test","team":"Fest crew"}}');
+insert into events(id, box_office_id, slug, status, data) values ('e0000000-0000-0000-0000-000000000011', 'b0000000-0000-0000-0000-000000000001', 'free-ten', 'published',
+  '{"name":"Free Ten","start":"2099-04-01T20:00:00Z","currency":"USD","visibility":"public","timeSlots":[],"ticketTypes":[{"id":"free","name":"Free","price":0,"qty":100,"admits":1}],"addons":[]}');
+-- grants: nobody reads orders / tickets / money tables directly
+set role authenticated; select t.who('gate@box.test');
+select t.err($$select price_paid from tickets$$, 'permission denied|does not exist', 'S10 door staff cannot read ticket prices straight from the table');
+select t.err($$select paid, fee, tax from tickets limit 1$$, 'permission denied', 'S10 door staff: ticket money columns are not readable');
+select t.err($$select * from outbox limit 1$$, 'permission denied', 'S10 staff cannot read the outbox directly');
+select t.err($$select * from bans$$, 'permission denied', 'S10 bans are not readable directly');
+select t.err($$select * from error_log$$, 'permission denied', 'S10 the error log is not readable directly');
+select t.ok(jsonb_array_length(admin_load('b0000000-0000-0000-0000-000000000001')->'tickets') > 0 and (select bool_and(x->'paid' = 'null'::jsonb or not (x ? 'paid')) from jsonb_array_elements(admin_load('b0000000-0000-0000-0000-000000000001')->'tickets') x), 'S10 door staff get tickets through admin_load — with the money masked');
+select t.err($$update events set controls = '{"salesPaused":true}' where id = 'e0000000-0000-0000-0000-000000000010'$$, 'permission denied', 'S10 the emergency-control column can''t be written directly');
+select t.err($$select event_control('e0000000-0000-0000-0000-000000000010', '{"salesPaused":true}')$$, 'permission', 'S10 emergency controls need events.controls');
+select t.who('other-owner@box2.test');
+select t.ok((admin_load('b0000000-0000-0000-0000-000000000001')->'bo'->>'id') = 'b0000000-0000-0000-0000-000000000002', 'S10 strict box office separation: another box office''s owner only ever loads their own');
+select t.err($$select event_control('e0000000-0000-0000-0000-000000000010', '{"salesPaused":true}')$$, 'permission', 'S10 another box office can''t pause this one''s event');
+select t.err($$select ban_customer('b0000000-0000-0000-0000-000000000001', 'x@y.test', 'r')$$, 'permission', 'S10 another box office can''t ban this one''s customers');
+select t.err($$select platform_health()$$, 'super admins', 'S10 system health is for super admins only');
+select t.err($$select billing_run('2099-01')$$, 'super admins', 'S10 only super admins run billing');
+select t.err($$select set_plan('b0000000-0000-0000-0000-000000000001', 'pro')$$, 'owner', 'S10 only the owner (or a super admin) changes the plan');
+reset role;
+set role anon; select t.who('');
+select t.ok((select controls from events where id = 'e0000000-0000-0000-0000-000000000011') = '{}', 'S10 buyers can see an event''s controls (to show "paused")');
+select t.err($$select * from orders$$, 'permission denied', 'S10 buyers cannot read orders');
+select t.err($$select platform_overview()$$, 'permission denied|super admins', 'S10 buyers cannot open the platform dashboard');
+select t.err($$select event_control('e0000000-0000-0000-0000-000000000010', '{"salesPaused":true}')$$, 'permission denied', 'S10 buyers cannot run staff functions');
+reset role;
+-- fees & taxes per event, policies, checkout form, donations
+set role anon; select t.who('');
+select t.err($$select place_order('{"buyer":{"name":"F","email":"f10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000010","ticketTypeId":"gen","qty":2}],"payment":"offline"}')$$, 'mobile', 'S10 the event''s checkout form requires a mobile number');
+select t.err($$select place_order('{"buyer":{"name":"F","email":"f10@mail.test","phone":"+12125550100"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000010","ticketTypeId":"gen","qty":2}],"payment":"offline"}')$$, 'accept', 'S10 the policies must be accepted');
+select place_order(('{"buyer":{"name":"F","email":"f10@mail.test","phone":"+12125550100"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000010","ticketTypeId":"gen","qty":2}],"optFees":["fx2"],"donation":500,"payment":"offline","accepted":[{"kind":"terms","eventId":"e0000000-0000-0000-0000-000000000010","version":"' || fnv('Fest terms v1') || '"}]}')::jsonb)->>'id' as f10 \gset
+reset role;
+select t.ok((data->>'fee')::bigint = 600 and (data->>'otherFee')::bigint = 400 + 400 and jsonb_array_length(data->'otherFees') = 2, 'S10 ticket-type booking fee ($3) + mandatory facility fee + optional 5% fee') from orders where id = :'f10';
+select t.ok((data->>'tax')::bigint = 800 and (data->>'total')::bigint = 8000 + 600 + 800 + 800 + 500, 'S10 the event''s own tax rate (10%); everything stored separately') from orders where id = :'f10';
+select t.ok(data->'accepted'->0->>'version' = fnv('Fest terms v1') and data->>'donationFor' = 'Music fund' and exists(select 1 from policy_texts where version = fnv('Fest terms v1')), 'S10 accepted policy version + time stored; donation purpose stored') from orders where id = :'f10';
+select t.ok(fnv('é ok') = '1ba406ad', 'S10 policy fingerprint matches the browser''s (UTF-8)');
+select t.who('root@platform.test'); update events set data = data || '{"terms":"Fest terms v2"}' where id = 'e0000000-0000-0000-0000-000000000010';
+set role anon; select t.who('');
+select t.err($$select place_order(('{"buyer":{"name":"F","email":"f11@mail.test","phone":"+12125550100"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000010","ticketTypeId":"gen","qty":1}],"payment":"offline","accepted":[{"kind":"terms","eventId":"e0000000-0000-0000-0000-000000000010","version":"' || fnv('Fest terms v1') || '"}]}')::jsonb)$$, 'changed', 'S10 a policy changed during checkout → old version refused');
+-- abuse protection
+reset role; select t.who('root@platform.test'); update events set data = jsonb_set(data, '{ticketTypes,0,price}', '0') where id = 'e0000000-0000-0000-0000-000000000002';
+set role anon; select t.who('');
+select t.err($$select place_order('{"buyer":{"name":"B","email":"b10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"offline","bot":{"hp":"x"}}')$$, 'Checkout failed', 'S10 honeypot field → refused');
+select place_order('{"buyer":{"name":"B","email":"v10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"free","bot":{"ms":300}}')->>'id' as v1 \gset
+reset role;
+select t.ok(data->'flags' ? 'bot', 'S10 an automated-looking checkout is flagged') from orders where id = :'v1';
+set role anon; select t.who('');
+select place_order('{"buyer":{"name":"B","email":"v10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"free"}')->>'id' as v2 \gset
+select place_order('{"buyer":{"name":"B","email":"v10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"free"}')->>'id' as v3 \gset
+reset role;
+select t.ok(data->'flags' ? 'velocity' and data->'flags' ? 'duplicate', 'S10 third order from one email in an hour → velocity + duplicate flags') from orders where id = :'v3';
+update orders set created_at = now() where buyer_email = 'v10@mail.test';
+insert into orders(box_office_id, ref, status, buyer_email, event_ids, data) select 'b0000000-0000-0000-0000-000000000001', 'SET-VEL' || g, 'paid', 'v10@mail.test', '{e0000000-0000-0000-0000-000000000002}', '{"lines":[],"total":0}' from generate_series(1, 12) g;
+set role anon; select t.who('');
+select t.err($$select place_order('{"buyer":{"name":"B","email":"v10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"free"}')$$, 'Too many orders', 'S10 velocity limit per email per hour');
+reset role; delete from rate_hits; insert into rate_hits(key) select 'order:local' from generate_series(1, 20);
+set role anon; select t.who('');
+select t.err($$select place_order('{"buyer":{"name":"B","email":"r10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"free"}')$$, 'Too many checkout attempts', 'S10 rate limit per connection');
+reset role; delete from rate_hits;
+-- bans
+set role authenticated; select t.who('owner@box.test');
+select ban_customer('b0000000-0000-0000-0000-000000000001', 'banned10@mail.test', 'Resale bot');
+reset role; set role anon; select t.who('');
+select t.err($$select place_order('{"buyer":{"name":"B","email":"banned10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"free"}')$$, 'contact the box office', 'S10 a banned customer can''t buy');
+reset role; set role authenticated; select t.who('owner@box.test');
+select unban_customer((select id from t.bans_v where email = 'banned10@mail.test'));
+reset role; set role anon; select t.who('');
+select t.ok(place_order('{"buyer":{"name":"B","email":"banned10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"free"}')->>'status' = 'paid', 'S10 ban removed → can buy again');
+reset role;
+select t.ok((select removed_by from bans where email = 'banned10@mail.test') = 'owner@box.test' and exists(select 1 from audit_log where kind = 'customers.ban'), 'S10 bans and their removal are on record');
+-- emergency controls
+set role authenticated; select t.who('owner@box.test');
+select event_control('e0000000-0000-0000-0000-000000000002', '{"salesPaused":true,"message":"Back at 2"}');
+reset role; set role anon; select t.who('');
+select t.err($$select place_order('{"buyer":{"name":"B","email":"c10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000002","ticketTypeId":"ga","qty":1}],"payment":"free"}')$$, 'Back at 2', 'S10 pause sales: orders refused with the organizer''s message');
+select t.ok(place_order('{"buyer":{"name":"B","email":"c10@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000011","ticketTypeId":"free","qty":1}],"payment":"free"}')->>'status' = 'paid', 'S10 other events keep selling');
+reset role; set role authenticated; select t.who('owner@box.test');
+select event_control('e0000000-0000-0000-0000-000000000002', '{"salesPaused":false}');
+select event_control('e0000000-0000-0000-0000-000000000003', '{"scanPaused":true}');
+select t.ok(checkin((select code from t.tickets where event_id = 'e0000000-0000-0000-0000-000000000003' and status = 'valid' limit 1), false, 'e0000000-0000-0000-0000-000000000003', '{}')->>'result' = 'paused', 'S10 stop scanning → "paused"');
+select event_control('e0000000-0000-0000-0000-000000000003', '{"scanPaused":false}');
+select t.ok((select count(*) from audit_log where kind = 'event.controls') >= 3, 'S10 every emergency control is logged');
+update events set data = data || '{"name":"GA Party!"}' where id = 'e0000000-0000-0000-0000-000000000002';
+select t.ok(exists(select 1 from t.versions_v where target = 'e0000000-0000-0000-0000-000000000002' and 'details' = any(sections) and by = 'owner@box.test'), 'S10 event saves keep a version (what changed, who)');
+select pause_gateway('b0000000-0000-0000-0000-000000000001', true);
+reset role; set role anon; select t.who('');
+select t.err($$select place_order(('{"buyer":{"name":"F","email":"g10@mail.test","phone":"+12125550100"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000010","ticketTypeId":"gen","qty":1}],"payment":"card","accepted":[{"kind":"terms","eventId":"e0000000-0000-0000-0000-000000000010","version":"' || fnv('Fest terms v2') || '"}]}')::jsonb)$$, 'paused', 'S10 a paused processor takes no card payments');
+reset role; set role authenticated; select t.who('owner@box.test'); select pause_gateway('b0000000-0000-0000-0000-000000000001', false); reset role;
+-- waiting room
+select t.who('root@platform.test'); update events set data = data || '{"queue":{"on":true,"rate":60,"passMinutes":20}}' where id = 'e0000000-0000-0000-0000-000000000010';
+set role anon; select t.who('');
+select t.ok(queue_status('e0000000-0000-0000-0000-000000000010', 'token-first-0001')->>'admitted' = 'true', 'S10 waiting room: first arrival goes straight in');
+select t.ok((queue_status('e0000000-0000-0000-0000-000000000010', 'token-second-001')->>'position')::int = 1 and queue_status('e0000000-0000-0000-0000-000000000010', 'token-third-0001')->>'position' = '2', 'S10 later arrivals queue in order');
+select t.err($$select place_order(('{"buyer":{"name":"F","email":"q10@mail.test","phone":"+12125550100"},"holdToken":"token-third-0001","items":[{"eventId":"e0000000-0000-0000-0000-000000000010","ticketTypeId":"gen","qty":1}],"payment":"offline","accepted":[{"kind":"terms","eventId":"e0000000-0000-0000-0000-000000000010","version":"' || fnv('Fest terms v2') || '"}]}')::jsonb)$$, 'waiting room', 'S10 no pass → no checkout');
+select t.ok(place_order(('{"buyer":{"name":"F","email":"q11@mail.test","phone":"+12125550100"},"holdToken":"token-first-0001","items":[{"eventId":"e0000000-0000-0000-0000-000000000010","ticketTypeId":"gen","qty":1}],"payment":"offline","accepted":[{"kind":"terms","eventId":"e0000000-0000-0000-0000-000000000010","version":"' || fnv('Fest terms v2') || '"}]}')::jsonb)->>'status' = 'pending', 'S10 admitted visitor checks out');
+-- customer service routing
+select t.ok(contact_organizer('e0000000-0000-0000-0000-000000000010', null, '{"name":"Q","email":"cs10@mail.test","body":"Is there parking?"}')->>'routed' = 'Fest crew', 'S10 contact form routed to the event''s team');
+reset role;
+select t.ok((select routed_to from support_messages where email = 'cs10@mail.test') = 'fest@box.test' and exists(select 1 from outbox where "to" = 'fest@box.test' and category = 'staff'), 'S10 the event''s contact gets the message by email');
+set role authenticated; select t.who('owner@box.test');
+select support_action((select id from t.support_v where email = 'cs10@mail.test'), 'reply', '{"body":"Yes, at Pier 17."}');
+reset role;
+select t.ok((select status from support_messages where email = 'cs10@mail.test') = 'answered' and exists(select 1 from outbox where "to" = 'cs10@mail.test' and body like '%Pier 17%'), 'S10 staff reply from the inbox');
+-- versions, plans, billing, incidents, health, API scopes, domains
+set role authenticated; select t.who('owner@box.test');
+update box_offices set settings = settings || '{"terms":"Box terms v2"}' where id = 'b0000000-0000-0000-0000-000000000001';
+select t.err($$update box_offices set plan = 'venue' where id = 'b0000000-0000-0000-0000-000000000001'$$, 'Plan and domains', 'S10 plan can''t be set by an ordinary settings update');
+select set_plan('b0000000-0000-0000-0000-000000000001', 'pro');
+reset role;
+select t.ok((pricing_settings(b)->'platform'->>'pct')::numeric = 0.5, 'S10 the plan sets the platform fee') from box_offices b where id = 'b0000000-0000-0000-0000-000000000001';
+set role authenticated; select t.who('owner@box.test');
+select save_domain('b0000000-0000-0000-0000-000000000001', 'tickets.testbox.example');
+select t.ok(bo_by_domain('tickets.testbox.example') is null, 'S10 an unverified custom domain doesn''t serve the site');
+select t.ok(admin_load('b0000000-0000-0000-0000-000000000001')->'bans' is not null and jsonb_array_length(admin_load('b0000000-0000-0000-0000-000000000001')->'versions') >= 2, 'S10 admin_load: versions + bans for the owner');
+select t.who('root@platform.test');
+select t.ok(billing_run(to_char(now(), 'YYYY-MM')) >= 1 and billing_run(to_char(now(), 'YYYY-MM')) = 0, 'S10 billing run: invoices once per box office per month');
+select save_incident('{"kind":"payment","title":"Cards failing","severity":"major"}');
+select t.ok(platform_health()->'parts'->>'payments' = 'down', 'S10 an open incident shows on system health');
+select t.ok(jsonb_array_length(platform_overview()->'events') >= 4 and jsonb_array_length(platform_overview()->'staff') >= 3, 'S10 the platform dashboard lists every event and staff member');
+reset role;
+set role service_role; select domain_result('b0000000-0000-0000-0000-000000000001', 'site', '{"status":"verified"}'); reset role;
+set role anon; select t.ok(bo_by_domain('tickets.testbox.example')->>'slug' = 'test-box', 'S10 verified domain → its box office'); reset role;
+insert into api_keys(box_office_id, name, prefix, hash, scopes, created_by) values ('b0000000-0000-0000-0000-000000000001', 'k', 'set_live_x', 'h10', '{orders:read,finance:read,events:read}', 'clerk@box.test');
+select t.ok((select api_auth('h10')->'scopes') = '["orders:read"]', 'S10 an API key only keeps the scopes its creator still has permission for');
+select t.ok(jsonb_typeof(api_read('b0000000-0000-0000-0000-000000000001', 'finance')) = 'array' and jsonb_typeof(api_read('b0000000-0000-0000-0000-000000000001', 'seating')) = 'array', 'S10 API: finance and seating resources');
+update box_offices set settings = settings - 'taxPct' || '{"feeFixed":100}' where id = 'b0000000-0000-0000-0000-000000000001';
 
 \o
 \pset tuples_only off

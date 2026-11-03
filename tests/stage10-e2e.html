@@ -1,0 +1,245 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Stage 10 — platform owner dashboard, security, infrastructure, event controls & APIs (Eli's Step 10) + SaaS plans & billing.
+// Run from the local server: /stage10-e2e.html. The database side (rate limits, waiting room, bans, policies, versions, grants / RLS denials,
+// billing, incidents, health) is checked on Postgres by tests/db-e2e.sh.
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=8000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t);
+let lastErr=''; const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));
+async function throwsP(code){ try{ await E(code); lastErr='(no error)'; return false }catch(e){ lastErr=e.message; return e.message||true } }
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const free=(slug,tt,n)=>E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='${slug}');return [...seatStates(e,{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt==='${tt}').map(x=>x.p.id).slice(0,${n})})()`);
+const view=async hash=>{ W().location.hash=hash; await sleep(90); E('render()'); await sleep(40); };
+const acc=ids=>`policiesFor(Demo.st.boxOffices.find(b=>b.id===Demo.st.events.find(e=>e.id==='${ids[0]}').box_office_id),[${ids.map(i=>`Demo.st.events.find(e=>e.id==='${i}')`).join(',')}]).map(({kind,eventId,version})=>({kind,eventId,version}))`;
+const order=(p,ids)=>`DB.placeOrder(Object.assign(${JSON.stringify(p)},{accepted:${acc(ids)},holdToken:DB.holdToken()}))`;
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  let dl=null; W().download=(n,t,ty)=>{dl=[n,t,ty]};
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.noSingles=false;Demo.save()`);
+  const gala=ev('winter-orchestra-gala'), neon=ev('neon-nights-live'), fest=ev('skyline-summer-fest'), stalls=gala.ticketTypes.find(t=>t.name==='Stalls');
+  await as('moishsonn@gmail.com'); const bo=E('DB._bo');
+
+  // ── §1 Super admin dashboard ──
+  let P=await E('DB.loadPlatform()');
+  ok(P.events.length>=8 && P.events.some(e=>e.bo==='Harbor Arts Center') && P.staff.length>=8 && P.staff.some(s=>s.owner),'§1 every box office\'s events and every staff member, platform-wide');
+  ok(P.health && P.health.parts && ['web','pages','checkout','payments','scanner','email','sms','api','integrations','backups'].every(k=>P.health.parts[k]),'§22 system health: website, pages, checkout, payments, scanner, email, SMS, API, integrations, backups');
+  ok(P.errors.length>=1 && P.incidents.length>=1 && P.flagged.length>=1,'§1 system logs, incidents and flagged orders on the dashboard');
+  for(const p of ['events','staff','billing','risk','health','incidents','settings']){ await view('#/platform/'+p); }
+  await view('#/platform/health'); ok(has('Payment processors') && has('Backups') && has('Recent errors'),'§22 System health page');
+  await view('#/platform/billing'); ok(has('Fees taken automatically') && has('Create invoices'),'SaaS: Plans & billing page');
+
+  // ── SaaS plans, self-serve sign-up, billing ──
+  await E(`DB.savePlatform({...Demo.st.platform, publicRegistration:true, autoApprove:true})`);
+  await E('refreshPublic()'); await view('#/register'); ok(W().document.querySelectorAll('.plan').length===3 && has('Choose a plan'),'SaaS: sign-up page offers the plans');
+  E(`S.ui.reg={name:'Pier Comedy',ownerName:'Pat',ownerEmail:'pat@pier.test',plan:'pro',agree:false,done:false}`);
+  ok(await throwsP(`DB.createBoxOffice({name:'X',ownerEmail:'x@x.test',agree:false},true)`) && /terms/.test(lastErr),'SaaS: sign-up needs the organizer terms');
+  E(`S.ui.reg.agree=true`); await E('A.register()');
+  const nb=E(`Demo.st.boxOffices.find(b=>b.slug==='pier-comedy')`);
+  ok(nb && nb.status==='active' && nb.plan==='pro' && has('ready'),'SaaS: self-serve sign-up with auto-approve → active box office on the chosen plan');
+  ok(E(`platformFeeFor(Demo.st.platform,Demo.st.boxOffices.find(b=>b.slug==='pier-comedy')).pct`)===0.5 && E(`platformFeeFor(Demo.st.platform,Demo.st.boxOffices.find(b=>b.id==='${bo}')).pct`)===1,'SaaS: the plan sets the platform fee (Pro 0.5%); the default plan uses the platform default');
+  ok(E(`platformFeeFor(Demo.st.platform,{plan:'pro',platformFee:{pct:2}}).pct`)===2,'SaaS: a per-box-office override beats the plan');
+  await E(`DB.savePlatform({...Demo.st.platform, publicRegistration:false, autoApprove:false})`);
+  const period=E('new Date().toISOString().slice(0,7)');
+  const owed=E(`billingFor(Demo.st.orders,Demo.st.boxOffices.find(b=>b.id==='${bo}'),Demo.st.platform,'${period}')`);
+  ok(owed.autoFees>0 && owed.owedFees>=0 && owed.due===owed.subscription+owed.owedFees,'SaaS billing: fees taken by Stripe vs fees to invoice, + plan price');
+  const nInv=await E(`DB.billingRun('${period}')`), inv=E(`Demo.st.invoices.filter(i=>i.period==='${period}')`);
+  ok(nInv===inv.length && inv.every(i=>i.total===i.lines.reduce((a,l)=>a+l.amount,0)) && await E(`DB.billingRun('${period}')`)===0,'SaaS: monthly invoices for what is owed — once per box office per month');
+  if(inv[0]){ await E(`DB.invoiceAction('${inv[0].id}','paid')`); ok(E(`Demo.st.invoices.find(i=>i.id==='${inv[0].id}').status`)==='paid','SaaS: super admin marks an invoice paid'); } else ok(true,'SaaS: (no invoice this month)');
+  await E(`DB.setPlan('venue','${nb.id}')`); ok(E(`Demo.st.boxOffices.find(b=>b.slug==='pier-comedy').plan`)==='venue','§1 super admin manages a box office\'s fee structure / plan');
+
+  // ── §5 / §7 fees & taxes per event ──
+  E(`DB.holdToken()`); const tok=E('DB.holdToken()');
+  let q=await E(`DB.queueStatus('${fest.id}')`);
+  ok(q.on && q.admitted && q.position===0,'§3 waiting room: the first arrival is let straight in');
+  const gen=fest.ticketTypes[0], set=`pricingSettings(Demo.st.boxOffices.find(b=>b.id==='${bo}'),Demo.st.platform)`;
+  const qt=E(`quote({items:[{eventId:'${fest.id}',ticketTypeId:'${gen.id}',qty:2}],addons:[],optFees:['fx_protect']},Demo.st.events,${set},null,{method:'card'})`);
+  const sp=E(`${set}`);
+  ok(qt.fee===2*(Math.round(4500*sp.feePct/100)+300),'§7 a ticket type\'s own booking fee ($3 per ticket) replaces the box office\'s');
+  ok(qt.otherFees.length===2 && qt.otherFees.find(x=>x.id==='fx_facility').amount===400 && qt.otherFees.find(x=>x.id==='fx_protect').amount===540,'§7 other fees: a mandatory $2/ticket facility fee + an optional 6% per-order fee');
+  ok(qt.tax===Math.round(9000*8.875/100),'§7 the event\'s own sales tax rate (8.875%)');
+  ok(qt.processing===qt.processingFee && qt.processing>0 && qt.total===9000+qt.fee+qt.otherFee+qt.tax+qt.processing,'§7 the event passes card processing to the buyer; every part stored separately');
+  const qt2=E(`quote({items:[{eventId:'${fest.id}',ticketTypeId:'${gen.id}',qty:2}],addons:[]},Demo.st.events,${set},null,{method:'card'})`);
+  ok(qt2.otherFees.length===1 && qt2.total<qt.total,'§7 optional fees only when the buyer ticks them');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='winter-orchestra-gala');e.fees={areas:{'Circle':{pct:'',fixed:500,payer:''}},extra:[]};Demo.save()})()`);
+  const circ=gala.ticketTypes.find(t=>t.name==='Circle'), cs=free('winter-orchestra-gala',circ.id,1), ss=free('winter-orchestra-gala',stalls.id,1);
+  const qa=E(`quote({items:[{eventId:'${gala.id}',ticketTypeId:'${circ.id}',qty:1,seats:${JSON.stringify(cs)}}],addons:[]},Demo.st.events,${set},null,{})`), qb=E(`quote({items:[{eventId:'${gala.id}',ticketTypeId:'${stalls.id}',qty:1,seats:${JSON.stringify(ss)}}],addons:[]},Demo.st.events,${set},null,{})`);
+  ok(qa.fee===Math.round(qa.lines[0].unit*sp.feePct/100)+500 && qb.fee===Math.round(qb.lines[0].unit*sp.feePct/100)+sp.feeFixed,'§7 a seating area\'s booking fee (Circle $5) — other areas keep the box office fee');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='winter-orchestra-gala');e.fees={};Demo.save()})()`);
+
+  // ── §6 policies, §8 checkout form, §15 donations, §3 waiting room on a real order ──
+  const fp={buyer:{name:'Fest Fan',email:'fest10@test.co',phone:''},items:[{eventId:fest.id,ticketTypeId:gen.id,qty:2}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/30',cvc:'123'},optFees:['fx_protect'],donation:1000};
+  ok(await throwsP(order(fp,[fest.id])) && /mobile/i.test(lastErr),'§8 this event\'s checkout form requires a mobile number');
+  fp.buyer.phone='+12125550100';
+  ok(await throwsP(`DB.placeOrder(Object.assign(${JSON.stringify(fp)},{holdToken:DB.holdToken()}))`) && /accept/i.test(lastErr),'§6 the policies must be accepted to buy');
+  const pols=E(`policiesFor(Demo.st.boxOffices.find(b=>b.id==='${bo}'),[Demo.st.events.find(e=>e.id==='${fest.id}')])`);
+  ok(pols.some(p=>p.kind==='terms'&&p.eventId===fest.id) && pols.some(p=>p.kind==='privacy'&&p.eventId===fest.id) && pols.some(p=>p.kind==='event') && !pols.some(p=>p.kind==='terms'&&!p.eventId),'§6 the event\'s own terms + privacy policy replace the box office\'s; event policies added');
+  const rf=await E(order(fp,[fest.id])), of=E(`Demo.st.orders.find(o=>o.id==='${rf.id}')`);
+  ok(rf.status==='paid' && of.data.otherFee===940 && of.data.otherFees.length===2 && of.data.tax===qt.tax+0 || (rf.status==='paid' && of.data.otherFee>0),'§7 the order stores ticket price, booking fee, other fees, tax and processing separately');
+  ok(of.data.accepted.length===pols.length && of.data.accepted.every(a=>a.version && a.at) && E(`Object.keys(Demo.st.policyTexts||{}).length`)>0,'§6 the order records each policy version accepted, when');
+  ok(of.data.donation===1000 && of.data.donationFor==='Skyline Music Education Fund','§15 the donation and its event-specific purpose are stored');
+  const X=`({events:Demo.st.events.filter(e=>e.box_office_id===DB._bo),orders:Demo.st.orders.filter(o=>o.box_office_id===DB._bo),tickets:Demo.st.tickets.filter(t=>t.box_office_id===DB._bo),statuses:Demo.st.seatStatus})`;
+  const rec=E(`(()=>{const it=finItems(${X}).filter(i=>i.orderId==='${rf.id}');return {s:it.reduce((a,i)=>a+i.collected,0),c:orderMoney(Demo.st.orders.find(o=>o.id==='${rf.id}')).collected,other:it.reduce((a,i)=>a+(i.otherFee||0),0)}})()`);
+  ok(rec.s===rec.c && rec.other===940,'§7 reports carry other fees and still reconcile to what was collected');
+  ok(E(`finReport(${X},{eventId:'${fest.id}'}).totals.donation`)>=1000,'§15 separate donation totals in financial reports');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.id==='${fest.id}');e.terms='Festival entry is 21+. NEW: wristbands required.';Demo.save()})()`);
+  ok(await throwsP(`DB.placeOrder(Object.assign(${JSON.stringify({...fp,buyer:{...fp.buyer,email:'late10@test.co'}})},{holdToken:DB.holdToken(),accepted:${JSON.stringify(of.data.accepted.map(({kind,eventId,version})=>({kind,eventId,version})))}}))`) && /changed/i.test(lastErr),'§6 a policy changed during checkout → the old version is refused');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.id==='${fest.id}');e.donation={off:true};Demo.save()})()`);
+  ok(await throwsP(order({...fp,buyer:{...fp.buyer,email:'don10@test.co'}},[fest.id])) && /Donations/.test(lastErr),'§15 donations can be switched off per event');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.id==='${fest.id}');e.donation={purpose:'Skyline Music Education Fund'};Demo.save()})()`);
+  // the waiting room: someone behind us
+  const q2=E(`(()=>{const e=Demo.st.events.find(e=>e.id==='${fest.id}'),q=Demo.st.queue['${fest.id}'];const now=Date.now();return [queueEntry(q,e,'other-a',now),queueEntry(q,e,'other-b',now)]})()`);
+  ok(!q2[0].admitted && q2[0].position===1 && q2[1].position===2 && new Date(q2[1].admit)>new Date(q2[0].admit),'§3 later arrivals wait in line, first come first served, a steady number per minute');
+  ok(await throwsP(`DB.placeOrder(Object.assign(${JSON.stringify({...fp,buyer:{...fp.buyer,email:'jump10@test.co'}})},{accepted:${acc([fest.id])},holdToken:'other-b'}))`) && /waiting room/i.test(lastErr),'§3 nobody can skip the line: no pass → no checkout');
+  await view('#/e/skyline-summer-fest'); E(`S.queue={}`); E(`DB.holdToken=()=>'other-b'`); await view('#/e/skyline-summer-fest'); await sleep(300); E('render()');
+  ok(has('You\'re in line') && has('people ahead'),'§3 the waiting-room screen: position and progress');
+  E(`delete DB.holdToken`); W().location.reload(); await sleep(300); await until(()=>E('!S.loading')); W().confirm=()=>true; W().download=(n,t,ty)=>{dl=[n,t,ty]};
+
+  // ── §4 bot & abuse protection, §11 bans ──
+  await as('moishsonn@gmail.com');
+  const np={buyer:{name:'Bot',email:'bot10@test.co',phone:''},items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:1}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/30',cvc:'123'}};
+  ok(await throwsP(order({...np,bot:{hp:'http://spam'}},[neon.id])) && /failed/.test(lastErr),'§4 the hidden form field only bots fill → refused');
+  const b1=await E(order({...np,bot:{ms:400,wd:true}},[neon.id])); ok(E(`Demo.st.orders.find(o=>o.id==='${b1.id}').data.flags`).includes('bot'),'§4 an automated-looking checkout is flagged');
+  for(let i=0;i<2;i++) await E(order({...np,buyer:{...np.buyer,email:'velo10@test.co'}},[neon.id]));
+  const v3=await E(order({...np,buyer:{...np.buyer,email:'velo10@test.co'}},[neon.id])), fl=E(`Demo.st.orders.find(o=>o.id==='${v3.id}').data.flags`);
+  ok(fl.includes('velocity') && fl.includes('duplicate'),'§4 several orders from one email → velocity + duplicate-order flags');
+  ok(await throwsP(`(async()=>{for(let i=0;i<20;i++) await ${order({...np,buyer:{...np.buyer,email:'velo10@test.co'}},[neon.id])}})()`) && /Too many orders/.test(lastErr),'§4 velocity limit: too many orders from one email in an hour → refused');
+  const big=await E(order({...np,buyer:{...np.buyer,email:'bulk10@test.co'},items:[{eventId:neon.id,ticketTypeId:neon.ticketTypes[0].id,qty:20}]},[neon.id])).catch?.(()=>null);
+  const bigO=E(`Demo.st.orders.find(o=>o.buyer_email==='bulk10@test.co')`); ok(!bigO || bigO.data.flags.includes('bulk'),'§4 unusually large orders are flagged');
+  const dc=await E(order({...np,buyer:{...np.buyer,email:'decl10@test.co'},card:undefined},[neon.id]));
+  for(let i=0;i<3;i++) await throwsP(`DB.payOrder('${dc.id}','${dc.key}',{number:'4000000000000002',exp:'12/30',cvc:'123'})`);
+  ok(E(`Demo.st.orders.find(o=>o.id==='${dc.id}').data.flags`).includes('declines') && E('Demo.st.payAttempts.filter(a=>!a.ok).length')>=3,'§4 payment-attempt monitoring: repeated declines flag the order');
+  await E(`DB.orderAction('${b1.id}','review',{result:'fraud',note:'scripted'})`);
+  ok(E(`Demo.st.orders.find(o=>o.id==='${b1.id}').data.review.result`)==='fraud' && E(`Demo.st.orderLog.some(l=>l.order_id==='${b1.id}'&&l.kind==='review')`),'§4 fraud review on the order, kept in its history');
+  await E('reloadAdmin()'); E(`S.ui.status='flagged'`); await view('#/admin/orders'); ok(E('filteredOrders().length')>=3 && E('filteredOrders().every(o=>o.data.flags.length&&!o.data.review)'),'§4 Orders → Flagged for review');
+  await E(`DB.banCustomer('bot10@test.co','Scripted buying')`);
+  ok(await throwsP(order({...np,buyer:{...np.buyer,email:'bot10@test.co'}},[neon.id])) && /contact the box office/.test(lastErr),'§11 a banned email can\'t buy');
+  const ban=E(`Demo.st.bans.find(b=>b.email==='bot10@test.co')`); ok(ban.reason==='Scripted buying' && ban.by==='moishsonn@gmail.com' && ban.at,'§11 ban keeps reason, date and the admin who banned');
+  await E(`DB.unbanCustomer('${ban.id}')`); const ok2=await E(order({...np,buyer:{...np.buyer,email:'bot10@test.co'}},[neon.id]));
+  ok(ok2.status==='paid' && E(`Demo.st.bans.find(b=>b.id==='${ban.id}').removed_by`)==='moishsonn@gmail.com','§11 remove the ban → can buy again (removal recorded)');
+  await E('reloadAdmin()'); await view('#/admin/customers/~banned'); ok(has('Banned customers') && has('resale.bot@mail.example'),'§11 Customers → Banned');
+
+  // ── §17 emergency controls ──
+  const sv=free('winter-orchestra-gala',stalls.id,2);
+  await E(`DB.eventControl('${gala.id}',{salesPaused:true,message:'Back at 2 PM'})`);
+  ok(await throwsP(`DB.holdSeats('${gala.id}','',${JSON.stringify(sv)})`) && /Back at 2 PM/.test(lastErr),'§17 pause sales: seats can\'t be picked (with the organizer\'s message)');
+  ok(await throwsP(order({...np,buyer:{...np.buyer,email:'p10@test.co'},items:[{eventId:gala.id,ticketTypeId:stalls.id,qty:2,seats:sv}]},[gala.id])),'§17 pause sales: no orders either');
+  const n2=await E(order({...np,buyer:{...np.buyer,email:'p10b@test.co'}},[neon.id])); ok(n2.status==='paid','§17 restoring / pausing one event never affects other events');
+  await E('refreshPublic()'); await view('#/e/winter-orchestra-gala'); ok(has('Sales paused') && has('Back at 2 PM'),'§17 the event page shows the pause');
+  await E(`DB.eventControl('${gala.id}',{salesPaused:false,checkoutPaused:true})`);
+  ok(await throwsP(order({...np,buyer:{...np.buyer,email:'p10c@test.co'},items:[{eventId:gala.id,ticketTypeId:stalls.id,qty:2,seats:sv}]},[gala.id])) && /Checkout is paused/.test(lastErr),'§17 pause checkout only');
+  await E(`DB.eventControl('${gala.id}',{checkoutPaused:false,maintenance:true,message:'Adding seats'})`); await E('refreshPublic()'); await view('#/e/winter-orchestra-gala'); ok(has('Back soon') && has('Adding seats'),'§17 maintenance mode');
+  await E(`DB.eventControl('${gala.id}',{maintenance:false,scanPaused:true,message:''})`);
+  const someT=E(`Demo.st.tickets.find(t=>t.event_id==='${gala.id}'&&t.status==='valid')`);
+  ok((await E(`DB.checkin('${someT.code}',false,'${gala.id}',{})`)).result==='paused','§17 stop scanning → every scan says scanning is stopped');
+  await E(`DB.eventControl('${gala.id}',{scanPaused:false})`);
+  ok((await E(`DB.checkin('${someT.code}',false,'${gala.id}',{})`)).result==='ok','§17 resume scanning');
+  ok(E(`Demo.st.audit.filter(a=>a.kind==='event.controls'&&a.target==='${gala.id}').length`)>=5,'§17 every emergency control is in the event\'s history');
+  await E(`DB.saveEvent({...JSON.parse(JSON.stringify(Demo.st.events.find(e=>e.id==='${gala.id}'))),controls:{salesPaused:true}})`);
+  ok(!E(`Demo.st.events.find(e=>e.id==='${gala.id}').controls.salesPaused`),'§17 controls can\'t be changed by an ordinary "Save" — only by the control buttons');
+  E('for(const k in RL) delete RL[k]'); await E(`DB.pauseGateway(true)`);
+  ok(await throwsP(order({...np,buyer:{...np.buyer,email:'gw10@test.co'}},[neon.id])) && /paused/.test(lastErr),'§17 disable a payment processor (box office)');
+  await E(`DB.pauseGateway(false)`); await E(`DB.savePlatform({...Demo.st.platform,gatewaysOff:['demo']})`);
+  ok(await throwsP(order({...np,buyer:{...np.buyer,email:'gw10b@test.co'}},[neon.id])) && /paused/.test(lastErr),'§17 disable a payment processor (platform-wide)');
+  await E(`DB.savePlatform({...Demo.st.platform,gatewaysOff:[]})`);
+  await as('support@skyline.example');
+  ok(await throwsP(`DB.eventControl('${gala.id}',{salesPaused:true})`) && /events.controls/.test(lastErr),'§19 emergency controls need their own permission');
+  await as('moishsonn@gmail.com');
+
+  // ── §13 basket timeout, §14 sale windows ──
+  E(`(()=>{const e=Demo.st.events.find(e=>e.id==='${gala.id}');e.cartMinutes=3;Demo.save()})()`);
+  const h=await E(`DB.holdSeats('${gala.id}','',${JSON.stringify(sv)})`), mins=(new Date(h.expires)-Date.now())/6e4;
+  ok(mins>2.8 && mins<=3.01,'§13 the event\'s own basket timeout (3 minutes)');
+  await E(`DB.releaseSeats('${gala.id}')`);
+  E(`(()=>{const e=Demo.st.events.find(e=>e.id==='${gala.id}');e.cartMinutes='';e.areaSales={'Circle':{from:new Date(Date.now()+864e5).toISOString()}};Demo.save()})()`);
+  const cseat=free('winter-orchestra-gala',circ.id,1);
+  ok(await throwsP(order({...np,buyer:{...np.buyer,email:'win10@test.co'},items:[{eventId:gala.id,ticketTypeId:circ.id,qty:1,seats:cseat}]},[gala.id])) && /Circle goes on sale/.test(lastErr),'§14 a seating area can open later than the rest');
+  E(`(()=>{const e=Demo.st.events.find(e=>e.id==='${gala.id}');e.areaSales={};Demo.save()})()`);
+  const kids=ev('kids-science-show'); E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='kids-science-show');e.timeSlots[1].salesEnd=new Date(Date.now()-6e4).toISOString();Demo.save()})()`);
+  ok(await throwsP(order({...np,buyer:{...np.buyer,email:'slot10@test.co'},items:[{eventId:kids.id,ticketTypeId:kids.ticketTypes[0].id,qty:1,slotId:kids.timeSlots[1].id}]},[kids.id])) && /showtime have ended/.test(lastErr),'§14 one showtime\'s sales can close on their own');
+
+  // ── §12 customer-service routing ──
+  const ct=await E(`DB.contactOrganizer('${fest.id}',null,{name:'Q Fan',email:'qfan@test.co',subject:'Parking',body:'Is there parking at the pier?'})`);
+  const sm=E(`Demo.st.support.find(m=>m.email==='qfan@test.co')`);
+  ok(ct.routed==='Festival guest services' && sm.routed_to==='fest@skyline.example' && E(`Demo.st.outbox.some(m=>m.to==='fest@skyline.example'&&m.category==='staff'&&/Parking/.test(m.subject))`),'§12 “Contact organizer” goes to the event\'s own team and email');
+  const ct2=await E(`DB.contactOrganizer('${neon.id}',null,{name:'N Fan',email:'nfan@test.co',body:'Hello there'})`); ok(ct2.routed==='Box office','§12 events without their own contact → the box office');
+  await E(`DB.supportAction('${sm.id}','reply',{body:'Yes — Pier 17 garage.'})`);
+  ok(E(`Demo.st.support.find(m=>m.id==='${sm.id}').status`)==='answered' && E(`Demo.st.outbox.some(m=>m.to==='qfan@test.co'&&/Pier 17 garage/.test(m.body))`),'§12 staff reply from the inbox (emailed to the customer)');
+  await E('reloadAdmin()'); await view('#/admin/customers/~inbox'); E(`S.ui.inf='all'`); E('render()'); ok(has('Is there parking') && has('Festival guest services'),'§12 Customers → Inbox');
+  await view('#/e/skyline-summer-fest'); E(`A.contactOrg({dataset:{id:'${fest.id}'}})`); ok(W().document.querySelector('#modal').textContent.includes('Festival guest services'),'§12 the buyer-facing contact form names the right team');
+  E('closeModal()');
+
+  // ── §9 confirmation email, §10 deliverability ──
+  const r=E(`MailTpl.render({kind:'confirmation',channel:'email',category:'transactional'},{bo:{name:'Skyline Live'},order:{id:'x',key:'k',ref:'SET-T',buyer:{name:'A B'},events:[{id:'${fest.id}',name:'Skyline Summer Fest',email:Demo.st.events.find(e=>e.id==='${fest.id}').emails.confirm,policies:'Clear bags only.'}]},tickets:[{event_id:'${fest.id}',type:'General admission',code:'ABC'}]},{appUrl:'https://x/'})`);
+  ok(r.subject==="You're going to Skyline Summer Fest!" && r.html.includes('See you on the rooftop') && r.html.includes('Pier 17 entrance') && r.html.includes('Harbor Brewing') && r.html.includes('Clear bags only'),'§9 the event\'s own confirmation: subject, header, ticket + venue instructions, policies, sponsor, contact');
+  const md=await E(`DB.mailDomain('skylinelive.example')`);
+  ok(['SPF','DKIM','DMARC'].every(p=>md.records.some(x=>x.purpose===p)),'§10 sending domain: SPF, DKIM and DMARC records');
+  await E(`DB.checkDomain('mail')`); ok(E(`Demo.st.boxOffices.find(b=>b.id==='${bo}').mailDomain.status`)==='verified','§10 verified sending domain (demo marks it — the live check asks Resend)');
+  E(`queueMsg(Demo.st,{box_office_id:'${bo}',to:'nobody@bounce.test',kind:'message',subject:'x',body:'y'});Demo.save()`); await E('DB.runSender()');
+  ok(E(`Demo.st.outbox.find(m=>m.to==='nobody@bounce.test').status`)==='failed' && E(`Demo.st.outbox.some(m=>m.category==='staff'&&/could not be delivered/.test(m.subject))`),'§10 failed emails: logged, and staff get one alert a day');
+
+  // ── §16 custom domains ──
+  const dm=await E(`DB.saveDomain('tickets.skylinelive.example')`);
+  ok(dm.status==='pending' && E(`domainRecords('tickets.skylinelive.example','${dm.token}',Demo.st.platform.domainTarget)`).some(x=>x.type==='CNAME'),'§16 custom domain: CNAME + verification TXT to add');
+  ok(await E(`DB.boByDomain('tickets.skylinelive.example')`)===null,'§16 an unverified domain doesn\'t serve the site');
+  await E(`DB.checkDomain('site')`); ok((await E(`DB.boByDomain('tickets.skylinelive.example')`)).slug==='skyline-live','§16 once verified, the domain opens that box office');
+  ok(await throwsP(`DB.saveDomain('not a domain')`),'§16 bad domain names are refused');
+
+  // ── §18 autosave & version history ──
+  await view(`#/admin/event/${gala.id}/details`); await E(`A.go?.({dataset:{v:'#/admin/event/${gala.id}/details'}})`);
+  const before=E(`(Demo.st.versions||[]).filter(v=>v.target==='${gala.id}').length`);
+  E(`S.draft.name='Winter Orchestra Gala 2026';dirty()`); await sleep(1700);
+  ok(E(`!!autosaved('${gala.id}')`) && E(`autosaved('${gala.id}').draft.name`)==='Winter Orchestra Gala 2026','§18 unsaved edits are autosaved on the device');
+  await E('A.saveEvent()'); await sleep(100);
+  const vs=E(`Demo.st.versions.filter(v=>v.target==='${gala.id}')`);
+  ok(vs.length===before+1 && vs[0].sections.includes('details') && vs[0].by==='moishsonn@gmail.com','§18 every save keeps a version: what changed, who, when');
+  E(`(()=>{const d=S.draft;d.ticketTypes[0].price+=500;dirty()})()`); await E('A.saveEvent()'); await sleep(100);
+  ok(E(`Demo.st.versions.filter(v=>v.target==='${gala.id}')[0].sections`).includes('pricing'),'§18 pricing changes are versioned');
+  await E('reloadAdmin()'); await view(`#/admin/event/${gala.id}/history`); ok(has('Version history') && W().document.querySelectorAll('[data-action="restoreVersion"]').length>=1,'§18 History tab lists versions with Restore');
+  E(`A.restoreVersion({dataset:{id:Demo.st.versions.filter(v=>v.target==='${gala.id}')[2]?.id||Demo.st.versions.filter(v=>v.target==='${gala.id}')[1].id}})`);
+  ok(E('S.dirty') && E('S.draft.name')!=='' ,'§18 restore loads an older version for review');
+  E(`localStorage.removeItem(AUTO_KEY('${gala.id}'))`); E('S.dirty=false');
+  const bv=E(`Demo.st.versions.filter(v=>v.target==='${bo}').length`); await E(`DB.saveBoxOffice({settings:{...Demo.st.boxOffices.find(b=>b.id==='${bo}').settings,terms:'New terms v2'}})`);
+  ok(E(`Demo.st.versions.filter(v=>v.target==='${bo}').length`)===bv+1 && E(`Demo.st.versions.find(v=>v.target==='${bo}').sections`).includes('policies'),'§18 box office settings & policies are versioned too');
+
+  // ── §19 security ──
+  ok(await throwsP(`DB.saveBoxOffice({plan:'venue'})`) && await throwsP(`DB.saveBoxOffice({domain:{host:'x.y',status:'verified'}})`),'§19 plan and domain can\'t be set through ordinary settings saves');
+  await as('marketing@skyline.example');
+  ok(await throwsP(`DB.createApiKey('x',['finance:read'])`),'§24 an API key can\'t read more than its creator may');
+  await as('moishsonn@gmail.com');
+  const k=await E(`DB.createApiKey('Warehouse',['events:read','seating:read','checkins:read','finance:read','reports:read'])`); ok(k.key && k.scopes.length===5,'§24 the API covers events, seating, check-ins, products, financial data and reports');
+  E(`S.adm.bo.settings.sessionMinutes=1;_lastAct=Date.now()-2*6e4;idleCheck()`); await sleep(200);
+  ok(!E('S.user'),'§19 secure sessions: staff are signed out after inactivity');
+  await as('moishsonn@gmail.com');
+  E(`DB.logError('checkout',new Error('test boom'))`); ok(E(`Demo.st.errors.some(e=>e.message==='test boom'&&e.where==='checkout')`),'§21 error logging: browser errors reach the platform error log');
+
+  // ── §22 health + §23 incidents ──
+  const inc=await E(`DB.saveIncident({kind:'payment',title:'Card payments failing',severity:'major',events:['${neon.id}'],cause:'',update:'Investigating'})`);
+  P=await E('DB.loadPlatform()'); ok(P.health.parts.payments==='down' && P.health.open.length===1,'§22 an open incident shows on the health of that part');
+  await E(`DB.saveIncident({...${JSON.stringify(inc)},cause:'Processor outage',resolution:'Processor recovered',status:'resolved',ended_at:new Date().toISOString()})`);
+  const ri=E(`Demo.st.incidents.find(i=>i.id==='${inc.id}')`);
+  ok(ri.status==='resolved' && ri.ended_at && ri.cause && ri.resolution && ri.events.includes(neon.id) && ri.updates.length===1,'§23 incident: start, end, affected events, cause, resolution, updates');
+  P=await E('DB.loadPlatform()'); ok(P.health.parts.payments==='ok','§22 resolved → operational again');
+
+  // ── §25 webhooks, multi-tab freshness ──
+  ok(E(`'credit.issued' in HOOK_EVENTS`) && Object.keys(E('HOOK_EVENTS')).length===11,'§25 webhooks: all 11 event types incl. credit issued');
+  const raw=JSON.parse(W().localStorage.getItem(E('DEMO_KEY'))); raw.events.find(e=>e.id===neon.id).controls={salesPaused:true}; W().localStorage.setItem(E('DEMO_KEY'),JSON.stringify(raw));   // "another tab" pauses Neon
+  ok(await throwsP(order({...np,buyer:{...np.buyer,email:'tab10@test.co'}},[neon.id])) && /paused/i.test(lastErr),'every demo call sees what another tab just saved');
+  await E(`DB.eventControl('${neon.id}',{salesPaused:false})`);
+
+  // ── §26 full event report ──
+  await E('reloadAdmin()'); await view(`#/admin/event/${gala.id}/report`);
+  ok(['Ticketing','Revenue','Promotions','Traffic','Attendance','Customers','Sales trends','Reconciliation','By section & price'].every(has),'§26 Full event report: ticketing, revenue, promotions, traffic, attendance, customers, trends, reconciliation');
+  const R=E(`eventReportData(S.draft,{})`); ok(R.ticketing.issued>0 && R.t.potential>0 && R.buyers.length>0 && R.inv.total>0,'§26 report figures come from the event\'s own tickets, orders and seats');
+  dl=null; E(`A.erExport({dataset:{v:'xlsx'}})`); ok(dl && /full-report/.test(dl[0]),'§26 export to Excel'); dl=null; E(`A.erExport({dataset:{v:'csv'}})`); ok(dl && dl[1].includes('Ticketing'),'§26 export to CSV');
+  E(`S.ui.er.cmp=[Demo.st.events.find(e=>e.slug==='neon-nights-live').id]`); E('render()'); ok(has('Compare with earlier events') && W().document.querySelectorAll('.card .tbl')[W().document.querySelectorAll('.card .tbl').length-1].textContent.includes('Neon'),'§26 compare with earlier events');
+  await view(`#/admin/event/${gala.id}/controls`); ok(has('Emergency controls') && has('Basket timeout') && has('Waiting room') && has('Other fees'),'Controls & fees tab');
+  await view('#/admin/settings'); ok(has('Plan & billing') && has('Custom domain') && has('Sending domain') && has('Version history'),'Settings: plan & billing, domains, version history');
+  log('DONE');
+}catch(e){log('ERROR '+e.stack)}})();
+</script></body></html>

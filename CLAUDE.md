@@ -113,10 +113,37 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   already-masked admin data (`xpRows`), CSV (formula-injection safe `csvCell`) or Excel via `frontend/xlsx.js` (no library). Owners can
   always pull everything with `export_box_office()` (even while suspended); super admins `platform_export()`. Accounting = balanced daily
   `journal()` → QuickBooks / Xero CSV; direct sync needs their OAuth apps.
+- **Platform, security & event controls (Stage 10):** the Stage 10 block in data.js (mirrored in schema.sql's "Stage 10 core" + RPC
+  sections). Emergency controls = `ev.controls` (LIVE: `events.controls` column, written only by `event_control()` — `events_guard` keeps
+  it on ordinary saves; perm `events.controls`) checked by `controlBlock()` / `control_block()` in holds, orders and `checkin` (result
+  `paused`). Basket timeout `ev.cartMinutes` (`cartMinutes()` / `cart_minutes()`); sale windows per showtime (`slot.salesStart/End`) and per
+  area (`ev.areaSales`) via `windowMsg()` / `window_msg()`. Waiting room `ev.queue {on, rate, passMinutes}`: FIFO entry times
+  (`queueEntry()` / `queue_status()` + `queue_entries`), pass checked by `queuePass()` / `queue_pass()` with the browser's hold token.
+  Fees per event: booking-fee rules seat area → ticket type (`tt.fee`) → event (`ev.fees`) → box office (`feeRuleFor()` / `fee_rule()`,
+  `feeSet()` / `fee_set()`; ticket lines also split on the rule), product fees (`ad.fee`), other fees `ev.fees.extra` (mandatory or
+  optional via `cart.optFees` / `p.optFees`) → `order.data.otherFees` / `otherFee` (finItems' order item, FIN_SUM `otherFee`), event tax
+  `ev.taxPct`, `ev.fees.passProcessing`. Policies: `policiesFor()` / `policies_for()` (box office terms / refund / privacy, replaced by the
+  event's own, + event policies), version = `fnv()` of the text (same in SQL); checkout sends `accepted`, `policyCheck()` / `policy_check()`
+  stores it on `order.data.accepted` and texts in `policyTexts` / `policy_texts`. Checkout form per event `ev.checkout` (`checkoutFor()` /
+  `checkout_for()` — strictest wins); donations `settings.donationAmounts/Purpose/Custom` + `ev.donation` → `order.data.donationFor`.
+  Abuse: `rateHit()` / `rate_hit()` (+ `client_ip()`), honeypot `p.bot.hp`, velocity, bans (`bans`, `activeBan()`), flags
+  (`ORDER_FLAGS` on `order.data.flags`, order action `review`); seat holds capped per address in SQL. Versions: `addVersion()` /
+  `add_version()` on every event / box office save (`versions`, 40 per target) + local autosave of the event editor (`autosaved()`).
+  Customer service: `contactOrganizer()` / `contact_organizer()` → `support_messages` + staff email to the event's contact (Customers →
+  Inbox, `customers.inbox`). Super admin (`#/platform/...`): all events, staff, plans & billing (`planList`, `bo.plan`, `billingFor()` /
+  `billing_for()`, `billing_run()` → `platform_invoices`; fees on Stripe orders are taken automatically, others invoiced), risk, system
+  health (`healthOf()` / `platform_health()` from `pay_attempts`, outbox, deliveries, `error_log`, `backup_runs`, open `incidents`),
+  incidents, processors off (`gatewaysOff`; per box office `pause_gateway()`). Domains: `bo.domain` + `bo.mailDomain` (column
+  `mail_domain`) set by `save_domain()` / the `domains` Edge Function; `bo_by_domain()` at boot. Self-serve sign-up `register_organizer()`.
+  Table lockdown: orders / tickets / outbox / credits / … have NO direct select for anon or authenticated — read through `admin_load()`.
+  API keys only keep scopes their creator still has permission for (`API_PERM`, checked in `api_auth`). DEMO: every `DB.*` call runs
+  `Demo.fresh()` first (other tabs' changes). `deploy/publish.sh` writes `version.json` + a `deploy-…` tag; `deploy/rollback.sh`,
+  `deploy/backup.sh`, `deploy/restore-test.sh`, `tests/load/onsale.js`. Older test suites wrap `DB.placeOrder` with `acceptAll()` (current
+  policy versions + reset demo rate limit) because they call it directly.
 - **Money is integer cents everywhere.**
 - **Not yet wired:** the payments, messaging and api Edge Functions are written but not deployed (no Supabase project yet; need
   Stripe / Resend / Twilio keys in Supabase secrets + pg_cron for `expire_orders()` and `marketing_tick()`; the messaging function sends
-  nothing until `EMAIL_LIVE=1`); Apple Wallet passes.
+  nothing until `EMAIL_LIVE=1`); the domains function (DNS / Resend) and Cloudflare for SaaS custom hostnames; Apple Wallet passes.
 
 ## Run locally
 `cd frontend && python3 -m http.server 8765` → http://localhost:8765 (organizer side: /#/admin).

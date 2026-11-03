@@ -1,9 +1,13 @@
 <!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Stage 10: a checkout now records which policy versions the buyer accepted. The UI sends them itself; direct DB.placeOrder calls in
+// this older suite accept the current ones (acceptAll), so these checks keep testing what they were written for. Its many orders from one
+// browser stand for many different buyers, so the demo's per-browser checkout rate limit is reset for them.
+function acceptAll(w){try{if(w&&w.eval&&w.eval('typeof DB==="object"&&!DB._acc'))w.eval(`(()=>{const po=DB.placeOrder;DB.placeOrder=function(p,t){for(const k in RL)delete RL[k];if(p&&p.accepted===undefined&&!t){const st=Demo.st,ids=[...new Set([...(p.items||[]),...(p.addons||[])].map(i=>i.eventId))],evs=ids.map(id=>st.events.find(e=>e.id===id)).filter(Boolean),bo=st.boxOffices.find(b=>b.id===(evs[0]&&evs[0].box_office_id));p={...p,accepted:policiesFor(bo,evs).map(({kind,eventId,version})=>({kind,eventId,version}))}}return po.call(this,p,t)};DB._acc=1})()`)}catch(e){}return w}
 // Stage 9 — financial reports, sales analytics, payouts & reconciliation, profitability, exports, accounting, data ownership (Eli's Step 9).
 // Run from the local server: /stage9-e2e.html. The database side (ticket money, chargebacks, processor ledger, payouts, expenses, exports)
 // is checked on Postgres by tests/db-e2e.sh.
 const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
-const f=document.getElementById('f'); const W=()=>f.contentWindow;
+const f=document.getElementById('f'); const W=()=>acceptAll(f.contentWindow);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
 const until=async(fn,ms=8000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
 const has=t=>W().document.body.textContent.includes(t);
@@ -40,7 +44,7 @@ const unzipNames=bytes=>{const u=bytes,names=[];for(let i=0;i<u.length-4;i++){if
   const recon=E(`(()=>{const x=${X()},items=finItems(x),bad=[];for(const o of x.orders.filter(wasPaid)){const s=items.filter(i=>i.orderId===o.id).reduce((a,i)=>a+i.collected,0);if(s!==orderMoney(o).collected)bad.push(o.ref)}return {bad,n:x.orders.filter(wasPaid).length}})()`);
   ok(recon.n>50 && recon.bad.length===0,`§1 every paid order's items add up to what it collected (${recon.n} orders${recon.bad.length?', off: '+recon.bad.slice(0,3):''})`);
   let T=rep().totals;
-  const ident=t=>t.collected===t.tface+t.pface-t.discount-t.savings+t.fees+t.tax+t.donation+t.cardFee+t.creditUsed+t.changes && t.net===t.collected-t.refunds-t.credits-t.chargebacks-t.processing;
+  const ident=t=>t.collected===t.tface+t.pface-t.discount-t.savings+t.fees+(t.otherFee||0)+t.tax+t.donation+t.cardFee+t.creditUsed+t.changes && t.net===t.collected-t.refunds-t.credits-t.chargebacks-t.processing;
   ok(ident(T),'§3 the dashboard waterfall is exact: gross − discounts + fees + tax … − refunds − processing = net collected');
   ok(T.collected===E(`Demo.st.orders.filter(o=>o.box_office_id===DB._bo&&wasPaid(o)).reduce((a,o)=>a+orderMoney(o).collected,0)`),'§1 report "collected" = every paid order\'s collected money');
   ok(E(`finGroup(finReport(${X()}),'event').reduce((a,r)=>a+r.collected,0)`)===T.collected && E(`finGroup(finReport(${X()}),'day').reduce((a,r)=>a+r.net,0)`)===T.net,'§2 by-event and by-day breakdowns add up to the totals');
@@ -103,7 +107,7 @@ const unzipNames=bytes=>{const u=bytes,names=[];for(let i=0;i<u.length-4;i++){if
   ok(E(`Demo.st.procTx.some(r=>r.payment===Demo.st.orders.find(o=>o.id==='${r1.id}').payment.ref&&r.type==='dispute_won')`),'§5 the processor ledger has refunds and chargebacks too');
   // a processor report with one wrong amount and one unknown transaction
   const ref1=E(`Demo.st.orders.find(o=>o.id==='${r1.id}').payment.ref`), o1n=E(`Demo.st.orders.find(o=>o.id==='${r1.id}')`);
-  const csvTxt='id,Type,Source,Amount,Fee,Created (UTC)\ntxn_1,charge,'+ref1+','+((o1n.data.total-100)/100)+','+(o1n.data.processingFee/100)+',2026-11-02 10:00:00\ntxn_2,charge,pi_unknown_9,25.00,1.03,2026-11-02 11:00:00\n';
+  const csvTxt='id,Type,Source,Amount,Fee,Created (UTC)\ntxn_1,charge,'+ref1+','+((o1n.data.total-100)/100)+','+(o1n.data.processingFee/100)+','+today+' 10:00:00\ntxn_2,charge,pi_unknown_9,25.00,1.03,'+today+' 11:00:00\n';   // today's date: the check filters to today
   const imp=E(`parseProcessorCsv(${JSON.stringify(csvTxt)})`); ok(imp.length===2 && imp[0].amount===o1n.data.total-100,'§5 import the processor\'s own report (CSV)');
   rc=E(`reconcile(Demo.st.orders.filter(o=>o.box_office_id===DB._bo),parseProcessorCsv(${JSON.stringify(csvTxt)}),{from:'${today}',to:'${today}'})`);
   const mine=rc.rows.find(r=>r.ref===ref1); ok(mine && mine.status==='different' && mine.diffs.some(d=>d.field==='charged'&&d.set-d.processor===100),'§5 differences between platform and processor totals are shown per transaction');

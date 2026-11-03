@@ -22,7 +22,9 @@ async function rpc(fn, args) {
 }
 const same = (a, b) => { a = String(a || ''); b = String(b || ''); if (!a || a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i); return d === 0; };
 const fnUrl = () => env.SUPABASE_URL + '/functions/v1/messaging';
-const fromFor = bo => { const m = /^(.*?)\s*<(.+)>$/.exec(env.MAIL_FROM || ''), addr = m ? m[2] : env.MAIL_FROM, name = String(bo?.mail?.fromName || bo?.name || (m ? m[1] : 'SET')).replace(/["<>\r\n]/g, '').slice(0, 60);
+// Stage 10: a box office with a verified sending domain (Settings → Sending domain) sends from its own address
+const fromFor = bo => { const m = /^(.*?)\s*<(.+)>$/.exec(env.MAIL_FROM || ''), name = String(bo?.mail?.fromName || bo?.name || (m ? m[1] : 'SET')).replace(/["<>\r\n]/g, '').slice(0, 60);
+  const own = /^[a-z0-9.-]+\.[a-z]{2,}$/.test(bo?.mailDomain || '') ? 'tickets@' + bo.mailDomain : null, addr = own || (m ? m[2] : env.MAIL_FROM);
   return `${name} <${addr}>`; };
 const replyTo = bo => /^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$/.test(bo?.mail?.replyTo || '') ? bo.mail.replyTo : undefined;
 

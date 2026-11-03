@@ -104,10 +104,13 @@ Add the new public key to the new company's GitHub account.
 6. Each box office: Settings → Payments → Connect Stripe → finishes Stripe's onboarding → card checkout turns on by itself.
 Test with Stripe's test cards first (4242 4242 4242 4242); switch to live keys only when everything checks out.
 
-## SET — custom domains for a box office
-Each box office already has a branded link (`#/b/<slug>`). A custom domain (tickets.theirvenue.com) needs production hosting that can
-issue certificates per domain (e.g. Cloudflare for SaaS / Vercel domains) pointing at the same site — planned with Stage 10's hosting.
-The box office saves the domain under Branding today; it shows "Not connected yet" until then.
+## SET — custom domains for a box office (Stage 10)
+The app side is built: Settings → Custom domain gives the box office a CNAME (→ `domainTarget` in Platform settings) and a TXT
+`_set-verify.<host>` record; the `domains` Edge Function checks them (DNS-over-HTTPS) and `bo_by_domain()` makes that host open the box
+office's own page. What GitHub Pages can't do is serve many domains with HTTPS, so production hosting moves to **Cloudflare Pages +
+Cloudflare for SaaS** (custom hostnames, automatic certificates): point `domainTarget` (e.g. `domains.set-tickets.app`) at the Pages site,
+add each verified host as a custom hostname (API or dashboard), and list the platform's own hosts in Platform settings → "The platform's
+own hosts". Deploy: `supabase functions deploy domains` (needs `APP_ORIGINS`, and `RESEND_API_KEY` for sending domains).
 
 ## SET — sending email & texts (Stage 8)
 Nothing is sent until every step below is done AND `EMAIL_LIVE=1` is set — until then the sender marks messages "sending is switched off".
@@ -128,3 +131,23 @@ Nothing is sent until every step below is done AND `EMAIL_LIVE=1` is set — unt
 6. Test by sending yourself an event update from a test box office, then set `supabase secrets set EMAIL_LIVE=1`.
 Box offices connect their own CRMs / webhooks / Meta Conversions API under Marketing → Integrations; their keys are stored in the
 database (server-side only, never returned to the browser).
+
+## SET — production go-live checklist (Stage 10)
+Do these in order; each is yours to do (accounts, keys, money) — paste nothing secret into chat.
+1. **Two Supabase projects:** `set-production` and `set-staging` (never the ASP project). Run `supabase/schema.sql` on both
+   (`psql "$DB_URL" -f supabase/schema.sql`; it is safe to re-run). Turn on Point-in-Time Recovery on production (Pro plan).
+2. **Two sites:** production = this repo's Pages site (or Cloudflare Pages for custom domains, above); staging = a second repo:
+   `SET_ENV=staging SET_REPO=<owner>/set-tickets-staging bash deploy/publish.sh` with `config.js` `env: 'staging'` (shows a ribbon).
+3. **Config:** fill `frontend/config.js` with each project's URL + anon key (public by design). Make yourself a super admin:
+   `insert into platform_admins(email) values ('you@…');`
+4. **Payments, email, texts:** the Stage 5 and Stage 8 sections above, on staging first with Stripe test keys and `EMAIL_LIVE` unset.
+5. **Schedules (pg_cron):** `expire_orders()` and `marketing_tick()` every minute (above), plus
+   `select cron.schedule('set-billing', '0 6 1 * *', $$select billing_run(to_char(now() - interval '1 month', 'YYYY-MM'))$$);`
+6. **Backups:** `~/.set-secrets/db_url` (chmod 600) = the production connection string; cron `0 3 * * * bash ~/set-tickets/deploy/backup.sh`;
+   once a month `bash deploy/restore-test.sh`. System health turns "Backups" amber after 26 hours without a good one.
+7. **Auth hardening (Supabase → Authentication):** email OTP + TOTP MFA on, rate limits on (defaults are fine), JWT expiry 1 hour,
+   refresh-token rotation on, "Secure email change" on. Staff inactivity sign-out is per box office (Settings → Staff security).
+8. **Load test before a big on-sale:** on staging, `k6 run … tests/load/onsale.js` (header explains); turn the event's waiting room on.
+9. **Test on staging:** `bash tests/db-e2e.sh` locally, then one real test order end to end (test card), a scan, a refund, an email.
+10. **Go live:** switch Stripe to live keys, set `EMAIL_LIVE=1`, publish production. Deployment history: `git tag -l 'deploy-*'`;
+    roll back the site with `bash deploy/rollback.sh <tag>` (the database is never rolled back — schema changes are additive).
