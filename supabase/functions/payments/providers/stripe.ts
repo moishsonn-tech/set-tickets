@@ -34,6 +34,20 @@ export default {
     if (!sig.split(',').some(x => x.startsWith('v1=') && safeEq(x.slice(3), mac))) throw new Error('bad signature');
     const ev = JSON.parse(raw), o = ev.data?.object || {};
     if (ev.type === 'account.updated') return { type: 'account', account: o.id, ready: !!o.charges_enabled, test: !ev.livemode };
+    // Stage 9: disputes (chargebacks) and payouts to the box office's bank — matched to SET by the payment id / connected account
+    if (ev.type?.startsWith('charge.dispute.')) return { type: 'dispute', id: o.id, payment: o.payment_intent, amount: o.amount, reason: o.reason || '', account: ev.account,
+      status: o.status === 'won' ? 'won' : o.status === 'lost' ? 'lost' : 'open' };
+    if (ev.type?.startsWith('payout.')) {
+      let tx = [];
+      if (o.status === 'paid') try {   // which charges / refunds this payout carried (balance transactions of the connected account)
+        for (let after = '', more = true; more && tx.length < 5000;) {
+          const r = await call(env, 'GET', `balance_transactions?payout=${o.id}&limit=100${after ? '&starting_after=' + after : ''}&expand[]=data.source`, null, { account: ev.account });
+          tx.push(...r.data.map(b => b.source?.payment_intent || b.source?.id || b.id)); more = r.has_more; after = r.data[r.data.length - 1]?.id || '';
+        }
+      } catch (e) { /* the payout is still recorded; reconciliation shows its transactions as not paid out */ }
+      return { type: 'payout', id: o.id, amount: o.amount, status: o.status, created: new Date(o.created * 1000).toISOString(), arrival: o.arrival_date ? new Date(o.arrival_date * 1000).toISOString() : null,
+        failure: o.failure_message || null, account: ev.account, tx };
+    }
     if (!o.metadata?.order_id) return null;
     if (ev.type === 'payment_intent.succeeded') {
       // the processor's own fee, from the charge's balance transaction (on the connected account)
@@ -43,7 +57,7 @@ export default {
         fee = ch.balance_transaction?.fee ?? null; const pm = ch.payment_method_details || {}; method = pm.card?.wallet?.type || pm.type || method;
         brand = pm.card?.wallet?.type === 'apple_pay' ? 'Apple Pay' : pm.card?.wallet?.type === 'google_pay' ? 'Google Pay' : (pm.card?.brand || '').replace(/^./, c => c.toUpperCase()); last4 = pm.card?.last4 || '';
       } catch (e) { /* fee stays the estimate */ }
-      return { type: 'succeeded', orderId: o.metadata.order_id, ref: o.id, amount: o.amount_received, fee, method, brand, last4, account: ev.account };
+      return { type: 'succeeded', orderId: o.metadata.order_id, ref: o.id, charge: o.latest_charge, amount: o.amount_received, fee, appFee: o.application_fee_amount || 0, method, brand, last4, account: ev.account };
     }
     if (ev.type === 'payment_intent.payment_failed') return { type: 'failed', orderId: o.metadata.order_id, ref: o.id, error: o.last_payment_error?.message || 'Payment failed' };
     return null;

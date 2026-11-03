@@ -4,9 +4,12 @@
 
    name                      display name
    createPayment(ctx)        → { clientSecret?, redirectUrl?, publishableKey?, account?, ref }   start paying for one order (idempotent per order)
-   parseWebhook(req, raw)    → { type: 'succeeded' | 'failed' | 'account', orderId?, ref?, amount?, fee?, method?, brand?, last4?, error?, account?, ready?, test? } | null
-                             verifies the processor's signature; null = ignore
-   refund(ctx)               refund a payment: ctx.ref = the processor's payment id, ctx.amount = cents (all when left out), ctx.idem = idempotency key
+   parseWebhook(req, raw)    → { type: 'succeeded' | 'failed' | 'account', orderId?, ref?, charge?, amount?, fee?, appFee?, method?, brand?, last4?, error?, account?, ready?, test? }
+                             | { type: 'dispute', id, payment, amount, reason, status: open|won|lost }       (Stage 9: chargebacks)
+                             | { type: 'payout', id, amount, status, created, arrival, failure, tx: [payment ids carried] }   (Stage 9: payouts)
+                             | null — verifies the processor's signature; null = ignore
+   refund(ctx)               → { id } the processor's refund id (recorded in processor_tx for reconciliation)
+                             refund a payment: ctx.ref = the processor's payment id, ctx.amount = cents (all when left out), ctx.idem = idempotency key
                              (late payments whose seats are gone, and staff refunds from the order screen — full or partial)
    connect(ctx)              → { url }   send the box office to the processor to connect THEIR account (payouts go to them)
 

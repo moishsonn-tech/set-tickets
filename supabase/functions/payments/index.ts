@@ -7,7 +7,8 @@
    POST {action:'connect', bo, provider, return}  staff with admin.payments: connect the box office's own processor account
    POST {action:'order', order, op, p}            staff: an order change that refunds the card (Stage 6). Runs order_action() AS the caller, so
                                                   their permissions apply, then refunds each 'processing' refund at the processor (retries any stuck one)
-   POST ?webhook=stripe                           the processor: payment succeeded / failed, account ready  → confirm_payment() issues tickets */
+   POST ?webhook=stripe                           the processor: payment succeeded / failed, account ready  → confirm_payment() issues tickets;
+                                                  disputes → record_dispute(); payouts → record_payout(); every charge / refund → record_processor_tx() */
 import { PROVIDERS } from './providers/index.ts';
 
 const env = Deno.env.toObject();
@@ -49,10 +50,17 @@ Deno.serve(async req => {
         await db(`box_offices?id=eq.${acc.box_office_id}`, { method: 'PATCH', body: { gateway: { provider: hook, status: ev.ready ? 'connected' : 'pending', test: ev.test } } });
         return new Response('ok');
       }
+      if (ev.type === 'dispute') { await rpc('record_dispute', { p: { ...ev, provider: hook } }); return new Response('ok'); }
+      if (ev.type === 'payout') { await rpc('record_payout', { p: { ...ev, provider: hook } }); return new Response('ok'); }
       if (ev.type === 'failed') { await rpc('record_payment_attempt', { p_order: ev.orderId, p: { ok: false, provider: hook, ref: ev.ref, error: ev.error } }); return new Response('ok'); }
       // succeeded: the database issues the tickets (once). Paid too late for seats that are gone, or the wrong amount → refund now.
       const res = await rpc('confirm_payment', { p_order: ev.orderId, p: { provider: hook, ref: ev.ref, amount: ev.amount, method: ev.method, brand: ev.brand, last4: ev.last4, ...(ev.fee != null ? { fee: ev.fee } : {}) } });
-      if (res === 'refund' || res === 'mismatch') await p.refund({ ref: ev.ref, account: ev.account, env });
+      // the processor's own record of the charge (Stage 9 reconciliation), whatever happened to the order
+      await rpc('record_processor_tx', { p: { id: ev.charge || ev.ref, payment: ev.ref, type: 'charge', amount: ev.amount, fee: ev.fee ?? 0, app_fee: ev.appFee || 0, provider: hook, account: ev.account } });
+      if (res === 'refund' || res === 'mismatch') {
+        const x = await p.refund({ ref: ev.ref, account: ev.account, env });
+        await rpc('record_processor_tx', { p: { id: x.id, payment: ev.ref, type: 'refund', amount: -ev.amount, provider: hook, account: ev.account } });
+      }
       return new Response('ok');
     }
     const body = await req.json().catch(() => ({}));
@@ -87,6 +95,7 @@ Deno.serve(async req => {
           if (!p || !account || account.provider !== rf.provider) throw new Error('The processor that took this payment is not connected');
           const x = await p.refund({ ref: rf.payment, amount: rf.amount, account: account.account, idem: 'set-refund-' + rf.id, env });   // one refund id → never refunded twice
           out = { ok: true, ref: x.id };
+          await rpc('record_processor_tx', { p: { id: x.id, payment: rf.payment, type: 'refund', amount: -rf.amount, provider: rf.provider, account: account.account } });
         } catch (e) { out = { ok: false, error: String(e.message || e) }; }
         await rpc('finish_refund', { p_order: order.id, p_refund: rf.id, p: out });
         if (res.refund?.id === rf.id) res.refund = { ...res.refund, status: out.ok ? 'done' : 'failed', error: out.error || null };

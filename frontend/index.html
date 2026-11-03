@@ -114,7 +114,8 @@ textarea.inp{min-height:90px;resize:vertical}
 .section{padding:48px 0}
 .section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap}
 .section-head h2{font-family:var(--display);font-weight:400;text-transform:uppercase;font-size:40px;line-height:1}
-.tabs{display:inline-flex;background:#ebe9e2;border-radius:999px;padding:4px;gap:2px}
+.tabs{display:inline-flex;background:#ebe9e2;border-radius:999px;padding:4px;gap:2px;max-width:100%;overflow-x:auto;scrollbar-width:none}
+.tabs button{white-space:nowrap;flex:none}
 .tabs button{border:0;background:none;padding:7px 16px;border-radius:999px;font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)}
 .tabs button.on{background:var(--surface);color:var(--text);box-shadow:var(--shadow)}
 .cat-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:22px}
@@ -628,6 +629,23 @@ tr.op-cur td{background:#fff8e1}tr.dimrow td{opacity:.55}
 .sms-pv{max-width:320px;background:#e9f0ff;border-radius:16px 16px 16px 4px;padding:10px 14px;font-size:14px;white-space:pre-wrap;line-height:1.4}
 .px-banner{position:fixed;left:16px;right:16px;bottom:16px;z-index:60;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;background:var(--ink);color:#fff;border-radius:12px;padding:12px 16px;box-shadow:0 8px 30px rgba(0,0,0,.2);font-size:14px;max-width:720px;margin:0 auto}
 @media (max-width:700px){.mail-pv{height:440px}}
+/* Stage 9: reports, money & exports */
+.fin-filters{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:16px}
+.ff{display:flex;flex-direction:column;gap:4px;min-width:0}
+.ff>span{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3)}
+.ff .inp{width:auto;min-width:130px;max-width:220px;height:36px;padding:6px 10px;font-size:13px}
+.ff.inline{flex-direction:row;align-items:center;gap:8px}
+.fin-dash .sum-line.sub{font-weight:700;border-top:1px solid var(--line);margin-top:6px;padding-top:9px}
+.fin-dash .muted-line{color:var(--text-3)}
+.tbl th.r,.tbl td.r{text-align:right}
+.tbl tr.tot td{background:#fbfaf7}
+.card.hl{border-color:var(--accent)}
+.exp-form{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;padding:4px 20px 8px}
+.exp-form .wide{grid-column:span 2}
+.exp-form .inp{min-width:0;padding:7px 10px;font-size:13px}
+.acct-row{display:grid;grid-template-columns:1fr 1fr 90px;gap:8px;align-items:center;margin-bottom:6px}
+.acct-row .inp{padding:6px 10px;font-size:13px;min-width:0}
+@media (max-width:760px){.exp-form{grid-template-columns:1fr 1fr}.exp-form .wide{grid-column:1/-1}.acct-row{grid-template-columns:1fr 90px}.acct-row span{grid-column:1/-1}.ff{flex:1 1 140px}.ff .inp{max-width:none;width:100%}}
 </style>
 </head>
 <body>
@@ -639,6 +657,7 @@ tr.op-cur td{background:#fff8e1}tr.dimrow td{opacity:.55}
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script src="config.js"></script>
 <script src="mailtpl.js"></script>
+<script src="xlsx.js"></script>
 <script src="data.js"></script>
 <script src="app.js"></script>
 </body>

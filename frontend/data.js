@@ -27,7 +27,7 @@ const PERMS = [
   ['tickets', 'Tickets & pricing', [['view', 'View ticket types', 'v'], ['create', 'Create ticket types'], ['edit', 'Edit ticket types'], ['pricing', 'Change pricing'], ['comps', 'Create complimentary tickets'], ['discounts', 'Create discount codes'], ['discountsEdit', 'Edit discount codes'], ['tracking', 'Manage tracking codes']]],
   ['orders', 'Orders', [['view', 'View orders', 'v'], ['edit', 'Edit orders'], ['cancel', 'Cancel orders'], ['cancelTicket', 'Cancel individual tickets'], ['resend', 'Resend tickets'], ['customer', 'Change customer information'], ['seats', 'Change seats'], ['refund', 'Issue refunds'], ['override', 'Override normal order restrictions']]],
   ['customers', 'Customer data', [['names', 'View customer names', 'v'], ['emails', 'View email addresses', 'v'], ['phones', 'View phone numbers', 'v'], ['profiles', 'View full customer profiles', 'v'], ['export', 'Export customer information']]],
-  ['finance', 'Sales & finance', [['totals', 'View ticket sales totals', 'v'], ['reports', 'View financial reports', 'v'], ['fees', 'View fees', 'v'], ['processing', 'View payment processing information', 'v'], ['payouts', 'View payouts', 'v'], ['export', 'Export financial reports']]],
+  ['finance', 'Sales & finance', [['totals', 'View ticket sales totals', 'v'], ['reports', 'View financial reports', 'v'], ['fees', 'View fees', 'v'], ['processing', 'View payment processing information', 'v'], ['payouts', 'View payouts', 'v'], ['export', 'Export financial reports'], ['expenses', 'Enter event expenses']]],
   ['door', 'Event-day access', [['scan', 'Scan tickets'], ['checkin', 'Check customers in'], ['undo', 'Undo check-in'], ['override', 'Override scanner warnings'], ['search', 'Look up guests at the door (name, email, phone, order)'], ['log', 'View scan history', 'v'], ['attendees', 'View attendee lists', 'v'], ['devices', 'Manage scanner devices'], ['staff', 'Manage door staff']]],
   ['comms', 'Communication', [['email', 'Send customer emails'], ['notify', 'Send event notifications'], ['lists', 'Access attendee mailing lists', 'v'], ['marketing', 'Send marketing campaigns'], ['sms', 'Send text messages'], ['automations', 'Manage automations'], ['consent', 'Manage consent, suppression & customer tags']]],
   ['admin', 'Administration', [['invite', 'Invite team members'], ['remove', 'Remove team members'], ['perms', 'Edit team permissions'], ['integrations', 'Access integrations'], ['api', 'Access API settings'], ['payments', 'Access payment settings'], ['settings', 'Access box office settings']]],
@@ -608,7 +608,7 @@ function singleGaps(ev, isFree, chosen) {
 }
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v12';
+const DEMO_KEY = 'set_demo_v13';
 const Demo = {
   st: null,
   load() {
@@ -874,6 +874,7 @@ function issueOrderTickets(st, order, o = {}) {
         { bundle: { id: l.bundleId, name: l.name, n: c + 1 }, extras: [...extras(l.eventId), ...l.addons.map(a => `${a.name} × ${a.qty} (in ${l.name})`)] });
     }
   }
+  allocTicketMoney(order, st.tickets.filter(t => t.order_id === order.id));   // Stage 9: each ticket's booking fee, tax and processing share
   // ONE confirmation email per order, with every ticket (the sender delivers it; transactional — never held back for marketing consent)
   if (!(st.outbox ||= []).some(m => m.order_id === order.id && m.kind === 'confirmation')) queueMail(st, order, 'confirmation', '', '', 'system');
   orderContact(st, order);
@@ -902,6 +903,11 @@ function demoCharge(st, order, card = {}) {
   confirmPayment(st, order, { provider: 'demo', ref: 'pi_demo_' + randCode(12).toLowerCase(), method: card.wallet || 'card', brand, last4, fee: order.data.processingFee });
   return { status: 'paid' };
 }
+// the demo processor's own ledger of what it charged, refunded and took back (LIVE: processor_tx, written by the payments Edge Function)
+function procTx(st, o, r) {
+  (st.procTx ||= []).push({ id: r.id, box_office_id: o.box_office_id, provider: 'demo', payment: o.payment?.ref || null, type: r.type, amount: r.amount, fee: r.fee || 0, app_fee: r.app_fee || 0,
+    at: r.at || nowIso(), payout_id: null, order_id: o.id });
+}
 // The processor says the money arrived. Idempotent. A payment that lands after the checkout expired still gets its tickets if every seat /
 // ticket is still free; otherwise it is refunded automatically (never two buyers for one seat). → 'issued' | 'already' | 'refunded'
 function confirmPayment(st, order, pay) {
@@ -917,6 +923,7 @@ function confirmPayment(st, order, pay) {
   }
   Object.assign(order, { status: 'paid', paid_at: nowIso(), payment: { ...(order.payment || {}), ...pay } });
   if (pay.fee != null) order.data.processingFee = pay.fee;
+  if (pay.provider === 'demo') procTx(st, order, { type: 'charge', id: 'ch_demo_' + randCode(12).toLowerCase(), amount: order.data.total, fee: order.data.processingFee || 0, app_fee: order.data.platformFee || 0 });
   issueOrderTickets(st, order, { by: order.buyer_email });
   return 'issued';
 }
@@ -953,8 +960,9 @@ const wasPaid = o => !!o.paid_at || ['paid', 'refunded'].includes(o.status);
 // what an order took in and gave back. refundable = money that can still go back (refunds and credits both come out of it)
 function orderMoney(o) {
   const d = o.data || {}, extra = d.extraPaid || 0, collected = (wasPaid(o) ? d.total || 0 : 0) + extra, refunded = d.refunded || 0, credited = d.credited || 0, fees = (d.fee || 0) + (d.serviceFee || 0);
-  return { collected, extra, refunded, credited, due: d.due || 0, creditUsed: d.credit && !d.credit.restored ? d.credit.amount || 0 : 0, net: collected - refunded,
-    refundable: Math.max(0, collected - refunded - credited), fees, feesLeft: Math.max(0, fees - (d.refundedFees || 0)) };
+  const chargedBack = (d.chargebacks || []).filter(c => c.status !== 'won').reduce((a, c) => a + (c.amount || 0), 0);   // Stage 9: the bank took it back
+  return { collected, extra, refunded, credited, chargedBack, due: d.due || 0, creditUsed: d.credit && !d.credit.restored ? d.credit.amount || 0 : 0, net: collected - refunded - chargedBack,
+    refundable: Math.max(0, collected - refunded - credited - chargedBack), fees, feesLeft: Math.max(0, fees - (d.refundedFees || 0)) };
 }
 // How much a refund request comes to. mode: full | tickets (+ their share of the booking fee when fees) | fees | percent | amount
 function refundPlan(o, tickets, p = {}) {
@@ -990,6 +998,245 @@ const eventPortion = (q, evId) => q.lines.filter(l => l.eventId === evId).reduce
 // "Dinner × 2" strings on an event's tickets, from the order's product lines (after products were added or removed)
 const orderExtras = (o, evId) => o.data.lines.filter(l => l.eventId === evId && l.kind === 'addon' && l.qty - (l.removed || 0) > 0).map(l => `${l.name} × ${l.qty - (l.removed || 0)}`);
 
+/* ════════════ Reports, money & reconciliation (Stage 9) ════════════
+   Every money figure comes from what the orders and tickets stored — nothing is recalculated from today's prices. finItems() turns each paid
+   order into items: one per ticket (face value, collected, discount, comp, booking fee, tax, card processing, refund, credit — the ticket's own
+   fields), one per product line, the products inside a package, and one "order" item holding what isn't any single ticket's (donations,
+   card fees passed on, credit used, later order changes, refunds / credits not tied to a ticket, chargebacks, the platform fee). The items of
+   an order always add up to exactly what the order collected, so every filter, total and export reconciles. */
+const CB_STATUS = { open: 'Open — the bank is holding the money', won: 'Won — money returned', lost: 'Lost' };
+const PAY_LABEL = { card: 'Card', apple_pay: 'Apple Pay', google_pay: 'Google Pay', cash: 'Cash', terminal: 'Card terminal', check: 'Check', transfer: 'Bank transfer', other: 'Other (offline)',
+  offline: 'Pay later (marked paid)', free: 'Free', comp: 'Complimentary', credit: 'Paid with credit' };
+const OFFLINE_PAY = ['cash', 'terminal', 'check', 'transfer', 'other', 'offline'];
+const EXPENSE_CATS = ['Venue', 'AV', 'Security', 'Marketing', 'Talent', 'Staffing', 'Food', 'Transportation', 'Insurance', 'Other'];
+const emptyFin = () => ({ eventId: '', slotId: '', from: '', to: '', ttId: '', area: '', price: '', promo: '', tracking: '', addonId: '', bundleId: '', method: '', customer: '' });
+const FIN_SUM = ['tface', 'pface', 'comp', 'discount', 'savings', 'fees', 'tax', 'donation', 'cardFee', 'creditUsed', 'changes', 'collected', 'refunds', 'credits', 'chargebacks', 'processing', 'platform',
+  'offline', 'ticketRev', 'productRev', 'bundleRev', 'sold', 'comps', 'refundedTickets'];
+const localDay = iso => { const d = new Date(iso); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+function payMethodOf(o) {
+  const d = o.data || {}, p = o.payment || {};
+  if (d.comp) return 'comp';
+  if (p.provider === 'manual') return PAY_LABEL[p.method] ? p.method : 'other';
+  if (p.markedPaidBy) return PAY_LABEL[p.method] && p.method !== 'card' ? p.method : 'offline';
+  if (p.provider) return ['apple_pay', 'google_pay'].includes(p.method) ? p.method : 'card';
+  return d.payment === 'credit' ? 'credit' : d.payment === 'offline' ? 'offline' : 'free';
+}
+const chargebacksOf = o => (o.data?.chargebacks || []).filter(c => c.status !== 'won').reduce((a, c) => a + (c.amount || 0), 0);
+// each ticket's share of the order's booking fee (+ the platform's service fee when the buyer pays it), sales tax and card processing cost.
+// Set once when the tickets are issued; products and donations keep the rest on the order. Mirrors SQL alloc_ticket_money().
+function allocTicketMoney(order, tks) {
+  const d = order.data, adds = d.lines.filter(l => l.kind === 'addon').map(l => Math.max(0, l.unit * l.qty - (l.disc || 0))), pw = tks.map(t => t.paid || 0);
+  const fees = spread((d.fee || 0) + (d.serviceFee || 0), pw), tax = spread(d.tax || 0, [...pw, ...adds]);
+  const proc = spread(d.processingFee || 0, [...pw.map((x, i) => x + fees[i] + tax[i]), ...adds.map((x, j) => x + tax[tks.length + j]), d.donation || 0]);
+  tks.forEach((t, i) => Object.assign(t, { fee: fees[i] || 0, tax: tax[i] || 0, proc: proc[i] || 0, credited: t.credited || 0 }));
+}
+// the items of every paid order (see the block comment). x = {orders, tickets}
+function finItems(x) {
+  const out = [], byOrder = {};
+  for (const t of x.tickets) if (t.status !== 'replaced') (byOrder[t.order_id] ||= []).push(t);
+  for (const o of x.orders) {
+    if (!wasPaid(o)) continue;
+    const d = o.data, m = orderMoney(o), method = payMethodOf(o), day = localDay(o.paid_at || o.created_at), base = { orderId: o.id, ref: o.ref, method, day, promo: d.code || '', tracking: d.tracking || '', email: o.buyer_email };
+    const tks = byOrder[o.id] || [], made = [];
+    for (const t of tks) {
+      const paid = t.paid || 0, fee = t.fee || 0, tax = t.tax || 0, cred = t.credited || 0, comp = !!t.comp;
+      made.push({ ...base, kind: 'ticket', eventId: t.event_id, slotId: t.slot_id || '', ttId: t.ticket_type_id, area: t.area || '', price: t.face || 0, bundleId: t.bundle?.id || '', addonId: '', ticket: t,
+        promo: t.promo || '', tface: comp ? 0 : t.face || 0, comp: comp ? t.face || 0 : 0, discount: comp ? 0 : t.discount || 0, savings: comp ? 0 : (t.face || 0) - paid - (t.discount || 0),
+        fees: fee, tax, collected: paid + fee + tax, refunds: (t.refunded || 0) - cred, credits: cred, processing: t.proc || 0, ticketRev: paid, bundleRev: t.bundle ? paid : 0,
+        sold: t.status === 'valid' ? 1 : 0, comps: comp && t.status === 'valid' ? 1 : 0, refundedTickets: t.refunded > 0 ? 1 : 0 });
+    }
+    const extra = [];   // products, and the products' share of package prices
+    for (const l of d.lines) {
+      if (l.kind === 'addon') extra.push({ ...base, kind: 'addon', eventId: l.eventId, addonId: l.addonId, name: l.name, qty: l.qty - (l.removed || 0), pface: l.face * l.qty, discount: l.disc || 0, paid: l.unit * l.qty - (l.disc || 0) });
+      if (l.kind === 'bundle') {
+        const mine = made.filter(i => i.bundleId === l.bundleId && i.eventId === l.eventId), lineDisc = l.disc || 0, paid = l.unit * l.qty - lineDisc - mine.reduce((a, i) => a + i.ticketRev, 0);
+        const pface = l.qty * (l.addons || []).reduce((a, x) => a + x.face * x.qty, 0), disc = Math.max(0, lineDisc - mine.reduce((a, i) => a + i.discount, 0));
+        if (pface || paid) extra.push({ ...base, kind: 'bundleExtra', eventId: l.eventId, bundleId: l.bundleId, addonId: '', name: l.name, pface, discount: disc, paid, bundle: true });
+      }
+    }
+    const tTax = made.reduce((a, i) => a + i.tax, 0), tProc = made.reduce((a, i) => a + i.processing, 0);
+    const xTax = spread(Math.max(0, (d.tax || 0) - tTax), extra.map(e => e.paid)), xProc = spread(Math.max(0, (d.processingFee || 0) - tProc), [...extra.map((e, j) => e.paid + (extra.length ? xTax[j] : 0)), d.donation || 0]);
+    extra.forEach((e, j) => { const tax = xTax[j] || 0; Object.assign(e, { savings: e.pface - e.paid - e.discount, tax, collected: e.paid + tax, processing: xProc[j] || 0, productRev: e.paid, bundleRev: e.bundle ? e.paid : 0 }); made.push(e); });
+    const S = k => made.reduce((a, i) => a + (i[k] || 0), 0), credUsed = m.creditUsed;
+    const rest = { ...base, kind: 'order', eventId: o.event_ids[0], slotId: '', ttId: '', area: '', price: '', bundleId: '', addonId: '',
+      fees: (d.fee || 0) + (d.serviceFee || 0) - S('fees'), tax: extra.length ? 0 : (d.tax || 0) - tTax, donation: d.donation || 0, cardFee: d.processing || 0, creditUsed: -credUsed,
+      refunds: (d.refunded || 0) - S('refunds'), credits: (d.credited || 0) - S('credits'), chargebacks: chargebacksOf(o), processing: (d.processingFee || 0) - S('processing'),
+      platform: d.platformFee || 0, offline: (OFFLINE_PAY.includes(method) ? d.total || 0 : 0) + (d.charges || []).reduce((a, c) => a + (c.amount || 0), 0) };
+    rest.collected = m.collected - S('collected');
+    rest.changes = rest.collected - rest.fees - rest.tax - rest.donation - rest.cardFee - rest.creditUsed;   // later charges, upgrades, removed products…
+    out.push(...made, rest);
+  }
+  return out;
+}
+const finItemLevel = f => !!(f.slotId || f.ttId || f.area || (f.price !== '' && f.price != null) || f.bundleId || f.addonId);
+function finMatch(i, f) {
+  if (f.eventId && i.eventId !== f.eventId) return false;
+  if (f.from && i.day < f.from) return false; if (f.to && i.day > f.to) return false;
+  if (f.promo && String(i.promo).toUpperCase() !== String(f.promo).toUpperCase()) return false;
+  if (f.tracking && i.tracking !== f.tracking) return false;
+  if (f.method && i.method !== f.method) return false;
+  if (f.customer && !String(i.email || '').includes(String(f.customer).trim().toLowerCase())) return false;
+  if (!finItemLevel(f)) return true;
+  if (f.addonId) return i.kind === 'addon' && i.addonId === f.addonId;
+  if (f.bundleId) return (i.kind === 'ticket' || i.kind === 'bundleExtra') && i.bundleId === f.bundleId && (!f.slotId || i.slotId === f.slotId);
+  return i.kind === 'ticket' && (!f.slotId || i.slotId === f.slotId) && (!f.ttId || i.ttId === f.ttId) && (!f.area || i.area === f.area) && (f.price === '' || f.price == null || i.price === +f.price);
+}
+function finTotals(items) {
+  const t = Object.fromEntries(FIN_SUM.map(k => [k, 0])), orders = new Set();
+  for (const i of items) { for (const k of FIN_SUM) t[k] += i[k] || 0; orders.add(i.orderId); }
+  t.orders = orders.size;
+  t.net = t.collected - t.refunds - t.credits - t.chargebacks - t.processing;   // Eli's "Net collected"
+  t.netBo = t.net - t.platform;                                                // what the box office keeps after the platform's fee
+  t.gross = t.tface; t.revenue = t.collected - t.tax;                           // sales tax is owed to the state, not revenue
+  return t;
+}
+// The whole report for one set of filters: totals, potential sellout, unpaid / failed payments, and grouping by any dimension.
+// x = {events, orders, tickets, statuses, expenses, expenseFinal}
+function finReport(x, f = {}) {
+  f = { ...emptyFin(), ...f };
+  const all = x._items || (x._items = finItems(x)), items = all.filter(i => finMatch(i, f)), t = finTotals(items), partial = finItemLevel(f);
+  const evs = x.events.filter(e => !f.eventId || e.id === f.eventId);
+  let potential = 0, remaining = 0;
+  for (const e of evs) {
+    const so = sellout(e, x.tickets, x.statuses || [], x.orders);
+    const row = f.ttId ? so.byTT.find(r => r.tt.id === f.ttId) : null, ar = f.area ? so.byArea.find(r => r.name === f.area) : null;
+    if (f.ttId) { if (row) { potential += row.potential; remaining += Math.max(0, row.potential - row.soldValue); } }
+    else if (f.area) { if (ar) { potential += ar.potential; remaining += ar.remaining; } }
+    else { potential += so.total; remaining += so.remaining; }
+  }
+  const om = o => (!f.eventId || o.event_ids.includes(f.eventId)) && (!f.from || localDay(o.created_at) >= f.from) && (!f.to || localDay(o.created_at) <= f.to)
+    && (!f.promo || String(o.data.code || '').toUpperCase() === String(f.promo).toUpperCase()) && (!f.tracking || o.data.tracking === f.tracking) && (!f.customer || o.buyer_email.includes(String(f.customer).trim().toLowerCase()));
+  const unpaid = x.orders.filter(o => o.status === 'pending' && om(o)), failedOs = x.orders.filter(o => om(o) && (o.payment?.attempts || []).some(a => !a.ok));
+  const exp = (x.expenses || []).filter(e => evs.some(v => v.id === e.event_id)), expenses = exp.reduce((a, e) => a + (e.amount || 0), 0);
+  const final = evs.length > 0 && evs.every(e => x.expenseFinal?.[e.id]);
+  const profit = t.revenue - t.refunds - t.credits - t.chargebacks - t.processing - t.platform - expenses;
+  return { f, items, totals: { ...t, potential, remaining, unpaid: unpaid.reduce((a, o) => a + (o.data.total || 0), 0), unpaidOrders: unpaid.length,
+    failedPayments: failedOs.reduce((a, o) => a + o.payment.attempts.filter(z => !z.ok).length, 0), failedOrders: failedOs.length, failedUnpaid: failedOs.filter(o => !wasPaid(o)).length,
+    expenses, profit, profitFinal: final }, partial, expenses: exp };
+}
+// group a report's items: key = event | day | month | method | tt | area | promo | tracking | product | bundle | slot
+function finGroup(rep, key, label = k => k) {
+  const g = {};
+  for (const i of rep.items) {
+    const k = key === 'event' ? i.eventId : key === 'day' ? i.day : key === 'month' ? i.day.slice(0, 7) : key === 'method' ? i.method : key === 'tt' ? (i.kind === 'ticket' ? i.ttId : '') : key === 'area' ? (i.kind === 'ticket' ? i.area : '')
+      : key === 'promo' ? i.promo : key === 'tracking' ? i.tracking : key === 'product' ? (i.kind === 'addon' ? i.addonId : '') : key === 'bundle' ? i.bundleId : key === 'slot' ? (i.kind === 'ticket' ? i.slotId : '') : '';
+    if (!k && !['event', 'day', 'month', 'method'].includes(key)) continue;
+    (g[k] ||= []).push(i);
+  }
+  return Object.entries(g).map(([k, list]) => ({ key: k, label: label(k), ...finTotals(list) }));
+}
+// Each ticket's financial history (Eli Step 9 §4), straight from the ticket.
+const ticketFin = t => ({ face: t.face || 0, paid: t.paid || 0, discount: t.discount || 0, promo: t.promo || '', comp: !!t.comp, fee: t.fee || 0, tax: t.tax || 0, proc: t.proc || 0,
+  refund: (t.refunded || 0) - (t.credited || 0), credit: t.credited || 0, net: (t.paid || 0) + (t.fee || 0) + (t.tax || 0) - (t.proc || 0) - (t.refunded || 0) });
+
+/* ── Payouts & reconciliation ──
+   SET's side: what each card payment should have done at the processor (charge, its fee, the platform's application fee, refunds to the card,
+   chargebacks). The processor's side: its own transactions (procTx — written by the processor: the demo processor here, the payments Edge
+   Function's webhooks LIVE) or a report exported from the processor and imported. Matched by the processor's payment id. */
+function platformTx(orders) {
+  const out = {};
+  for (const o of orders) {
+    const p = o.payment || {}; if (!p.ref || p.provider === 'manual' || !wasPaid(o)) continue;
+    const refunds = (o.data.refunds || []).filter(r => r.to === 'original' && r.status === 'done' && (r.provider || r.payment)).reduce((a, r) => a + r.amount, 0);
+    out[p.ref] = { ref: p.ref, orderId: o.id, orderRef: o.ref, eventId: o.event_ids[0], day: localDay(o.paid_at || o.created_at), charged: o.data.total || 0, fee: o.data.processingFee || 0,
+      app: o.data.platformFee || 0, refunded: refunds, disputed: chargebacksOf(o) };
+  }
+  return out;
+}
+function processorSide(tx) {
+  const out = {};
+  for (const r of tx) {
+    const k = r.payment || r.id, s = out[k] ||= { ref: k, charged: 0, fee: 0, app: 0, refunded: 0, disputed: 0, day: r.at ? localDay(r.at) : '', payouts: new Set() };
+    if (r.type === 'charge') { s.charged += r.amount; s.fee += r.fee || 0; s.app += r.app_fee || 0; if (r.at) s.day = localDay(r.at); }
+    else if (r.type === 'refund') s.refunded += -r.amount;
+    else if (r.type === 'dispute') s.disputed += -r.amount;
+    else if (r.type === 'dispute_won') s.disputed -= r.amount;
+    if (r.payout_id) s.payouts.add(r.payout_id);
+  }
+  return out;
+}
+const RECON_FIELDS = [['charged', 'Charged'], ['fee', 'Processing fee'], ['app', 'Platform fee'], ['refunded', 'Refunded'], ['disputed', 'Chargebacks']];
+function reconcile(orders, tx, f = {}) {
+  const P = platformTx(orders), Q = processorSide(tx), rows = [];
+  for (const k of new Set([...Object.keys(P), ...Object.keys(Q)])) {
+    const a = P[k], b = Q[k], diffs = a && b ? RECON_FIELDS.filter(([z]) => (a[z] || 0) !== (b[z] || 0)).map(([z, l]) => ({ field: z, label: l, set: a[z] || 0, processor: b[z] || 0 })) : [];
+    const status = !a ? 'not in SET' : !b ? 'missing at processor' : diffs.length ? 'different' : 'matched';
+    const net = s => s ? s.charged - s.fee - s.app - s.refunded - s.disputed : 0;
+    rows.push({ ref: k, status, diffs, set: a || null, processor: b || null, eventId: a?.eventId || '', day: a?.day || b?.day || '', orderRef: a?.orderRef || '', setNet: net(a), procNet: net(b), diff: net(b) - net(a) });
+  }
+  const sel = rows.filter(r => (!f.eventId || r.eventId === f.eventId) && (!f.from || r.day >= f.from) && (!f.to || r.day <= f.to));
+  const by = key => { const g = {}; for (const r of sel) { const z = g[r[key] || '—'] ||= { key: r[key] || '—', setNet: 0, procNet: 0, diff: 0, issues: 0, n: 0 }; z.setNet += r.setNet; z.procNet += r.procNet; z.diff += r.diff; z.n++; if (r.status !== 'matched') z.issues++; }
+    return Object.values(g).sort((p, q) => String(q.key).localeCompare(String(p.key))); };
+  return { rows: sel, byEvent: by('eventId'), byDay: by('day'), issues: sel.filter(r => r.status !== 'matched'),
+    totals: { setNet: sel.reduce((a, r) => a + r.setNet, 0), procNet: sel.reduce((a, r) => a + r.procNet, 0), diff: sel.reduce((a, r) => a + r.diff, 0) } };
+}
+function payoutSummary(payouts, tx) {
+  const sum = st => payouts.filter(p => st.includes(p.status)).reduce((a, p) => a + p.amount, 0);
+  const unpaidTx = tx.filter(r => !r.payout_id), pending = unpaidTx.reduce((a, r) => a + (r.amount - (r.fee || 0) - (r.app_fee || 0)), 0);
+  return { processed: tx.filter(r => r.type === 'charge').reduce((a, r) => a + r.amount, 0), completed: sum(['paid']), inTransit: sum(['pending', 'in_transit']), failed: sum(['failed', 'canceled']),
+    failedN: payouts.filter(p => ['failed', 'canceled'].includes(p.status)).length, pending: pending + sum(['pending', 'in_transit']), notYetPaidOut: pending };
+}
+// A processor's own export (Stripe "Balance transactions" / "Payments" CSV, or any CSV with reference + amount columns) → procTx rows.
+function parseProcessorCsv(text) {
+  const rows = parseCsv(text); if (rows.length < 2) throw new Error('That file has no rows');
+  const H = rows[0].map(h => h.trim().toLowerCase()), col = (...names) => { for (const n of names) { const i = H.indexOf(n); if (i >= 0) return i; } return -1; };
+  const iRef = col('paymentintent id', 'payment_intent', 'payment intent', 'source', 'charge id', 'reference', 'transaction id', 'id'), iAmt = col('amount', 'gross'), iFee = col('fee', 'fees');
+  const iType = col('type', 'reporting category', 'reporting_category'), iAt = col('created (utc)', 'created', 'date', 'available on (utc)'), iRefunded = col('amount refunded', 'refunded amount');
+  if (iRef < 0 || iAmt < 0) throw new Error('Couldn\'t find a reference column and an amount column in that file');
+  const c = v => Math.round(parseFloat(String(v || '0').replace(/[$,\s]/g, '')) * 100) || 0, out = [];
+  for (const r of rows.slice(1)) {
+    if (!r[iRef]) continue;
+    const type = String(r[iType] || 'charge').toLowerCase(), amount = c(r[iAmt]), at = r[iAt] ? new Date(r[iAt].replace(' ', 'T') + (/Z|[+-]\d\d:?\d\d$/.test(r[iAt]) ? '' : 'Z')).toISOString() : null;
+    const kind = /refund/.test(type) ? 'refund' : /dispute|chargeback/.test(type) ? 'dispute' : /payout|transfer|adjust/.test(type) ? null : 'charge';
+    if (!kind) continue;
+    out.push({ id: 'imp_' + out.length, payment: r[iRef].trim(), type: kind, amount: kind === 'charge' ? Math.abs(amount) : -Math.abs(amount), fee: iFee >= 0 ? Math.abs(c(r[iFee])) : 0, at });
+    if (kind === 'charge' && iRefunded >= 0 && c(r[iRefunded])) out.push({ id: 'imp_' + out.length, payment: r[iRef].trim(), type: 'refund', amount: -Math.abs(c(r[iRefunded])), fee: 0, at });
+  }
+  return out;
+}
+function parseCsv(text) {
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) { if (ch === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += ch; }
+    else if (ch === '"') q = true; else if (ch === ',') { row.push(cell); cell = ''; } else if (ch === '\n' || ch === '\r') { if (ch === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; } else cell += ch;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter(r => r.some(c => c.trim() !== ''));
+}
+// Expense rows from a spreadsheet: date, category, description, amount (any order; headers matched by name)
+function parseExpenseCsv(text) {
+  const rows = parseCsv(text); if (rows.length < 2) throw new Error('That file has no rows');
+  const H = rows[0].map(h => h.trim().toLowerCase()), at = n => H.findIndex(h => h.includes(n));
+  const iAmt = at('amount'), iCat = at('categ'), iDesc = Math.max(at('desc'), at('item')), iDate = at('date'), iVen = at('vendor');
+  if (iAmt < 0) throw new Error('Add an "Amount" column');
+  return rows.slice(1).map(r => ({ amount: Math.round(parseFloat(String(r[iAmt] || '').replace(/[$,\s]/g, '')) * 100) || 0, category: EXPENSE_CATS.find(c => c.toLowerCase() === String(r[iCat] || '').trim().toLowerCase()) || 'Other',
+    description: String(r[iDesc] ?? '').trim().slice(0, 200), vendor: iVen >= 0 ? String(r[iVen] || '').trim().slice(0, 120) : '', date: iDate >= 0 && r[iDate] ? String(r[iDate]).trim().slice(0, 10) : '' })).filter(r => r.amount > 0);
+}
+
+/* ── Accounting (QuickBooks / Xero / any ledger) ── a daily journal from the report: every day balances (debits = credits).
+   Direct sync needs an OAuth app with Intuit / Xero (ACCOUNTING_PROVIDERS); until then the journal imports into either. */
+const ACCOUNTS = [['clearing', 'Processor clearing / undeposited funds', '1200'], ['tickets', 'Ticket sales', '4000'], ['products', 'Product & add-on sales', '4010'], ['fees', 'Booking fee income', '4020'],
+  ['donations', 'Donations', '4030'], ['cardFees', 'Card fees recovered', '4040'], ['changes', 'Order changes & adjustments', '4050'], ['tax', 'Sales tax payable', '2200'], ['credit', 'Customer credit (liability)', '2300'],
+  ['refunds', 'Refunds', '4900'], ['chargebacks', 'Chargebacks', '6010'], ['processing', 'Card processing fees', '6000'], ['platform', 'Ticketing platform fees', '6020']];
+const ACCOUNTING_PROVIDERS = [['quickbooks', 'QuickBooks Online', 'Needs an Intuit Developer app (OAuth) — then daily journals post automatically'], ['xero', 'Xero', 'Needs a Xero app (OAuth) — then daily journals post automatically'],
+  ['api', 'Any other system', 'Read-only API keys + signed webhooks (Marketing → Integrations), or the journal / exports below']];
+function journal(rep, accounts = {}) {
+  const A = k => accounts[k] || ACCOUNTS.find(a => a[0] === k)[1], days = finGroup(rep, 'day').sort((a, b) => a.key.localeCompare(b.key)), out = [];
+  for (const d of days) {
+    const L = (acct, dr, cr, memo) => { const v = dr - cr; if (v) out.push({ date: d.key, account: A(acct), key: acct, debit: v > 0 ? v : 0, credit: v < 0 ? -v : 0, memo }); };
+    L('clearing', d.collected, 0, 'Collected'); L('credit', -d.creditUsed, 0, 'Customer credit used');
+    L('tickets', 0, d.ticketRev, 'Tickets'); L('products', 0, d.productRev, 'Products & package extras');
+    L('fees', 0, d.fees, 'Booking fees'); L('tax', 0, d.tax, 'Sales tax'); L('donations', 0, d.donation, 'Donations'); L('cardFees', 0, d.cardFee, 'Card fees paid by buyers'); L('changes', 0, d.changes, 'Order changes');
+    L('refunds', d.refunds, 0, 'Refunds to customers'); L('clearing', 0, d.refunds, 'Refunds paid out');
+    L('refunds', d.credits, 0, 'Refunded as credit'); L('credit', 0, d.credits, 'Credit issued');
+    L('chargebacks', d.chargebacks, 0, 'Chargebacks'); L('clearing', 0, d.chargebacks, 'Chargebacks');
+    L('processing', d.processing, 0, 'Card processing'); L('clearing', 0, d.processing, 'Card processing');
+    L('platform', d.platform, 0, 'Platform fees'); L('clearing', 0, d.platform, 'Platform fees');
+  }
+  return out;
+}
+
 /* ── DEMO server side of orderAction() ── */
 function issueCreditRow(st, boId, c) {
   const email = String(c.email || '').trim().toLowerCase(), amount = cents(c.amount);
@@ -1015,8 +1262,9 @@ function applyRefund(st, o, plan, p, by) {
     d.refunded = (d.refunded || 0) + plan.amount;
   }
   d.refundedFees = (d.refundedFees || 0) + plan.fees;
-  for (const [id, v] of Object.entries(plan.per)) { const t = st.tickets.find(x => x.id === id); if (t) t.refunded = (t.refunded || 0) + v; }
+  for (const [id, v] of Object.entries(plan.per)) { const t = st.tickets.find(x => x.id === id); if (t) { t.refunded = (t.refunded || 0) + v; if (r.credit) t.credited = (t.credited || 0) + v; } }
   (d.refunds ||= []).push(r);
+  if (r.provider === 'demo') procTx(st, o, { type: 'refund', id: r.ref, amount: -r.amount });
   return r;
 }
 const refundText = r => `${money_(r.amount)} ${r.to === 'credit' || r.to === 'eventCredit' ? `as credit ${r.credit}` : 'to ' + REFUND_TO[r.to].toLowerCase()}`;
@@ -1084,7 +1332,7 @@ function changeOrderTickets(st, o, p, by, inventory = false) {
     const t = x.t, inf = x.seat ? seatInfo(x.ev, x.seat) : null, paid = keepPaid ? t.paid : x.newPaid;
     const nt = { ...clone(t), id: uid(), ticket_type_id: x.tt.id, slot_id: x.slot, seat: x.seat, area: inf?.area ?? null, row: inf?.row ?? null, seat_label: inf?.seat ?? null, unit: inf?.unit || null,
       face: x.face, paid, discount: t.comp ? 0 : x.ovr ? Math.max(0, x.face - paid) : (t.discount || 0) + (keepPaid && x.diff > 0 ? x.diff : 0), price_override: x.ovr || !!t.price_override,
-      refunded: 0, code: randCode(10), status: 'valid', replaces: t.id, issued_at: nowIso() };
+      refunded: 0, credited: 0, code: randCode(10), status: 'valid', replaces: t.id, issued_at: nowIso() };
     delete nt.replaced_by; delete nt.changed_at;
     Object.assign(t, { status: 'replaced', replaced_by: nt.id, changed_at: nowIso() }); st.tickets.push(nt);
     const from = t.seat ? seatText(x.ev, t.seat) : x.ev.ticketTypes.find(z => z.id === t.ticket_type_id)?.name, to = x.seat ? seatText(x.ev, x.seat) : x.tt.name;
@@ -1238,6 +1486,22 @@ function demoOrderAction(id, action, p = {}) {
       need('orders.customer', ev0);
       const t = live().find(x => x.id === p.ticket), name = String(p.name || '').trim().slice(0, 120); if (!t) throw new Error('That ticket is no longer valid'); if (!name) throw new Error('Enter the new name');
       const before = t.holder; t.holder = name; log('holder', `ticket ${t.code} now in the name of ${name} (was ${before})`, { ticket: t.code }, { holder: before }, { holder: name }); break;
+    }
+    case 'chargeback': {  // Stage 9: a card dispute — the bank takes the money back while it decides (LIVE the processor's webhook records these too)
+      need('orders.refund', ev0); const list = d.chargebacks ||= [];
+      if (p.id) {
+        const c = list.find(x => x.id === p.id); if (!c) throw new Error('Chargeback not found'); if (!CB_STATUS[p.status] || p.status === 'open') throw new Error('Choose won or lost');
+        if (c.status !== 'open') throw new Error('That chargeback is already closed');
+        c.status = p.status; c.closed_at = nowIso(); c.closed_by = by;
+        if (p.status === 'won' && o.payment?.provider === 'demo') procTx(st, o, { type: 'dispute_won', id: 'du_demo_' + randCode(10).toLowerCase(), amount: c.amount });
+        log('chargeback', `Chargeback ${p.status} — ${money_(c.amount)}${p.status === 'won' ? ' returned' : ' lost'}`, { amount: c.amount, status: p.status }); break;
+      }
+      if (!wasPaid(o)) throw new Error('Only paid orders can have a chargeback');
+      const amount = cents(p.amount), m = orderMoney(o); if (!(amount > 0)) throw new Error('Enter the disputed amount');
+      if (amount > m.collected - m.refunded - m.chargedBack) throw new Error(`At most ${money_(Math.max(0, m.collected - m.refunded - m.chargedBack))} can be disputed on this order`);
+      const c = { id: uid(), at: nowIso(), by, amount, status: 'open', reason: String(p.reason || '').slice(0, 120), ref: String(p.ref || '').slice(0, 80) };
+      list.push(c); if (o.payment?.provider === 'demo') procTx(st, o, { type: 'dispute', id: 'dp_demo_' + randCode(10).toLowerCase(), amount: -amount });
+      log('chargeback', `Chargeback opened — ${money_(amount)}${c.reason ? ' · ' + c.reason : ''}`, { amount }); break;
     }
     case 'note': { need('orders.edit', ev0); const body = String(p.body || '').trim(); if (!body) throw new Error('Write a note'); log('note', body.slice(0, 500)); break; }
     case 'message': {
@@ -1959,8 +2223,9 @@ const DB = {
     if (!P('finance.fees')) orders.forEach(o => delete o.data.platformFee);
     if (!P('finance.totals')) {
       orders.forEach(o => { for (const k of MONEY_KEYS) o.data[k] = null; o.data.lines.forEach(l => { for (const k of LINE_MONEY) delete l[k]; l.unit = null; }); });
-      tickets.forEach(t => { t.face = t.paid = t.discount = t.refunded = null; });
+      tickets.forEach(t => { t.face = t.paid = t.discount = t.refunded = t.fee = t.tax = t.proc = t.credited = null; });
     }
+    if (!P('finance.processing')) tickets.forEach(t => { t.proc = null; });
     // door-only staff (scanner): a ticket is just where the guest belongs — no answers, codes used or purchases
     if (!P('orders.view') && !P('door.attendees')) tickets.forEach(t => { t.answers = {}; t.promo = t.tracking = t.bundle = null; t.extras = []; t.price_override = false; });
     const full = clone({ ...bo, templates: bo.templates?.length ? bo.templates : DEFAULT_TEMPLATES });
@@ -1991,7 +2256,12 @@ const DB = {
       credits: P('orders.view') || P('customers.profiles') ? clone((st.credits || []).filter(x => x.box_office_id === bo.id)).map(c => ({ ...c, ...creditState(c, st.orders) })) : [],
       custNotes: P('customers.profiles') ? clone((st.custNotes || []).filter(x => x.box_office_id === bo.id)) : [],
       accounts: P('customers.profiles') ? (st.customers || []).map(c => c.email).filter(e => orders.some(o => o.buyer_email === e)) : [],
-      live: Object.fromEntries([...evIds].map(id => [id, presenceStats(st.presence?.[id])])) };
+      live: Object.fromEntries([...evIds].map(id => [id, presenceStats(st.presence?.[id])])),
+      // Stage 9: event expenses (+ which events have all their expenses in), the processor's payouts and its own transaction ledger
+      expenses: P('finance.reports') || P('finance.expenses') ? clone((st.expenses || []).filter(x => x.box_office_id === bo.id && evIds.has(x.event_id))) : [],
+      expenseFinal: P('finance.reports') || P('finance.expenses') ? clone(Object.fromEntries(Object.entries(st.expenseFinal || {}).filter(([k]) => evIds.has(k)))) : {},
+      payouts: P('finance.payouts') ? clone((st.payouts || []).filter(x => x.box_office_id === bo.id)) : [],
+      procTx: P('finance.payouts') ? clone((st.procTx || []).filter(x => x.box_office_id === bo.id)) : [] };
   },
   async stillAllowed() { if (LIVE) return true; try { need(); return true; } catch (e) { return !e.revoked; } },
   async saveEvent(ev) {
@@ -2295,6 +2565,66 @@ const DB = {
       if (prefs.sms === false && !c.unsub_sms_at && c.phone) consentChange(st, c, 'sms_optout', 'unsubscribe link', c.email); else if (prefs.sms === true && c.phone && !(c.sms_optin && !c.unsub_sms_at)) consentChange(st, c, 'sms_optin', 'preferences page', c.email);
       Demo.save(); return this.unsubInfo(token); }
     return must(sb.rpc('unsubscribe', { p_token: token, p: prefs }));
+  },
+  // ── Stage 9: event expenses, full data exports ──
+  async saveExpense(e) {
+    const row = { id: e.id || null, event_id: e.event_id, category: EXPENSE_CATS.includes(e.category) ? e.category : 'Other', description: String(e.description || '').trim().slice(0, 200),
+      vendor: String(e.vendor || '').trim().slice(0, 120), amount: cents(e.amount), date: String(e.date || '').slice(0, 10) };
+    if (!(row.amount > 0)) throw new Error('Enter the expense amount');
+    if (LIVE) return must(sb.rpc('save_expense', { p_bo: DB._bo, p: row }));
+    const st = Demo.fresh(); need('finance.expenses', row.event_id);
+    if (!st.events.some(x => x.id === row.event_id && x.box_office_id === DB._bo)) throw new Error('Unknown event');
+    const list = st.expenses ||= [], prev = row.id && list.find(x => x.id === row.id && x.box_office_id === DB._bo);
+    if (row.id && !prev) throw new Error('Expense not found');
+    const out = prev ? Object.assign(prev, row, { updated_at: nowIso(), updated_by: DB._actor }) : (list.push({ ...row, id: uid(), box_office_id: DB._bo, by: DB._actor, at: nowIso() }), list[list.length - 1]);
+    audit('finance.expense', `${prev ? 'Changed' : 'Added'} expense: ${row.category}${row.description ? ' — ' + row.description : ''} ${money_(row.amount)}`, { target: row.event_id }); Demo.save(); return clone(out);
+  },
+  async deleteExpense(id) {
+    if (LIVE) return must(sb.rpc('delete_expense', { p_bo: DB._bo, p_id: id }));
+    const st = Demo.fresh(), e = (st.expenses || []).find(x => x.id === id && x.box_office_id === DB._bo); if (!e) throw new Error('Expense not found');
+    need('finance.expenses', e.event_id); st.expenses = st.expenses.filter(x => x !== e);
+    audit('finance.expense', `Deleted expense: ${e.category}${e.description ? ' — ' + e.description : ''} ${money_(e.amount)}`, { target: e.event_id }); Demo.save();
+  },
+  async importExpenses(eventId, rows) {
+    if (!rows?.length) throw new Error('No expenses to import');
+    if (LIVE) return must(sb.rpc('import_expenses', { p_bo: DB._bo, p_event: eventId, p: rows }));
+    const st = Demo.fresh(); need('finance.expenses', eventId); if (!st.events.some(x => x.id === eventId && x.box_office_id === DB._bo)) throw new Error('Unknown event');
+    for (const r of rows) { if (!(cents(r.amount) > 0)) throw new Error('Every expense needs an amount'); (st.expenses ||= []).push({ id: uid(), box_office_id: DB._bo, event_id: eventId, category: EXPENSE_CATS.includes(r.category) ? r.category : 'Other',
+      description: String(r.description || '').slice(0, 200), vendor: String(r.vendor || '').slice(0, 120), amount: cents(r.amount), date: String(r.date || '').slice(0, 10), by: DB._actor, at: nowIso(), imported: true }); }
+    audit('finance.expense', `Imported ${rows.length} expense${rows.length === 1 ? '' : 's'}`, { target: eventId }); Demo.save(); return rows.length;
+  },
+  async setExpensesFinal(eventId, final) {
+    if (LIVE) return must(sb.rpc('set_expenses_final', { p_bo: DB._bo, p_event: eventId, p_final: !!final }));
+    const st = Demo.fresh(); need('finance.expenses', eventId); st.expenseFinal ||= {};
+    if (final) st.expenseFinal[eventId] = { by: DB._actor, at: nowIso() }; else delete st.expenseFinal[eventId];
+    audit('finance.expense', final ? 'Marked all expenses entered — profit is final' : 'Profit marked estimated again (more expenses to come)', { target: eventId }); Demo.save();
+  },
+  // Everything a box office owns, unmasked — for its owner (always, even while suspended), staff holding both export permissions, or a
+  // platform super admin. The organizer never depends on the platform to get its records out. LIVE: export_box_office().
+  async exportAll(boId) {
+    if (LIVE) return must(sb.rpc('export_box_office', { p_bo: boId }));
+    const st = Demo.fresh(), bo = st.boxOffices.find(b => b.id === boId); if (!bo) throw new Error('Box office not found');
+    const m = memberFor(st, DB._actor, bo.id), sup = st.platform.admins.includes(DB._actor);
+    if (!sup && !(m && (m.owner || (hasPerm(m, 'finance.export') && hasPerm(m, 'customers.export'))))) throw new Error('Only the owner (or staff who can export both customer and financial data) can download everything');
+    const of = k => clone((st[k] || []).filter(x => x.box_office_id === bo.id)), evIds = new Set(st.events.filter(e => e.box_office_id === bo.id).map(e => e.id));
+    const prev = DB._bo; DB._bo = bo.id; audit('data.export', 'Downloaded all of the box office\'s data'); DB._bo = prev; Demo.save();
+    return { exported_at: nowIso(), box_office: clone({ ...bo, secrets: undefined }), events: of('events'), orders: of('orders').map(({ access_key, attempt_key, ...o }) => o), tickets: of('tickets'),
+      credits: of('credits'), order_log: of('orderLog'), contacts: of('contacts').map(({ token, ...c }) => c), consent_log: of('consentLog'), promos: of('promos'), tracking: of('tracking'),
+      waitlist: clone((st.waitlist || []).filter(w => evIds.has(w.event_id))), scan_log: clone((st.scanLog || []).filter(r => evIds.has(r.event_id))), seat_log: clone((st.seatLog || []).filter(r => evIds.has(r.event_id))),
+      expenses: of('expenses'), payouts: of('payouts'), processor_tx: of('procTx'), outbox: of('outbox').map(({ vars, ...m2 }) => m2), audit: of('audit'),
+      members: of('members').map(({ id, email, name, template, perms, events, status }) => ({ id, email, name, template, perms, events, status })),
+      views: Object.fromEntries([...evIds].map(id => [id, viewStats(st.views?.[id])])) };
+  },
+  // Platform-wide (super admins only): every box office, its team size, sales, platform fees and payouts — never card details.
+  async platformExport() {
+    if (LIVE) return must(sb.rpc('platform_export'));
+    needSuper(); const st = Demo.fresh(); audit('data.export', 'Downloaded platform-wide data', { bo: null }); Demo.save();
+    return { exported_at: nowIso(), platform: clone(st.platform), box_offices: st.boxOffices.map(b => ({ id: b.id, name: b.name, slug: b.slug, status: b.status, owner: b.owner, created_at: b.created_at, platform_fee: b.platformFee || null })),
+      members: st.members.map(({ box_office_id, email, name, template, status }) => ({ box_office_id, email, name, template, status })),
+      events: st.events.map(e => ({ id: e.id, box_office_id: e.box_office_id, name: e.name, start: e.start, status: e.status })),
+      orders: st.orders.map(o => ({ id: o.id, box_office_id: o.box_office_id, ref: o.ref, status: o.status, created_at: o.created_at, paid_at: o.paid_at, events: o.event_ids, method: payMethodOf(o),
+        total: o.data.total || 0, tax: o.data.tax || 0, fee: o.data.fee || 0, platform_fee: o.data.platformFee || 0, processing_fee: o.data.processingFee || 0, refunded: o.data.refunded || 0, credited: o.data.credited || 0, chargebacks: chargebacksOf(o) })),
+      payouts: clone(st.payouts || []) };
   },
   // ── platform super admin ──
   async loadPlatform() {
@@ -2877,6 +3207,34 @@ function seedDemo() {
     st.deliveries = st.orders.filter(o => o.box_office_id === bo1.id && wasPaid(o)).slice(-6).map(o => ({ id: uid(), box_office_id: bo1.id, integration_id: st.integrations[0].id, kind: 'webhook', event: 'payment.completed', event_id: 'evt_' + randCode(14).toLowerCase(),
       payload: { type: 'payment.completed', created: o.paid_at, data: hookOrder(st, o) }, status: 'delivered', attempts: 1, created_at: o.paid_at, done_at: o.paid_at, response: '200 OK' }));
     st.apiKeys = [{ id: uid(), box_office_id: bo1.id, name: 'Website event listing', prefix: 'set_live_7k2m', hash: '0'.repeat(64), scopes: ['events:read'], created_at: day(-20), created_by: bo1.owner, last_used_at: day(0, 9), revoked_at: null }];
+  }
+  // Stage 9: sample refunds keep their per-ticket amounts; the demo processor's ledger is dated like the orders; daily payouts arrive two days
+  // later (the last two days aren't paid out yet); the gala's expenses so far (profit still estimated); one open chargeback.
+  { const st = Demo.st, O = id => st.orders.find(o => o.id === id);
+    for (const o of st.orders) if (o.status === 'refunded' && !(o.data.refunds || []).length) {
+      const tks = st.tickets.filter(t => t.order_id === o.id), ref = o.payment?.provider === 'demo' ? 're_demo_' + randCode(12).toLowerCase() : null;
+      tks.forEach(t => { t.refunded = t.paid || 0; });
+      o.data.refunds = [{ id: uid(), at: o.created_at, by: bo1.owner, amount: o.data.total, fees: (o.data.fee || 0) + (o.data.serviceFee || 0), to: 'original', note: '', per: Object.fromEntries(tks.map(t => [t.id, t.paid || 0])),
+        status: 'done', ref, provider: o.payment?.provider || null }];
+      o.data.refundedFees = (o.data.fee || 0) + (o.data.serviceFee || 0);
+      if (ref) procTx(st, o, { type: 'refund', id: ref, amount: -o.data.total, at: o.created_at });
+    }
+    for (const r of st.procTx || []) { const o = O(r.order_id); if (o && r.type === 'charge') r.at = o.paid_at || o.created_at; }
+    const cut = Date.now() - 2 * 864e5, groups = {};
+    for (const r of st.procTx || []) if (new Date(r.at) < cut) (groups[r.box_office_id + '|' + localDay(r.at)] ||= []).push(r);
+    st.payouts = Object.entries(groups).map(([k, rs]) => {
+      const [boId, dayS] = k.split('|'), arr = new Date(dayS + 'T12:00:00'), id = 'po_demo_' + randCode(10).toLowerCase(); arr.setDate(arr.getDate() + 2); rs.forEach(r => { r.payout_id = id; });
+      return { id, box_office_id: boId, provider: 'demo', amount: rs.reduce((a, r) => a + r.amount - (r.fee || 0) - (r.app_fee || 0), 0), status: arr <= new Date() ? 'paid' : 'in_transit',
+        created_at: new Date(dayS + 'T23:59:00').toISOString(), arrival_at: arr.toISOString(), tx: rs.length };
+    });
+    const cbO = st.orders.find(o => o.box_office_id === bo1.id && o.status === 'paid' && o.payment?.provider === 'demo' && o.event_ids[0] === ev2.id && !o.data.refunds?.length);
+    if (cbO) { const c = { id: uid(), at: day(-3, 15), by: 'processor', amount: cbO.data.total, status: 'open', reason: 'Customer says they did not make this purchase', ref: 'dp_demo_' + randCode(10).toLowerCase() };
+      cbO.data.chargebacks = [c]; procTx(st, cbO, { type: 'dispute', id: c.ref, amount: -c.amount, at: c.at });
+      (st.orderLog ||= []).unshift({ id: uid(), at: c.at, box_office_id: cbO.box_office_id, order_id: cbO.id, ref: cbO.ref, event_id: cbO.event_ids[0], kind: 'chargeback', summary: `Chargeback opened — ${money_(c.amount)} · ${c.reason}`, by: 'processor', note: '', data: { amount: c.amount }, before: null, after: null }); }
+    st.expenses = [['Venue', 'Hall rental & house staff', 150000], ['Talent', 'Orchestra fee', 120000], ['AV', 'Sound & lighting', 30000], ['Security', 'Door & floor security', 15000],
+      ['Marketing', 'Social ads', 20000], ['Insurance', 'Event liability cover', 6000]]
+      .map(([category, description, amount], i) => ({ id: uid(), box_office_id: bo1.id, event_id: ev1.id, category, description, vendor: '', amount, date: localDay(day(-24 + i * 3)), by: bo1.owner, at: day(-24 + i * 3) }));
+    st.expenseFinal = {};
   }
   return Demo.st;
 }

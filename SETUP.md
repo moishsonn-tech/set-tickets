@@ -98,7 +98,8 @@ Add the new public key to the new company's GitHub account.
    `supabase secrets set STRIPE_SECRET_KEY=sk_test_… STRIPE_PUBLISHABLE_KEY=pk_test_… APP_ORIGINS=https://your-site`
 4. Deploy: `supabase functions deploy payments --no-verify-jwt`.
 5. Stripe → Developers → Webhooks → add `https://<project>.functions.supabase.co/payments?webhook=stripe`, listening to
-   `payment_intent.succeeded`, `payment_intent.payment_failed`, `account.updated` (tick "events on Connected accounts"). Put its signing
+   `payment_intent.succeeded`, `payment_intent.payment_failed`, `account.updated`, `charge.dispute.created`, `charge.dispute.closed`,
+   `payout.created`, `payout.paid`, `payout.failed` (tick "events on Connected accounts"). Put its signing
    secret in `STRIPE_WEBHOOK_SECRET`.
 6. Each box office: Settings → Payments → Connect Stripe → finishes Stripe's onboarding → card checkout turns on by itself.
 Test with Stripe's test cards first (4242 4242 4242 4242); switch to live keys only when everything checks out.

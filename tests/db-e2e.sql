@@ -383,6 +383,96 @@ set role authenticated; select t.who('owner@box.test'); select revoke_api_key('b
 set role service_role; select t.ok(api_auth(encode(sha256(convert_to((:'s8k'::jsonb)->>'key', 'UTF8')), 'hex')) is null, 'S8 a revoked key stops working'); reset role;
 set role anon; select t.err($$select api_auth('x')$$, 'permission denied', 'S8 the API functions are server-only'); reset role;
 
+-- ══ Stage 9: ticket money, chargebacks, processor ledger + payouts, expenses, exports ══
+update box_offices set settings = settings || '{"taxPct":8}' where id = 'b0000000-0000-0000-0000-000000000001';
+insert into events(id, box_office_id, slug, status, data) values ('e0000000-0000-0000-0000-000000000009', 'b0000000-0000-0000-0000-000000000001', 'money-night', 'published', '{
+  "name":"Money Night","start":"2099-03-01T20:00:00Z","currency":"USD","visibility":"public","timeSlots":[],
+  "ticketTypes":[{"id":"m","name":"Main","price":3333,"qty":50,"admits":1}],"addons":[{"id":"prog","name":"Programme","price":700,"qty":20,"standalone":false}]}');
+set role anon; select t.who('');
+select place_order('{"buyer":{"name":"Money Fan","email":"money@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-000000000009","ticketTypeId":"m","qty":3,"seats":[]}],"addons":[{"eventId":"e0000000-0000-0000-0000-000000000009","addonId":"prog","qty":1}],"payment":"card"}')->>'id' as s9o \gset
+reset role; set role service_role;
+select confirm_payment(:'s9o', json_build_object('amount', (select (data->>'total')::bigint from orders where id = :'s9o'), 'ref', 'pi_s9', 'provider', 'stripe', 'fee', 397)::jsonb);
+reset role;
+select t.ok((select sum(fee) from tickets where order_id = :'s9o') = (select (data->>'fee')::bigint + coalesce((data->>'serviceFee')::bigint, 0) from orders where id = :'s9o') and (select sum(fee) from tickets where order_id = :'s9o') > 0,
+  'S9 the tickets share the order''s booking fee exactly');
+select t.ok((select sum(tax) from tickets where order_id = :'s9o') > 0 and (select sum(tax) from tickets where order_id = :'s9o') < (select (data->>'tax')::bigint from orders where id = :'s9o'),
+  'S9 tickets carry their part of the sales tax; the product keeps the rest');
+select t.ok((select sum(proc) from tickets where order_id = :'s9o') between 1 and 396, 'S9 tickets carry their part of the card processing fee');
+select t.ok((select bool_and(fee > 0 and tax > 0 and proc > 0) from tickets where order_id = :'s9o'), 'S9 every ticket has its own booking fee, tax and processing share');
+-- refund one ticket as credit → that ticket shows the credit; a chargeback; a clerk can't record one
+set role authenticated; select t.who('owner@box.test');
+select order_action(:'s9o', 'refund', json_build_object('mode', 'tickets', 'tickets', (select jsonb_agg(id) from (select id from tickets where order_id = :'s9o' limit 1) x), 'to', 'credit')::jsonb);
+reset role;
+select t.ok((select count(*) from tickets where order_id = :'s9o' and credited > 0 and credited = refunded) = 1, 'S9 a refund as credit is recorded on the ticket as credit');
+set role authenticated; select t.who('clerk@box.test');
+select t.err($$select order_action('$$ || :'s9o' || $$', 'chargeback', '{"amount":1000}')$$, 'permission', 'S9 a clerk without “Issue refunds” cannot record a chargeback');
+select t.who('owner@box.test');
+select t.err($$select order_action('$$ || :'s9o' || $$', 'chargeback', '{"amount":99999999}')$$, 'at most', 'S9 a chargeback can''t exceed what was collected');
+select order_action(:'s9o', 'chargeback', '{"amount":1000,"reason":"fraudulent"}');
+reset role;
+select t.ok((order_money(o)->>'chargedBack')::bigint = 1000 and (order_money(o)->>'refundable')::bigint = (order_money(o)->>'collected')::bigint - (order_money(o)->>'credited')::bigint - 1000, 'S9 an open chargeback reduces what can still be refunded')
+  from orders o where id = :'s9o';
+set role authenticated; select t.who('owner@box.test');
+select order_action(:'s9o', 'chargeback', json_build_object('id', (select data->'chargebacks'->0->>'id' from orders where id = :'s9o'), 'status', 'won')::jsonb);
+reset role;
+select t.ok((order_money(o)->>'chargedBack')::bigint = 0 and o.data->'chargebacks'->0->>'status' = 'won', 'S9 a won chargeback gives the money back') from orders o where id = :'s9o';
+select t.ok(exists(select 1 from order_log where order_id = :'s9o' and kind = 'chargeback'), 'S9 chargebacks are in the order''s change history');
+-- the processor's side: charge, dispute (webhook, twice), payout
+set role service_role;
+select record_processor_tx(json_build_object('id', 'ch_s9', 'payment', 'pi_s9', 'type', 'charge', 'amount', (select (data->>'total')::bigint from orders where id = :'s9o'), 'fee', 397, 'app_fee', 0, 'account', 'acct_test')::jsonb);
+select record_processor_tx('{"id":"ch_s9","payment":"pi_s9","type":"charge","amount":1,"account":"acct_test"}');
+select record_dispute('{"id":"dp_s9","payment":"pi_s9","amount":500,"reason":"duplicate","status":"open","provider":"stripe"}');
+select record_dispute('{"id":"dp_s9","payment":"pi_s9","amount":500,"reason":"duplicate","status":"open","provider":"stripe"}');
+select record_payout('{"id":"po_s9","account":"acct_test","amount":9000,"status":"paid","arrival":"2099-01-03T00:00:00Z","tx":["pi_s9"],"provider":"stripe"}');
+reset role;
+select t.ok((select count(*) from processor_tx where id = 'ch_s9') = 1 and (select amount from processor_tx where id = 'ch_s9') > 1, 'S9 processor transactions are recorded once (a repeated webhook changes nothing)');
+select t.ok((select count(*) from orders o, jsonb_array_elements(o.data->'chargebacks') c where o.id = :'s9o' and c->>'id' = 'dp_s9') = 1 and exists(select 1 from processor_tx where id = 'dp:dp_s9' and amount = -500),
+  'S9 a processor dispute opens one chargeback on the order + a processor transaction');
+select t.ok((select status from payouts where id = 'po_s9') = 'paid' and (select bool_and(payout_id = 'po_s9') from processor_tx where payment = 'pi_s9'), 'S9 a paid payout links the transactions it carried');
+set role anon; select t.err($$select record_payout('{"id":"x","account":"acct_test","amount":1,"status":"paid"}')$$, 'permission denied', 'S9 payouts can only be written by the processor (service role)'); reset role;
+set role authenticated; select t.who('owner@box.test'); select t.err($$select * from processor_tx$$, 'permission denied', 'S9 nobody reads the processor ledger directly'); reset role;
+-- expenses
+set role authenticated; select t.who('clerk@box.test');
+select t.err($$select save_expense('b0000000-0000-0000-0000-000000000001', '{"event_id":"e0000000-0000-0000-0000-000000000009","category":"Venue","amount":50000}')$$, 'permission', 'S9 entering expenses needs “Enter event expenses”');
+reset role; select t.who('root@platform.test'); update members set perms = perms || '{events.view}' where email = 'clerk@box.test'; set role authenticated; select t.who('clerk@box.test');
+select t.ok(jsonb_array_length(admin_load('b0000000-0000-0000-0000-000000000001')->'expenses') = 0 and jsonb_array_length(admin_load('b0000000-0000-0000-0000-000000000001')->'tickets') > 0
+  and (select bool_and(t2->'fee' = 'null'::jsonb and t2->'proc' = 'null'::jsonb) from jsonb_array_elements(admin_load('b0000000-0000-0000-0000-000000000001')->'tickets') t2),
+  'S9 staff without finance permissions see no expenses and no ticket fees');
+reset role; select t.who('root@platform.test'); update members set perms = array_remove(perms, 'events.view') where email = 'clerk@box.test'; set role authenticated; select t.who('owner@box.test');
+select t.who('owner@box.test');
+select save_expense('b0000000-0000-0000-0000-000000000001', '{"event_id":"e0000000-0000-0000-0000-000000000009","category":"Venue","description":"Hall","amount":50000,"date":"2099-02-01"}');
+select t.err($$select save_expense('b0000000-0000-0000-0000-000000000001', '{"event_id":"e0000000-0000-0000-0000-000000000009","amount":0}')$$, 'amount', 'S9 an expense needs an amount');
+select t.ok(import_expenses('b0000000-0000-0000-0000-000000000001', 'e0000000-0000-0000-0000-000000000009', '[{"category":"AV","amount":12000},{"category":"Nope","description":"Misc","amount":3000}]') = 2, 'S9 import expenses from a spreadsheet');
+select set_expenses_final('b0000000-0000-0000-0000-000000000001', 'e0000000-0000-0000-0000-000000000009', true);
+select admin_load('b0000000-0000-0000-0000-000000000001') as s9al \gset
+reset role;
+select t.ok((select sum((x->>'amount')::bigint) from jsonb_array_elements((:'s9al'::jsonb)->'expenses') x where x->>'event_id' = 'e0000000-0000-0000-0000-000000000009') = 65000
+  and (select count(*) from expenses where category = 'Other' and description = 'Misc') = 1, 'S9 expenses add up (unknown categories become Other)');
+select t.ok((:'s9al'::jsonb)->'expenseFinal' ? 'e0000000-0000-0000-0000-000000000009', 'S9 profit marked final for the event');
+select t.ok(jsonb_array_length((:'s9al'::jsonb)->'payouts') >= 1 and jsonb_array_length((:'s9al'::jsonb)->'procTx') >= 2, 'S9 the owner sees payouts and the processor ledger');
+select t.ok(exists(select 1 from audit_log where kind = 'finance.expense' and target = 'e0000000-0000-0000-0000-000000000009'), 'S9 expense changes are in the activity log');
+-- reissue keeps a ticket's money
+set role authenticated; select t.who('owner@box.test');
+select order_action(:'s9o', 'reissue', json_build_object('tickets', (select jsonb_agg(id) from (select id from tickets where order_id = :'s9o' and status = 'valid' and credited = 0 limit 1) x))::jsonb);
+reset role;
+select t.ok((select sum(fee) from tickets where order_id = :'s9o' and status <> 'replaced') = (select (data->>'fee')::bigint + coalesce((data->>'serviceFee')::bigint, 0) from orders where id = :'s9o'), 'S9 a reissued ticket keeps its fee, tax and processing share');
+-- data ownership
+set role authenticated; select t.who('clerk@box.test');
+select t.err($$select export_box_office('b0000000-0000-0000-0000-000000000001')$$, 'owner', 'S9 staff without both export permissions can''t download everything');
+select t.err($$select platform_export()$$, 'super admins', 'S9 only super admins export platform-wide data');
+select t.who('owner@box.test');
+select export_box_office('b0000000-0000-0000-0000-000000000001') as s9x \gset
+select t.who('root@platform.test'); select platform_export() as s9p \gset
+reset role;
+select t.ok(jsonb_array_length((:'s9x'::jsonb)->'orders') = (select count(*) from orders where box_office_id = 'b0000000-0000-0000-0000-000000000001') and not (:'s9x')::text like '%access_key%'
+  and jsonb_array_length((:'s9x'::jsonb)->'expenses') = 3, 'S9 the owner downloads every order (no private keys), ticket and expense');
+select t.ok(jsonb_array_length((:'s9p'::jsonb)->'box_offices') >= 1 and not (:'s9p')::text like '%buyer_email%', 'S9 platform export: box offices and order money, no customer contact data');
+set role authenticated; select t.who('root@platform.test'); select set_box_office_status('b0000000-0000-0000-0000-000000000001', 'suspended'); select t.who('owner@box.test');
+select t.ok(jsonb_array_length(export_box_office('b0000000-0000-0000-0000-000000000001')->'orders') > 0, 'S9 a suspended box office''s owner can still download all of its data');
+reset role;
+set role authenticated; select t.who('root@platform.test'); select set_box_office_status('b0000000-0000-0000-0000-000000000001', 'active'); reset role;
+update box_offices set settings = settings - 'taxPct' where id = 'b0000000-0000-0000-0000-000000000001';
+
 \o
 \pset tuples_only off
 select count(*) filter (where ok) as passed, count(*) filter (where not ok) as failed from t.results;

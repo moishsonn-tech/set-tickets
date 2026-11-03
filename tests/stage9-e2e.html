@@ -1,0 +1,184 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Stage 9 — financial reports, sales analytics, payouts & reconciliation, profitability, exports, accounting, data ownership (Eli's Step 9).
+// Run from the local server: /stage9-e2e.html. The database side (ticket money, chargebacks, processor ledger, payouts, expenses, exports)
+// is checked on Postgres by tests/db-e2e.sh.
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=8000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t);
+let lastErr=''; const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));
+async function throwsP(code){ try{ await E(code); lastErr='(no error)'; return false }catch(e){ lastErr=e.message; return e.message||true } }
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const free=(slug,tt,n)=>E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='${slug}');return [...seatStates(e,{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt==='${tt}').map(x=>x.p.id).slice(0,${n})})()`);
+const view=async hash=>{ W().location.hash=hash; await sleep(90); E('render()'); await sleep(40); };
+const X=()=>`({events:Demo.st.events.filter(e=>e.box_office_id===DB._bo),orders:Demo.st.orders.filter(o=>o.box_office_id===DB._bo),tickets:Demo.st.tickets.filter(t=>t.box_office_id===DB._bo),statuses:Demo.st.seatStatus,expenses:(Demo.st.expenses||[]).filter(x=>x.box_office_id===DB._bo),expenseFinal:Demo.st.expenseFinal||{}})`;
+const rep=(fl={})=>E(`finReport(${X()},${JSON.stringify(fl)})`);
+const unzipNames=bytes=>{const u=bytes,names=[];for(let i=0;i<u.length-4;i++){if(u[i]===0x50&&u[i+1]===0x4b&&u[i+2]===1&&u[i+3]===2){const n=u[i+28]|(u[i+29]<<8);names.push(new TextDecoder().decode(u.slice(i+46,i+46+n)));}}return names};
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  let dl=null; W().download=(n,t,ty)=>{dl=[n,t,ty]};
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.noSingles=false;Demo.save()`);
+  const gala=ev('winter-orchestra-gala'), neon=ev('neon-nights-live'), stalls=gala.ticketTypes.find(t=>t.name==='Stalls'), prem=gala.ticketTypes.find(t=>t.name==='Premium');
+  await as('moishsonn@gmail.com'); const bo=E('DB._bo');
+
+  // ── §1 financial tracking: every figure from what the orders and tickets stored, reconciling exactly ──
+  E(`(()=>{const b=Demo.st.boxOffices.find(b=>b.id===DB._bo);b.settings.taxPct=8;Demo.save()})()`);
+  const seats=free('winter-orchestra-gala',stalls.id,3);
+  const r1=await E(`DB.placeOrder({buyer:{name:'Fin Test',email:'fin9@test.co',phone:''},items:[{eventId:'${gala.id}',ticketTypeId:'${stalls.id}',qty:3,seats:${JSON.stringify(seats)}}],addons:[],payment:'card',card:{number:'4242424242424242',exp:'12/30',cvc:'123'}})`);
+  const o1=E(`Demo.st.orders.find(o=>o.id==='${r1.id}')`), t1=E(`Demo.st.tickets.filter(t=>t.order_id==='${r1.id}')`);
+  ok(o1.status==='paid' && o1.data.tax>0 && o1.data.processingFee>0,'§1 a card order with booking fee, sales tax and card processing');
+  ok(t1.reduce((a,t)=>a+t.fee,0)===o1.data.fee+(o1.data.serviceFee||0) && t1.reduce((a,t)=>a+t.tax,0)===o1.data.tax && t1.reduce((a,t)=>a+t.proc,0)===o1.data.processingFee,'§4 the tickets carry exactly the order\'s booking fee, tax and processing');
+  ok(t1.reduce((a,t)=>a+t.paid+t.fee+t.tax,0)+(o1.data.donation||0)+(o1.data.processing||0)===o1.data.total,'§4 the tickets add up to the order total');
+  const tf=E(`ticketFin(Demo.st.tickets.find(t=>t.order_id==='${r1.id}'))`);
+  ok(['face','paid','discount','promo','comp','fee','tax','proc','refund','credit','net'].every(k=>k in tf) && tf.net===tf.paid+tf.fee+tf.tax-tf.proc,'§4 each ticket: face, paid, discount, promo, comp, fee, tax, processing, refund, credit, net');
+  // per order: the items always add up to what the order collected
+  const recon=E(`(()=>{const x=${X()},items=finItems(x),bad=[];for(const o of x.orders.filter(wasPaid)){const s=items.filter(i=>i.orderId===o.id).reduce((a,i)=>a+i.collected,0);if(s!==orderMoney(o).collected)bad.push(o.ref)}return {bad,n:x.orders.filter(wasPaid).length}})()`);
+  ok(recon.n>50 && recon.bad.length===0,`§1 every paid order's items add up to what it collected (${recon.n} orders${recon.bad.length?', off: '+recon.bad.slice(0,3):''})`);
+  let T=rep().totals;
+  const ident=t=>t.collected===t.tface+t.pface-t.discount-t.savings+t.fees+t.tax+t.donation+t.cardFee+t.creditUsed+t.changes && t.net===t.collected-t.refunds-t.credits-t.chargebacks-t.processing;
+  ok(ident(T),'§3 the dashboard waterfall is exact: gross − discounts + fees + tax … − refunds − processing = net collected');
+  ok(T.collected===E(`Demo.st.orders.filter(o=>o.box_office_id===DB._bo&&wasPaid(o)).reduce((a,o)=>a+orderMoney(o).collected,0)`),'§1 report "collected" = every paid order\'s collected money');
+  ok(E(`finGroup(finReport(${X()}),'event').reduce((a,r)=>a+r.collected,0)`)===T.collected && E(`finGroup(finReport(${X()}),'day').reduce((a,r)=>a+r.net,0)`)===T.net,'§2 by-event and by-day breakdowns add up to the totals');
+  ok(T.potential===E(`${X()}.events.reduce((a,e)=>a+sellout(e,Demo.st.tickets,Demo.st.seatStatus,Demo.st.orders).total,0)`) && T.remaining>0,'§1 potential sellout and remaining potential revenue');
+  ok(T.comp>0 && T.comps>=2,'§1 complimentary ticket value tracked (not collected)');
+  ok(T.pface>0 && T.productRev>0 && T.bundleRev>0,'§1 product/add-on and bundle revenue');
+  ok(T.refunds>0 && T.processing>0 && T.platform>0 && T.chargebacks>0,'§1 refunds, processing fees, platform fees and a chargeback tracked');
+  ok(T.discount>0 && T.fees>0 && T.tax>0,'§1 discounts, booking fees and sales tax');
+  // credit + cash refunds, offline payments
+  await E(`DB.orderAction('${r1.id}','refund',{mode:'tickets',tickets:['${t1[0].id}'],to:'credit'})`);
+  ok(E(`Demo.st.tickets.find(t=>t.id==='${t1[0].id}').credited`)===t1[0].paid,'§4 a refund as credit is kept on the ticket as credit');
+  const T2=rep().totals; ok(T2.credits-T.credits===t1[0].paid && T2.refunds===T.refunds && ident(T2),'§1 credits issued tracked apart from cash refunds');
+  const r2=await E(`DB.placeOrder({buyer:{name:'Cash Buyer',email:'cash9@test.co',phone:''},items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:2}],addons:[],payment:'manual',payMethod:'cash'},true)`);
+  const T3=rep().totals, o2=E(`Demo.st.orders.find(o=>o.id==='${r2.id}')`);
+  ok(T3.offline-T2.offline===o2.data.total && rep({method:'cash'}).totals.collected>=o2.data.total,'§1 offline / manual payments (cash) tracked');
+  // chargebacks
+  await E(`DB.orderAction('${r1.id}','chargeback',{amount:2000,reason:'fraudulent'})`);
+  const T4=rep().totals; ok(T4.chargebacks-T3.chargebacks===2000 && T4.net===T3.net-2000,'§1 a chargeback comes off net collected');
+  ok(/at most/i.test(String(await throwsP(`DB.orderAction('${r1.id}','chargeback',{amount:99999999})`))),'§5 a chargeback can\'t exceed what is left of the payment');
+  const cb=E(`Demo.st.orders.find(o=>o.id==='${r1.id}').data.chargebacks[0]`);
+  await E(`DB.orderAction('${r1.id}','chargeback',{id:'${cb.id}',status:'won'})`);
+  ok(rep().totals.chargebacks===T3.chargebacks && E(`Demo.st.orderLog.filter(l=>l.order_id==='${r1.id}'&&l.kind==='chargeback').length`)===2,'§5 a won chargeback returns the money; both steps in the order history');
+
+  // ── §2 reporting views: every filter ──
+  const fg=rep({eventId:gala.id});
+  ok(fg.items.every(i=>i.eventId===gala.id) && fg.totals.collected===E(`finGroup(finReport(${X()}),'event').find(r=>r.key==='${gala.id}').collected`),'§2 by event');
+  const ft=rep({eventId:gala.id,ttId:stalls.id}); ok(ft.partial && ft.items.length && ft.items.every(i=>i.kind==='ticket'&&i.ttId===stalls.id) && ft.totals.tface<fg.totals.tface,'§2 by ticket type (tickets only)');
+  const area=E(`Demo.st.tickets.find(t=>t.event_id==='${gala.id}'&&t.area&&t.status==='valid').area`), fa=rep({eventId:gala.id,area});
+  ok(fa.items.length && fa.items.every(i=>i.area===area),'§2 by seating area');
+  const fp=rep({eventId:gala.id,price:stalls.price}); ok(fp.items.length && fp.items.every(i=>i.price===stalls.price),'§2 by price level');
+  const promo=E(`Demo.st.orders.find(o=>o.box_office_id===DB._bo&&o.data.code&&wasPaid(o)).data.code`), fpr=rep({promo});
+  ok(fpr.items.length && fpr.items.every(i=>String(i.promo).toUpperCase()===promo.toUpperCase()||i.kind!=='ticket') && fpr.totals.discount>0,'§2 by promo code');
+  const trk=E(`Demo.st.orders.find(o=>o.box_office_id===DB._bo&&o.data.tracking&&wasPaid(o)).data.tracking`), ftr=rep({tracking:trk}); ok(ftr.items.length && ftr.items.every(i=>i.tracking===trk),'§2 by tracking / referral code');
+  const ad=E(`Demo.st.orders.flatMap(o=>o.box_office_id===DB._bo&&wasPaid(o)?o.data.lines.filter(l=>l.kind==='addon'):[])[0]`), fad=rep({addonId:ad.addonId});
+  ok(fad.items.length && fad.items.every(i=>i.kind==='addon'&&i.addonId===ad.addonId) && fad.totals.productRev>0,'§2 by product / add-on');
+  const bun=E(`Demo.st.tickets.find(t=>t.box_office_id===DB._bo&&t.bundle).bundle.id`), fb=rep({bundleId:bun}); ok(fb.items.length && fb.totals.bundleRev>0 && fb.items.every(i=>i.bundleId===bun),'§2 by bundle');
+  const fm=rep({method:'card'}); ok(fm.items.every(i=>i.method==='card') && fm.totals.collected<T4.collected,'§2 by payment method');
+  const today=E(`localDay(new Date().toISOString())`), fd=rep({from:today,to:today}); ok(fd.items.length && fd.items.every(i=>i.day===today) && fd.items.some(i=>i.orderId===r1.id),'§2 by date range');
+  ok(E(`finReport({events:[],orders:[],tickets:[]},{}).totals.collected`)===0,'§2 box office: only that box office\'s data is ever in the report');
+  await as('director@harborarts.example');
+  const ev5=E(`Demo.st.events.find(e=>e.box_office_id===DB._bo&&(e.timeSlots||[]).length>1&&Demo.st.tickets.some(t=>t.event_id===e.id&&t.slot_id))`);
+  if(ev5){const sl=E(`Demo.st.tickets.find(t=>t.event_id==='${ev5.id}'&&t.slot_id).slot_id`), fs=rep({eventId:ev5.id,slotId:sl}); ok(fs.items.length && fs.items.every(i=>i.slotId===sl),'§2 by occurrence / showtime');} else ok(false,'§2 sample data has a multi-showtime event');
+  const hb=rep(); ok(hb.items.every(i=>E(`Demo.st.orders.find(o=>o.id==='${hb.items[0]?.orderId}')?.box_office_id`)===E('DB._bo')) && E('S.adm.orders.every(o=>o.box_office_id===DB._bo)'),'§2 another box office sees only its own numbers');
+  await as('moishsonn@gmail.com');
+
+  // ── §3 event financial dashboard (UI) ──
+  await view('#/admin/event/'+gala.id+'/overview'); ok(has('Financial dashboard') && has('Gross ticket value sold') && has('Net collected') && has('Estimated profit'),'§3 the event page has its financial dashboard');
+  await view('#/admin/reports'); E(`S.ui.rep={...emptyFin(),eventId:'${gala.id}'}`); E('render()');
+  ok(has('financial dashboard') && has('Potential sellout revenue') && has('Booking fees collected') && has('Processing fees') && W().document.querySelector('svg.chart'),'§3 Reports: dashboard for the chosen event + daily chart');
+  W().document.querySelector('[data-action-change="repBy"]').value='area'; W().document.querySelector('[data-action-change="repBy"]').dispatchEvent(new Event('change',{bubbles:true})); await sleep(40);
+  ok(has('Seating area') && has(area),'§2 breakdown by seating area in the UI');
+  await view('#/admin/reports/events'); ok(has('Gross sold') && has('Profit') && has(gala.name),'§3 every event at a glance');
+
+  // ── §5 payouts & reconciliation ──
+  const ps=E(`payoutSummary(Demo.st.payouts.filter(p=>p.box_office_id===DB._bo),Demo.st.procTx.filter(r=>r.box_office_id===DB._bo))`);
+  ok(ps.processed>0 && ps.completed>0 && ps.pending>0,'§5 total processed, completed and pending payouts');
+  let rc=E(`reconcile(Demo.st.orders.filter(o=>o.box_office_id===DB._bo),Demo.st.procTx.filter(r=>r.box_office_id===DB._bo))`);
+  ok(rc.rows.length>20 && rc.issues.length===0 && rc.totals.diff===0,`§5 SET and the processor agree on every card payment (${rc.rows.length} transactions)`);
+  ok(rc.byEvent.length>=2 && rc.byDay.length>=5,'§5 reconciliation by event and by date');
+  ok(E(`Demo.st.procTx.some(r=>r.payment===Demo.st.orders.find(o=>o.id==='${r1.id}').payment.ref&&r.type==='dispute_won')`),'§5 the processor ledger has refunds and chargebacks too');
+  // a processor report with one wrong amount and one unknown transaction
+  const ref1=E(`Demo.st.orders.find(o=>o.id==='${r1.id}').payment.ref`), o1n=E(`Demo.st.orders.find(o=>o.id==='${r1.id}')`);
+  const csvTxt='id,Type,Source,Amount,Fee,Created (UTC)\ntxn_1,charge,'+ref1+','+((o1n.data.total-100)/100)+','+(o1n.data.processingFee/100)+',2026-11-02 10:00:00\ntxn_2,charge,pi_unknown_9,25.00,1.03,2026-11-02 11:00:00\n';
+  const imp=E(`parseProcessorCsv(${JSON.stringify(csvTxt)})`); ok(imp.length===2 && imp[0].amount===o1n.data.total-100,'§5 import the processor\'s own report (CSV)');
+  rc=E(`reconcile(Demo.st.orders.filter(o=>o.box_office_id===DB._bo),parseProcessorCsv(${JSON.stringify(csvTxt)}),{from:'${today}',to:'${today}'})`);
+  const mine=rc.rows.find(r=>r.ref===ref1); ok(mine && mine.status==='different' && mine.diffs.some(d=>d.field==='charged'&&d.set-d.processor===100),'§5 differences between platform and processor totals are shown per transaction');
+  ok(rc.rows.some(r=>r.ref==='pi_unknown_9'&&r.status==='not in SET'),'§5 a processor payment SET has no order for is flagged');
+  E(`S.ui.recImport={name:'stripe.csv',rows:parseProcessorCsv(${JSON.stringify(csvTxt)})}`); await view('#/admin/reports/payouts');
+  ok(has('Reconciliation') && has('different') && has('Completed payouts') && has('Failed payments') && has('Chargebacks') && has('stripe.csv'),'§5 payouts & reconciliation page');
+  E('S.ui.recImport=null');
+
+  // ── §6 profitability ──
+  let g=rep({eventId:gala.id}).totals;
+  ok(g.expenses>0 && !g.profitFinal && g.profit===g.revenue-g.refunds-g.credits-g.chargebacks-g.processing-g.platform-g.expenses,'§6 revenue − refunds − processing/ticketing − expenses = estimated profit');
+  await as('finance@skyline.example');
+  await E(`DB.saveExpense({event_id:'${gala.id}',category:'Staffing',description:'Ushers',amount:85000,date:'2026-11-01'})`);
+  const n=await E(`DB.importExpenses('${gala.id}',parseExpenseCsv('Date,Category,Description,Amount\\n2026-11-01,Food,Green room catering,"$1,250.00"\\n2026-11-01,Limo,Artist car,300'))`);
+  const g2=rep({eventId:gala.id}).totals; ok(n===2 && g2.expenses-g.expenses===85000+125000+30000,'§6 finance enters and imports expenses');
+  ok(E(`Demo.st.expenses.some(x=>x.description==='Artist car'&&x.category==='Other')`),'§6 an unknown category is filed as Other');
+  await E(`DB.setExpensesFinal('${gala.id}',true)`); ok(rep({eventId:gala.id}).totals.profitFinal,'§6 "all expenses entered" turns the estimate into profit');
+  await E('reloadAdmin()'); await view('#/admin/reports/profit'); E(`S.ui.rep={...emptyFin(),eventId:'${gala.id}'}`); E('render()'); ok(has('Event profit') && has('Ushers') && has('final — all expenses entered'),'§6 profitability page');
+  await E(`DB.setExpensesFinal('${gala.id}',false)`);
+  await as('support@skyline.example'); ok(/permission/.test(String(await throwsP(`DB.saveExpense({event_id:'${gala.id}',category:'AV',amount:100})`))),'§6 customer service can\'t enter expenses');
+  ok(E('S.adm.expenses.length')===0 && !E(`can('finance.reports')`),'§6 … and doesn\'t see them');
+
+  // ── §7 export center ──
+  await as('moishsonn@gmail.com');
+  const nm=await E(`DB.placeOrder({buyer:{name:'=HYPERLINK("http://x")',email:'inject9@test.co',phone:''},items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:1}],addons:[],payment:'manual',payMethod:'check'},true)`);
+  await E('reloadAdmin()'); await view('#/admin/reports/exports');
+  ok(has('Tickets (financial history)') && has('Accounting journal') && has('Your data belongs to you'),'§7 export center lists every export');
+  E(`S.ui.rep={...emptyFin()}`); W().document.querySelector('[data-action="xp"][data-k="orders"][data-fmt="csv"]').click(); await sleep(30);
+  ok(dl && /orders/.test(dl[0]) && dl[1].includes(`'=HYPERLINK`) && !/(^|,)=HYPERLINK/m.test(dl[1]),'§7 CSV: a name that looks like a formula is neutralised');
+  E(`A.xp({dataset:{k:'summary',fmt:'csv'}})`); ok(/Discounts,-\d/.test(dl[1]) && !dl[1].includes(`'-`),'§7 CSV: negative amounts stay numbers');
+  E(`S.ui.rep={...emptyFin(),eventId:'${gala.id}',ttId:'${stalls.id}'}`); E(`A.xp({dataset:{k:'tickets',fmt:'csv'}})`);
+  const tl=dl[1].split('\n'); ok(tl[0].includes('Booking fee') && tl[0].includes('Processing fee') && tl[0].includes('Net') && tl.length-1===rep({eventId:gala.id,ttId:stalls.id}).items.length,'§7 export by event + ticket type: one row per ticket with its full financial history');
+  E(`S.ui.rep={...emptyFin(),customer:'fin9@test.co'}`); E(`A.xp({dataset:{k:'orders',fmt:'xlsx'}})`);
+  ok(/\.xlsx$/.test(dl[0]) && dl[1][0]===0x50 && dl[1][1]===0x4b && unzipNames(dl[1]).includes('xl/worksheets/sheet1.xml'),'§7 Excel export (a real .xlsx workbook)');
+  const xml=new TextDecoder().decode(dl[1]); ok(xml.includes(o1.ref) && !xml.includes('cash9@test.co'),'§7 export by customer');
+  E(`S.ui.rep={...emptyFin()}`); E('A.xpAll()'); ok(unzipNames(dl[1]).filter(n=>/worksheets\/sheet\d+/.test(n)).length>=15,'§7 all exports in one workbook');
+  await as('finance@skyline.example'); await view('#/admin/reports/exports');
+  ok(!W().document.querySelector('[data-k="customers"]') && W().document.querySelector('[data-k="orders"]'),'§7 finance (no "Export customer information") gets financial exports but not the customer list');
+  await as('marketing@skyline.example'); ok(!E(`NAV.find(n=>n[0]==='reports')&&navOk(NAV.find(n=>n[0]==='reports'))`),'§7 marketing (sales totals only) has no Reports');
+
+  // ── §8 full event export ──
+  await as('moishsonn@gmail.com'); E(`S.ui.rep={...emptyFin(),eventId:'${gala.id}'}`);
+  E(`A.xpEvent({dataset:{fmt:'zip'}})`); const zn=unzipNames(dl[1]);
+  ok(['orders.csv','tickets-financial-history.csv','seat-status.csv','check-ins.csv','products-add-ons.csv','payments-transaction-ids.csv','refunds.csv','credits.csv','chargebacks.csv','traffic-conversion.csv','order-history.csv','event-expenses.csv','financial-summary.csv','customers.csv'].every(x=>zn.includes(x)),'§8 "Export everything for this event": every table in one download ('+zn.length+' files)');
+  E(`A.xpEvent({dataset:{fmt:'xlsx'}})`); const ex=new TextDecoder().decode(dl[1]);
+  ok(/\.xlsx$/.test(dl[0]) && ex.includes('Transaction id') && ex.includes('Checked in') && ex.includes('Page views') && ex.includes('Seat ID') && ex.includes('Net collected'),'§8 the event workbook: orders, tickets, seats, check-ins, traffic, transactions, financial breakdown');
+  await view('#/admin/event/'+gala.id+'/overview'); ok(W().document.querySelector('[data-action="xpEventId"]'),'§8 the event page has "Export everything for this event"');
+
+  // ── §9 accounting ──
+  const j=E(`journal(finReport(${X()}))`), days=[...new Set(j.map(x=>x.date))];
+  ok(j.length>20 && days.every(d=>{const r=j.filter(x=>x.date===d);return r.reduce((a,x)=>a+x.debit,0)===r.reduce((a,x)=>a+x.credit,0)}),'§9 a balanced journal for every day (debits = credits)');
+  await view('#/admin/reports/accounting'); ok(has('QuickBooks Online') && has('Xero') && has('✓'),'§9 accounting page: QuickBooks / Xero / API');
+  E(`S.ui.acct={tickets:'4100 Box office sales',tickets_code:'4100'}`); await E('A.acctSave()');
+  E(`A.xpJournal({dataset:{v:'xero'}})`); ok(dl[1].startsWith('*Narration') && dl[1].includes(',4100,'),'§9 Xero journal uses your account codes');
+  E(`A.xpJournal({dataset:{v:'quickbooks'}})`); ok(dl[1].startsWith('Journal No') && dl[1].includes('4100 Box office sales'),'§9 QuickBooks journal uses your account names');
+
+  // ── §10 data ownership ──
+  const all=await E(`DB.exportAll(DB._bo)`);
+  ok(all.orders.length===E(`Demo.st.orders.filter(o=>o.box_office_id===DB._bo).length`) && !JSON.stringify(all).includes('access_key') && all.tickets.length && all.expenses.length && all.payouts.length,'§10 the box office downloads all of its data (no private keys)');
+  E(`A.xpOwn({dataset:{fmt:'xlsx'}})`); await sleep(50); ok(/all-data.*\.xlsx$/.test(dl[0]),'§10 … as an Excel workbook');
+  await as('finance@skyline.example'); ok(/owner/.test(String(await throwsP(`DB.exportAll(DB._bo)`))),'§10 staff without both export permissions can\'t download everything');
+  await as('director@harborarts.example'); ok(/super admin/i.test(String(await throwsP(`DB.platformExport()`))),'§10 only platform super admins export platform-wide data');
+  ok(String(await throwsP(`DB.exportAll(Demo.st.boxOffices[0].id)`)).length>0,'§10 one box office can\'t download another\'s data');
+  await as('moishsonn@gmail.com'); const pe=await E('DB.platformExport()');
+  ok(pe.box_offices.length===3 && pe.orders.length===E('Demo.st.orders.length') && !JSON.stringify(pe).includes('buyer_email'),'§10 platform owner: platform-wide export without customer contact data');
+  E(`(()=>{const b=Demo.st.boxOffices.find(b=>b.id===DB._bo);b.status='suspended';Demo.save()})()`); await E('reloadAdmin()'); await view('#/admin');
+  ok(has('download all of your data'),'§10 a suspended box office\'s owner still sees "download all of your data"');
+  W().document.querySelector('[data-action="gateXp"]').click(); await sleep(150); ok(/all-data.*\.xlsx$/.test(dl[0]),'§10 … and gets it');
+  E(`(()=>{const b=Demo.st.boxOffices.find(b=>b.id===DB._bo);b.status='active';b.settings.taxPct=0;Demo.save()})()`); await E('reloadAdmin()');
+
+  // ── permissions & pages ──
+  await as('door@example.com'); ok(!E(`navOk(NAV.find(n=>n[0]==='reports'))`) && E('S.adm.payouts.length')===0 && E('S.adm.procTx.length')===0,'door staff: no reports, payouts or processor data');
+  await as('support@skyline.example'); ok(E('S.adm.tickets.every(t=>t.proc===null)'),'processing fees per ticket are hidden without "View payment processing information"');
+  await as('moishsonn@gmail.com'); E('S.ui.rep=emptyFin()');
+  for (const [h,t] of [['#/admin/reports','Financial summary'],['#/admin/reports/events','Gross sold'],['#/admin/reports/payouts','Total processed'],['#/admin/reports/profit','Expenses'],['#/admin/reports/exports','Export'],['#/admin/reports/accounting','Journal preview'],['#/admin/orders/'+r1.id,'Chargebacks'],['#/platform','Export platform data']]) { await view(h); ok(has(t),'page renders: '+h); }
+  log('DONE');
+}catch(e){log('ERROR '+e.message+'\n'+e.stack)}})();
+</script></body></html>

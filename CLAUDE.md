@@ -102,6 +102,17 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   function — keep `supabase/functions/_shared/mailtpl.js` a byte-identical copy (db-e2e.sh checks). Read-only API = `api` Edge Function +
   `api_keys` (SHA-256 only). Pixels (GA4 / Meta / TikTok, optional consent banner) in `loadPixels()` / `pix()`; UTM tags → `order.data.utm`.
   Marketing page `#/admin/marketing/<tab>`; buyer preferences page `#/unsubscribe/<token>`.
+- **Reports & money (Stage 9):** every figure comes from `finReport(x, filters)` in data.js — `finItems()` turns each paid order into items
+  (one per ticket with its own stored face / paid / discount / comp / `fee` / `tax` / `proc` / `refunded` / `credited`, one per product line,
+  package extras, and one "order" item for donations, card fees passed on, credit used, later changes, chargebacks and the platform fee), so
+  an order's items always sum to `orderMoney(o).collected` and every filter / breakdown / export reconciles. Ticket fee/tax/processing shares
+  are set once at issue (`allocTicketMoney` / SQL `alloc_ticket_money`). Chargebacks live on `order.data.chargebacks` (order_action
+  'chargeback'; processor webhook → `record_dispute`). The processor's own ledger is `procTx` / `processor_tx` + `payouts` (demo processor /
+  payments Edge Function webhooks); `reconcile()` matches it to SET by payment id (or against an imported processor CSV). Expenses:
+  `expenses` + `expense_status` (perm `finance.expenses`; profit is "estimated" until marked final). Exports are built client-side from the
+  already-masked admin data (`xpRows`), CSV (formula-injection safe `csvCell`) or Excel via `frontend/xlsx.js` (no library). Owners can
+  always pull everything with `export_box_office()` (even while suspended); super admins `platform_export()`. Accounting = balanced daily
+  `journal()` → QuickBooks / Xero CSV; direct sync needs their OAuth apps.
 - **Money is integer cents everywhere.**
 - **Not yet wired:** the payments, messaging and api Edge Functions are written but not deployed (no Supabase project yet; need
   Stripe / Resend / Twilio keys in Supabase secrets + pg_cron for `expire_orders()` and `marketing_tick()`; the messaging function sends

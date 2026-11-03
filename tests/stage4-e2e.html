@@ -198,9 +198,11 @@ const Q=(cart,code)=>E(`quote(${JSON.stringify(cart)},Demo.st.events,{...DEFAULT
   // (orders changed after purchase — Stage 6 upgrades, refunds, replaced tickets — are checked by the Stage 6 suite)
   const bad=E(`Demo.st.orders.filter(o=>!o.data.comp&&o.status==='paid'&&!(Demo.st.orderLog||[]).some(x=>x.order_id===o.id)).filter(o=>{const t=Demo.st.tickets.filter(x=>x.order_id===o.id).reduce((s,x)=>s+x.paid,0);const ad=o.data.lines.filter(l=>l.kind==='addon').reduce((s,l)=>s+l.unit*l.qty-(l.disc||0),0);const bad=o.data.lines.filter(l=>l.kind==='bundle').reduce((s,l)=>s+l.addons.reduce((a,x)=>a+0,0),0);return Math.abs(t+ad-(o.data.subtotal-o.data.discount))>0 && !o.data.lines.some(l=>l.kind==='bundle'&&l.addons.length)}).length`);
   ok(bad===0,'collected per ticket + products = order subtotal − discount, for every order without packaged products');
-  W().location.hash='#/admin/reports'; await until(()=>W().document.querySelector('[data-action="exportTickets"]'));
-  ok(true,'ticket detail CSV export available on Reports');
-  E(`S.ui.repEv='${g.id}'`); E('render()'); await sleep(60); ok(has('In packages') && has('Collected') && has('Premium + dinner (package)'),'reports: by ticket type from tickets (face, discounts, collected, comps, packages) + products');
+  // Stage 9 moved these to the new Reports: the ticket-level export is in the Export center, the breakdowns come from the tickets
+  W().location.hash='#/admin/reports/exports'; await until(()=>W().document.querySelector('[data-action="xp"][data-k="tickets"]'));
+  ok(true,'ticket detail export available (Reports → Export center)');
+  W().location.hash='#/admin/reports'; await sleep(60); E(`S.ui.rep={...emptyFin(),eventId:'${g.id}'}`); E(`S.ui.repBy='bundle'`); E('render()'); await sleep(60);
+  ok(has('Collected') && has('Premium + dinner') && has('Complimentary ticket value'),'reports: by package, from the tickets (face, discounts, collected, comps)');
 
   // ── buyer UI: packages from the ticket panel (general admission + seated) ──
   W().location.hash='#/'; await sleep(60); E(`S.cart={items:[],addons:[],donation:0,unlock:{}};saveCart()`);
