@@ -22,11 +22,11 @@ const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
    changes the template. 'v' marks a view-only key (what the "View only" group setting grants).
    The box office owner and platform super admins always hold every permission. ── */
 const PERMS = [
-  ['events', 'Events', [['view', 'View events', 'v'], ['edit', 'Edit events'], ['create', 'Create events'], ['publish', 'Publish / unpublish'], ['settings', 'Edit event settings']]],
+  ['events', 'Events', [['view', 'View events', 'v'], ['edit', 'Edit events'], ['create', 'Create events'], ['publish', 'Publish / unpublish'], ['settings', 'Edit event settings'], ['controls', 'Emergency controls (pause sales, checkout or scanning)']]],
   ['seating', 'Seating', [['view', 'View seating chart', 'v'], ['edit', 'Edit seating chart'], ['block', 'Block seats'], ['unblock', 'Unblock seats'], ['move', 'Move customers between seats'], ['assign', 'Change seat assignments']]],
   ['tickets', 'Tickets & pricing', [['view', 'View ticket types', 'v'], ['create', 'Create ticket types'], ['edit', 'Edit ticket types'], ['pricing', 'Change pricing'], ['comps', 'Create complimentary tickets'], ['discounts', 'Create discount codes'], ['discountsEdit', 'Edit discount codes'], ['tracking', 'Manage tracking codes']]],
   ['orders', 'Orders', [['view', 'View orders', 'v'], ['edit', 'Edit orders'], ['cancel', 'Cancel orders'], ['cancelTicket', 'Cancel individual tickets'], ['resend', 'Resend tickets'], ['customer', 'Change customer information'], ['seats', 'Change seats'], ['refund', 'Issue refunds'], ['override', 'Override normal order restrictions']]],
-  ['customers', 'Customer data', [['names', 'View customer names', 'v'], ['emails', 'View email addresses', 'v'], ['phones', 'View phone numbers', 'v'], ['profiles', 'View full customer profiles', 'v'], ['export', 'Export customer information']]],
+  ['customers', 'Customer data', [['names', 'View customer names', 'v'], ['emails', 'View email addresses', 'v'], ['phones', 'View phone numbers', 'v'], ['profiles', 'View full customer profiles', 'v'], ['export', 'Export customer information'], ['ban', 'Ban customers from buying'], ['inbox', 'Read customer-service messages', 'v']]],
   ['finance', 'Sales & finance', [['totals', 'View ticket sales totals', 'v'], ['reports', 'View financial reports', 'v'], ['fees', 'View fees', 'v'], ['processing', 'View payment processing information', 'v'], ['payouts', 'View payouts', 'v'], ['export', 'Export financial reports'], ['expenses', 'Enter event expenses']]],
   ['door', 'Event-day access', [['scan', 'Scan tickets'], ['checkin', 'Check customers in'], ['undo', 'Undo check-in'], ['override', 'Override scanner warnings'], ['search', 'Look up guests at the door (name, email, phone, order)'], ['log', 'View scan history', 'v'], ['attendees', 'View attendee lists', 'v'], ['devices', 'Manage scanner devices'], ['staff', 'Manage door staff']]],
   ['comms', 'Communication', [['email', 'Send customer emails'], ['notify', 'Send event notifications'], ['lists', 'Access attendee mailing lists', 'v'], ['marketing', 'Send marketing campaigns'], ['sms', 'Send text messages'], ['automations', 'Manage automations'], ['consent', 'Manage consent, suppression & customer tags']]],
@@ -37,7 +37,7 @@ const groupPerms = (g, viewOnly) => PERMS.find(x => x[0] === g)[2].filter(k => !
 const DEFAULT_TEMPLATES = [
   { id: 'full', name: 'Full administrator', perms: ALL_PERMS },
   { id: 'event_manager', name: 'Event manager', perms: [...groupPerms('events'), ...groupPerms('seating'), ...groupPerms('tickets'), ...groupPerms('door'), 'orders.view', 'customers.names', 'finance.totals', 'comms.notify'] },
-  { id: 'customer_service', name: 'Customer service', perms: ['events.view', 'seating.view', 'seating.move', 'seating.assign', 'tickets.view', 'orders.view', 'orders.edit', 'orders.cancel', 'orders.cancelTicket', 'orders.resend', 'orders.customer', 'orders.seats', 'orders.refund', ...groupPerms('customers', true), 'door.attendees', 'comms.email'] },
+  { id: 'customer_service', name: 'Customer service', perms: ['events.view', 'seating.view', 'seating.move', 'seating.assign', 'tickets.view', 'orders.view', 'orders.edit', 'orders.cancel', 'orders.cancelTicket', 'orders.resend', 'orders.customer', 'orders.seats', 'orders.refund', ...groupPerms('customers', true), 'door.attendees', 'comms.email', 'customers.ban'] },
   { id: 'door_staff', name: 'Door staff', perms: ['events.view', 'seating.view', 'customers.names', 'door.scan', 'door.checkin', 'door.undo', 'door.override', 'door.search', 'door.log', 'door.attendees'] },
   // Scanner staff: scan, see valid / seat / basic totals — nothing else (no back office, no customer or money data).
   { id: 'scanner', name: 'Scanner staff', perms: ['door.scan', 'door.checkin'] },
@@ -47,9 +47,16 @@ const DEFAULT_TEMPLATES = [
 // member = {email, perms:[], events:'all'|[eventId], owner?, support?}; eventId optional (checks event scope too)
 const hasPerm = (m, key, eventId) => !!m && (m.owner || m.support || (m.perms || []).includes(key)) && (!eventId || m.owner || m.support || m.events === 'all' || (m.events || []).includes(eventId));
 const BO_STATUS = { pending: 'Awaiting approval', active: 'Active', suspended: 'Suspended', deactivated: 'Deactivated' };
-const DEFAULT_PLATFORM = { name: 'SET', publicRegistration: false, feePct: 1, feeFixed: 25, feePayer: 'organizer', plans: 'Per-ticket platform fee only — no subscription.', admins: ['moishsonn@gmail.com'] };
+// Stage 10: plans are the money model — each has a monthly price and its own platform fee (blank = the platform default). Still undecided,
+// so it's all data the super admin edits; a box office's own override (platformFee) beats its plan, its plan beats the platform default.
+const DEFAULT_PLANS = [
+  { id: 'pay', name: 'Pay as you go', monthly: 0, feePct: '', feeFixed: '', blurb: 'No monthly fee — the platform fee on each paid ticket only.' },
+  { id: 'pro', name: 'Pro', monthly: 4900, feePct: 0.5, feeFixed: 15, blurb: 'A lower per-ticket fee for regular sellers.' },
+  { id: 'venue', name: 'Venue', monthly: 19900, feePct: 0, feeFixed: 10, blurb: 'For venues with shows every week.' }];
+const DEFAULT_PLATFORM = { name: 'SET', publicRegistration: false, autoApprove: false, feePct: 1, feeFixed: 25, feePayer: 'organizer', planList: DEFAULT_PLANS, defaultPlan: 'pay',
+  gatewaysOff: [], domainTarget: 'domains.set-tickets.app', appHosts: ['moishsonn-tech.github.io', 'localhost', '127.0.0.1'], invoiceDays: 14, admins: ['moishsonn@gmail.com'] };
 const DEFAULT_BRANDING = { logo: '', banner: '', ink: '#020a16', accent: '#f4cd5e', font: 'Anton', tagline: '', phone: '', website: '', instagram: '', facebook: '', tiktok: '', x: '',
-  refundPolicy: '', privacyPolicy: '', domain: '' };
+  refundPolicy: '', privacyPolicy: '' };
 const FONTS = ['Anton', 'Bebas Neue', 'Oswald', 'Playfair Display', 'DM Serif Display', 'Montserrat'];
 
 /* ── Authenticator-app codes (TOTP, RFC 6238) — used by DEMO mode 2FA; LIVE uses Supabase MFA. ── */
@@ -71,6 +78,8 @@ const DEFAULT_SETTINGS = {
   // Stage 5: who pays card processing, tax on fees, what checkout asks for, and questions asked on every order
   passProcessing: false, taxOnFees: false, questions: [],
   checkout: { phone: 'optional', address: 'off', promo: true, optIn: true, smsOptIn: true, note: '', thanks: '' },
+  // Stage 10: donation amounts + purpose, staff sign-out after inactivity, where failed-email alerts go
+  donationAmounts: [1800, 3600, 10000], donationCustom: true, donationPurpose: '', sessionMinutes: 120,
 };
 
 /* ── Payments (Stage 5): one gateway interface, many processors ──
@@ -94,15 +103,186 @@ const luhn = n => { let s = 0; for (let i = 0; i < n.length; i++) { let d = +n[n
 const cardBrand = n => /^4/.test(n) ? 'Visa' : /^(5[1-5]|2[2-7])/.test(n) ? 'Mastercard' : /^3[47]/.test(n) ? 'Amex' : /^6/.test(n) ? 'Discover' : 'Card';
 const optNum = (v, d) => v === undefined || v === null || v === '' ? d : +v || 0;
 // the platform's own fee for one box office (super admin may override per box office) and who pays it
-const platformFeeFor = (plat, bo) => ({ pct: optNum(bo?.platformFee?.pct, +plat?.feePct || 0), fixed: optNum(bo?.platformFee?.fixed, +plat?.feeFixed || 0),
-  payer: bo?.platformFee?.payer || plat?.feePayer || 'organizer' });
+// precedence: this box office's own override → its plan's fee → the platform default (Stage 10 plans)
+const platformFeeFor = (plat, bo) => { const pl = planOf(plat, bo);
+  return { pct: optNum(bo?.platformFee?.pct, optNum(pl?.feePct, +plat?.feePct || 0)), fixed: optNum(bo?.platformFee?.fixed, optNum(pl?.feeFixed, +plat?.feeFixed || 0)),
+    payer: bo?.platformFee?.payer || plat?.feePayer || 'organizer' }; };
 // everything quote() needs to price a cart for one box office: its settings + the platform fee + its processor's card rate
 function pricingSettings(bo, plat) {
   const g = bo?.gateway, gw = GATEWAYS[g?.provider];
   return { ...DEFAULT_SETTINGS, ...(bo?.settings || {}), platform: platformFeeFor(plat, bo),
     card: { pct: gw ? optNum(g.pct, gw.pct) : 0, fixed: gw ? optNum(g.fixed, gw.fixed) : 0, pass: !!bo?.settings?.passProcessing } };
 }
-const cardReady = bo => !!bo?.gateway && bo.gateway.status === 'connected' && !!GATEWAYS[bo.gateway.provider];
+// a processor can be switched off by the box office (bo.gateway.disabled) or for everyone by the platform (platform.gatewaysOff) — emergency control
+const cardReady = (bo, plat) => !!bo?.gateway && bo.gateway.status === 'connected' && !!GATEWAYS[bo.gateway.provider] && !bo.gateway.disabled && !(plat?.gatewaysOff || []).includes(bo.gateway.provider);
+const cardOffWhy = (bo, plat) => bo?.gateway?.disabled ? 'Card payments are paused by the box office right now' : (plat?.gatewaysOff || []).includes(bo?.gateway?.provider) ? 'Card payments are paused right now — please try again shortly' : 'Card payments are not set up for this box office yet';
+
+/* ── Stage 10: event controls, fees & taxes per event, policies, waiting room, abuse protection ──────────────────────────────────────────
+   Mirrored in schema.sql (event_controls, fee_rule, price_cart, policy_check, queue_status, order_guard). Keep both sides in step. */
+// Emergency controls live in ev.controls (LIVE: events.controls column) — only event_control() / DB.eventControl() change them, never "Save".
+const EV_CONTROLS = [['salesPaused', 'Pause ticket sales', 'Buyers can browse but nothing can be added or bought.'], ['checkoutPaused', 'Pause checkout', 'Carts stay, but no order can be placed or paid.'],
+  ['scanPaused', 'Stop scanning', 'Every scan answers “Scanning is stopped” until you resume it.'], ['maintenance', 'Maintenance mode', 'The event page shows your message instead of tickets.']];
+function controlBlock(ev, what) {   // what: sales | checkout | scan → '' or the message buyers / scanners see
+  const c = ev?.controls || {};
+  if (what === 'scan') return c.scanPaused ? 'Scanning is stopped for this event' : '';
+  if (c.maintenance) return c.message || 'This event is being updated — please check back in a few minutes.';
+  if (c.salesPaused) return c.message || 'Ticket sales are paused right now — please check back shortly.';
+  if (what === 'checkout' && c.checkoutPaused) return 'Checkout is paused for a moment — please try again shortly.';
+  return '';
+}
+// Basket timeout per event: how long seats picked on the map stay held for the buyer (Eli: 1, 2, 3, 5, 8, 10, 15 minutes or exact).
+const CART_MINUTES = [1, 2, 3, 5, 8, 10, 15];
+const cartMinutes = ev => Math.min(120, Math.max(1, Math.round(+ev?.cartMinutes || 10)));
+// Sales windows beyond the event's own: per showtime (slot.salesStart / salesEnd) and per seating area (ev.areaSales[area] = {from, until}).
+function windowMsg(ev, slot, area, now = new Date()) {
+  if (slot && slot.salesStart && new Date(slot.salesStart) > now) return 'Tickets for that showtime go on sale ' + new Date(slot.salesStart).toLocaleString();
+  if (slot && slot.salesEnd && new Date(slot.salesEnd) <= now) return 'Sales for that showtime have ended';
+  const w = area && ev.areaSales?.[area];
+  if (w?.from && new Date(w.from) > now) return area + ' goes on sale ' + new Date(w.from).toLocaleString();
+  if (w?.until && new Date(w.until) <= now) return area + ' sales have ended';
+  return '';
+}
+// Booking-fee rules: seating area → ticket type → event → box office (first one that sets something wins). payer 'organizer' = absorbed.
+const hasRule = r => !!r && ((r.pct !== '' && r.pct != null) || (r.fixed !== '' && r.fixed != null) || !!r.payer);
+const feeSet = (set, r) => !hasRule(r) ? set : { ...set, feePct: optNum(r.pct, set.feePct), feeFixed: optNum(r.fixed, set.feeFixed), feeMode: r.payer === 'organizer' ? 'absorb' : r.payer === 'buyer' ? 'buyer' : set.feeMode };
+function feeRuleFor(ev, tt, seat) {
+  const f = ev?.fees || {}, area = seat && ev.seating?.enabled ? ev.seating.meta?.[seat]?.[0] : '';
+  return [area && f.areas?.[area], tt?.fee, f].find(hasRule) || null;
+}
+const ruleKey = r => r ? [r.pct ?? '', r.fixed ?? '', r.payer || ''].join('/') : '';
+// other fees an event adds (a facility fee, a restoration levy, optional ticket protection): per ticket or per order, flat and/or %.
+const evTax = (ev, set) => ev?.taxPct === '' || ev?.taxPct == null ? +set.taxPct || 0 : +ev.taxPct || 0;
+const passFor = (evs, card) => evs.length ? evs.every(e => e?.fees?.passProcessing === 'yes' ? true : e?.fees?.passProcessing === 'no' ? false : !!card.pass) : !!card.pass;
+
+// Policies (Eli §6): the box office's terms / refund / privacy policy, replaced per event when the event has its own, plus event-specific
+// policies. A version is a short fingerprint of the text (FNV-1a, also in SQL), so "which version did this buyer accept" never needs a counter.
+function fnv(s) { let h = 0x811c9dc5; for (const b of new TextEncoder().encode(String(s ?? ''))) { h ^= b; h = Math.imul(h, 16777619) >>> 0; } return h.toString(16).padStart(8, '0'); }
+const POLICY_KINDS = { terms: 'Terms & conditions', refund: 'Refund policy', privacy: 'Privacy policy', event: 'Event policies' };
+function policiesFor(bo, events) {
+  const set = { ...DEFAULT_SETTINGS, ...(bo?.settings || {}) }, br = { ...DEFAULT_BRANDING, ...(bo?.branding || {}) }, evs = events.filter(Boolean), out = [];
+  const add = (kind, ev, text) => { text = String(text || '').trim(); if (text) out.push({ kind, eventId: ev?.id || null, title: (ev ? ev.name + ' — ' : '') + POLICY_KINDS[kind], text, version: fnv(text) }); };
+  for (const [kind, evKey, boText] of [['terms', 'terms', set.terms], ['refund', 'refundPolicy', br.refundPolicy], ['privacy', 'privacyPolicy', br.privacyPolicy]]) {
+    const own = evs.filter(e => String(e[evKey] || '').trim());
+    own.forEach(e => add(kind, e, e[evKey]));
+    if (own.length < evs.length || !evs.length) add(kind, null, boText);
+  }
+  evs.forEach(e => add('event', e, e.policies));
+  return out;
+}
+// the server's check: every current policy accepted at its current version → what gets stored on the order
+function policyCheck(required, accepted = []) {
+  for (const r of required) if (!accepted.some(a => a.kind === r.kind && (a.eventId || null) === r.eventId && a.version === r.version))
+    return { error: accepted.some(a => a.kind === r.kind && (a.eventId || null) === r.eventId) ? `The ${r.title.toLowerCase()} changed while you were checking out — please read and accept it again` : `Please accept the ${r.title.toLowerCase()}` };
+  const at = nowIso(); return { accepted: required.map(r => ({ kind: r.kind, eventId: r.eventId, version: r.version, at })) };
+}
+// Checkout form per event (Eli §8): an event can ask for more than the box office (phone / address required, opt-ins off) — the strictest wins.
+const CK_RANK = { off: 0, optional: 1, required: 2 };
+function checkoutFor(set, evs) {
+  const ck = { ...DEFAULT_SETTINGS.checkout, ...(set.checkout || {}) };
+  for (const e of evs.filter(Boolean)) { const o = e.checkout || {};
+    for (const k of ['phone', 'address']) if (o[k] && CK_RANK[o[k]] > CK_RANK[ck[k]]) ck[k] = o[k];
+    for (const k of ['optIn', 'smsOptIn', 'promo']) if (o[k] === false) ck[k] = false; }
+  return ck;
+}
+// Donations (Eli §15): suggested amounts + custom amount; the purpose is the event's own when it has one, else the box office's.
+const donationPurpose = (set, evs) => evs.map(e => e?.donation?.purpose).find(Boolean) || set.donationPurpose || '';
+const donationOn = (set, evs) => !!set.donations && !evs.some(e => e?.donation?.off);
+
+// Waiting room (Eli §3): first come, first served. Each arrival gets an entry time `rate` per minute after the one before (a steady flow,
+// never a stampede); the pass then lasts passMinutes. Only admitted visitors can hold seats or place orders while the room is on.
+const QUEUE_DEFAULT = { on: false, rate: 60, passMinutes: 30, message: '' };
+function queueEntry(q, ev, token, now) {
+  const cfg = { ...QUEUE_DEFAULT, ...(ev.queue || {}) }, gap = 6e4 / Math.max(1, +cfg.rate || 60), pass = Math.max(5, +cfg.passMinutes || 30) * 6e4;
+  let e = q.entries[token];
+  if (e && now > e.admit + pass) { delete q.entries[token]; e = null; }   // pass used up → back of the line
+  if (!e) { const admit = Math.max(now, (q.last || 0) + gap); q.last = admit; e = q.entries[token] = { joined: now, admit }; }
+  const ahead = Object.values(q.entries).filter(x => x.admit > now && x.admit < e.admit).length;
+  return { admitted: e.admit <= now, position: e.admit <= now ? 0 : ahead + 1, admit: new Date(e.admit).toISOString(), until: new Date(e.admit + pass).toISOString(),
+    waiting: Object.values(q.entries).filter(x => x.admit > now).length, joined: new Date(e.joined).toISOString(), progress: e.admit <= now ? 1 : Math.max(0, Math.min(.99, (now - e.joined) / Math.max(1, e.admit - e.joined))) };
+}
+const queuePass = (q, ev, token, now) => { const e = q?.entries?.[token]; return !!e && e.admit <= now && now <= e.admit + Math.max(5, +ev.queue?.passMinutes || 30) * 6e4; };
+// Abuse protection (Eli §4). Hard limits stop a request; flags mark an order for review (Orders → Flagged; Platform → Risk).
+const ORDER_FLAGS = { velocity: 'Many orders from this email in a short time', duplicate: 'Looks like a duplicate of an earlier order', declines: 'Several declined card attempts',
+  bulk: 'Unusually large order', bot: 'Automated-looking checkout (too fast, or a scripted browser)', banned_try: 'A banned customer tried to buy' };
+const LIMITS = { holdPerMin: 60, holdSeatsPerIp: 40, ordersPerMin: 20, ordersPerEmailHour: 15, declinesFlag: 3, declinesStop: 8, bulkTickets: 20, botMs: 2500 };
+const RL = {};   // DEMO stand-in for SQL rate_hit(): key → recent hit times
+function rateHit(key, max, secs, now = Date.now()) { const a = (RL[key] = (RL[key] || []).filter(t => t > now - secs * 1e3)); if (a.length >= max) return false; a.push(now); return true; }
+// what an order contains, for duplicate detection: event | ticket type or package | showtime = quantity (products ignored) — SQL line_sig()
+const lineSig = items => { const m = {}; for (const i of items || []) if (i.kind !== 'addon') { const k = [i.eventId, i.ticketTypeId || i.bundleId, i.slotId || ''].join('|'); m[k] = (m[k] || 0) + (+i.qty || 0); }
+  return Object.keys(m).sort().map(k => k + '=' + m[k]).join(','); };
+function orderFlags(st, p, bo, email, evIds, manual, now = Date.now()) {
+  if (manual) return [];
+  const flags = [], mine = st.orders.filter(o => o.box_office_id === bo.id && o.buyer_email === email && now - new Date(o.created_at) < 36e5);
+  if (mine.length >= 2) flags.push('velocity');   // this is at least the 3rd order from the email within the hour
+  if (mine.some(o => o.status === 'paid' && now - new Date(o.created_at) < 9e5 && lineSig(o.data.lines) === lineSig(p.items))) flags.push('duplicate');
+  const n = (p.items || []).reduce((a, i) => a + (+i.qty || 0), 0); if (n >= LIMITS.bulkTickets) flags.push('bulk');
+  if (p.bot && (p.bot.wd || (+p.bot.ms > 0 && +p.bot.ms < LIMITS.botMs))) flags.push('bot');
+  return flags;
+}
+const activeBan = (st, boId, email) => (st.bans || []).find(b => b.box_office_id === boId && b.email === email && !b.removed_at);
+
+// Plans & billing (SaaS): what the platform is owed. A processor with an application fee (Stripe Connect; the demo processor) takes the
+// platform fee automatically; every other paid order (cash, check, invoice, pay-later marked paid, other processors) is invoiced monthly.
+const planOf = (plat, bo) => (plat?.planList || DEFAULT_PLANS).find(p => p.id === (bo?.plan || plat?.defaultPlan || 'pay')) || (plat?.planList || DEFAULT_PLANS)[0];
+const AUTO_FEE_PROVIDERS = ['stripe', 'demo'];
+const feeAuto = o => AUTO_FEE_PROVIDERS.includes(o.payment?.provider) && !o.payment?.markedPaidBy;
+const monthOf = iso => (iso || '').slice(0, 7);
+function billingFor(orders, bo, plat, period) {
+  const paid = orders.filter(o => o.box_office_id === bo.id && wasPaid(o) && monthOf(o.paid_at || o.created_at) === period && (o.data.platformFee || 0) > 0);
+  const auto = paid.filter(feeAuto), owed = paid.filter(o => !feeAuto(o)), plan = planOf(plat, bo), sum = l => l.reduce((a, o) => a + (o.data.platformFee || 0), 0);
+  return { period, plan, subscription: +plan?.monthly || 0, autoFees: sum(auto), autoOrders: auto.length, owedFees: sum(owed), owedOrders: owed.length,
+    due: (+plan?.monthly || 0) + sum(owed), byMethod: owed.reduce((a, o) => { const m = payMethodOf(o); a[m] = (a[m] || 0) + o.data.platformFee; return a; }, {}) };
+}
+const INVOICE_STATUS = { open: 'Open', paid: 'Paid', void: 'Void' };
+
+// System health (Eli §22–23): one status per part of the platform from what actually happened recently, plus open incidents.
+const HEALTH_PARTS = [['web', 'Website'], ['pages', 'Event pages'], ['checkout', 'Checkout'], ['payments', 'Payment processors'], ['scanner', 'Scanner system'],
+  ['email', 'Email system'], ['sms', 'SMS system'], ['api', 'API'], ['integrations', 'Integrations'], ['backups', 'Backups']];
+const INCIDENT_KINDS = { outage: 'Outage', checkout: 'Checkout failure', payment: 'Payment failure', email: 'Email failure', scanner: 'Scanner failure', api: 'API failure', system: 'System error' };
+const KIND_PART = { outage: 'web', checkout: 'checkout', payment: 'payments', email: 'email', scanner: 'scanner', api: 'api', system: 'web' };
+function healthOf(x, now = Date.now()) {   // x = {errors, incidents, attempts:[{at, ok}], outbox, deliveries, backups, live:{email, sms}}
+  const recent = (l, ms, k = 'at') => (l || []).filter(r => now - new Date(r[k]) < ms), errs = where => recent(x.errors, 9e5).filter(e => e.where === where).length;
+  const open = (x.incidents || []).filter(i => i.status !== 'resolved'), inc = part => open.find(i => KIND_PART[i.kind] === part);
+  const att = recent(x.attempts, 36e5), bad = att.filter(a => !a.ok).length;
+  const failedMail = recent(x.outbox, 864e5, 'at').filter(m => m.status === 'failed'), stuck = (x.outbox || []).filter(m => m.status === 'queued' && now - new Date(m.send_at || m.at) > 9e5);
+  const failedHooks = recent(x.deliveries, 864e5, 'created_at').filter(d => d.status === 'failed'), lastBackup = (x.backups || []).filter(b => b.ok).map(b => b.at).sort().pop();
+  const s = {
+    web: errs('app') > 20 ? 'degraded' : 'ok', pages: errs('event') > 5 ? 'degraded' : 'ok', checkout: errs('checkout') > 5 ? 'degraded' : 'ok',
+    payments: att.length >= 5 && bad / att.length > .5 ? 'degraded' : 'ok', scanner: errs('scan') > 5 ? 'degraded' : 'ok',
+    email: !x.live?.email ? 'off' : stuck.filter(m => m.channel !== 'sms').length > 20 || failedMail.filter(m => m.channel !== 'sms').length > 50 ? 'degraded' : 'ok',
+    sms: !x.live?.sms ? 'off' : failedMail.filter(m => m.channel === 'sms').length > 20 ? 'degraded' : 'ok',
+    api: errs('api') > 10 ? 'degraded' : 'ok', integrations: failedHooks.length > 20 ? 'degraded' : 'ok',
+    backups: !x.live?.backups ? 'off' : !lastBackup || now - new Date(lastBackup) > 26 * 36e5 ? 'degraded' : 'ok' };
+  for (const [k] of HEALTH_PARTS) if (inc(k)) s[k] = inc(k).kind === 'outage' || inc(k).severity === 'major' ? 'down' : 'degraded';
+  return { parts: s, failedPayments: bad, attempts: att.length, failedMail, stuck, failedHooks, lastBackup, open };
+}
+// Versions (Eli §18): every save of an event / the box office settings keeps a snapshot; these are the groups shown as "what changed".
+const EVENT_SECTIONS = [['details', 'Event settings', ['name', 'status', 'start', 'end', 'allDay', 'timezone', 'venue', 'address', 'online', 'onlineUrl', 'summary', 'description', 'image', 'category', 'capacity', 'visibility', 'publishAt', 'salesStart', 'salesEnd', 'timeSlots', 'contact', 'areaSales', 'cartMinutes', 'queue', 'entrances', 'waitlistMode']],
+  ['seating', 'Seating chart', ['seating']], ['pricing', 'Pricing', ['ticketTypes', 'addons', 'bundles', 'upsells', 'fees', 'taxPct']],
+  ['checkout', 'Checkout form', ['questions', 'checkout', 'page', 'donation']], ['emails', 'Confirmation email', ['emails']], ['policies', 'Policies', ['terms', 'refundPolicy', 'privacyPolicy', 'policies', 'instructions']]];
+const BO_SECTIONS = [['settings', 'Box office settings', s => ({ ...s.settings, checkout: undefined, questions: undefined, terms: undefined, mail: undefined })], ['checkout', 'Checkout form', s => [s.settings?.checkout, s.settings?.questions]],
+  ['emails', 'Email settings', s => s.settings?.mail], ['policies', 'Policies', s => [s.settings?.terms, s.branding?.refundPolicy, s.branding?.privacyPolicy]], ['branding', 'Branding', s => ({ ...s.branding, refundPolicy: undefined, privacyPolicy: undefined })]];
+function sectionsChanged(kind, a, b) {
+  if (!a) return ['created'];
+  const J = v => JSON.stringify(v ?? null);
+  if (kind === 'event') { const strip = e => ({ ...e, seating: e.seating ? { ...e.seating, bg: undefined, index: undefined, meta: undefined, rows: undefined } : e.seating });
+    const A = strip(a), B = strip(b); return EVENT_SECTIONS.filter(([, , keys]) => keys.some(k => J(A[k]) !== J(B[k]))).map(x => x[0]); }
+  return BO_SECTIONS.filter(([, , f]) => J(f(a)) !== J(f(b))).map(x => x[0]);
+}
+const snapEvent = e => { const c = clone(e); if (c.seating) { delete c.seating.bg; delete c.seating.index; delete c.seating.meta; delete c.seating.rows; } delete c.secrets; delete c.controls; return c; };
+function addVersion(st, kind, target, boId, prev, next, by) {
+  const sections = sectionsChanged(kind, prev, next); if (!sections.length) return null;
+  const v = { id: uid(), box_office_id: boId, kind, target, sections, snapshot: kind === 'event' ? snapEvent(next) : clone({ settings: next.settings, branding: next.branding }), by: by || DB._actor || 'system', at: nowIso() };
+  (st.versions ||= []).unshift(v);
+  const mine = st.versions.filter(x => x.target === target); if (mine.length > 40) st.versions = st.versions.filter(x => x.target !== target || mine.indexOf(x) < 40);
+  return v;
+}
+// Custom domains (Eli §16) and sending domains (§10): the DNS records an organizer adds. Verified by the `domains` Edge Function (DNS-over-HTTPS +
+// Resend's domain API); the demo can't look DNS up, so it says so.
+const domainRecords = (host, token, target) => [{ type: 'CNAME', name: host, value: target }, { type: 'TXT', name: '_set-verify.' + host, value: 'set-verify=' + token }];
+const mailRecords = d => [{ type: 'TXT', name: 'send.' + d, value: 'v=spf1 include:amazonses.com ~all', purpose: 'SPF' }, { type: 'MX', name: 'send.' + d, value: '10 feedback-smtp.us-east-1.amazonses.com', purpose: 'Bounces (MAIL FROM)' },
+  { type: 'TXT', name: 'resend._domainkey.' + d, value: 'p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQ…(from Resend)', purpose: 'DKIM' }, { type: 'TXT', name: '_dmarc.' + d, value: 'v=DMARC1; p=none; rua=mailto:dmarc@' + d, purpose: 'DMARC' }];
+const HOST_RE = /^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
 /* ── Pricing (Stage 4): the one pricing engine — display everywhere, authoritative in DEMO; SQL price_cart() mirrors it line for line.
    A ticket's price = its showtime price (slotPrices) or base price, replaced by the active price phase (early bird, a scheduled change,
@@ -142,7 +322,7 @@ function bundleTicketTypes(ev, b, it) {
 const anyOf = (list, v) => !(list || []).length || list.map(String).includes(String(v));
 function quote(cart, events, settings, promo, o = {}) {
   const now = o.now || new Date(), byEv = id => events.find(e => e.id === id), lines = [], seen = {};
-  const feeOf = (unit, tickets) => unit > 0 && settings.feeMode === 'buyer' ? Math.round(unit * (+settings.feePct || 0) / 100) + tickets * (+settings.feeFixed || 0) : 0;
+  const feeOf = (unit, tickets, s = settings) => unit > 0 && s.feeMode === 'buyer' ? Math.round(unit * (+s.feePct || 0) / 100) + tickets * (+s.feeFixed || 0) : 0;
   for (const it of cart.items || []) {
     const ev = byEv(it.eventId); if (!ev || !(+it.qty >= 1)) continue;
     const slot = it.slotId ? (ev.timeSlots || []).find(s => s.id === it.slotId) : null;
@@ -151,7 +331,7 @@ function quote(cart, events, settings, promo, o = {}) {
       const b = (ev.bundles || []).find(x => x.id === it.bundleId); if (!b) continue;
       const tts = bundleTicketTypes(ev, b, it), tfaces = tts.map(id => listPrice(ev.ticketTypes.find(t => t.id === id), it.slotId));
       const adds = (b.addons || []).map(a => { const ad = (ev.addons || []).find(x => x.id === a.addonId); return ad ? { addonId: ad.id, name: ad.name, qty: Math.max(1, +a.qty || 1), face: cents(ad.price) } : null; }).filter(Boolean);
-      const unit = cents(b.price), per = bundlePositions(b).length, uf = feeOf(unit, Math.max(1, per));
+      const unit = cents(b.price), per = bundlePositions(b).length, uf = feeOf(unit, Math.max(1, per), feeSet(settings, [b.fee, ev.fees].find(hasRule)));
       lines.push({ kind: 'bundle', ...base, bundleId: b.id, name: b.name, qty: +it.qty, unit, face: unit, perCopy: per, tts, tfaces, addons: adds,
         value: tfaces.reduce((a, x) => a + x, 0) + +it.qty * adds.reduce((a, x) => a + x.face * x.qty, 0), seats: it.seats || [], admits: 1, unitFee: uf, fee: +it.qty * uf });
       continue;
@@ -161,9 +341,10 @@ function quote(cart, events, settings, promo, o = {}) {
     const inOrder = (cart.items || []).filter(x => x.eventId === ev.id && x.ticketTypeId === tt.id && !x.bundleId).reduce((a, x) => a + (+x.qty || 0), 0);
     const prices = ttPrices(tt, it.slotId, sold, +it.qty, inOrder, now); seen[k] = (seen[k] || 0) + +it.qty * adm;
     const ovr = !!o.manual && it.price !== undefined && it.price !== null && it.price !== '';
-    for (let i = 0; i < prices.length;) {  // a phase can end inside one order: one line per run of equal prices
-      let j = i; while (j < prices.length && prices[j].price === prices[i].price && prices[j].label === prices[i].label) j++;
-      const face = prices[i].price, unit = ovr ? cents(it.price) : face, uf = feeOf(unit, 1);
+    const rule = i => feeRuleFor(ev, tt, (it.seats || [])[i * adm]);   // Stage 10: a seating area / ticket type / event can set its own booking fee
+    for (let i = 0; i < prices.length;) {  // a phase can end inside one order: one line per run of equal prices (and equal fee rule)
+      let j = i; while (j < prices.length && prices[j].price === prices[i].price && prices[j].label === prices[i].label && ruleKey(rule(j)) === ruleKey(rule(i))) j++;
+      const face = prices[i].price, unit = ovr ? cents(it.price) : face, uf = feeOf(unit, 1, feeSet(settings, rule(i)));
       lines.push({ kind: 'ticket', ...base, ticketTypeId: tt.id, name: tt.name, seats: (it.seats || []).slice(i * adm, j * adm), qty: j - i, unit, face,
         ...(prices[i].label ? { phase: prices[i].label } : {}), ...(ovr ? { override: true } : {}), admits: adm, unitFee: uf, fee: (j - i) * uf });
       i = j;
@@ -172,7 +353,8 @@ function quote(cart, events, settings, promo, o = {}) {
   for (const a of cart.addons || []) {
     const ev = byEv(a.eventId), ad = (ev?.addons || []).find(x => x.id === a.addonId);
     if (!ad || !(+a.qty >= 1)) continue;
-    lines.push({ kind: 'addon', eventId: ev.id, eventName: ev.name, addonId: ad.id, name: ad.name, qty: +a.qty, unit: cents(ad.price), face: cents(ad.price), unitFee: 0, fee: 0 });
+    const uf = hasRule(ad.fee) ? feeOf(cents(ad.price), 0, feeSet(settings, ad.fee)) : 0;   // products carry a booking fee only when they set one
+    lines.push({ kind: 'addon', eventId: ev.id, eventName: ev.name, addonId: ad.id, name: ad.name, qty: +a.qty, unit: cents(ad.price), face: cents(ad.price), unitFee: uf, fee: +a.qty * uf });
   }
   const subtotal = lines.reduce((a, l) => a + l.unit * l.qty, 0), promoErr = promo ? applyPromo(lines, promo, events, subtotal) : '';
   const disc = lines.reduce((a, l) => a + (l.disc || 0), 0), feeDisc = lines.reduce((a, l) => a + (l.feeDisc || 0), 0);
@@ -184,12 +366,28 @@ function quote(cart, events, settings, promo, o = {}) {
   const pf = settings.platform || { pct: 0, fixed: 0, payer: 'organizer' }, paidTickets = lines.reduce((a, l) => a + (l.unit > 0 ? l.kind === 'ticket' ? l.qty : l.kind === 'bundle' ? l.qty * l.perCopy : 0 : 0), 0);
   const platformFee = subtotal - disc > 0 ? Math.round((subtotal - disc) * (+pf.pct || 0) / 100) + paidTickets * (+pf.fixed || 0) : 0;
   const serviceFee = pf.payer === 'buyer' ? platformFee : 0;
-  const tax = Math.round((subtotal - disc + (settings.taxOnFees ? fee + serviceFee : 0)) * (+settings.taxPct || 0) / 100);
-  const pre = subtotal - disc + fee + serviceFee + tax + donation, card = settings.card || { pct: 0, fixed: 0, pass: false };
+  // Stage 10: other fees an event adds (mandatory, or optional ones the buyer ticked — cart.optFees), per ticket or per order
+  const evIds = [...new Set(lines.map(l => l.eventId))], evs = evIds.map(byEv), part = (id, f) => lines.filter(l => l.eventId === id).reduce((a, l) => a + f(l), 0);
+  const otherFees = [];
+  for (const ev of evs) for (const x of ev.fees?.extra || []) {
+    if (x.optional && !(cart.optFees || []).includes(x.id)) continue;
+    const base = part(ev.id, l => l.unit * l.qty - (l.disc || 0)), tks = part(ev.id, l => l.unit > 0 ? l.kind === 'ticket' ? l.qty * (l.admits || 1) : l.kind === 'bundle' ? l.qty * l.perCopy : 0 : 0);
+    if (base <= 0) continue;
+    const amount = Math.round(base * (+x.pct || 0) / 100) + (x.per === 'order' ? 1 : tks) * cents(x.fixed);
+    if (amount > 0) otherFees.push({ id: x.id, eventId: ev.id, name: String(x.name || 'Fee').slice(0, 60), amount, ...(x.optional ? { optional: true } : {}) });
+  }
+  const otherFee = otherFees.reduce((a, x) => a + x.amount, 0);
+  // tax: one rate for the order, unless an event sets its own — then each event's part is taxed at its rate (the service fee at the box office's)
+  const tof = !!settings.taxOnFees, perEv = evs.some(e => e.taxPct !== '' && e.taxPct != null);
+  const tax = !perEv ? Math.round((subtotal - disc + (tof ? fee + serviceFee + otherFee : 0)) * (+settings.taxPct || 0) / 100)
+    : evs.reduce((a, e) => a + Math.round((part(e.id, l => l.unit * l.qty - (l.disc || 0)) + (tof ? part(e.id, l => l.fee - (l.feeDisc || 0)) + otherFees.filter(x => x.eventId === e.id).reduce((s, x) => s + x.amount, 0) : 0)) * evTax(e, settings) / 100), 0)
+      + (tof ? Math.round(serviceFee * (+settings.taxPct || 0) / 100) : 0);
+  const pre = subtotal - disc + fee + serviceFee + otherFee + tax + donation, card = { pct: 0, fixed: 0, pass: false, ...(settings.card || {}) };
+  card.pass = passFor(evs, card);
   const credit = Math.min(Math.max(0, Math.round(+o.credit || 0)), pre), owed = pre - credit;   // Stage 6: account / event credit pays first
   const processingFee = o.method === 'card' && owed > 0 ? Math.round(owed * (+card.pct || 0) / 100) + (+card.fixed || 0) : 0, processing = card.pass ? processingFee : 0;
   const sumKind = k => lines.filter(l => k.includes(l.kind)).reduce((a, l) => a + l.unit * l.qty, 0);
-  return { lines, subtotal, ticketsTotal: sumKind(['ticket', 'bundle']), addonsTotal: sumKind(['addon']), discount: disc, feeDiscount: feeDisc, fee, serviceFee, tax, donation,
+  return { lines, subtotal, ticketsTotal: sumKind(['ticket', 'bundle']), addonsTotal: sumKind(['addon']), discount: disc, feeDiscount: feeDisc, fee, serviceFee, otherFees, otherFee, tax, donation,
     processing, processingFee, platformFee, credit, total: owed + processing, promoErr,
     faceValue: lines.reduce((a, l) => a + (l.kind === 'bundle' ? l.value : l.face * l.qty), 0), currency: lines.find(l => l.currency)?.currency || settings.currency };
 }
@@ -608,7 +806,7 @@ function singleGaps(ev, isFree, chosen) {
 }
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v13';
+const DEMO_KEY = 'set_demo_v14';
 const Demo = {
   st: null,
   load() {
@@ -690,6 +888,8 @@ function demoPlaceOrder(p, asTeam) {
         if (ev.salesStart && new Date(ev.salesStart) > now) throw new Error('Tickets go on sale ' + new Date(ev.salesStart).toLocaleString());
         if (ev.salesEnd && new Date(ev.salesEnd) < now) throw new Error('Sales have ended');
         if (ev.secrets?.password && (p.unlock?.[ev.id] || '') !== ev.secrets.password) throw new Error('This event needs a password');
+        const blocked = controlBlock(ev, 'checkout'); if (blocked) throw new Error(blocked);   // Stage 10 emergency controls
+        if (ev.queue?.on && !queuePass(st.queue?.[ev.id], ev, p.holdToken || '', now.getTime())) throw new Error('Please join the waiting room for this event first');   // waiting room: only admitted visitors buy
       }
     }
     return ev;
@@ -704,6 +904,7 @@ function demoPlaceOrder(p, asTeam) {
     if (ev.timeSlots?.length) {
       const slot = ev.timeSlots.find(s => s.id === it.slotId); if (!slot) throw new Error('Pick a time slot');
       if (!manual && (slot.hidden || slot.unavailable || slot.soldOut)) throw new Error('That showtime is not available');
+      if (!manual) { const w = windowMsg(ev, slot, '', now); if (w) throw new Error(w); }
       const sk = ev.id + slot.id; pending.slots[sk] = (pending.slots[sk] || 0) + n;
       if (+slot.capacity > 0 && (av.slots[slot.id] || 0) + pending.slots[sk] > +slot.capacity) throw new Error('That time slot is full');
     }
@@ -719,6 +920,7 @@ function demoPlaceOrder(p, asTeam) {
       // staff may sell a seat they're holding; nobody sells a blocked/unavailable seat or one in another buyer's checkout
       if (h && !(h.status === 'checkout' && p.holdToken && h.token === p.holdToken) && !(manual && h.status === 'held'))
         throw new Error(h.status === 'checkout' ? `${seatText(ev, s)} is being held by another buyer — try again in a few minutes` : `${seatText(ev, s)} is unavailable`);
+      if (!manual) { const w = windowMsg(ev, null, ev.seating.meta?.[s]?.[0] || '', now); if (w) throw new Error(w); }
       pending.seats.push(ev.id + key); mine[ev.id].areas.push(ev.seating.meta?.[s]?.[0] || '');
     }
   };
@@ -781,8 +983,16 @@ function demoPlaceOrder(p, asTeam) {
     if (!ad) throw new Error('Unknown add-on');
     if (+ad.qty > 0 && sold + n > +ad.qty) throw new Error(`Only ${Math.max(0, +ad.qty - sold)} ${ad.name} left`);
   }
-  // promo / tracking code — one box office, one code namespace
+  // Stage 10 abuse protection: honeypot, banned customers, request rate, order velocity → hard stops; the rest become review flags
   const email = p.buyer.email.trim().toLowerCase();
+  if (!manual && !asTeam && !Demo._seeding) {   // (asTeam on a non-manual order = the demo's own sample data)
+    if (p.bot?.hp) throw new Error('Checkout failed — please try again');
+    if (activeBan(st, bo.id, email)) { audit('fraud.banned', `Blocked an order from banned customer ${email}`, { bo: bo.id }); Demo.save(); throw new Error('We can\'t take this order. Please contact the box office.'); }
+    if (!rateHit('order:' + (p.holdToken || 'anon'), LIMITS.ordersPerMin, 60)) throw new Error('Too many checkout attempts — please wait a minute and try again');
+    if (st.orders.filter(o => o.box_office_id === bo.id && o.buyer_email === email && orderCounts(o) && now - new Date(o.created_at) < 36e5).length >= LIMITS.ordersPerEmailHour)
+      throw new Error('Too many orders from this email in a short time — please contact the box office');
+  }
+  // promo / tracking code — one box office, one code namespace
   let promo = null, tracking = null;
   if (p.code && !p.comp) {
     const f = findCode(st, bo.id, p.code);
@@ -793,7 +1003,7 @@ function demoPlaceOrder(p, asTeam) {
   if (!tracking && p.tracking) { const f = findCode(st, bo.id, p.tracking); if (f?.tracking && trackingUsable(f.tracking, evIds, st.orders, now)) tracking = f.tracking.code; }  // a stale link never blocks a sale
   const set = pricingSettings(bo, st.platform);
   const qOpts = { avail: avs, manual, now, method: p.payment };
-  let q = quote({ items, addons, donation: p.donation }, st.events, set, promo, qOpts);
+  let q = quote({ items, addons, donation: p.donation, optFees: p.optFees || [] }, st.events, set, promo, qOpts);
   if (promo && q.promoErr) throw new Error(q.promoErr);
   // credit (Stage 6): a credit code, the signed-in customer's own account credit, or one a staff member picks on a manual order
   let credit = null;
@@ -806,20 +1016,30 @@ function demoPlaceOrder(p, asTeam) {
       if (!credit) throw new Error('You have no credit that can be used on this order');
     } else credit = cs.find(c => c.code === String(p.credit).trim().toUpperCase());
     const why = creditProblem(credit, credit && cst(credit), evIds); if (why) throw new Error(why);
-    q = quote({ items, addons, donation: p.donation }, st.events, set, promo, { ...qOpts, credit: Math.min(cst(credit).remaining, credit.event_id ? eventPortion(q, credit.event_id) : Infinity) });
+    q = quote({ items, addons, donation: p.donation, optFees: p.optFees || [] }, st.events, set, promo, { ...qOpts, credit: Math.min(cst(credit).remaining, credit.event_id ? eventPortion(q, credit.event_id) : Infinity) });
   }
   // checkout questions: once per order (box office), once per event, once per ticket
   const perEv = {}; q.lines.forEach(l => { perEv[l.eventId] = (perEv[l.eventId] || 0) + lineUnits(l).length; });
   if (!manual) { const e = checkAnswers(set.questions, evIds.map(id => st.events.find(x => x.id === id)), p.answers || {}, p.ticketAnswers || {}, perEv); if (e) throw new Error(e); }
+  // Stage 10: the event's checkout form (strictest of box office + events) and the current policies, accepted at their current versions
+  const evObjs = evIds.map(id => st.events.find(x => x.id === id)), ckf = checkoutFor(set, evObjs);
+  let accepted = [];
+  if (!manual) {
+    if (ckf.phone === 'required' && !normPhone(p.buyer?.phone)) throw new Error('A mobile number is required');
+    if (ckf.address === 'required' && !String(p.buyer?.address || '').trim()) throw new Error('An address is required');
+    const req = policiesFor(bo, evObjs), pc = policyCheck(req, p.accepted || []); if (pc.error) throw new Error(pc.error);
+    accepted = pc.accepted; st.policyTexts ||= {}; for (const r of req) st.policyTexts[r.version] ||= { kind: r.kind, title: r.title, text: r.text, first_at: nowIso() };
+  }
+  if (+p.donation > 0 && !manual && !donationOn(set, evObjs)) throw new Error('Donations are not offered for this event');
   if (p.comp) {  // complimentary: keeps the real ticket type and face value, collects $0
     if (!manual) throw new Error('not allowed');
     for (const id of evIds) if (!hasPerm(asTeam, 'tickets.comps', id)) throw new Error('You don\'t have permission to issue complimentary tickets');
     q.lines.forEach(l => Object.assign(l, { unit: 0, fee: 0, unitFee: 0, comp: true }));
-    Object.assign(q, { subtotal: 0, ticketsTotal: 0, addonsTotal: 0, discount: 0, feeDiscount: 0, fee: 0, serviceFee: 0, tax: 0, donation: 0, processing: 0, processingFee: 0, platformFee: 0, total: 0 });
+    Object.assign(q, { subtotal: 0, ticketsTotal: 0, addonsTotal: 0, discount: 0, feeDiscount: 0, fee: 0, serviceFee: 0, otherFee: 0, otherFees: [], tax: 0, donation: 0, processing: 0, processingFee: 0, platformFee: 0, total: 0 });
   }
   // how it's paid: free and staff orders are paid now; a card checkout waits for the processor; pay-later reserves without tickets
   if (q.total > 0 && !manual) {
-    if (p.payment === 'card') { if (set.payments?.card === false || !cardReady(bo)) throw new Error('Card payments are not set up for this box office yet'); }
+    if (p.payment === 'card') { if (set.payments?.card === false || !cardReady(bo, st.platform)) throw new Error(set.payments?.card === false ? 'Card payments are not set up for this box office yet' : cardOffWhy(bo, st.platform)); }
     else if (p.payment === 'offline') { if (set.payments?.offline === false) throw new Error('Pay later is not available for this box office'); }
     else throw new Error('Choose a payment method');
   }
@@ -830,10 +1050,10 @@ function demoPlaceOrder(p, asTeam) {
     payment: status === 'awaiting_payment' ? { provider: bo.gateway.provider, test: !!bo.gateway.test, attempts: [] }
       : manual && q.total > 0 ? { provider: 'manual', method: PAY_METHODS[p.payMethod] ? p.payMethod : 'other', ref: String(p.payRef || '').slice(0, 80), by: asTeam?.email || DB._actor } : null,
     data: { buyer: p.buyer, lines: q.lines, subtotal: q.subtotal, ticketsTotal: q.ticketsTotal, addonsTotal: q.addonsTotal, discount: q.discount, feeDiscount: q.feeDiscount,
-      fee: q.fee, serviceFee: q.serviceFee, tax: q.tax, donation: q.donation, processing: q.processing, processingFee: q.processingFee, total: q.total, refunded: 0, faceValue: q.faceValue,
+      fee: q.fee, serviceFee: q.serviceFee, otherFee: q.otherFee, otherFees: q.otherFees, tax: q.tax, donation: q.donation, ...(q.donation ? { donationFor: donationPurpose(set, evObjs) } : {}), processing: q.processing, processingFee: q.processingFee, total: q.total, refunded: 0, faceValue: q.faceValue,
       code: promo?.code || null, promo: promo ? { id: promo.id, code: findCode(st, bo.id, promo.code).promo.code } : null, tracking,
       payment: q.total === 0 ? (q.credit ? 'credit' : 'free') : p.payment, credit: credit && q.credit ? { id: credit.id, code: credit.code, amount: q.credit } : null, answers: p.answers || {}, ticketAnswers: p.ticketAnswers || {}, optIn: !!p.optIn, smsOptIn: !!p.smsOptIn && !!normPhone(p.buyer?.phone), source: p.source || null, utm: cleanUtm(p.utm), currency: q.currency,
-      platformFee: q.platformFee, ...(p.comp ? { comp: true } : {}) } };
+      platformFee: q.platformFee, ...(p.comp ? { comp: true } : {}), accepted, flags: orderFlags(st, p, bo, email, evIds, manual, now.getTime()) } };
   st.orders.push(order);
   emitEvent(st, bo.id, 'order.created', hookOrder(st, order));
   if (status === 'pending') orderContact(st, order);
@@ -899,6 +1119,8 @@ function demoCharge(st, order, card = {}) {
     else err = TEST_CARDS[n];
   }
   atts.push({ at: nowIso(), ok: !err, method: card.wallet || 'card', brand, last4, error: err || null });
+  (st.payAttempts ||= []).unshift({ at: nowIso(), ok: !err, box_office_id: order.box_office_id }); if (st.payAttempts.length > 2000) st.payAttempts.length = 2000;   // payment-attempt monitoring
+  if (err && atts.filter(a => !a.ok).length >= LIMITS.declinesFlag && !(order.data.flags || []).includes('declines')) (order.data.flags ||= []).push('declines');
   if (err) return { error: err };
   confirmPayment(st, order, { provider: 'demo', ref: 'pi_demo_' + randCode(12).toLowerCase(), method: card.wallet || 'card', brand, last4, fee: order.data.processingFee });
   return { status: 'paid' };
@@ -1010,7 +1232,7 @@ const PAY_LABEL = { card: 'Card', apple_pay: 'Apple Pay', google_pay: 'Google Pa
 const OFFLINE_PAY = ['cash', 'terminal', 'check', 'transfer', 'other', 'offline'];
 const EXPENSE_CATS = ['Venue', 'AV', 'Security', 'Marketing', 'Talent', 'Staffing', 'Food', 'Transportation', 'Insurance', 'Other'];
 const emptyFin = () => ({ eventId: '', slotId: '', from: '', to: '', ttId: '', area: '', price: '', promo: '', tracking: '', addonId: '', bundleId: '', method: '', customer: '' });
-const FIN_SUM = ['tface', 'pface', 'comp', 'discount', 'savings', 'fees', 'tax', 'donation', 'cardFee', 'creditUsed', 'changes', 'collected', 'refunds', 'credits', 'chargebacks', 'processing', 'platform',
+const FIN_SUM = ['tface', 'pface', 'comp', 'discount', 'savings', 'fees', 'otherFee', 'tax', 'donation', 'cardFee', 'creditUsed', 'changes', 'collected', 'refunds', 'credits', 'chargebacks', 'processing', 'platform',
   'offline', 'ticketRev', 'productRev', 'bundleRev', 'sold', 'comps', 'refundedTickets'];
 const localDay = iso => { const d = new Date(iso); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 function payMethodOf(o) {
@@ -1059,11 +1281,11 @@ function finItems(x) {
     extra.forEach((e, j) => { const tax = xTax[j] || 0; Object.assign(e, { savings: e.pface - e.paid - e.discount, tax, collected: e.paid + tax, processing: xProc[j] || 0, productRev: e.paid, bundleRev: e.bundle ? e.paid : 0 }); made.push(e); });
     const S = k => made.reduce((a, i) => a + (i[k] || 0), 0), credUsed = m.creditUsed;
     const rest = { ...base, kind: 'order', eventId: o.event_ids[0], slotId: '', ttId: '', area: '', price: '', bundleId: '', addonId: '',
-      fees: (d.fee || 0) + (d.serviceFee || 0) - S('fees'), tax: extra.length ? 0 : (d.tax || 0) - tTax, donation: d.donation || 0, cardFee: d.processing || 0, creditUsed: -credUsed,
+      fees: (d.fee || 0) + (d.serviceFee || 0) - S('fees'), otherFee: d.otherFee || 0, tax: extra.length ? 0 : (d.tax || 0) - tTax, donation: d.donation || 0, donationFor: d.donationFor || '', cardFee: d.processing || 0, creditUsed: -credUsed,
       refunds: (d.refunded || 0) - S('refunds'), credits: (d.credited || 0) - S('credits'), chargebacks: chargebacksOf(o), processing: (d.processingFee || 0) - S('processing'),
       platform: d.platformFee || 0, offline: (OFFLINE_PAY.includes(method) ? d.total || 0 : 0) + (d.charges || []).reduce((a, c) => a + (c.amount || 0), 0) };
     rest.collected = m.collected - S('collected');
-    rest.changes = rest.collected - rest.fees - rest.tax - rest.donation - rest.cardFee - rest.creditUsed;   // later charges, upgrades, removed products…
+    rest.changes = rest.collected - rest.fees - rest.otherFee - rest.tax - rest.donation - rest.cardFee - rest.creditUsed;   // later charges, upgrades, removed products…
     out.push(...made, rest);
   }
   return out;
@@ -1246,7 +1468,9 @@ function issueCreditRow(st, boId, c) {
   let code; do { code = 'CR-' + randCode(8); } while ((st.credits ||= []).some(x => x.code === code));
   const row = { id: uid(), box_office_id: boId, code, email, name: String(c.name || '').slice(0, 120), amount, event_id: c.eventId || null, expires: c.expires || null,
     source_order: c.order?.id || null, source_ref: c.order?.ref || null, note: String(c.note || '').slice(0, 300), issued_by: c.by, issued_at: nowIso(), revoked_at: null, revoked_by: null, applied: [] };
-  st.credits.push(row); return row;
+  st.credits.push(row);
+  emitEvent(st, boId, 'credit.issued', { credit: row.code, email, amount, event_id: row.event_id, expires: row.expires, order_ref: row.source_ref });
+  return row;
 }
 function applyRefund(st, o, plan, p, by) {
   const d = o.data, to = p.to || 'original';
@@ -1503,6 +1727,11 @@ function demoOrderAction(id, action, p = {}) {
       list.push(c); if (o.payment?.provider === 'demo') procTx(st, o, { type: 'dispute', id: 'dp_demo_' + randCode(10).toLowerCase(), amount: -amount });
       log('chargeback', `Chargeback opened — ${money_(amount)}${c.reason ? ' · ' + c.reason : ''}`, { amount }); break;
     }
+    case 'review': {  // Stage 10: a flagged order was looked at — cleared (genuine) or confirmed (fraud); the flags stay on record
+      need('orders.edit', ev0); if (!(d.flags || []).length) throw new Error('This order has no flags');
+      d.review = { result: p.result === 'fraud' ? 'fraud' : 'ok', by, at: nowIso(), note: String(p.note || '').slice(0, 300) };
+      log('review', d.review.result === 'fraud' ? 'Flagged order confirmed as fraud' : 'Flags reviewed — order is genuine', { flags: d.flags }); break;
+    }
     case 'note': { need('orders.edit', ev0); const body = String(p.body || '').trim(); if (!body) throw new Error('Write a note'); log('note', body.slice(0, 500)); break; }
     case 'message': {
       need('comms.email', ev0); const subject = String(p.subject || '').trim(), body = String(p.body || '').trim();
@@ -1563,8 +1792,9 @@ function presenceStats(pres, now = Date.now()) {
   return { now: on.length, carts: on.filter(x => x.cart > 0).length, cartTickets: on.reduce((a, x) => a + (x.cart > 0 ? x.cart : 0), 0), carted: P.filter(x => x.carted).length, converted, abandoned };
 }
 
-const rowToEvent = r => ({ ...(r.data || {}), id: r.id, box_office_id: r.box_office_id, slug: r.slug, status: r.status, created_at: r.created_at, ...(r.secrets ? { secrets: r.secrets } : {}) });
-const eventToRow = ev => { const { id, box_office_id, slug, status, secrets, created_at, ...data } = ev; return { id, box_office_id, slug, status, data, secrets: secrets || {}, updated_at: new Date().toISOString() }; };
+const rowToEvent = r => ({ ...(r.data || {}), id: r.id, box_office_id: r.box_office_id, slug: r.slug, status: r.status, created_at: r.created_at, controls: r.controls || {}, ...(r.secrets ? { secrets: r.secrets } : {}) });
+// (controls are left out: only event_control() changes them)
+const eventToRow = ev => { const { id, box_office_id, slug, status, secrets, created_at, controls, ...data } = ev; return { id, box_office_id, slug, status, data, secrets: secrets || {}, updated_at: new Date().toISOString() }; };
 const clone = o => JSON.parse(JSON.stringify(o));
 const publicEvent = ev => { const { secrets, ...rest } = clone(ev); return rest; };
 const publicBo = b => ({ id: b.id, slug: b.slug, name: b.name, status: b.status, branding: { ...DEFAULT_BRANDING, ...b.branding }, settings: { ...DEFAULT_SETTINGS, ...b.settings, name: b.name },
@@ -1583,7 +1813,7 @@ function viewStats(v) {
   return { total: hits.length, unique: new Set(hits.map(h => h[1])).size, today: hits.filter(h => h[0] >= day0).length, last10m: new Set(hits.filter(h => h[0] >= Date.now() - 6e5).map(h => h[1])).size, bySrc,
     byRef: Object.fromEntries(Object.entries(byRef).map(([k, r]) => [k, { views: r.views, unique: r.v.size }])) };
 }
-const MONEY_KEYS = ['subtotal', 'ticketsTotal', 'addonsTotal', 'discount', 'feeDiscount', 'fee', 'serviceFee', 'tax', 'donation', 'processing', 'processingFee', 'refunded', 'total', 'faceValue', 'platformFee'], LINE_MONEY = ['face', 'value', 'tfaces', 'discs', 'feeDiscs', 'disc', 'feeDisc', 'fee', 'unitFee'];
+const MONEY_KEYS = ['subtotal', 'ticketsTotal', 'addonsTotal', 'discount', 'feeDiscount', 'fee', 'serviceFee', 'otherFee', 'tax', 'donation', 'processing', 'processingFee', 'refunded', 'total', 'faceValue', 'platformFee'], LINE_MONEY = ['face', 'value', 'tfaces', 'discs', 'feeDiscs', 'disc', 'feeDisc', 'fee', 'unitFee'];
 const maskEmail = e => String(e || '').replace(/^(.)[^@]*@(.)[^.]*(\..+)$/, '$1•••@$2•••$3');
 
 /* ── DEMO "server": every organizer write passes need(), the same checks the SQL policies make in LIVE. ── */
@@ -1648,7 +1878,7 @@ function eventDiff(a, b) {
 // ── Door / scanning (Stage 7) ─────────────────────────────────────────────────
 // A ticket's QR holds only its random code. Every scan is checked by the "server" (DEMO: here; LIVE: checkin()), logged in
 // scanLog / scan_log, and answered with doorTicket(): where the guest belongs — never money, email or phone.
-const SCAN_RESULTS = ['ok', 'already', 'undone', 'unknown', 'cancelled', 'refunded', 'replaced', 'wrong_event', 'wrong_slot', 'wrong_entrance', 'inactive', 'device_off'];
+const SCAN_RESULTS = ['ok', 'already', 'undone', 'paused', 'unknown', 'cancelled', 'refunded', 'replaced', 'wrong_event', 'wrong_slot', 'wrong_entrance', 'inactive', 'device_off'];
 function doorTicket(st, t, P) {
   const ev = st.events.find(e => e.id === t.event_id), tt = ev?.ticketTypes.find(x => x.id === t.ticket_type_id), o = st.orders.find(x => x.id === t.order_id);
   const sibs = st.tickets.filter(x => x.order_id === t.order_id && x.status === 'valid'), sp = t.seat ? seatInfo(ev, t.seat, t) : null, slot = t.slot_id && (ev?.timeSlots || []).find(x => x.id === t.slot_id);
@@ -1678,6 +1908,7 @@ function demoCheckin(code, undo, eventId, o) {
     const tk = !t ? null : result === 'wrong_event' ? (x => ({ code: x.code, event_id: x.event_id, event_name: x.event_name, event_start: x.event_start, slot_start: x.slot_start }))(doorTicket(st, t, () => false)) : doorTicket(st, t, P);
     return { result, ticket: tk, ...extra };
   };
+  if (ev && controlBlock(ev, 'scan') && !undo) return done('paused');
   if (dev?.disabled) return done('device_off');
   if (!t) return done('unknown');
   if (eventId && t.event_id !== eventId) { need('door.checkin', eventId); return done('wrong_event'); }   // says which event it is for, nothing more
@@ -1732,7 +1963,7 @@ const MSG_STATUS = { queued: 'Queued', sending: 'Sending', sent: 'Sent', failed:
 const MSG_VARS = [['first_name', 'First name'], ['name', 'Full name'], ['event', 'Event name'], ['date', 'Event date'], ['time', 'Start time'], ['venue', 'Venue'], ['doors', 'Doors open'],
   ['order_ref', 'Order number'], ['tickets_link', 'Link to their tickets'], ['event_link', 'Event page link'], ['box_office', 'Box office name'], ['promo_code', 'Promo code (automation)'], ['link', 'Your link (automation)']];
 const HOOK_EVENTS = { 'order.created': 'Order created', 'payment.completed': 'Payment completed', 'ticket.issued': 'Ticket issued', 'ticket.cancelled': 'Ticket cancelled',
-  'refund.issued': 'Refund issued', 'seat.changed': 'Seat changed', 'cart.expired': 'Cart expired', 'waitlist.signup': 'Waitlist signup', 'customer.checked_in': 'Customer checked in', 'event.updated': 'Event updated' };
+  'refund.issued': 'Refund issued', 'credit.issued': 'Credit issued', 'seat.changed': 'Seat changed', 'cart.expired': 'Cart expired', 'waitlist.signup': 'Waitlist signup', 'customer.checked_in': 'Customer checked in', 'event.updated': 'Event updated' };
 const AUTO_TRIGGERS = { 'ticket.purchased': 'Ticket purchased', 'ticket.cancelled': 'Ticket cancelled', 'refund.issued': 'Refund issued', 'waitlist.joined': 'Customer added to waitlist',
   'event.approaching': 'Event approaching', 'checked_in': 'Customer checked in', 'no_show': 'Customer did not attend', 'cart.abandoned': 'Cart abandoned (checkout left unpaid)',
   'promo.used': 'Promo code used', 'event.ended': 'Event ended' };
@@ -1750,7 +1981,11 @@ const INTEGRATIONS = {
   constantcontact: { name: 'Constant Contact', crm: true, fields: [['list', 'List ID']], secret: 'Access token', blurb: 'Adds opted-in buyers to a contact list.' },
   meta_capi: { name: 'Meta Conversions API', crm: false, fields: [['pixel', 'Pixel ID'], ['test', 'Test event code (optional)']], secret: 'Access token', blurb: 'Sends purchases to Meta from the server (works with ad blockers; matched with the browser pixel).' },
 };
-const API_SCOPES = { 'events:read': 'Events & ticket types', 'orders:read': 'Orders', 'tickets:read': 'Tickets & check-ins', 'customers:read': 'Customers & consent' };
+// each scope needs the creator's own permission, checked again on every call (a key never outlives its creator's access)
+const API_SCOPES = { 'events:read': 'Events & ticket types', 'orders:read': 'Orders', 'tickets:read': 'Tickets', 'customers:read': 'Customers & consent', 'seating:read': 'Seating & seat status',
+  'checkins:read': 'Check-ins', 'products:read': 'Products & packages', 'finance:read': 'Financial data (order money)', 'reports:read': 'Event reports' };
+const API_PERM = { 'events:read': 'events.view', 'orders:read': 'orders.view', 'tickets:read': 'tickets.view', 'customers:read': 'customers.profiles', 'seating:read': 'seating.view',
+  'checkins:read': 'door.log', 'products:read': 'events.view', 'finance:read': 'finance.reports', 'reports:read': 'finance.reports' };
 const SEG_STATUS = { any: 'Everyone', buyers: 'Has bought tickets', optedIn: 'Opted in to marketing email', smsOptIn: 'Opted in to marketing texts', account: 'Has a customer account',
   refunded: 'Had a refund', credit: 'Has credit', waitlist: 'On a waitlist', unsubscribed: 'Unsubscribed / suppressed' };
 const emptySeg = () => ({ eventIds: [], ticketTypeIds: [], areas: [], from: '', to: '', promo: '', tracking: '', checkin: 'any', status: 'any', tags: [] });
@@ -1843,12 +2078,22 @@ function demoDeliver(st, now = Date.now()) {
     if (m.status !== 'queued' || new Date(m.send_at || m.at) > now) continue;
     const b = outboxBlock(st, m); m.attempts = (m.attempts || 0) + 1; n++;
     if (b) Object.assign(m, { status: b.cancel ? 'cancelled' : 'suppressed', error: b.text });
+    else if (m.channel === 'email' && /@(bounce|fail)\.test$/.test(m.to)) Object.assign(m, { status: 'failed', error: 'Mailbox does not exist (demo test address)', provider: 'demo' });   // lets the demo show a failed email
     else Object.assign(m, { status: 'sent', sent_at: new Date(now).toISOString(), provider: 'demo', provider_id: 'demo_' + randCode(10).toLowerCase(), error: '' });
   }
+  mailFailAlerts(st, now);
   for (const d of st.deliveries || []) if (d.status === 'queued') Object.assign(d, { status: 'delivered', attempts: 1, done_at: new Date(now).toISOString(), response: 'demo mode — recorded, not posted' });
   return n;
 }
 
+// Stage 10 failed-email notifications: once a day per box office, staff hear how many emails failed (Messages tab has the details + Retry)
+function mailFailAlerts(st, now = Date.now()) {
+  const day = new Date(now).toISOString().slice(0, 10), by = {};
+  for (const m of st.outbox || []) if (m.status === 'failed' && m.category !== 'staff' && (m.at || '').slice(0, 10) === day) by[m.box_office_id] = (by[m.box_office_id] || 0) + 1;
+  for (const [boId, n] of Object.entries(by)) { const bo = st.boxOffices.find(b => b.id === boId); if (!bo) continue;
+    queueMsg(st, { box_office_id: boId, to: bo.settings?.mail?.alerts || bo.settings?.contactEmail || bo.owner, kind: 'staff', category: 'staff', dedupe: `mailfail:${boId}:${day}`,
+      subject: `Some emails could not be delivered`, body: `${n} email${n === 1 ? '' : 's'} failed to send today. See Marketing → Messages (filter: Failed) to check the address and retry.`, by: 'system' }); }
+}
 /* ── segments: who matches a filter. x = { orders, tickets, contacts, waitlist, credits, accounts } (admin data or the demo store) ── */
 function segmentPeople(x, f = {}, boId) {
   f = { ...emptySeg(), ...f }; const by = new Map(), inBo = r => !boId || r.box_office_id === boId;
@@ -2112,11 +2357,12 @@ const DB = {
     if (!LIVE) {
       const st = Demo.load(), act = new Set(st.boxOffices.filter(b => b.status === 'active').map(b => b.id));
       return { settings: { ...DEFAULT_SETTINGS }, events: st.events.map(normEvent).filter(e => eventListed(e) && act.has(e.box_office_id)).map(publicEvent),
-        bos: st.boxOffices.filter(b => act.has(b.id)).map(publicBo), platform: { name: st.platform.name, publicRegistration: st.platform.publicRegistration, feePct: st.platform.feePct, feeFixed: st.platform.feeFixed, feePayer: st.platform.feePayer || 'organizer' } };
+        bos: st.boxOffices.filter(b => act.has(b.id)).map(publicBo), platform: { name: st.platform.name, publicRegistration: st.platform.publicRegistration, feePct: st.platform.feePct, feeFixed: st.platform.feeFixed, feePayer: st.platform.feePayer || 'organizer',
+          gatewaysOff: st.platform.gatewaysOff || [], appHosts: st.platform.appHosts || DEFAULT_PLATFORM.appHosts, planList: clone(st.platform.planList || DEFAULT_PLANS), defaultPlan: st.platform.defaultPlan || 'pay' } };
     }
     const [plat, bos, evs] = await Promise.all([must(sb.from('platform_public').select('*').maybeSingle()),
       must(sb.from('box_offices').select('id,slug,name,status,branding,settings,gateway,platform_fee').eq('status', 'active')),
-      must(sb.from('events').select('id,box_office_id,slug,status,data,created_at').eq('status', 'published'))]);
+      must(sb.from('events').select('id,box_office_id,slug,status,data,controls,created_at').eq('status', 'published'))]);
     return { settings: { ...DEFAULT_SETTINGS }, events: evs.map(rowToEvent).map(normEvent), bos: bos.map(publicBo), platform: { ...DEFAULT_PLATFORM, ...(plat || {}) } };
   },
   // ── auth: email one-time code, then an authenticator-app code when 2FA is on ──
@@ -2187,7 +2433,7 @@ const DB = {
     email = email.toLowerCase(); DB._actor = email;
     if (LIVE) {
       const r = await must(sb.rpc('admin_load', { p_bo: boId || null, p_support: support })); r.events = (r.events || []).map(rowToEvent);
-      if (r.bo) r.bo = { ...r.bo, platformFee: r.bo.platform_fee || null, templates: r.bo.templates?.length ? r.bo.templates : DEFAULT_TEMPLATES, branding: { ...DEFAULT_BRANDING, ...r.bo.branding }, settings: { ...DEFAULT_SETTINGS, ...r.bo.settings, name: r.bo.name } };
+      if (r.bo) r.bo = { ...r.bo, platformFee: r.bo.platform_fee || null, mailDomain: r.bo.mail_domain || null, templates: r.bo.templates?.length ? r.bo.templates : DEFAULT_TEMPLATES, branding: { ...DEFAULT_BRANDING, ...r.bo.branding }, settings: { ...DEFAULT_SETTINGS, ...r.bo.settings, name: r.bo.name } };
       DB._bo = r.bo?.id || null; DB._support = !!r.me?.support; return r;
     }
     const st = Demo.fresh(), isSuper = st.platform.admins.includes(email);
@@ -2261,7 +2507,14 @@ const DB = {
       expenses: P('finance.reports') || P('finance.expenses') ? clone((st.expenses || []).filter(x => x.box_office_id === bo.id && evIds.has(x.event_id))) : [],
       expenseFinal: P('finance.reports') || P('finance.expenses') ? clone(Object.fromEntries(Object.entries(st.expenseFinal || {}).filter(([k]) => evIds.has(k)))) : {},
       payouts: P('finance.payouts') ? clone((st.payouts || []).filter(x => x.box_office_id === bo.id)) : [],
-      procTx: P('finance.payouts') ? clone((st.procTx || []).filter(x => x.box_office_id === bo.id)) : [] };
+      procTx: P('finance.payouts') ? clone((st.procTx || []).filter(x => x.box_office_id === bo.id)) : [],
+      // Stage 10: version history, banned customers, customer-service inbox, the platform's invoices + plans, accepted policy texts
+      versions: clone((st.versions || []).filter(v => v.box_office_id === bo.id && (v.kind === 'event' ? evIds.has(v.target) && hasPerm(m, 'events.edit', v.target) : P('admin.settings'))).slice(0, 400)),
+      bans: P('customers.ban') || P('customers.profiles') ? clone((st.bans || []).filter(b => b.box_office_id === bo.id)).map(mask) : [],
+      inbox: P('customers.inbox') ? clone((st.support || []).filter(x => x.box_office_id === bo.id && (!x.event_id || evIds.has(x.event_id)))).map(mask) : [],
+      invoices: P('admin.settings') ? clone((st.invoices || []).filter(x => x.box_office_id === bo.id)) : [],
+      plans: clone(st.platform.planList || DEFAULT_PLANS), platform: { feePct: st.platform.feePct, feeFixed: st.platform.feeFixed, feePayer: st.platform.feePayer, domainTarget: st.platform.domainTarget, defaultPlan: st.platform.defaultPlan },
+      policyTexts: P('orders.view') ? clone(Object.fromEntries(Object.entries(st.policyTexts || {}).filter(([h]) => orders.some(o => (o.data.accepted || []).some(a => a.version === h))))) : {} };
   },
   async stillAllowed() { if (LIVE) return true; try { need(); return true; } catch (e) { return !e.revoked; } },
   async saveEvent(ev) {
@@ -2271,7 +2524,7 @@ const DB = {
       if (prev && prev.status !== ev.status) need('events.publish', ev.id);
       if (prev && priceSig(prev) !== priceSig(ev)) need('tickets.pricing', ev.id);  // prices, price rules, product and bundle prices
       if (prev && prev.box_office_id !== DB._bo) throw new Error('not allowed');
-      const row = clone({ ...ev, box_office_id: DB._bo }), diff = eventDiff(prev, row);
+      const row = clone({ ...ev, box_office_id: DB._bo, controls: prev?.controls || {} }), diff = eventDiff(prev, row);   // emergency controls only change through eventControl()
       if (prev && row.seating?.enabled) {  // a layout edit can never delete a seat somebody holds a ticket for
         const lost = st.tickets.filter(t => t.event_id === ev.id && t.status === 'valid' && t.seat && !row.seating.meta?.[t.seat]);
         if (lost.length) throw new Error(`${lost.length} sold seat${lost.length === 1 ? '' : 's'} would disappear from the map (${[...new Set(lost.map(t => t.seat))].slice(0, 4).join(', ')}). Move those customers first, or block the seats instead.`);
@@ -2279,6 +2532,7 @@ const DB = {
       }
       if (i >= 0) st.events[i] = row; else st.events.push(row);
       if (prev && !!prev.archived !== !!row.archived) need('events.publish', ev.id);
+      addVersion(st, 'event', row.id, DB._bo, prev, row);   // Stage 10 version history
       if (!prev) audit('event.created', 'Created event “' + row.name + '”', { target: row.id });
       else if (diff.length) audit('event.updated', 'Updated “' + row.name + '”: ' + [...new Set(diff.map(d => d[0].split(' · ')[0]))].join(', '), { target: row.id, before: Object.fromEntries(diff.map(d => [d[0], d[1]])), after: Object.fromEntries(diff.map(d => [d[0], d[2]])) });
       if (prev && diff.length && row.status === 'published') emitEvent(st, DB._bo, 'event.updated', { event_id: row.id, name: row.name, start: row.start, venue: row.venue || '', changed: [...new Set(diff.map(d => d[0].split(' · ')[0]))] });
@@ -2298,8 +2552,9 @@ const DB = {
   async saveBoxOffice(patch) {
     if (!LIVE) {
       const st = Demo.st, bo = st.boxOffices.find(b => b.id === DB._bo); need('admin.settings');
-      const changed = Object.keys(patch).filter(k => JSON.stringify(bo[k]) !== JSON.stringify(patch[k]));
-      Object.assign(bo, clone(patch)); if (patch.name) bo.settings = { ...bo.settings, name: patch.name };
+      if (['plan', 'domain', 'mailDomain', 'gateway', 'platformFee', 'status', 'owner'].some(k => k in patch)) throw new Error('not allowed');   // their own actions only
+      const changed = Object.keys(patch).filter(k => JSON.stringify(bo[k]) !== JSON.stringify(patch[k])), before = clone({ settings: bo.settings, branding: bo.branding });
+      Object.assign(bo, clone(patch)); addVersion(st, 'settings', bo.id, bo.id, before, bo); if (patch.name) bo.settings = { ...bo.settings, name: patch.name };
       if (changed.length) audit('settings.updated', 'Changed box office ' + changed.join(', ')); Demo.save(); return clone(bo);
     }
     return must(sb.from('box_offices').update(patch).eq('id', DB._bo).select().single());
@@ -2543,7 +2798,9 @@ const DB = {
   async createApiKey(name, scopes) {
     const sc = (scopes || []).filter(x => API_SCOPES[x]); if (!sc.length) throw new Error('Choose what the key may read');
     if (!LIVE) {
-      const st = Demo.fresh(); need('admin.api'); const key = 'set_live_' + [...crypto.getRandomValues(new Uint8Array(20))].map(b => b.toString(16).padStart(2, '0')).join(''), row = { id: uid(), box_office_id: DB._bo, name: String(name || 'API key').trim().slice(0, 80) || 'API key',
+      const st = Demo.fresh(); const me = need('admin.api');
+      for (const x of sc) if (!hasPerm(me, API_PERM[x])) throw new Error(`You can't give a key access you don't have yourself (${API_SCOPES[x]})`);   // Stage 10
+      const key = 'set_live_' + [...crypto.getRandomValues(new Uint8Array(20))].map(b => b.toString(16).padStart(2, '0')).join(''), row = { id: uid(), box_office_id: DB._bo, name: String(name || 'API key').trim().slice(0, 80) || 'API key',
         prefix: key.slice(0, 13), hash: await sha256hex(key), scopes: sc, created_at: nowIso(), created_by: DB._actor, last_used_at: null, revoked_at: null };
       (st.apiKeys ||= []).push(row); audit('admin.api', `Created API key “${row.name}” (${sc.join(', ')})`); Demo.save(); const { hash, ...k } = row; return { ...clone(k), key };
     }
@@ -2638,19 +2895,34 @@ const DB = {
         staff: st.members.filter(m => m.box_office_id === b.id && m.status === 'active').length,
         lastSale: os.map(o => o.created_at).sort().pop() || null } };
     });
+    const boName = id => st.boxOffices.find(b => b.id === id)?.name || '';
+    const errors = clone((st.errors || []).slice(0, 300)), incidents = clone(st.incidents || []);
     return { platform: clone(st.platform), bos, audit: clone(st.audit.slice(0, 600)),
-      orders: clone(st.orders.map(o => ({ box_office_id: o.box_office_id, status: o.status, created_at: o.created_at, total: o.data.total, platformFee: o.data.platformFee || 0 }))) };
+      orders: clone(st.orders.map(o => ({ box_office_id: o.box_office_id, status: o.status, created_at: o.created_at, paid_at: o.paid_at, total: o.data.total, platformFee: o.data.platformFee || 0,
+        provider: o.payment?.provider || null, marked: !!o.payment?.markedPaidBy, method: payMethodOf(o) }))),
+      // Stage 10: every event, every staff member, risk, incidents, errors, invoices and system health
+      events: st.events.map(e => ({ id: e.id, box_office_id: e.box_office_id, bo: boName(e.box_office_id), name: e.name, slug: e.slug, start: e.start, status: e.status, archived: !!e.archived, visibility: e.visibility,
+        controls: clone(e.controls || {}), tickets: st.tickets.filter(t => t.event_id === e.id && t.status === 'valid').length })),
+      staff: st.members.filter(m => m.status === 'active').map(m => ({ email: m.email, name: m.name, box_office_id: m.box_office_id, bo: boName(m.box_office_id), template: m.template, owner: st.boxOffices.find(b => b.id === m.box_office_id)?.owner === m.email,
+        last: (st.sessions || []).filter(s => s.email === m.email).map(s => s.last_seen).sort().pop() || null })),
+      flagged: st.orders.filter(o => (o.data.flags || []).length).map(o => ({ id: o.id, ref: o.ref, box_office_id: o.box_office_id, bo: boName(o.box_office_id), email: maskEmail(o.buyer_email), flags: o.data.flags, total: o.data.total, status: o.status, created_at: o.created_at, review: o.data.review || null })),
+      bans: (st.bans || []).filter(b => !b.removed_at).length, incidents, errors, invoices: clone(st.invoices || []),
+      health: clone(healthOf({ errors, incidents, attempts: st.payAttempts || [], outbox: st.outbox || [], deliveries: st.deliveries || [], backups: st.backups || [], live: { email: false, sms: false, backups: false } })) };
   },
   async savePlatform(p) {
     if (!LIVE) { needSuper(); const st = Demo.st; st.platform = { ...st.platform, ...clone(p), admins: [...new Set((p.admins || st.platform.admins).map(e => e.trim().toLowerCase()).filter(Boolean))] }; if (!st.platform.admins.includes(DB._actor)) st.platform.admins.push(DB._actor); audit('platform.settings', 'Changed platform settings', { bo: null }); Demo.save(); return clone(st.platform); }
     await must(sb.rpc('platform_save', { p }));
   },
-  async createBoxOffice({ name, slug, ownerEmail, ownerName }, pending = false) {
+  async createBoxOffice({ name, slug, ownerEmail, ownerName, plan, phone, agree }, pending = false) {
     if (!name?.trim()) throw new Error('Enter the box office name'); if (!EMAIL_RE.test(ownerEmail || '')) throw new Error('Enter the owner\'s email');
-    if (LIVE) return must(sb.rpc(pending ? 'register_box_office' : 'create_box_office', { p_name: name, p_slug: slug, p_owner: ownerEmail, p_owner_name: ownerName || '' }));
+    if (LIVE) return pending ? must(sb.rpc('register_organizer', { p: { name, slug, owner: ownerEmail, ownerName: ownerName || '', plan, phone, agree } }))
+      : must(sb.rpc('create_box_office', { p_name: name, p_slug: slug, p_owner: ownerEmail, p_owner_name: ownerName || '' }));
     const st = Demo.fresh(); if (!pending) needSuper(); else if (!st.platform.publicRegistration) throw new Error('Registration is closed');
+    if (pending && !agree) throw new Error('Please accept the organizer terms');
+    if (pending && plan && !(st.platform.planList || DEFAULT_PLANS).some(p => p.id === plan)) throw new Error('Unknown plan');
     slug = slugify(slug || name); if (st.boxOffices.some(b => b.slug === slug)) slug += '-' + randCode(3).toLowerCase();
-    const email = ownerEmail.trim().toLowerCase(), bo = { id: uid(), slug, name: name.trim(), status: pending ? 'pending' : 'active', owner: email, created_at: nowIso(), created_by: pending ? 'self-registration' : DB._actor,
+    const email = ownerEmail.trim().toLowerCase(), bo = { id: uid(), slug, name: name.trim(), status: pending && !st.platform.autoApprove ? 'pending' : 'active', owner: email, created_at: nowIso(), created_by: pending ? 'self-registration' : DB._actor,
+      plan: plan || st.platform.defaultPlan || 'pay',
       branding: { ...DEFAULT_BRANDING }, settings: { ...DEFAULT_SETTINGS, name: name.trim(), contactEmail: email }, templates: clone(DEFAULT_TEMPLATES) };
     st.boxOffices.push(bo); st.members.push({ id: uid(), box_office_id: bo.id, email, name: ownerName || email.split('@')[0], perms: [...ALL_PERMS], template: 'full', events: 'all', status: 'active', created_at: nowIso(), added_by: bo.created_by });
     audit(pending ? 'platform.registered' : 'platform.created', (pending ? 'Registration request: ' : 'Created box office ') + bo.name, { bo: bo.id }); Demo.save(); return clone(bo);
@@ -2668,6 +2940,144 @@ const DB = {
     st.boxOffices = st.boxOffices.filter(b => b.id !== id); st.events = st.events.filter(e => e.box_office_id !== id); st.members = st.members.filter(m => m.box_office_id !== id);
     audit('platform.deleted', 'Permanently deleted box office ' + bo.name, { bo: null }); Demo.save();
   },
+  // ── Stage 10: event emergency controls, waiting room, customer service, bans, versions, errors & incidents, billing, domains ──
+  async eventControl(eventId, patch) {   // pause sales / checkout / scanning, maintenance mode — immediate, audited, nothing else changes
+    const keep = ['salesPaused', 'checkoutPaused', 'scanPaused', 'maintenance', 'message'], p = Object.fromEntries(Object.entries(patch || {}).filter(([k]) => keep.includes(k)));
+    if (LIVE) return must(sb.rpc('event_control', { p_event: eventId, p }));
+    const st = Demo.fresh(), ev = st.events.find(e => e.id === eventId && e.box_office_id === DB._bo); if (!ev) throw new Error('Event not found');
+    need('events.controls', eventId);
+    const before = clone(ev.controls || {}); ev.controls = { ...before, ...p, message: String(p.message ?? before.message ?? '').slice(0, 300), at: nowIso(), by: DB._actor };
+    const what = EV_CONTROLS.filter(([k]) => !!before[k] !== !!ev.controls[k]).map(([k, t]) => (ev.controls[k] ? '' : 'Undo: ') + t);
+    audit('event.controls', `“${ev.name}”: ${what.join(', ') || 'control message updated'}`, { target: ev.id, before, after: clone(ev.controls) }); Demo.save(); return clone(ev.controls);
+  },
+  async queueStatus(eventId) {   // join (or check) the waiting room for one event: {on, admitted, position, waiting, admit, until, progress}
+    const token = this.holdToken();
+    if (LIVE) return must(sb.rpc('queue_status', { p_event: eventId, p_token: token }));
+    const st = Demo.fresh(), ev = st.events.find(e => e.id === eventId); if (!ev) throw new Error('Event not found');
+    if (!ev.queue?.on) return { on: false, admitted: true };
+    if (!rateHit('queue:' + token, 40, 60)) throw new Error('Slow down — your place is saved');
+    const q = ((st.queue ||= {})[eventId] ||= { last: 0, entries: {} }), r = queueEntry(q, ev, token, Date.now()); Demo.save();
+    return { on: true, ...r, message: ev.queue.message || '' };
+  },
+  async contactOrganizer(eventId, boId, m) {   // "Contact organizer": routed to the event's own contact / team, else the box office
+    const msg = { name: String(m.name || '').trim().slice(0, 120), email: String(m.email || '').trim().toLowerCase(), ref: String(m.ref || '').trim().toUpperCase().slice(0, 20), subject: String(m.subject || '').trim().slice(0, 150), body: String(m.body || '').trim().slice(0, 4000) };
+    if (!msg.name || !EMAIL_RE.test(msg.email)) throw new Error('Enter your name and a valid email'); if (msg.body.length < 5) throw new Error('Write your message');
+    if (LIVE) return must(sb.rpc('contact_organizer', { p_event: eventId || null, p_bo: boId || null, p: msg }));
+    const st = Demo.fresh(), ev = eventId && st.events.find(e => e.id === eventId), bo = st.boxOffices.find(b => b.id === (ev?.box_office_id || boId)); if (!bo) throw new Error('Box office not found');
+    if (!rateHit('contact:' + msg.email, 5, 3600)) throw new Error('You\'ve sent several messages already — the team will reply by email');
+    const to = (ev?.contact?.email || bo.settings?.contactEmail || bo.owner).toLowerCase(), team = ev?.contact?.team || ev?.contact?.name || 'Box office';
+    const row = { id: uid(), box_office_id: bo.id, event_id: ev?.id || null, ...msg, routed_to: to, team, status: 'open', at: nowIso(), replies: [] };
+    (st.support ||= []).unshift(row);
+    queueMsg(st, { box_office_id: bo.id, event_id: ev?.id || null, to, kind: 'staff', category: 'staff', subject: `Customer message: ${msg.subject || (ev ? ev.name : bo.name)}`,
+      body: `From ${msg.name} <${msg.email}>${msg.ref ? ' · order ' + msg.ref : ''}${ev ? ' · ' + ev.name : ''}\n\n${msg.body}\n\nReply in SET (Customers → Inbox) or by email.`, by: 'customer' });
+    Demo.save(); return { routed: team };
+  },
+  async supportAction(id, action, p = {}) {   // reply (emails the customer) · close · reopen
+    if (LIVE) return must(sb.rpc('support_action', { p_id: id, p_action: action, p }));
+    const st = Demo.fresh(), r = (st.support || []).find(x => x.id === id && x.box_office_id === DB._bo); if (!r) throw new Error('Message not found');
+    need('customers.inbox', r.event_id || undefined);
+    if (action === 'reply') { const body = String(p.body || '').trim(); if (!body) throw new Error('Write a reply'); need('comms.email');
+      queueMsg(st, { box_office_id: r.box_office_id, event_id: r.event_id, to: r.email, kind: 'message', category: 'transactional', subject: 'Re: ' + (r.subject || 'your message'), body, by: DB._actor });
+      r.replies.push({ at: nowIso(), by: DB._actor, body: body.slice(0, 4000) }); r.status = 'answered'; }
+    else if (action === 'close' || action === 'reopen') r.status = action === 'close' ? 'closed' : 'open';
+    else throw new Error('Unknown action');
+    r.handled_by = DB._actor; r.handled_at = nowIso(); audit('customers.inbox', `Customer message from ${r.email}: ${action}`, { target: r.event_id }); Demo.save();
+  },
+  async banCustomer(email, reason) {
+    email = String(email || '').trim().toLowerCase(); if (!EMAIL_RE.test(email)) throw new Error('Enter the customer\'s email');
+    if (!String(reason || '').trim()) throw new Error('Give a reason (only staff see it)');
+    if (LIVE) return must(sb.rpc('ban_customer', { p_bo: DB._bo, p_email: email, p_reason: reason }));
+    const st = Demo.fresh(); need('customers.ban'); if (activeBan(st, DB._bo, email)) throw new Error('Already banned');
+    (st.bans ||= []).unshift({ id: uid(), box_office_id: DB._bo, email, reason: String(reason).trim().slice(0, 500), by: DB._actor, at: nowIso(), removed_at: null, removed_by: null });
+    audit('customers.ban', 'Banned ' + email + ' from buying', { after: { reason } }); Demo.save();
+  },
+  async unbanCustomer(id) {
+    if (LIVE) return must(sb.rpc('unban_customer', { p_id: id }));
+    const st = Demo.fresh(); need('customers.ban'); const b = (st.bans || []).find(x => x.id === id && x.box_office_id === DB._bo && !x.removed_at); if (!b) throw new Error('Ban not found');
+    Object.assign(b, { removed_at: nowIso(), removed_by: DB._actor }); audit('customers.ban', 'Removed the ban on ' + b.email); Demo.save();
+  },
+  async policyTexts(versions) {   // the exact text a buyer accepted, by version
+    if (LIVE) return must(sb.rpc('policy_texts', { p_bo: DB._bo, p_versions: versions }));
+    const all = Demo.fresh().policyTexts || {}; return Object.fromEntries(versions.filter(v => all[v]).map(v => [v, clone(all[v])]));
+  },
+  _errs: 0, _seen: new Set(),
+  logError(where, err) {   // client errors → error log (Platform → System health). At most 20 per page load, each message once.
+    try {
+      const message = String(err?.message || err || 'error').slice(0, 300); if (this._errs >= 20 || this._seen.has(message)) return; this._errs++; this._seen.add(message);
+      const row = { where: String(where || 'app').slice(0, 20), message, stack: String(err?.stack || '').slice(0, 1500), url: location.hash.replace(/\/[0-9a-f-]{36}$/i, '/…').slice(0, 120), bo: this._bo || null };
+      if (LIVE) { sb.rpc('log_client_error', { p: row }).then(() => { }, () => { }); return; }
+      const st = Demo.fresh(); (st.errors ||= []).unshift({ id: uid(), at: nowIso(), source: 'client', ...row, user: this._actor || null }); if (st.errors.length > 500) st.errors.length = 500; Demo.save();
+    } catch (e) { }
+  },
+  async saveIncident(i) {   // super admin: open / update / resolve an incident
+    if (LIVE) return must(sb.rpc('save_incident', { p: i }));
+    needSuper(); const st = Demo.fresh(); st.incidents ||= [];
+    if (!INCIDENT_KINDS[i.kind]) throw new Error('Pick what kind of incident'); if (!String(i.title || '').trim()) throw new Error('Give the incident a title');
+    let r = i.id && st.incidents.find(x => x.id === i.id);
+    const fields = { kind: i.kind, title: String(i.title).trim().slice(0, 150), severity: i.severity === 'major' ? 'major' : 'minor', events: (i.events || []).slice(0, 50), cause: String(i.cause || '').slice(0, 2000), resolution: String(i.resolution || '').slice(0, 2000),
+      started_at: i.started_at || nowIso(), ended_at: i.ended_at || null, status: i.ended_at || i.status === 'resolved' ? 'resolved' : 'open' };
+    if (fields.status === 'resolved' && !fields.ended_at) fields.ended_at = nowIso();
+    if (r) Object.assign(r, fields); else st.incidents.unshift(r = { id: uid(), ...fields, by: DB._actor, created_at: nowIso(), updates: [] });
+    if (i.update) r.updates.push({ at: nowIso(), by: DB._actor, text: String(i.update).slice(0, 1000) });
+    audit('platform.incident', `Incident “${r.title}”: ${r.status}`, { bo: null }); Demo.save(); return clone(r);
+  },
+  async setPlan(planId, boId) {   // the owner picks a plan for their box office (super admin can set any box office's)
+    if (LIVE) return must(sb.rpc('set_plan', { p_bo: boId || DB._bo, p_plan: planId }));
+    const st = Demo.fresh(), id = boId || DB._bo, bo = st.boxOffices.find(b => b.id === id), plan = (st.platform.planList || DEFAULT_PLANS).find(p => p.id === planId);
+    if (!plan) throw new Error('Unknown plan');
+    if (boId && boId !== DB._bo) needSuper(); else { const me = need('admin.settings'); if (!me.owner && !me.support && bo.owner !== DB._actor) throw new Error('Only the owner can change the plan'); }
+    const was = bo.plan || st.platform.defaultPlan || 'pay'; bo.plan = plan.id;
+    audit('billing.plan', `${bo.name}: plan ${planOf(st.platform, { plan: was })?.name || was} → ${plan.name}`, { bo: bo.id, before: { plan: was }, after: { plan: plan.id } }); Demo.save();
+  },
+  async billingRun(period) {   // super admin (and pg_cron on the 1st of the month): one invoice per box office that owes something for that month
+    if (!/^\d{4}-\d{2}$/.test(period || '')) throw new Error('Pick a month');
+    if (LIVE) return must(sb.rpc('billing_run', { p_period: period }));
+    needSuper(); const st = Demo.fresh(), plat = st.platform, made = [];
+    for (const bo of st.boxOffices.filter(b => b.status === 'active' || b.status === 'suspended')) {
+      if ((st.invoices || []).some(x => x.box_office_id === bo.id && x.period === period && x.status !== 'void')) continue;
+      const b = billingFor(st.orders, bo, plat, period); if (b.due <= 0) continue;
+      const n = (st.invoices || []).length + 1, lines = [...(b.subscription ? [{ label: `${b.plan.name} plan — ${period}`, amount: b.subscription }] : []),
+        ...(b.owedFees ? [{ label: `Platform fees on ${b.owedOrders} order${b.owedOrders === 1 ? '' : 's'} not paid through ${GATEWAYS.stripe.name} (cash, check, invoice, other)`, amount: b.owedFees }] : [])];
+      const inv = { id: uid(), number: `SET-${period.replace('-', '')}-${String(n).padStart(4, '0')}`, box_office_id: bo.id, bo_name: bo.name, period, lines, total: b.due,
+        info: { autoFees: b.autoFees, autoOrders: b.autoOrders }, status: 'open', issued_at: nowIso(), due_at: new Date(Date.now() + (+plat.invoiceDays || 14) * 864e5).toISOString(), paid_at: null, by: DB._actor };
+      (st.invoices ||= []).push(inv); made.push(inv);
+      queueMsg(st, { box_office_id: bo.id, to: bo.owner, kind: 'staff', category: 'staff', subject: `${plat.name} invoice ${inv.number}`, body: `Your ${plat.name} invoice for ${period} is ready: ${money_(inv.total)}, due ${inv.due_at.slice(0, 10)}. See Settings → Plan & billing.`, by: 'system' });
+    }
+    audit('billing.run', `Billing run ${period}: ${made.length} invoice${made.length === 1 ? '' : 's'}`, { bo: null }); Demo.save(); return made.length;
+  },
+  async invoiceAction(id, action, note = '') {   // super admin: mark paid · void · reopen
+    if (LIVE) return must(sb.rpc('invoice_action', { p_id: id, p_action: action, p_note: note }));
+    needSuper(); const inv = (Demo.fresh().invoices || []).find(x => x.id === id); if (!inv) throw new Error('Invoice not found');
+    if (!['paid', 'void', 'open'].includes(action)) throw new Error('Unknown action');
+    Object.assign(inv, { status: action, paid_at: action === 'paid' ? nowIso() : null, note: String(note || '').slice(0, 300), handled_by: DB._actor });
+    audit('billing.invoice', `Invoice ${inv.number}: ${INVOICE_STATUS[action]}`, { bo: inv.box_office_id }); Demo.save();
+  },
+  async saveDomain(host) {   // a custom domain for the box office's site: '' removes it
+    host = String(host || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    if (host && !HOST_RE.test(host)) throw new Error('Enter a domain like tickets.yourvenue.com');
+    if (LIVE) return must(sb.rpc('save_domain', { p_bo: DB._bo, p_host: host }));
+    const st = Demo.fresh(); need('admin.settings'); const bo = st.boxOffices.find(b => b.id === DB._bo);
+    if (host && st.boxOffices.some(b => b.id !== bo.id && b.domain?.host === host)) throw new Error('That domain is already used by another box office');
+    bo.domain = host ? { host, token: bo.domain?.host === host ? bo.domain.token : randCode(16).toLowerCase(), status: 'pending', checked_at: null } : null;
+    audit('settings.domain', host ? 'Custom domain set to ' + host : 'Custom domain removed'); Demo.save(); return clone(bo.domain);
+  },
+  async checkDomain(kind = 'site') {   // LIVE: the domains Edge Function looks the DNS records up (and asks Resend for sending domains)
+    if (LIVE) { const { data, error } = await sb.functions.invoke('domains', { body: { action: kind === 'mail' ? 'mail_verify' : 'site_verify', bo: DB._bo } }); if (error || data?.error) throw new Error(data?.error || error.message); return data; }
+    const st = Demo.fresh(); need('admin.settings'); const bo = st.boxOffices.find(b => b.id === DB._bo), d = kind === 'mail' ? bo.mailDomain : bo.domain;
+    if (!d) throw new Error('Add the domain first');
+    Object.assign(d, { status: 'verified', checked_at: nowIso(), demo: true }); audit('settings.domain', `${kind === 'mail' ? 'Sending' : 'Custom'} domain ${d.host || d.domain} marked verified (demo — DNS not looked up)`); Demo.save(); return clone(d);
+  },
+  async mailDomain(domain) {   // a sending domain (SPF / DKIM / DMARC) so emails go from the box office's own address
+    domain = String(domain || '').trim().toLowerCase(); if (domain && !HOST_RE.test(domain)) throw new Error('Enter a domain like yourvenue.com');
+    if (LIVE) { const { data, error } = await sb.functions.invoke('domains', { body: { action: 'mail_add', bo: DB._bo, domain } }); if (error || data?.error) throw new Error(data?.error || error.message); return data; }
+    const st = Demo.fresh(); need('admin.settings'); const bo = st.boxOffices.find(b => b.id === DB._bo);
+    bo.mailDomain = domain ? { domain, status: 'pending', records: mailRecords(domain), checked_at: null } : null;
+    audit('settings.domain', domain ? 'Sending domain set to ' + domain : 'Sending domain removed'); Demo.save(); return clone(bo.mailDomain);
+  },
+  async boByDomain(host) {   // a box office's own domain → which box office this site is
+    if (LIVE) return must(sb.rpc('bo_by_domain', { p_host: host }));
+    const b = Demo.fresh().boxOffices.find(x => x.domain?.host === String(host).toLowerCase() && x.domain.status === 'verified' && x.status === 'active'); return b ? { id: b.id, slug: b.slug } : null;
+  },
   // ── buyer-facing ──
   async availability(eventId) {
     if (!LIVE) { const st = Demo.fresh(); if (expireOrders(st)) Demo.save(); return availabilityFrom(st.tickets, eventId, st.seatStatus, this.holdToken(), st.orders); }
@@ -2681,11 +3091,14 @@ const DB = {
     const st = Demo.fresh(), ev = st.events.find(e => e.id === eventId);
     if (!ev || !eventLive(normEvent(ev))) throw new Error('Event is not on sale');
     if (!ev.seating?.enabled) return null;
+    const blocked = controlBlock(ev, 'sales'); if (blocked) throw new Error(blocked);
+    if (ev.queue?.on && !queuePass(st.queue?.[ev.id], ev, token, Date.now())) throw new Error('Please wait for your turn in the waiting room');
+    if (!rateHit('hold:' + token, LIMITS.holdPerMin, 60)) throw new Error('Too many seat changes — please wait a moment');
     if (seats.length > 10) throw new Error('Maximum 10 seats per order');
     const states = seatStates(ev, { tickets: st.tickets, statuses: st.seatStatus, orders: st.orders, slotId, token });
     for (const id of seats) { const x = states.get(id); if (!x || x.state !== 'available') throw new Error(x?.state === 'checkout' ? `${seatText(ev, id)} is being held by another buyer — try again in a few minutes` : `${seatText(ev, id)} is no longer available`); }
     if (ev.seating.noSingles) { const g = singleGaps(ev, id => states.get(id)?.state === 'available', seats); if (g.length) throw new Error(gapMsg(ev, g)); }
-    const expires = new Date(Date.now() + HOLD_MINUTES * 6e4).toISOString();
+    const expires = new Date(Date.now() + cartMinutes(ev) * 6e4).toISOString();
     st.seatStatus = (st.seatStatus || []).filter(r => !(r.status === 'checkout' && r.token === token && r.event_id === eventId)).concat(
       seats.map(seat => ({ id: uid(), box_office_id: ev.box_office_id, event_id: eventId, slot_id: slotId || '', seat, status: 'checkout', note: '', by: 'buyer', at: nowIso(), expires_at: expires, token })));
     Demo.save(); return { expires };
@@ -2832,6 +3245,11 @@ const DB = {
     const before = bo.gateway || null; bo.gateway = { provider, account: (provider === 'demo' ? 'demo_' : 'acct_demo_') + randCode(10).toLowerCase(), status: 'connected', test: !!test, connected_at: nowIso() };
     audit('settings.payments', `Connected ${gw.name}${test ? ' (test mode)' : ''}`, { before, after: bo.gateway }); Demo.save(); return { gateway: clone(bo.gateway) };
   },
+  async pauseGateway(on) {   // emergency: switch card payments off (and back on) for this box office without disconnecting the account
+    if (LIVE) return must(sb.rpc('pause_gateway', { p_bo: DB._bo, p_on: !!on }));
+    need('admin.payments'); const bo = Demo.fresh().boxOffices.find(b => b.id === DB._bo); if (!bo.gateway) throw new Error('No processor connected');
+    bo.gateway.disabled = !!on; audit('settings.payments', on ? 'Card payments paused' : 'Card payments resumed'); Demo.save();
+  },
   async disconnectGateway() {
     if (LIVE) return must(sb.rpc('disconnect_gateway', { p_bo: DB._bo }));
     need('admin.payments'); const bo = Demo.st.boxOffices.find(b => b.id === DB._bo), before = bo.gateway; bo.gateway = null;
@@ -2903,6 +3321,8 @@ const DB = {
   },
   demoReset() { if (!LIVE) Demo.reset(); },
 };
+// DEMO: every data call first picks up what other tabs saved, as a real server always sees the latest data (Stage 10 — no call works on a stale copy)
+if (!LIVE) for (const k of Object.keys(DB)) if (typeof DB[k] === 'function' && !['holdToken', 'logError', 'demoReset'].includes(k)) { const f = DB[k]; DB[k] = function (...a) { Demo.fresh(); return f.apply(this, a); }; }
 
 /* ════════════ Sample data (DEMO only) ════════════ */
 function seedDemo() {
@@ -3008,7 +3428,21 @@ function seedDemo() {
     address: '22 W 32nd St, New York, NY 10001', summary: 'Live trio, brunch buffet, city views.', description: 'A relaxed late-morning set from the Skyline house trio with a brunch buffet.',
     publishAt: day(5, 10, 0), salesStart: day(7, 10, 0), waitlistMode: 'presale', capacity: 140,
     ticketTypes: [tt('Brunch + music', 8500, 120), tt('Music only (bar)', 3500, 20)] });
-  const events = [ev1, ev2, ev3, ev4, ev5, ev6, ev7]; ev7.box_office_id = bo1.id;
+  // Stage 10 sample: a direct-link festival with a waiting room, its own fees / tax / policies / checkout form / confirmation email
+  const genTT = tt('General admission', 4500, 2000, { fee: { pct: '', fixed: 300, payer: '' } }), vipFest = tt('VIP deck', 12000, 150, { max: 6 });
+  const ev8 = mk({ slug: 'skyline-summer-fest', name: 'Skyline Summer Fest', category: 'Festival', start: day(40, 15, 0), end: day(40, 23, 0), venue: 'Pier 17 Rooftop',
+    address: '89 South St, New York, NY 10038', summary: 'Eight bands, one rooftop — direct-link presale with a waiting room.', description: 'A big on-sale: the waiting room lets buyers in a steady stream so nobody fights the crowd.',
+    visibility: 'link', capacity: 2150, cartMinutes: 5, queue: { on: true, rate: 120, passMinutes: 20, message: 'Presale is busy — you\'re in line and won\'t lose your place.' },
+    ticketTypes: [genTT, vipFest], taxPct: 8.875,
+    fees: { pct: '', fixed: '', payer: '', areas: {}, passProcessing: 'yes', extra: [{ id: 'fx_facility', name: 'Facility fee', pct: '', fixed: 200, per: 'ticket', optional: false },
+      { id: 'fx_protect', name: 'Ticket protection (refund if you can\'t go)', pct: 6, fixed: '', per: 'order', optional: true }] },
+    checkout: { phone: 'required' }, donation: { purpose: 'Skyline Music Education Fund' },
+    contact: { name: 'Festival guest services', email: 'fest@skyline.example', phone: '', team: 'Festival guest services' },
+    terms: 'Festival entry is 21+ with valid photo ID. Re-entry is not permitted. The line-up may change.', privacyPolicy: 'The festival shares attendee names with Pier 17 security for entry only.',
+    policies: 'Clear bags only. No outside food or drink.',
+    emails: { confirmation: '', reminders: [], confirm: { subject: 'You\'re going to Skyline Summer Fest!', header: 'See you on the rooftop', instructions: 'Show the QR code at the Pier 17 entrance. Have your photo ID ready.',
+      venue: 'Enter from South St; the rooftop lift is on the left. Doors 2:30 PM.', sponsor: 'Presented with Harbor Brewing Co.', contact: 'Questions? Reply to this email or write to fest@skyline.example.', policies: true } } });
+  const events = [ev1, ev2, ev3, ev4, ev5, ev6, ev7, ev8]; ev7.box_office_id = bo1.id; ev8.box_office_id = bo1.id;
   bo1.eventTemplates = [
     eventToTemplate(ev2, 'Standard Concert'), eventToTemplate(ev1, 'Reserved Seating Event'),
     eventToTemplate({ ...ev2, name: 'General Admission Event', ticketTypes: [tt('General admission', 3000, 0)], capacity: 300 }, 'General Admission Event'),
@@ -3055,7 +3489,11 @@ function seedDemo() {
   let n = 0; const rnd = a => a[Math.floor(Math.random() * a.length)], card = { number: '4242424242424242', exp: '12/34', cvc: '123' };
   const qAns = ev => Object.fromEntries((ev.questions || []).filter(q => q.scope !== 'ticket').map(q => [q.id, q.type === 'terms' || q.type === 'waiver' ? true : q.type === 'signature' ? 'Sample Parent' : q.type === 'select' ? q.options.split(',')[0].trim() : 'Sample Co']));
   const tAns = (ev, k) => Object.fromEntries((ev.questions || []).filter(q => q.scope === 'ticket').map(q => [q.id, Array.from({ length: k }, () => q.type === 'select' ? 'None' : rnd(first) + ' ' + rnd(last))]));
-  for (const ev of events.filter(e => e.status === 'published')) {
+  // sample buyers accept the policies like real ones (Stage 10 records the version each buyer accepted)
+  const acc = ev => policiesFor(Demo.st.boxOffices.find(b => b.id === ev.box_office_id), [ev]).map(({ kind, eventId, version }) => ({ kind, eventId, version }));
+  Demo._seeding = true;
+  for (const ev of events.filter(e => e.status === 'published' && e !== ev8)) {   // the festival's waiting room opens with no sales yet
+    const accepted = acc(ev);
     const count = ev === ev1 ? 46 : ev === ev2 ? 60 : 24;
     for (let i = 0; i < count; i++) {
       const name = rnd(first) + ' ' + rnd(last), email = name.toLowerCase().replace(' ', '.') + (n++) + '@example.com';
@@ -3070,7 +3508,7 @@ function seedDemo() {
       try {
         const adds = (ev.addons || []).filter(a => !a.ticketTypeIds?.length && !a.areas?.length && Math.random() < .15).map(a => ({ eventId: ev.id, addonId: a.id, qty: 1 }));
         const r = demoPlaceOrder({ buyer: { name, email, phone: '' }, items: [item], addons: adds, payment: Math.random() < .85 ? 'card' : 'offline', card, optIn: Math.random() < .6, answers: qAns(ev), ticketAnswers: tAns(ev, qty * (t.admits || 1)),
-          code: Math.random() < .14 ? rnd(codeFor[ev.id] || ['']) : '', tracking: Math.random() < .18 ? rnd(refFor[ev.box_office_id] || ['']) : '', source: rnd(['', '', 'instagram', 'facebook', 'newsletter']) }, { owner: true });
+          code: Math.random() < .14 ? rnd(codeFor[ev.id] || ['']) : '', tracking: Math.random() < .18 ? rnd(refFor[ev.box_office_id] || ['']) : '', source: rnd(['', '', 'instagram', 'facebook', 'newsletter']), accepted }, { owner: true });
         const o = Demo.st.orders.find(x => x.id === r.id); o.created_at = day(-Math.floor(Math.random() * 28), 8 + Math.floor(Math.random() * 14), Math.floor(Math.random() * 60)); if (o.paid_at) o.paid_at = o.created_at;
         if (o.status === 'paid' && Math.random() < .04) { o.status = 'refunded'; o.data.refunded = o.data.total; Demo.st.tickets.forEach(t => { if (t.order_id === o.id) { if (t.seat) seatLog(ev, t.slot_id, t.seat, 'cancelled', `Order ${o.ref} refunded — seat released`, { ref: o.ref, by: 'moishsonn@gmail.com' }); t.status = 'cancelled'; } }); }
       } catch (e) { /* sold out etc. — skip */ }
@@ -3081,7 +3519,7 @@ function seedDemo() {
     try { demoPlaceOrder({ buyer: { name: 'City Arts Review', email: 'press@example.com', phone: '' }, items: [{ eventId: ev1.id, ticketTypeId: stallsTT.id, qty: 2, seats: free }], addons: [], payment: 'manual', comp: true, source: 'box office' }, { owner: true, email: 'moishsonn@gmail.com' }); } catch (e) { }
   }
   { // a few bundle sales
-    const buy = (ev, it, extra = {}) => { try { const r = demoPlaceOrder({ buyer: { name: rnd(first) + ' ' + rnd(last), email: `bundle${n++}@example.com`, phone: '' }, items: [{ eventId: ev.id, ...it }], addons: [], payment: 'card', card, answers: qAns(ev), ...extra }, { owner: true });
+    const buy = (ev, it, extra = {}) => { try { const r = demoPlaceOrder({ buyer: { name: rnd(first) + ' ' + rnd(last), email: `bundle${n++}@example.com`, phone: '' }, items: [{ eventId: ev.id, ...it }], addons: [], payment: 'card', card, answers: qAns(ev), accepted: acc(ev), ...extra }, { owner: true });
       const o = Demo.st.orders.find(x => x.id === r.id); o.created_at = o.paid_at = day(-Math.floor(Math.random() * 20), 9 + Math.floor(Math.random() * 12)); } catch (e) { } };
     for (let i = 0; i < 4; i++) buy(ev2, { bundleId: ev2.bundles[0].id, qty: 1 + (i % 2) });
     for (let i = 0; i < 3; i++) buy(ev5, { bundleId: ev5.bundles[0].id, qty: 1, slotId: ev5.timeSlots[1 + i].id });
@@ -3091,8 +3529,8 @@ function seedDemo() {
   { // a sample customer account: one upcoming order tonight, one festival order, one pay-later reservation
     Demo.st.customers = [{ email: 'maya@example.com', name: 'Maya Patel', phone: '(917) 555-0188', salt: 'SEEDSALTDEMO2026', hash: 'OAHNUKE7C6R6FZSZF5WLK4F6KZFWUDTRLBPIOBEJG2EFNHMGODT', created_at: day(-12) }];
     const me = { name: 'Maya Patel', email: 'maya@example.com', phone: '(917) 555-0188' };
-    try { demoPlaceOrder({ buyer: me, items: [{ eventId: ev2.id, ticketTypeId: ev2.ticketTypes[0].id, qty: 2 }], addons: [], payment: 'card', card }, null); } catch (e) { }
-    try { demoPlaceOrder({ buyer: me, items: [{ eventId: ev3.id, ticketTypeId: ev3.ticketTypes[0].id, qty: 1, slotId: ev3.timeSlots[0].id }], addons: [], payment: 'offline' }, null); } catch (e) { }
+    try { demoPlaceOrder({ buyer: me, items: [{ eventId: ev2.id, ticketTypeId: ev2.ticketTypes[0].id, qty: 2 }], addons: [], payment: 'card', card, accepted: acc(ev2) }, null); } catch (e) { }
+    try { demoPlaceOrder({ buyer: me, items: [{ eventId: ev3.id, ticketTypeId: ev3.ticketTypes[0].id, qty: 1, slotId: ev3.timeSlots[0].id }], addons: [], payment: 'offline', accepted: acc(ev3) }, null); } catch (e) { }
   }
   { // Stage 6 sample history: an upgrade paid at the box office, a one-ticket refund, a ticket turned into future-event credit, goodwill credit, notes
     const A = DB._actor, B = DB._bo; DB._actor = bo1.owner; DB._bo = bo1.id;
@@ -3144,7 +3582,7 @@ function seedDemo() {
   for (const ev of [ev1, ev2]) for (let i = 0; i < 4; i++) try {
     const t = ev.ticketTypes.find(x => !x.hidden && !x.adminOnly), open = ev.seating?.enabled ? [...seatStates(ev, { tickets: Demo.st.tickets, statuses: Demo.st.seatStatus, orders: Demo.st.orders }).values()].filter(x => x.state === 'available' && x.p.tt === t.id) : [];
     const seats = open.length ? [open[open.length - 1 - i].p.id] : [];
-    const r = demoPlaceOrder({ buyer: { name: rnd(first) + ' ' + rnd(last), email: `left${n++}@example.com`, phone: '' }, items: [{ eventId: ev.id, ticketTypeId: t.id, qty: 1, seats }], addons: [], payment: 'card', answers: qAns(ev), ticketAnswers: tAns(ev, 1) }, null);
+    const r = demoPlaceOrder({ buyer: { name: rnd(first) + ' ' + rnd(last), email: `left${n++}@example.com`, phone: '' }, items: [{ eventId: ev.id, ticketTypeId: t.id, qty: 1, seats }], addons: [], payment: 'card', answers: qAns(ev), ticketAnswers: tAns(ev, 1), accepted: acc(ev) }, null);
     const o = Demo.st.orders.find(x => x.id === r.id); o.created_at = day(-Math.floor(Math.random() * 20), 10 + i); o.expires_at = o.created_at; o.status = 'expired';
   } catch (e) { }
   { const L = [...seatStates(ev1, { tickets: Demo.st.tickets, statuses: Demo.st.seatStatus, orders: Demo.st.orders }).values()].filter(x => x.state === 'available' && x.p.tt === circleTT.id).slice(0, 3);
@@ -3236,5 +3674,15 @@ function seedDemo() {
       .map(([category, description, amount], i) => ({ id: uid(), box_office_id: bo1.id, event_id: ev1.id, category, description, vendor: '', amount, date: localDay(day(-24 + i * 3)), by: bo1.owner, at: day(-24 + i * 3) }));
     st.expenseFinal = {};
   }
+  // Stage 10 sample: a banned customer, a customer-service message, a flagged order to review, a past incident, a client error, the pending box office's plan
+  { const st = Demo.st;
+    st.bans = [{ id: uid(), box_office_id: bo1.id, email: 'resale.bot@mail.example', reason: 'Bought 40 tickets across 9 orders in 5 minutes and listed them on a resale site', by: bo1.owner, at: day(-12, 14), removed_at: null, removed_by: null }];
+    st.support = [{ id: uid(), box_office_id: bo1.id, event_id: ev1.id, name: 'Maya Gold', email: 'maya@example.com', ref: '', subject: 'Wheelchair access', body: 'Is there step-free access to the Stalls? My father uses a wheelchair.',
+      routed_to: bo1.settings.contactEmail || bo1.owner, team: 'Box office', status: 'open', at: day(-1, 16, 20), replies: [] }];
+    const fo = st.orders.filter(o => o.box_office_id === bo1.id && o.status === 'paid' && o.event_ids[0] === ev2.id)[3]; if (fo) fo.data.flags = ['velocity', 'bot'];
+    st.incidents = [{ id: uid(), kind: 'email', title: 'Confirmation emails delayed', severity: 'minor', events: [ev2.id], cause: 'The email provider throttled our sending for 25 minutes.', resolution: 'Sending resumed; every queued email went out — none were lost.',
+      started_at: day(-9, 19, 5), ended_at: day(-9, 19, 30), status: 'resolved', by: 'moishsonn@gmail.com', created_at: day(-9, 19, 8), updates: [{ at: day(-9, 19, 8), by: 'moishsonn@gmail.com', text: 'Investigating slow confirmations.' }] }];
+    st.errors = [{ id: uid(), at: day(-2, 21, 4), source: 'client', where: 'checkout', message: 'Failed to fetch', stack: '', url: '#/cart', bo: bo1.id, user: null }];
+    bo3.plan = 'venue'; Demo._seeding = false; }
   return Demo.st;
 }

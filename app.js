@@ -35,6 +35,8 @@ function ics(ev) {
 
 const ICON = {
   home: '<path d="M3 11l9-8 9 8v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
+  mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
+  pulse: '<path d="M3 12h4l3-8 4 16 3-8h4"/>', flag: '<path d="M5 21V4M5 4h12l-2 4 2 4H5"/>', pause: '<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>',
   cal: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
   ticket: '<path d="M3 7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3a2 2 0 0 0 0-4z"/><path d="M14 5v14" stroke-dasharray="2 2"/>',
   cart: '<path d="M3 4h2l2.4 11.2a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 2-1.5L21 8H6.2"/><circle cx="10" cy="20" r="1.4"/><circle cx="17" cy="20" r="1.4"/>',
@@ -72,6 +74,7 @@ const S = {
   home: { view: 'list', cat: 'All', q: '', when: '', month: null },
   avail: {}, sel: null, cart: loadCart(), co: { name: '', email: '', phone: '', address: '', answers: {}, tanswers: {}, optIn: false, terms: false, payment: '', code: '', disc: null, busy: false, err: '', pay: null, attempt: null },
   cust: null,  // signed-in customer account (optional — guest checkout always works)
+  queue: {}, domainBo: null,   // Stage 10: waiting-room state per event · the box office this custom domain belongs to
   bos: [], bo: null, platform: { ...DEFAULT_PLATFORM }, plat: null,  // public box offices · box office in context · platform (public part) · super-admin data
   user: null, adm: null, draft: null, dirty: false,
   ui: { q: '', ev: '', status: '', picked: {}, attEv: '', repEv: '', login: { email: '', code: '', sent: false, totp: '' } },
@@ -121,6 +124,7 @@ function parseRoute() {
   if (ref) sessionStorage.setItem('set_ref', ref.trim().toUpperCase().slice(0, 40));  // tracking / referral code link
   if (parts[0] === 'admin') return { page: 'admin', sub: parts[1] || 'dashboard', params: parts.slice(2) };
   if (parts[0] === 'platform') return { page: 'platform', params: parts.slice(1) };
+  if (!parts[0] && S.domainBo) return { page: 'b', params: [S.domainBo] };   // a box office's own domain opens on its own page
   return { page: parts[0] || 'home', params: parts.slice(1) };
 }
 async function onRoute() {
@@ -311,6 +315,9 @@ function EventPage() {
   const sel = S.sel, av = S.avail[ev.id];
   const preview = !eventLive(ev), shows = (ev.timeSlots || []).filter(s => !s.hidden), multiDay = new Set(shows.map(s => fmtDate(s.start))).size > 1;
   const contact = ev.contact?.email || ev.contact?.phone ? ev.contact : { email: S.settings.contactEmail };
+  // Stage 10: an emergency control (paused / maintenance) or the waiting room replaces the ticket panel
+  const stop = !preview && controlBlock(ev, 'sales'), gate = stop ? `<h3>${ev.controls?.maintenance ? 'Back soon' : 'Sales paused'}</h3><p class="muted small" style="margin-top:8px">${esc(stop)}</p>`
+    : !preview && ev.queue?.on ? WaitingRoom(ev) : '';
   return `
   <section class="ev-hero"><div class="bg" style="${artBg(ev)}"></div>
     <div class="inner">
@@ -327,6 +334,7 @@ function EventPage() {
           <button class="btn glass btn-sm" data-action="ics" data-id="${ev.id}">${ic('cal', 14)} Add to calendar</button>
           <a class="btn glass btn-sm" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(ev.name + ' ' + shareUrl(ev.slug))}">Share on WhatsApp</a>
           <button class="btn glass btn-sm" data-action="copyLink" data-v="${esc(shareUrl(ev.slug))}">Copy link</button>
+          <button class="btn glass btn-sm" data-action="contactOrg" data-id="${ev.id}">${ic('mail', 14)} Contact organizer</button>
         </div>
       </div>
       <div class="poster hide-sm" style="${artBg(ev)}">${artTitle(ev, 'art-t lg')}</div>
@@ -334,11 +342,31 @@ function EventPage() {
   </section>
   <div class="container"><div class="ev-layout">
     <div>
-      ${ev.seating?.enabled && sel && (!ev.timeSlots?.length || sel.slotId) && !(ev.hasPassword && !sel.unlocked.event) ? BuyerSeatMap(ev, av, sel) : ''}
+      ${!gate && ev.seating?.enabled && sel && (!ev.timeSlots?.length || sel.slotId) && !(ev.hasPassword && !sel.unlocked.event) ? BuyerSeatMap(ev, av, sel) : ''}
       ${EventSections(ev, contact)}
     </div>
-    <aside class="ticket-panel"><div class="card">${TicketPanel(ev, sel, av)}</div></aside>
+    <aside class="ticket-panel"><div class="card">${gate || TicketPanel(ev, sel, av)}</div></aside>
   </div></div>`;
+}
+// ── Waiting room (Stage 10): in line → a steady stream is let in; once admitted the normal ticket panel shows for the pass's time ──
+function WaitingRoom(ev) {
+  const q = S.queue[ev.id];
+  if (!q) { queueTick(ev.id); return `<h3>Joining the line…</h3>`; }
+  if (q.error) return `<h3>Waiting room</h3><p class="small" style="color:var(--bad);margin-top:8px">${esc(q.error)}</p><button class="btn btn-ghost btn-sm" style="margin-top:10px" data-action="queueRetry" data-id="${ev.id}">Try again</button>`;
+  if (q.admitted) return '';
+  setTimeout(() => queueTick(ev.id), 3000);
+  return `<div class="eyebrow dash">Waiting room</div><h3 style="margin-top:10px">You're in line</h3>
+    <p class="small muted" style="margin:6px 0 14px">${esc(q.message || 'Lots of people want tickets right now. We let buyers in a few at a time so everyone gets a fair go.')} Keep this page open — you won't lose your place.</p>
+    <div class="q-pos"><div class="display">${q.position}</div><div class="small muted">${q.position === 1 ? 'You\'re next' : 'people ahead of you: ' + (q.position - 1)}</div></div>
+    <div class="q-bar"><span style="width:${Math.round((q.progress || 0) * 100)}%"></span></div>
+    <p class="small muted" style="margin-top:8px">Estimated entry ${esc(fmtTime(q.admit))} · ${q.waiting} in line</p>`;
+}
+const _qBusy = {};
+async function queueTick(id) {
+  if (_qBusy[id] || S.route.page !== 'e') return; _qBusy[id] = 1;
+  try { const was = S.queue[id]?.admitted; S.queue[id] = await DB.queueStatus(id); if (S.queue[id].admitted && !was) toast('It\'s your turn — tickets are open for you'); }
+  catch (e) { S.queue[id] = { error: e.message }; } finally { _qBusy[id] = 0; }
+  render();
 }
 // ── Event page sections (Stage 5): each one shows when it has content and the organizer hasn't switched it off (ev.page.hide) ──
 const PAGE_SECTIONS = [['about', 'About this event'], ['video', 'Video'], ['gallery', 'Photo gallery'], ['blocks', 'Custom text blocks'], ['instructions', 'Good to know'],
@@ -596,14 +624,16 @@ function upsellsFor(q) {
   return out;
 }
 function Checkout() {
-  const co = S.co, set = S.settings, bo = cartBo(), ck = { ...DEFAULT_SETTINGS.checkout, ...(set.checkout || {}) };
+  const co = S.co, set = S.settings, bo = cartBo();
   if (co.pay) return PaymentStep();
   const q = cartQuote(), ups = upsellsFor(q), ref = co.tracking || sessionStorage.getItem('set_ref') || '';
-  const evIds = cartEventIds(), evs = evIds.map(evById).filter(Boolean);
+  const evIds = cartEventIds(), evs = evIds.map(evById).filter(Boolean), ck = checkoutFor(set, evs);   // Stage 10: the strictest of the box office's and each event's form
+  co.t0 ||= Date.now();
+  const stopped = evs.map(e => controlBlock(e, 'checkout')).find(Boolean), pols = policiesFor(bo, evs), optFees = evs.flatMap(e => (e.fees?.extra || []).filter(x => x.optional).map(x => ({ ...x, ev: e })));
   if (!q.lines.length) return `<div class="container section"><div class="empty"><div class="display">Your cart is empty</div><p style="margin-bottom:18px">Find something great to go to.</p><a class="btn btn-accent" href="#/">Browse events <span class="arr">→</span></a></div></div>`;
-  const card = cardReady(bo) && set.payments?.card !== false, gw = GATEWAYS[bo?.gateway?.provider];
+  const card = cardReady(bo, S.platform) && set.payments?.card !== false, gw = GATEWAYS[bo?.gateway?.provider];
   const payOpts = [
-    set.payments?.card !== false && { v: 'card', t: 'Card, Apple Pay or Google Pay', d: card ? `Secure payment by ${gw.name}${bo.gateway.test ? ' · test mode, no real charge' : ''}` : 'Card payments aren\'t set up for this box office yet', off: !card },
+    set.payments?.card !== false && { v: 'card', t: 'Card, Apple Pay or Google Pay', d: card ? `Secure payment by ${gw.name}${bo.gateway.test ? ' · test mode, no real charge' : ''}` : cardOffWhy(bo, S.platform), off: !card },
     set.payments?.offline !== false && { v: 'offline', t: 'Pay later / at the door', d: 'Reserve now. Your tickets are issued once the box office has your payment.' },
   ].filter(Boolean);
   if (!co.payment || payOpts.find(p => p.v === co.payment)?.off) co.payment = (payOpts.find(p => !p.off) || {}).v || '';
@@ -628,12 +658,15 @@ function Checkout() {
         ${e.questions.filter(qq => qq.scope !== 'ticket').map(qq => QField(qq, `answers.${qq.id}`)).join('')}
         ${Array.from({ length: e.questions.some(qq => qq.scope === 'ticket') ? perEv[e.id] || 0 : 0 }, (_, i) => `<div class="tq"><div class="small"><b>Ticket ${i + 1}</b></div>
           ${e.questions.filter(qq => qq.scope === 'ticket').map(qq => QField(qq, `tanswers.${qq.id}.${i}`)).join('')}</div>`).join('')}</div>`).join('')}
-      ${set.donations ? `<div class="card" style="margin-top:16px"><div class="eyebrow dash">Add a donation</div><p class="small muted" style="margin:6px 0 12px">Support ${esc(set.name)}'s community programs. No fees are charged on donations.</p>
-        <div class="row wrap">${[0, 1800, 3600, 10000].map(v => `<button class="btn ${+S.cart.donation === v ? 'btn-dark' : 'btn-ghost'} btn-sm" data-action="donate" data-v="${v}">${v ? money(v) : 'None'}</button>`).join('')}</div></div>` : ''}
+      ${optFees.length ? `<div class="card" style="margin-top:16px"><div class="eyebrow dash" style="margin-bottom:10px">Optional extras</div>${optFees.map(x => `<label class="check" style="margin-bottom:6px"><input type="checkbox" data-action="optFee" data-v="${esc(x.id)}" ${(S.cart.optFees || []).includes(x.id) ? 'checked' : ''}> <span>${esc(x.name)} <span class="muted">· ${esc([x.pct ? x.pct + '%' : '', x.fixed ? money(x.fixed) + (x.per === 'order' ? ' per order' : ' per ticket') : ''].filter(Boolean).join(' + '))}</span></span></label>`).join('')}</div>` : ''}
+      ${donationOn(set, evs) ? `<div class="card" style="margin-top:16px"><div class="eyebrow dash">Add a donation</div><p class="small muted" style="margin:6px 0 12px">${donationPurpose(set, evs) ? 'Support the ' + esc(donationPurpose(set, evs)) : `Support ${esc(set.name)}'s community programs`}. No fees are charged on donations.</p>
+        <div class="row wrap">${[0, ...(set.donationAmounts?.length ? set.donationAmounts : DEFAULT_SETTINGS.donationAmounts)].map(v => `<button class="btn ${+S.cart.donation === v && !co.donCustom ? 'btn-dark' : 'btn-ghost'} btn-sm" data-action="donate" data-v="${v}">${v ? money(v) : 'None'}</button>`).join('')}
+          ${set.donationCustom !== false ? `<input class="inp" style="width:120px" type="number" min="0" step="1" placeholder="Other $" value="${co.donCustom ? esc(S.cart.donation / 100) : ''}" data-action-change="donateCustom" aria-label="Other donation amount">` : ''}</div></div>` : ''}
       <div class="card" style="margin-top:16px"><div class="eyebrow dash" style="margin-bottom:12px">Payment</div>
         ${payOpts.map(p => `<label class="pay-opt ${co.payment === p.v ? 'on' : ''} ${p.off ? 'off' : ''}"><input type="radio" name="pay" ${p.off ? 'disabled' : ''} ${co.payment === p.v ? 'checked' : ''} data-action="pay" data-v="${p.v}"><div><b>${esc(p.t)}</b><div class="small muted">${esc(p.d)}</div></div></label>`).join('') || '<p class="small muted">This box office isn\'t taking payments online right now.</p>'}
         <div class="sep"></div>
-        <label class="check"><input type="checkbox" data-bind="co.terms" ${co.terms ? 'checked' : ''}> <span>I agree to the <a href="#" data-action="showTerms">terms & conditions</a>.</span></label>
+        <label class="check"><input type="checkbox" data-bind="co.terms" ${co.terms ? 'checked' : ''}> <span>I agree to the ${pols.length ? pols.map((p, i) => `<a href="#" data-action="showPolicy2" data-i="${i}">${esc(evs.length > 1 ? p.title : POLICY_KINDS[p.kind])}</a>`).join(', ') : 'terms'}.</span></label>
+        <input class="hp" type="text" name="website" tabindex="-1" autocomplete="off" aria-hidden="true" data-bind="co.hp" value="">
         ${ck.optIn !== false ? `<label class="check" style="margin-top:8px"><input type="checkbox" data-bind="co.optIn" ${co.optIn ? 'checked' : ''}> <span>Email me about future ${esc(set.name)} events.</span></label>` : ''}
         ${ck.smsOptIn !== false && ck.phone !== 'off' && normPhone(co.phone) ? `<label class="check" style="margin-top:8px"><input type="checkbox" data-bind="co.smsOptIn" ${co.smsOptIn ? 'checked' : ''}> <span>Text me news and offers from ${esc(set.name)}. Msg &amp; data rates may apply; reply STOP to opt out.</span></label>` : ''}
       </div>
@@ -651,8 +684,8 @@ function Checkout() {
       ${ref ? `<div class="between small" style="margin-top:8px"><span class="muted">Referral code <b class="tnum">${esc(ref)}</b></span><a href="#" data-action="removeRef" class="small">Remove</a></div>` : ''}
       ${CreditBox()}
       ${Breakdown(q, co.disc?.code)}
-      ${co.err ? `<div class="banner" style="background:var(--bad-bg);color:var(--bad);margin:12px 0 0">${esc(co.err)}</div>` : ''}
-      <button class="btn btn-accent btn-lg btn-block" style="margin-top:16px" data-action="placeOrder" ${co.busy || (q.total && !co.payment) ? 'disabled' : ''}>${co.busy ? 'One moment…' : q.total ? (co.payment === 'offline' ? 'Reserve tickets' : 'Continue to payment') : 'Get free tickets'} <span class="arr">→</span></button>
+      ${co.err || stopped ? `<div class="banner" style="background:var(--bad-bg);color:var(--bad);margin:12px 0 0">${esc(stopped || co.err)}</div>` : ''}
+      <button class="btn btn-accent btn-lg btn-block" style="margin-top:16px" data-action="placeOrder" ${co.busy || stopped || (q.total && !co.payment) ? 'disabled' : ''}>${co.busy ? 'One moment…' : q.total ? (co.payment === 'offline' ? 'Reserve tickets' : 'Continue to payment') : 'Get free tickets'} <span class="arr">→</span></button>
       <p class="small muted" style="text-align:center;margin-top:10px">${ic('lock', 12)} ${q.total && co.payment === 'card' ? 'You\'ll see the exact total before you pay' : 'Secure checkout'} · tickets only after payment</p>
     </div></aside>
   </div></div>`;
@@ -672,7 +705,7 @@ function Breakdown(q, code) {
   const row = (t, v, cls = '') => v ? `<div class="sum-line ${cls}"><span${cls ? '' : ' class="muted"'}>${t}</span><span class="tnum">${v < 0 ? '−' + money(-v, q.currency) : money(v, q.currency)}</span></div>` : '';
   return `<div class="breakdown" style="margin-top:12px">
     ${row('Tickets', q.ticketsTotal)}${row('Products & add-ons', q.addonsTotal)}
-    ${row('Booking fee', (q.fee || 0) + (q.feeDiscount || 0))}${row('Service fee', q.serviceFee)}${row('Sales tax', q.tax)}
+    ${row('Booking fee', (q.fee || 0) + (q.feeDiscount || 0))}${row('Service fee', q.serviceFee)}${(q.otherFees || []).map(x => row(esc(x.name), x.amount)).join('')}${row('Sales tax', q.tax)}
     ${q.discount + q.feeDiscount ? `<div class="sum-line" style="color:var(--ok)"><span>Discount${code ? ' · ' + esc(code) : ''}</span><span class="tnum">−${money(q.discount + q.feeDiscount, q.currency)}</span></div>` : ''}
     ${row('Card processing', q.processing)}${row('Donation', q.donation)}${q.credit ? `<div class="sum-line" style="color:var(--ok)"><span>Credit applied</span><span class="tnum">−${money(q.credit, q.currency)}</span></div>` : ''}${q.refunded ? row('Refunded', -q.refunded) : ''}
     <div class="sum-line total"><span>Total</span><span class="tnum">${money(q.total, q.currency)}</span></div></div>`;
@@ -807,7 +840,7 @@ function OrderPage() {
       ${ord.status === 'awaiting_payment' ? `<div class="banner info" style="margin-top:14px">This order isn't paid yet, so no tickets were issued. <a href="#/cart" data-action="resumePay">Finish paying</a> before the time runs out.</div>` : ''}
       ${ord.status === 'expired' ? `<div class="banner" style="margin-top:14px">The payment wasn't completed in time, so nothing was charged and the seats were released.</div>` : ''}
       ${S.settings.checkout?.thanks && ord.status === 'paid' ? `<p style="margin-top:12px">${esc(S.settings.checkout.thanks)}</p>` : ''}
-      <div class="row wrap" style="margin:18px 0 26px">
+      <div class="row wrap" style="margin:18px 0 26px"><button class="btn btn-ghost" data-action="contactOrg" data-id="${esc(ord.event_ids?.[0] || '')}" data-ref="${esc(ord.ref)}">${ic('mail', 14)} Contact organizer</button>
         ${o.tickets.some(t => t.status === 'valid') ? '<button class="btn btn-dark" data-action="print">Download PDF / print tickets</button>' : ''}
         ${[...new Set(d.lines.map(l => l.eventId))].map(id => evById(id) ? `<button class="btn btn-ghost" data-action="ics" data-id="${id}">${ic('cal', 14)} Add ${esc(evById(id).name)} to calendar</button>` : '').join('')}
         ${ord.status === 'paid' ? '<button class="btn btn-ghost" data-action="resendMine">Email my tickets again</button>' : ''}
@@ -979,7 +1012,7 @@ function Dashboard() {
   const upcoming = S.adm.events.filter(e => e.status !== 'cancelled' && D(e.end || e.start) >= Date.now()).sort((a, b) => D(a.start) - D(b.start));
   const sold = S.adm.tickets.filter(t => t.status === 'valid').length, pend = os.filter(o => o.status === 'pending'), fin = can('finance.totals');
   return head(`Good ${new Date().getHours() < 12 ? 'morning' : new Date().getHours() < 18 ? 'afternoon' : 'evening'}`, esc(fmtDate(new Date().toISOString(), { weekday: 'long', month: 'long', day: 'numeric' })),
-    can('events.create') ? `<a class="btn btn-accent" href="#" data-action="newEvent">${ic('plus', 15)} New event</a>` : '') + `
+    can('events.create') ? `<a class="btn btn-accent" href="#" data-action="newEvent">${ic('plus', 15)} New event</a>` : '') + Onboarding() + `
   <div class="kpis">
     ${fin ? `<div class="kpi dark"><div class="eyebrow">Revenue · 30 days</div><div class="v">${money(sum(recent, o => o.data.total))}</div><div class="d" style="color:var(--mut)">${money(sum(os, o => o.data.total))} all time</div></div>` : `<div class="kpi dark"><div class="eyebrow">Checked in today</div><div class="v">${S.adm.tickets.filter(t => t.checked_in_at && D(t.checked_in_at) >= new Date().setHours(0, 0, 0, 0)).length}</div><div class="d" style="color:var(--mut)">across your events</div></div>`}
     <div class="kpi"><div class="eyebrow">Tickets sold</div><div class="v">${sold.toLocaleString()}</div><div class="d">${S.adm.tickets.filter(t => t.status === 'valid' && D(S.adm.orders.find(o => o.id === t.order_id)?.created_at) >= Date.now() - 7 * 864e5).length} this week</div></div>
@@ -1036,19 +1069,21 @@ function NewEventModal() {
   modal('New event', `<div class="new-ev"><button class="item-card" data-action="blankEvent"><b>Blank event</b><span class="small muted">Start from scratch</span></button>
     ${list.map(t => `<button class="item-card" data-action="fromTemplate" data-v="${t.id}"><b>${esc(t.name)}</b><span class="small muted">${esc(t.event.ticketTypes.length)} ticket types${t.event.seating?.enabled ? ' · seating map' : ''}</span></button>`).join('')}</div>`);
 }
-const ETABS = [['overview', 'Overview'], ['live', 'Live activity'], ['details', 'Details'], ['tickets', 'Tickets & pricing'], ['products', 'Products & packages'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['inventory', 'Seat inventory'], ['checkout', 'Page & checkout'], ['discounts', 'Promo codes'],
-  ['door', 'Door & check-in'], ['emails', 'Emails'], ['waitlist', 'Waitlist'], ['team', 'Team'], ['history', 'History'], ['share', 'Share & embed']];
+const ETABS = [['overview', 'Overview'], ['live', 'Live activity'], ['details', 'Details'], ['tickets', 'Tickets & pricing'], ['products', 'Products & packages'], ['schedule', 'Showtimes'], ['seating', 'Seating'], ['inventory', 'Seat inventory'], ['checkout', 'Page & checkout'], ['controls', 'Controls & fees'], ['discounts', 'Promo codes'],
+  ['door', 'Door & check-in'], ['emails', 'Emails'], ['waitlist', 'Waitlist'], ['team', 'Team'], ['report', 'Full report'], ['history', 'History'], ['share', 'Share & embed']];
 function EventEditor() {
   const ev = S.draft; if (!ev) return '<p class="muted">Event not found.</p>';
   const tab = S.route.params[1] || 'overview', ro = !can('events.edit', ev.id), pub = can('events.publish', ev.id);
-  const body = { overview: EdOverview, live: EdLive, details: EdDetails, tickets: EdTickets, products: EdProducts, schedule: EdSchedule, seating: EdSeating, inventory: EdInventory, checkout: EdCheckout, discounts: EdDiscounts, door: EdDoor, emails: EdEmails, waitlist: EdWaitlist, team: EdTeam, history: EdHistory, share: EdShare }[tab] || EdOverview;
-  const live = ['overview', 'live', 'team', 'history', 'waitlist', 'inventory', 'discounts', 'door'].includes(tab);  // these tabs act immediately, not through "Save changes"
+  const body = { overview: EdOverview, live: EdLive, details: EdDetails, tickets: EdTickets, products: EdProducts, schedule: EdSchedule, seating: EdSeating, inventory: EdInventory, checkout: EdCheckout, controls: EdControls, discounts: EdDiscounts, door: EdDoor, emails: EdEmails, waitlist: EdWaitlist, team: EdTeam, report: EdReport, history: EdHistory, share: EdShare }[tab] || EdOverview;
+  const live = ['overview', 'live', 'team', 'history', 'waitlist', 'inventory', 'discounts', 'door', 'report'].includes(tab);
+  const auto = autosaved(ev.id);   // Stage 10: unsaved edits survive a closed tab or a crash  // these tabs act immediately, not through "Save changes"
   return `<a href="#/admin/events" class="small muted" style="text-decoration:none">← Events</a>
   ${head(esc(ev.name || 'Untitled event'), `${evChip(ev)} ${S.dirty ? '<span class="chip warn">Unsaved changes</span>' : ''}`,
     `<a class="btn btn-ghost" href="#/e/${esc(ev.slug)}?preview=1" target="_blank">Preview</a>
     ${can('events.create') ? '<button class="btn btn-ghost" data-action="saveTemplate">Save as template</button>' : ''}
     ${pub && !ev.archived ? (ev.status === 'published' ? '<button class="btn btn-ghost" data-action="setStatus" data-v="draft">Unpublish</button>' : ev.status === 'draft' ? '<button class="btn btn-dark" data-action="setStatus" data-v="published">Publish</button>' : '') : ''}
     ${ro ? '' : `<button class="btn btn-accent" data-action="saveEvent" ${S.dirty ? '' : 'disabled'}>Save changes</button>`}`)}
+  ${auto && !S.dirty ? `<div class="banner info" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span>Unsaved changes from ${esc(fmtDT(auto.at))} were kept on this device.</span><button class="btn btn-dark btn-sm" data-action="autoRestore">Restore them</button><button class="btn btn-ghost btn-sm" data-action="autoDiscard">Discard</button></div>` : ''}
   <nav class="etabs">${ETABS.map(([k, t]) => `<a class="${tab === k ? 'on' : ''}" href="#/admin/event/${ev.id}/${k}">${t}</a>`).join('')}</nav>
   ${live ? body(ev) : `<fieldset ${ro ? 'disabled' : ''} style="border:0">${body(ev)}</fieldset>`}`;
 }
@@ -1128,10 +1163,13 @@ function EdDetails(ev) {
     ${inp('image', 'Image / banner URL', { ph: 'https://…', hint: 'Use a 16:10 photo or poster, at least 1200px wide.' })}
     <div class="grid2">${inp('audience', 'Audience note', { ph: 'e.g. Men & boys only' })}${inp('doors', 'Doors open', { ph: '7:00 PM' })}</div></div>
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Event contact</div><p class="small muted" style="margin:-4px 0 12px">Shown on the event page. Leave blank to use the box office's contact details.</p>
-      <div class="grid3">${inp('contact.name', 'Name')}${inp('contact.email', 'Email')}${inp('contact.phone', 'Phone')}</div></div>
+      <div class="grid3">${inp('contact.name', 'Name')}${inp('contact.email', 'Email')}${inp('contact.phone', 'Phone')}</div>
+      ${inp('contact.team', 'Customer-service team', { ph: 'e.g. Festival guest services', hint: '“Contact organizer” messages for this event go to this email / team (else the box office).' })}</div>
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Policies & instructions</div>
       ${inp('policies', 'Event-specific policies', { t: 'area', ph: 'e.g. No refunds within 7 days. Strollers not permitted.' })}
-      ${inp('instructions', 'Attendee instructions', { t: 'area', ph: 'Parking, entrance, dress code, what to bring…' })}</div>
+      ${inp('instructions', 'Attendee instructions', { t: 'area', ph: 'Parking, entrance, dress code, what to bring…' })}
+      <p class="small muted" style="margin:6px 0 10px">This event's own terms / refund / privacy policy replace the box office's for its buyers. Buyers accept every policy at checkout and the version they accepted is kept on the order.</p>
+      ${inp('terms', 'Terms & conditions (this event)', { t: 'area', ph: 'Blank = the box office terms' })}${inp('refundPolicy', 'Refund policy (this event)', { t: 'area', ph: 'Blank = the box office refund policy' })}${inp('privacyPolicy', 'Privacy policy (this event)', { t: 'area', ph: 'Blank = the box office privacy policy' })}</div>
   </div><div class="stack">
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">When</div>
       ${chk('allDay', 'All-day event')}<div style="height:10px"></div>
@@ -1296,8 +1334,13 @@ function VenueEditor() {
 }
 function EdHistory(ev) {
   const list = (S.adm.audit || []).filter(a => a.target === ev.id);
-  return `<p class="muted" style="margin:-4px 0 16px">Every change to this event — dates, venue, capacity, status, visibility, ticket settings and prices, showtimes and seating — with who made it and the before/after values.</p>${AuditTable(list)}`;
+  return `${VersionsCard(ev.id, 'restoreVersion')}<p class="muted" style="margin:16px 0">Every change to this event — dates, venue, capacity, status, visibility, ticket settings and prices, showtimes and seating, emergency controls — with who made it and the before/after values.</p>${AuditTable(list)}`;
 }
+// autosave (Stage 10): the event editor keeps unsaved edits on this device every few seconds
+const AUTO_KEY = id => 'set_autosave_' + id;
+function autosaved(id) { try { const a = JSON.parse(localStorage.getItem(AUTO_KEY(id)) || 'null'); return a && a.by === S.user?.email ? a : null; } catch (e) { return null; } }
+let _autoT = 0;
+function autosave() { clearTimeout(_autoT); _autoT = setTimeout(() => { if (S.dirty && S.draft?.id) try { localStorage.setItem(AUTO_KEY(S.draft.id), JSON.stringify({ at: new Date().toISOString(), by: S.user?.email, draft: { ...S.draft, seating: S.draft.seating ? { ...S.draft.seating, bg: undefined } : S.draft.seating } })); } catch (e) { } }, 1500); }
 
 // ── Event editor ─────────────────────────────────────────────────────────────
 const inp = (path, label, o = {}) => {
@@ -1755,7 +1798,13 @@ function EdEmails(ev) {
   const b = S.ui.bc?.ev === ev.id ? S.ui.bc : (S.ui.bc = { ev: ev.id, subject: '', body: '', channel: 'email', sendAt: '' }), past = (S.adm.broadcasts || []).filter(x => x.event_id === ev.id);
   const sms = can('comms.sms'), auto = (S.adm.automations || []).filter(a => a.enabled && TIMED_TRIGGERS.includes(a.trigger.type)).map(a => a.name), rems = ev.emails?.reminders || [];
   return `<div class="cols"><div class="stack">
-    <div class="card"><h3>Order confirmation</h3><p class="small muted" style="margin-bottom:10px">Extra message included in every confirmation email for this event.</p>${inp('emails.confirmation', '', { t: 'area', ph: 'e.g. Parking is on 38th St. Please arrive 20 minutes early.' })}</div>
+    <div class="card"><div class="between"><h3>Order confirmation</h3><button type="button" class="btn btn-ghost btn-sm" data-action="confPreview">Preview</button></div><p class="small muted" style="margin-bottom:10px">This event's own confirmation email. Blank fields use the standard wording.</p>
+      ${inp('emails.confirm.subject', 'Subject', { ph: 'Your tickets — {{event}}' })}${inp('emails.confirm.header', 'Header', { ph: 'See you there!' })}
+      ${inp('emails.confirmation', 'Custom message', { t: 'area', ph: 'e.g. Parking is on 38th St. Please arrive 20 minutes early.' })}
+      ${inp('emails.confirm.instructions', 'Ticket instructions', { t: 'area', ph: 'Show the QR code at the door…' })}${inp('emails.confirm.venue', 'Venue instructions', { t: 'area' })}
+      ${inp('emails.confirm.sponsor', 'Sponsor message', { ph: 'Presented with…' })}${inp('emails.confirm.contact', 'Contact information', { ph: 'Questions? Reply to this email.' })}
+      ${chk('emails.confirm.policies', 'Include this event\'s policies')}
+      <p class="small muted" style="margin-top:6px">Sent from ${S.adm.bo.mailDomain?.status === 'verified' ? `your own domain <b>${esc(S.adm.bo.mailDomain.domain)}</b>` : 'the platform\'s domain under your box office\'s name (verify a sending domain in Settings to use your own)'}.</p></div>
     <div class="card"><h3>Message ticket holders</h3><p class="small muted" style="margin-bottom:12px">Venue changes, door times, last-minute news — to all ${holders.size} buyers with valid tickets. Goes to everyone with a ticket, opted in or not, so keep it to event information.</p>
       ${sms ? `<div class="field"><select class="inp" data-bind="ui.bc.channel">${[['email', 'Email'], ['sms', 'Text message'], ['both', 'Email + text']].map(([k, l]) => `<option value="${k}" ${b.channel === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>` : ''}
       ${b.channel !== 'sms' ? `<div class="field"><input class="inp" data-bind="ui.bc.subject" placeholder="Subject" value="${esc(b.subject)}"></div>` : ''}<div class="field"><textarea class="inp" data-bind="ui.bc.body" placeholder="Message — {{first_name}}, {{event}}, {{date}}, {{tickets_link}} work here">${esc(b.body)}</textarea></div>
@@ -1793,7 +1842,7 @@ function filteredOrders() {
   const words = S.ui.q.trim().toLowerCase().split(/\s+/).filter(Boolean), by = {};
   if (words.length) S.adm.tickets.forEach(t => (by[t.order_id] ||= []).push(t));
   return S.adm.orders.filter(o => {
-    if ((S.ui.ev && !o.event_ids.includes(S.ui.ev)) || (S.ui.status && o.status !== S.ui.status)) return false;
+    if ((S.ui.ev && !o.event_ids.includes(S.ui.ev)) || (S.ui.status && (S.ui.status === 'flagged' ? !(o.data.flags || []).length || o.data.review : o.status !== S.ui.status))) return false;
     if (!words.length) return true;
     const d = o.data, tks = by[o.id] || [];
     const hay = [o.ref, d.buyer.name, o.buyer_email, d.buyer.phone, String(d.buyer.phone || '').replace(/\D/g, ''), o.payment?.ref, d.code, d.tracking, d.credit?.code, ...(d.refunds || []).map(r => [r.credit, r.ref].join(' ')),
@@ -1815,7 +1864,7 @@ function Orders() {
     `${can('customers.export') ? '<button class="btn btn-ghost" data-action="exportOrders">Export CSV</button>' : ''}${can('orders.edit') ? `<button class="btn btn-accent" data-action="manualOrder">${ic('plus', 15)} Manual order</button>` : ''}`) + `
   <div class="toolbar"><input class="inp" style="min-width:320px;flex:1" data-input="q" placeholder="Search name, email, phone, order #, ticket code, seat, row, promo or referral code…" value="${esc(S.ui.q)}">
     <select class="inp" data-input="ev">${evOptions(S.ui.ev)}</select>
-    <select class="inp" data-input="status"><option value="">Any status</option>${Object.entries(ORDER_STATUS).map(([k, t]) => `<option value="${k}" ${S.ui.status === k ? 'selected' : ''}>${t}</option>`).join('')}</select>
+    <select class="inp" data-input="status"><option value="">Any status</option>${Object.entries(ORDER_STATUS).map(([k, t]) => `<option value="${k}" ${S.ui.status === k ? 'selected' : ''}>${t}</option>`).join('')}<option value="flagged" ${S.ui.status === 'flagged' ? 'selected' : ''}>Flagged for review (${S.adm.orders.filter(o => (o.data.flags || []).length && !o.data.review).length})</option></select>
     ${picked.length && can('orders.refund') ? `<button class="btn btn-danger btn-sm" data-action="bulkCancel">Cancel & refund ${picked.length} selected</button>` : ''}</div>
   <p class="small muted" style="margin:-6px 0 12px">Narrow by ticket: <code>row:F</code> <code>seat:12</code> <code>area:balcony</code> <code>type:premium</code> <code>ticket:CODE</code> <code>code:BINAH15</code> — or paste a payment / transaction id.</p>
   <div class="tbl-wrap"><table class="tbl"><thead><tr><th style="width:30px"></th><th>Order</th><th>Buyer</th><th>Event</th><th>Tickets</th><th>Total</th><th>Status</th><th>Placed</th></tr></thead><tbody>
@@ -1876,7 +1925,8 @@ function OrderView(id) {
       <div class="tl">${orderTimeline(o).map(r => `<div class="tl-row"><span class="tl-i">${LOG_ICON[r.kind] || '•'}</span><div><div class="small">${esc(r.text.charAt(0).toUpperCase() + r.text.slice(1))}</div>
         <div class="small muted">${esc(fmtDT(r.at))}${r.by ? ' · ' + esc(r.by) : ''}${r.note ? ' · “' + esc(r.note) + '”' : ''}</div></div></div>`).join('')}</div></div>
   </div><div class="stack">
-    <div class="card"><div class="between"><h3>Customer</h3>${btn('customer', 'Edit', 'orders.customer')}</div>
+    ${FlagsCard(o)}
+    ${PoliciesCard(o)}<div class="card"><div class="between"><h3>Customer</h3>${btn('customer', 'Edit', 'orders.customer')}</div>
       <div style="margin-top:6px"><b>${esc(d.buyer.name)}</b><div class="small muted">${esc(o.buyer_email)}${d.buyer.phone ? ' · ' + esc(d.buyer.phone) : ''}</div>${d.buyer.address ? `<div class="small muted">${esc(d.buyer.address)}</div>` : ''}</div>
       <div class="small muted" style="margin-top:6px">${cust ? '<span class="chip ok mini">has an account</span>' : 'Guest checkout'}${d.optIn ? ' · opted in to marketing' : ''}</div>
       ${can('customers.profiles') ? `<a class="small" href="#/admin/customers/${encodeURIComponent(o.buyer_email)}">Customer profile →</a>` : ''}</div>
@@ -2073,10 +2123,12 @@ function customerIndex() {
     return { ...c, tickets: tks, spent: sum(c.orders, o => orderMoney(o).net), refunds: sum(c.orders, o => orderMoney(o).refunded + orderMoney(o).credited), credit: sum((S.adm.credits || []).filter(x => x.email === c.email && x.status === 'active'), x => x.remaining), account: (S.adm.accounts || []).includes(c.email) }; });
 }
 function Customers() {
+  if (S.route.params[0] === '~inbox') return CustomerInbox();
+  if (S.route.params[0] === '~banned') return CustomerBans();
   if (S.route.params[0]) return CustomerView(S.route.params[0]);
   const q = String(S.ui.cq || '').trim().toLowerCase(), all = customerIndex(), list = all.filter(c => !q || [c.name, c.email, c.phone].join(' ').toLowerCase().includes(q)).sort((a, b) => D(b.last) - D(a.last));
   return head('Customers', `${all.length} customers · ${all.filter(c => c.account).length} with an account`, (navOk(NAV.find(n => n[0] === 'marketing')) ? '<a class="btn btn-ghost" href="#/admin/marketing/audience">Segment & export</a>' : '') + (can('customers.export') ? '<button class="btn btn-ghost" data-action="exportCustomers">Export CSV</button>' : '')) + `
-  <div class="toolbar"><input class="inp" style="flex:1" data-input="cq" data-rr="1" placeholder="Search name, email or phone…" value="${esc(S.ui.cq || '')}"></div>
+  ${CustomersTabs('list')}<div class="toolbar"><input class="inp" style="flex:1" data-input="cq" data-rr="1" placeholder="Search name, email or phone…" value="${esc(S.ui.cq || '')}"></div>
   <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Customer</th><th>Orders</th><th>Tickets</th><th>Spent</th><th>Refunds</th><th>Credit</th><th>Marketing</th><th>Account</th><th>Last order</th></tr></thead><tbody>
   ${list.slice(0, 400).map(c => `<tr class="click" data-action="go" data-v="#/admin/customers/${encodeURIComponent(c.email)}"><td><b>${esc(c.name)}</b><div class="small muted">${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''}</div></td>
     <td class="tnum">${c.orders.length}</td><td class="tnum">${c.tickets.filter(t => t.status === 'valid').length}</td><td class="tnum">${money(c.spent)}</td><td class="tnum">${c.refunds ? money(c.refunds) : '—'}</td><td class="tnum">${c.credit ? `<span class="chip ok mini">${money(c.credit)}</span>` : '—'}</td><td>${consentChips(contactFor(c.email), c.phone)}</td>
@@ -2095,7 +2147,8 @@ function CustomerView(email) {
   const kpi = (l, v, d = '') => `<div class="kpi"><div class="eyebrow">${l}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`;
   const cu = S.ui.cust?.email === email ? S.ui.cust : (S.ui.cust = { email, amount: '', eventId: '', expires: '', note: '' });
   return `<a href="#/admin/customers" class="small muted" style="text-decoration:none">← Customers</a>
-  ${head(esc(c.name), `${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''} · ${c.account ? '<span class="chip ok mini">customer account</span>' : '<span class="chip mini">guest — no account</span>'}`)}
+  ${head(esc(c.name), `${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''} · ${c.account ? '<span class="chip ok mini">customer account</span>' : '<span class="chip mini">guest — no account</span>'}${(S.adm.bans || []).some(b => b.email === email && !b.removed_at) ? ' <span class="chip bad mini">banned</span>' : ''}`,
+    can('customers.ban') && !(S.adm.bans || []).some(b => b.email === email && !b.removed_at) ? `<button class="btn btn-ghost" data-action="banAsk" data-v="${esc(email)}">Ban from buying…</button>` : '')}
   <div class="kpis">${kpi('Total spent', money(c.spent), `${c.orders.length} order${c.orders.length === 1 ? '' : 's'}`)}${kpi('Tickets', valid.length, `${upcoming.length} upcoming · ${comps} comp`)}${kpi('Refunds', money(c.refunds))}${kpi('Credit balance', money(c.credit), `${credits.length} credit${credits.length === 1 ? '' : 's'}`)}</div>
   <div class="ord-grid"><div class="stack">
     <div class="card"><h3>Upcoming events & current tickets</h3>${upcoming.map(tkRow).join('') || '<p class="small muted" style="margin-top:6px">No upcoming tickets.</p>'}</div>
@@ -2340,7 +2393,7 @@ function ScanCam() {
   ${S.sc.recent.length ? `<div class="sc-recent"><div class="sc-eyebrow">Recent</div>${S.sc.recent.slice(0, 5).map(r => `<div class="sc-rec"><span class="dot ${resKind(r.result)}"></span><b>${esc(r.ticket?.holder || r.code)}</b><span class="sc-dim">${esc(RES_TITLE[r.result])} · ${esc(fmtTime(new Date(r.at).toISOString()))}</span></div>`).join('')}</div>` : ''}`;
 }
 // [title, colour] for every answer the server can give
-const RES = { ok: ['Valid', 'ok'], already: ['Already scanned', 'warn'], undone: ['Check-in undone', 'info'], unknown: ['Invalid QR code', 'bad'], cancelled: ['Ticket cancelled', 'bad'],
+const RES = { ok: ['Valid', 'ok'], already: ['Already scanned', 'warn'], undone: ['Check-in undone', 'info'], paused: ['Scanning stopped', 'bad'], unknown: ['Invalid QR code', 'bad'], cancelled: ['Ticket cancelled', 'bad'],
   refunded: ['Ticket refunded', 'bad'], replaced: ['Replaced ticket', 'bad'], wrong_event: ['Wrong event', 'bad'], wrong_slot: ['Wrong showtime', 'bad'], wrong_entrance: ['Wrong entrance', 'warn'],
   inactive: ['Ticket not active', 'bad'], device_off: ['Scanner switched off', 'bad'] };
 const RES_TITLE = Object.fromEntries(Object.entries(RES).map(([k, v]) => [k, v[0]]));
@@ -2545,7 +2598,7 @@ function FinDash(t, o = {}) {
     ${L('Discounts', neg(t.discount))}${opt('Package savings & price overrides', t.savings, t.savings > 0 ? '-' : '')}
     ${L('Complimentary ticket value', money(t.comp), 'muted-line', `${t.comps} comp ticket${t.comps === 1 ? '' : 's'} — not collected`)}
     ${L('Booking fees collected', money(t.fees))}${L('Sales tax', money(t.tax))}
-    ${opt('Donations', t.donation)}${opt('Card fees paid by buyers', t.cardFee)}${opt('Paid with credit', -t.creditUsed, '-')}${opt('Order changes & adjustments', t.changes)}
+    ${opt('Other fees (facility, levies…)', t.otherFee)}${opt('Donations', t.donation)}${opt('Card fees paid by buyers', t.cardFee)}${opt('Paid with credit', -t.creditUsed, '-')}${opt('Order changes & adjustments', t.changes)}
     ${L('Collected', money(t.collected), 'sub')}
     ${L('Refunds', neg(t.refunds))}${opt('Refunded as credit', t.credits, '-')}${opt('Chargebacks', t.chargebacks, '-')}
     ${proc ? L('Processing fees', neg(t.processing)) : L('Processing fees', '<span class="muted">hidden</span>')}
@@ -2757,11 +2810,12 @@ function consentChips(c, phone) {
 }
 // the render context for a message, from what the back office already holds (LIVE: the server builds the same with msg_context())
 function msgCtx(m) {
-  const o = m.order_id && S.adm.orders.find(x => x.id === m.order_id), ev = evById(m.event_id || o?.event_ids?.[0]), bo = S.adm.bo, c = contactFor(m.email);
+  const o = m.order_id && S.adm.orders.find(x => x.id === m.order_id) || m._order, evOf = id => m._event?.id === id ? m._event : evById(id), ev = evOf(m.event_id || o?.event_ids?.[0]), bo = S.adm.bo, c = contactFor(m.email);
   const tks = o ? S.adm.tickets.filter(t => t.order_id === o.id && t.status === 'valid').map(t => { const e = evById(t.event_id), tt = e?.ticketTypes.find(x => x.id === t.ticket_type_id), sp = t.seat && e ? seatParts(e, t.seat, t) : null;
     return { event_id: t.event_id, slot_id: t.slot_id, type: tt?.name || 'Ticket', area: sp?.area || t.area || '', row: sp?.row || t.row || '', seat: sp?.seat || t.seat_label || '', unit: t.unit || '', code: t.code }; }) : [];
-  return { bo: { name: bo.name, slug: bo.slug, branding: bo.branding, mail: bo.settings?.mail }, event: ev ? { ...ev } : null, tickets: tks, contact: { name: c?.name || '', token: c ? 'preview-token' : '' },
-    order: o ? { id: o.id, key: 'private-key', ref: o.ref, buyer: o.data.buyer, events: [...new Set(o.data.lines.map(l => l.eventId))].map(evById).filter(Boolean).map(e => ({ id: e.id, name: e.name, start: e.start, venue: e.venue, address: e.address, confirmation: e.emails?.confirmation })) } : null };
+  return { bo: { name: bo.name, slug: bo.slug, branding: bo.branding, mail: bo.settings?.mail, mailDomain: bo.mailDomain?.status === 'verified' ? bo.mailDomain.domain : null }, event: ev ? { ...ev } : null, tickets: tks, contact: { name: c?.name || '', token: c ? 'preview-token' : '' },
+    order: o ? { id: o.id, key: 'private-key', ref: o.ref, buyer: o.data.buyer, events: [...new Set(o.data.lines.map(l => l.eventId))].map(evOf).filter(Boolean).map(e => ({ id: e.id, name: e.name, start: e.start, venue: e.venue, address: e.address, confirmation: e.emails?.confirmation,
+      email: e.emails?.confirm || null, policies: e.policies || '', contact: e.contact || null })) } : null };
 }
 function msgPreview(m) {
   const r = MailTpl.render(m, msgCtx(m), { appUrl: location.origin + location.pathname });
@@ -3123,8 +3177,7 @@ function Branding() {
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Web address</div>
       <div class="field"><label class="fl">Branded link (works now)</label><div class="row"><input class="inp" readonly value="${esc(url)}"><button class="btn btn-ghost btn-sm" data-action="copyLink" data-v="${esc(url)}">Copy</button></div></div>
       ${f('slug', 'Link name', 'text', 'Lowercase letters, numbers and dashes')}
-      ${f('branding.domain', 'Custom domain', 'text', 'e.g. tickets.yourvenue.com — point a CNAME record at the platform. Connecting custom domains needs the production hosting (planned for Stage 10); it is saved now and shown as not yet connected.')}
-      ${br.domain ? `<span class="chip warn">Not connected yet</span>` : ''}</div>
+      <p class="small muted">Custom domain and sending domain: <a href="#/admin/settings">Settings</a>.</p></div>
   </div></div>`;
 }
 function BrandPreview(b) {
@@ -3163,7 +3216,8 @@ function PaymentsCard(s, c) {
   return `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Payments</div>
     ${g ? `<div class="item-card"><div class="between"><b>${esc(gw?.name || g.provider)}</b><span class="chip ${g.status === 'connected' ? 'ok' : 'warn'}">${g.status === 'connected' ? 'Connected' : 'Finish setup'}${g.test ? ' · test mode' : ''}</span></div>
         <p class="small muted" style="margin-top:6px">${esc((gw?.methods || []).join(' · '))}${g.account ? ` · account <code>${esc(g.account)}</code>` : ''}. Payouts go straight to this account; the platform fee is taken automatically.</p>
-        <div class="row wrap" style="margin-top:10px">${g.status !== 'connected' ? `<button class="btn btn-accent btn-sm" data-action="gwConnect" data-v="${esc(g.provider)}">Continue setup</button>` : ''}<button class="btn btn-ghost btn-sm" data-action="gwDisconnect">Disconnect</button></div></div>`
+        <div class="row wrap" style="margin-top:10px">${g.status !== 'connected' ? `<button class="btn btn-accent btn-sm" data-action="gwConnect" data-v="${esc(g.provider)}">Continue setup</button>` : ''}<button class="btn btn-ghost btn-sm" data-action="gwDisconnect">Disconnect</button>
+          ${g.status === 'connected' ? `<button class="btn ${g.disabled ? 'btn-danger' : 'btn-ghost'} btn-sm" data-action="gwPause">${ic('pause', 13)} ${g.disabled ? 'Paused — resume card payments' : 'Pause card payments'}</button>` : ''}</div></div>`
       : `<p class="small muted" style="margin-bottom:10px">Connect your own payment account to take cards, Apple Pay and Google Pay. Payouts go straight to you.</p>
         <div class="field"><label class="fl">Payment processor</label><select class="inp" data-input="gwPick" data-rr="1">${Object.entries(GATEWAYS).filter(([k]) => k !== 'demo' || !DB.live).map(([k, x]) => `<option value="${k}" ${pick === k ? 'selected' : ''}>${esc(x.name)}${x.adapter ? '' : ' — on request'}</option>`).join('')}</select>
         <div class="small muted" style="margin-top:4px">${esc(GATEWAYS[pick]?.how || '')} · ${esc((GATEWAYS[pick]?.methods || []).join(', '))}</div></div>
@@ -3185,6 +3239,7 @@ function Settings() {
       <div class="field"><label class="fl">Who pays the booking fee?</label><select class="inp" data-bind="set.feeMode"><option value="buyer" ${s.feeMode === 'buyer' ? 'selected' : ''}>Buyer (added at checkout)</option><option value="absorb" ${s.feeMode === 'absorb' ? 'selected' : ''}>We absorb it</option></select></div>
       ${c('taxOnFees', 'Charge sales tax on booking and service fees too')}
       ${c('donations', 'Offer a donation at checkout')}
+      ${s.donations ? `<div class="grid2"><div class="field"><label class="fl">Suggested amounts ($)</label><input class="inp" data-input="donAmts" value="${esc((S.ui.donAmts ?? (s.donationAmounts || DEFAULT_SETTINGS.donationAmounts).map(v => v / 100).join(', ')))}" placeholder="18, 36, 100"></div>${f('donationPurpose', 'What donations support')}</div>${c('donationCustom', 'Let buyers type their own amount')}` : ''}
       <p class="small muted">Platform fee: ${esc(feeText(platformFeeFor(S.platform, S.adm.bo)))} — set by the platform.</p></div>
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Checkout</div>
       <div class="grid2"><div class="field"><label class="fl">Mobile number</label><select class="inp" data-bind="set.checkout.phone">${[['off', 'Don\'t ask'], ['optional', 'Optional'], ['required', 'Required']].map(([v, t]) => `<option value="${v}" ${s.checkout?.phone === v ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
@@ -3193,15 +3248,18 @@ function Settings() {
       ${f('checkout.note', 'Message at the top of checkout')}${f('checkout.thanks', 'Message on the confirmation page')}</div>
     <div class="card">${QEditor('set', 'questions', s.questions || [], [])}</div>
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Staff security</div>${c('require2fa', 'Require two-factor sign-in for everyone on this team')}
+      ${f('sessionMinutes', 'Sign staff out after this many minutes without activity', 'num', '0 = never. Applies to the back office and scanner.')}
       <p class="small muted">People without it are asked to set it up before they can see anything. <a href="#/admin/security">Set up yours</a>.</p></div>
   </div><div class="stack">
     ${can('admin.payments') ? PaymentsCard(s, c) : ''}
     ${can('admin.integrations') ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Tracking</div>${f('pixels.ga4', 'Google Analytics 4 ID', 'text', 'e.g. G-XXXXXXX')}${f('pixels.meta', 'Meta Pixel ID')}${f('pixels.tiktok', 'TikTok Pixel ID')}
       ${c('pixels.consent', 'Ask visitors before loading pixels (cookie banner)')}<p class="small muted">Server-side Meta Conversions API, CRMs and webhooks: <a href="#/admin/marketing/integrations">Marketing → Integrations</a>.</p></div>` : ''}
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Email sender</div>${f('mail.fromName', 'Sender name', 'text', 'Shown as the “from” name — defaults to the box office name')}${f('mail.replyTo', 'Reply-to address', 'email', 'Where customer replies go')}
-      <p class="small muted">Emails go out from the platform's verified sending domain with this name and reply-to.</p></div>
+      ${f('mail.alerts', 'Where failed-email alerts go', 'email', 'Blank = the customer service email')}</div>
+    ${MailDomainCard()}${DomainCard()}${PlanCard()}
     ${can('admin.api') ? `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Developers</div><p class="small muted">Read-only API keys, webhooks and CRM connections are on <a href="#/admin/marketing/integrations">Marketing → Integrations</a>.</p>
       ${!DB.live ? `<div class="sep"></div><button class="btn btn-danger btn-sm" data-action="demoReset">Reset demo data</button>` : ''}</div>` : ''}
+    ${VersionsCard(S.adm.bo.id, 'restoreSettings')}
   </div></div>`;
 }
 
@@ -3214,12 +3272,13 @@ const closeModal = () => { $('#modal').innerHTML = ''; };
 // ══════════════════════════════════════════════════════════════════════════════
 //  PLATFORM SUPER ADMIN  (#/platform) — separate from every box office's back office
 // ══════════════════════════════════════════════════════════════════════════════
-const PNAV = [['overview', 'Overview', 'home'], ['boxoffices', 'Box offices', 'cal'], ['activity', 'Activity log', 'chart'], ['settings', 'Platform settings', 'gear']];
+const PNAV = [['overview', 'Overview', 'home'], ['boxoffices', 'Box offices', 'ticket'], ['events', 'All events', 'cal'], ['staff', 'Staff & users', 'users'], ['billing', 'Plans & billing', 'tag'], ['risk', 'Risk & fraud', 'flag'],
+  ['health', 'System health', 'pulse'], ['incidents', 'Incidents', 'bolt'], ['activity', 'Activity log', 'chart'], ['settings', 'Platform settings', 'gear']];
 function PlatformShell() {
   if (!S.user || S.user.mfa) return Login('Platform sign in', 'open the platform dashboard');
   if (!S.adm?.super) return `<div class="empty" style="padding-top:20vh"><div class="display" style="font-size:32px">Super admins only</div><p class="muted" style="margin:10px 0 18px">${esc(S.user.email)} isn't a platform administrator.</p><a class="btn btn-dark" href="#/admin">Go to my box office</a></div>`;
   if (!S.plat) { DB.loadPlatform().then(p => { S.plat = p; render(); }).catch(e => toast(e.message, true)); return `<div class="empty" style="padding-top:30vh">Loading…</div>`; }
-  const sub = S.route.params[0] || 'overview', page = { overview: POverview, boxoffices: PBoxOffices, activity: PActivity, settings: PSettings }[sub] || POverview;
+  const sub = S.route.params[0] || 'overview', page = { overview: POverview, boxoffices: PBoxOffices, events: PEvents, staff: PStaff, billing: PBilling, risk: PRisk, health: PHealth, incidents: PIncidents, activity: PActivity, settings: PSettings }[sub] || POverview;
   return `<div class="admin plat">
     <aside class="side"><a class="logo" href="#/platform">${logo()}<small>Platform admin</small></a><div class="grp">Platform</div>
       ${PNAV.map(([k, t, i]) => `<a class="nav ${sub === k ? 'on' : ''}" href="#/platform/${k}">${ic(i)}${t}</a>`).join('')}
@@ -3239,9 +3298,9 @@ function POverview() {
     <div class="kpi"><div class="eyebrow">Tickets sold</div><div class="v">${sum(P.bos, b => b.stats.tickets).toLocaleString()}</div><div class="d">${live.length} orders</div></div>
     <div class="kpi"><div class="eyebrow">Box offices</div><div class="v">${by('active')}</div><div class="d">${by('pending')} pending · ${by('suspended')} suspended · ${sum(P.bos, b => b.stats.staff)} staff</div></div></div>
   <div class="cols"><div class="card"><h3>Platform sales</h3><div class="small muted">Gross across every box office, last 28 days</div>${barChart(dailySeries(live.map(o => ({ ...o, data: { total: o.total } })), 28, o => o.data.total), v => money(v))}</div>
-    <div class="card"><h3>System health</h3>${[['Website & event pages', 'ok'], ['Checkout', 'ok'], ['Scanner sync', 'ok'], ['Database', DB.live ? 'ok' : 'demo'], ['Card payments (Stripe)', 'off'], ['Email delivery', 'off'], ['SMS', 'off']].map(([n, s]) =>
-      `<div class="between small" style="padding:7px 0;border-bottom:1px solid var(--line)"><span>${n}</span>${s === 'ok' ? '<span class="chip ok">Operational</span>' : s === 'demo' ? '<span class="chip info">Demo (browser)</span>' : '<span class="chip">Not connected</span>'}</div>`).join('')}
-      <p class="small muted" style="margin-top:10px">Full monitoring and incident history arrive with Stage 10.</p></div></div>
+    <div class="card"><div class="between"><h3>System health</h3><a class="small" href="#/platform/health">Details</a></div>${HEALTH_PARTS.map(([k, n]) => { const [cls, lbl] = HEALTH_CHIP[P.health?.parts?.[k] || 'ok'];
+      return `<div class="between small" style="padding:7px 0;border-bottom:1px solid var(--line)"><span>${n}</span><span class="chip ${cls}">${lbl}</span></div>`; }).join('')}
+      ${(P.flagged || []).filter(o => !o.review).length ? `<p class="small" style="margin-top:10px"><a href="#/platform/risk">${(P.flagged || []).filter(o => !o.review).length} flagged orders to review</a></p>` : ''}</div></div>
   <div class="card" style="margin-top:18px"><div class="between" style="margin-bottom:8px"><h3>Latest platform activity</h3><a class="small" href="#/platform/activity">All activity</a></div>
     ${P.audit.slice(0, 8).map(a => `<div class="between small" style="padding:7px 0;border-bottom:1px solid var(--line)"><span><b>${esc(a.actor)}</b> · ${esc(a.summary)}</span><span class="muted">${esc(ago(a.at))}</span></div>`).join('')}</div>`;
 }
@@ -3280,19 +3339,34 @@ function PActivity() {
   return head('Activity log', 'Every sign-in, permission change and admin action across the platform') + AuditFilters(S.plat.audit) + AuditTable(auditRows(S.plat.audit), true);
 }
 function PSettings() {
-  const f = S.ui.ps || (S.ui.ps = JSON.parse(JSON.stringify({ ...S.plat.platform, adminsText: S.plat.platform.admins.join(', ') })));
+  const f = S.ui.ps || (S.ui.ps = JSON.parse(JSON.stringify({ ...DEFAULT_PLATFORM, ...S.plat.platform, adminsText: S.plat.platform.admins.join(', '), appHostsText: (S.plat.platform.appHosts || DEFAULT_PLATFORM.appHosts).join(', '),
+    off: Object.fromEntries((S.plat.platform.gatewaysOff || []).map(k => [k, true])), planList: (S.plat.platform.planList || DEFAULT_PLANS).map(p => ({ ...p, monthly: (p.monthly || 0) / 100, feeFixed: p.feeFixed === '' ? '' : p.feeFixed / 100 })) })));
   return head('Platform settings', 'Applies to every box office', `<button class="btn btn-accent" data-action="savePlatform">Save</button>`) + `
   <div class="cols"><div class="stack"><div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Registration</div>
       <label class="check" style="margin-bottom:8px"><input type="checkbox" data-bind="ui.ps.publicRegistration" data-t="bool" ${f.publicRegistration ? 'checked' : ''}> <span>Allow organizers to register a box office themselves at <code>#/register</code></span></label>
-      <p class="small muted">Off at launch. Even when on, every new box office waits for a super admin's approval before it can sell.</p></div>
+      <label class="check" style="margin-bottom:8px"><input type="checkbox" data-bind="ui.ps.autoApprove" data-t="bool" ${f.autoApprove ? 'checked' : ''}> <span>Approve new sign-ups automatically (self-serve)</span></label>
+      <p class="small muted">Off at launch. Without auto-approve, every new box office waits for a super admin's approval before it can sell.</p></div>
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Platform fees</div><div class="grid2">
       <div class="field"><label class="fl">Percent of ticket sales</label><input class="inp" type="number" step="0.1" data-bind="ui.ps.feePct" data-t="num" value="${esc(f.feePct)}"></div>
       <div class="field"><label class="fl">Per paid ticket</label><input class="inp" type="number" step="0.01" data-bind="ui.ps.feeFixed" data-t="money" value="${esc(+f.feeFixed / 100)}"></div></div>
       <div class="field"><label class="fl">Who pays it</label><select class="inp" data-bind="ui.ps.feePayer"><option value="organizer" ${f.feePayer !== 'buyer' ? 'selected' : ''}>The organizer — deducted from payouts, buyers don't see it</option><option value="buyer" ${f.feePayer === 'buyer' ? 'selected' : ''}>The buyer — added at checkout as a “service fee”</option></select></div>
       <p class="small muted">Recorded on each order and taken automatically as the processor's application fee. Override it for one box office from Box offices → Fee. Box offices set their own booking fees separately.</p>
-      <div class="field"><label class="fl">Subscription / service pricing</label><textarea class="inp" data-bind="ui.ps.plans">${esc(f.plans || '')}</textarea></div></div></div>
+      </div>
+    <div class="card"><div class="between"><div class="eyebrow dash">Plans</div><button class="btn btn-ghost btn-sm" data-action="addPlan">${ic('plus', 14)} Add plan</button></div>
+      <p class="small muted" style="margin:6px 0 10px">The money model: each plan has a monthly price and its own platform fee (blank = the default above). Organizers pick one at sign-up and can switch in Settings.</p>
+      ${f.planList.map((p, i) => `<div class="item-card"><div class="grid2"><div class="field"><label class="fl">Name</label><input class="inp" data-bind="ui.ps.planList.${i}.name" value="${esc(p.name)}"></div><div class="field"><label class="fl">Monthly ($)</label><input class="inp" type="number" step="0.01" data-bind="ui.ps.planList.${i}.monthly" value="${esc(p.monthly)}"></div></div>
+        <div class="grid2"><div class="field"><label class="fl">Platform fee %</label><input class="inp" data-bind="ui.ps.planList.${i}.feePct" value="${esc(p.feePct)}" placeholder="default"></div><div class="field"><label class="fl">Per paid ticket ($)</label><input class="inp" data-bind="ui.ps.planList.${i}.feeFixed" value="${esc(p.feeFixed)}" placeholder="default"></div></div>
+        <div class="field"><label class="fl">Description</label><input class="inp" data-bind="ui.ps.planList.${i}.blurb" value="${esc(p.blurb || '')}"></div>
+        <div class="between"><label class="check small"><input type="radio" name="defplan" data-action="defPlan" data-v="${esc(p.id)}" ${f.defaultPlan === p.id ? 'checked' : ''}> <span>Default for new box offices</span></label>${f.planList.length > 1 ? `<button class="btn btn-ghost btn-sm" data-action="delPlan" data-i="${i}">Remove</button>` : ''}</div></div>`).join('')}
+      <div class="field"><label class="fl">Invoice payment terms (days)</label><input class="inp" type="number" data-bind="ui.ps.invoiceDays" data-t="num" value="${esc(f.invoiceDays)}"></div></div></div>
   <div class="stack"><div class="card"><div class="eyebrow dash" style="margin-bottom:12px">General</div><div class="field"><label class="fl">Platform name</label><input class="inp" data-bind="ui.ps.name" value="${esc(f.name)}"></div>
-    <div class="field"><label class="fl">Super admins</label><input class="inp" data-bind="ui.ps.adminsText" value="${esc(f.adminsText)}"><div class="small muted" style="margin-top:4px">Comma-separated emails. Super admins can see and manage every box office.</div></div></div></div></div>`;
+    <div class="field"><label class="fl">Super admins</label><input class="inp" data-bind="ui.ps.adminsText" value="${esc(f.adminsText)}"><div class="small muted" style="margin-top:4px">Comma-separated emails. Super admins can see and manage every box office.</div></div></div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Payment processors</div><p class="small muted" style="margin-bottom:10px">Emergency switch: turn a processor off for every box office (checkout says card payments are paused).</p>
+      ${Object.entries(GATEWAYS).map(([k, g]) => `<label class="check" style="margin-bottom:6px"><input type="checkbox" data-bind="ui.ps.off.${k}" data-t="bool" ${f.off?.[k] ? 'checked' : ''}> <span>${esc(g.name)} switched off</span></label>`).join('')}</div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Domains & integrations</div>
+      <div class="field"><label class="fl">Custom domains point at (CNAME target)</label><input class="inp" data-bind="ui.ps.domainTarget" value="${esc(f.domainTarget || '')}"></div>
+      <div class="field"><label class="fl">The platform's own hosts</label><input class="inp" data-bind="ui.ps.appHostsText" value="${esc(f.appHostsText)}"><div class="small muted" style="margin-top:4px">Any other host name is looked up as a box office's custom domain.</div></div>
+      <p class="small muted">API keys and webhooks are per box office (Marketing → Integrations) and follow each person's permissions.</p></div></div></div>`;
 }
 
 // ── Public: a box office's own page, and self-registration ──────────────────────
@@ -3306,23 +3380,323 @@ function BoxOfficePage() {
     <section class="container section"><div class="eyebrow dash" style="margin-bottom:16px">Upcoming events</div>
       ${all.length > 1 ? EventFilters(all) : ''}
       ${evs.length ? `<div class="ev-grid">${evs.map(EvCard).join('')}</div>` : `<div class="empty">${all.length ? 'No events match — try a different search.' : 'No events on sale right now — check back soon.'}</div>`}</section>
-    <section class="container section" style="padding-top:0"><div class="cols"><div class="card"><h3>Contact</h3><p class="small" style="margin-top:6px">${bo.settings.contactEmail ? `<a href="mailto:${esc(bo.settings.contactEmail)}">${esc(bo.settings.contactEmail)}</a>` : ''}${br.phone ? '<br>' + esc(br.phone) : ''}</p></div>
+    <section class="container section" style="padding-top:0"><div class="cols"><div class="card"><h3>Contact</h3><p class="small" style="margin-top:6px">${bo.settings.contactEmail ? `<a href="mailto:${esc(bo.settings.contactEmail)}">${esc(bo.settings.contactEmail)}</a>` : ''}${br.phone ? '<br>' + esc(br.phone) : ''}</p>
+      <button class="btn btn-ghost btn-sm" style="margin-top:10px" data-action="contactOrg" data-bo="${bo.id}">${ic('mail', 14)} Send a message</button></div>
       <div class="card"><h3>Policies</h3><p class="small" style="margin-top:6px"><a href="#" data-action="showPolicy" data-v="terms">Terms</a>${br.refundPolicy ? ' · <a href="#" data-action="showPolicy" data-v="refundPolicy">Refunds</a>' : ''}${br.privacyPolicy ? ' · <a href="#" data-action="showPolicy" data-v="privacyPolicy">Privacy</a>' : ''}</p></div></div></section>`;
 }
 function Register() {
   const f = S.ui.reg || (S.ui.reg = { name: '', ownerName: '', ownerEmail: '', done: false });
   if (!S.platform.publicRegistration) return `<div class="container section"><div class="empty"><div class="display" style="font-size:34px">Invitation only</div><p class="muted" style="margin:10px 0 18px">New box offices are set up by the platform team. Get in touch and we'll create yours.</p><a class="btn btn-dark" href="#/">Back to events</a></div></div>`;
-  if (f.done) return `<div class="container section"><div class="empty"><div class="display" style="font-size:34px">Request received</div><p class="muted" style="margin:10px 0 18px">We'll review <b>${esc(f.name)}</b> and email ${esc(f.ownerEmail)} once it's approved.</p></div></div>`;
+  if (f.done) return `<div class="container section"><div class="empty"><div class="display" style="font-size:34px">${f.active ? 'Your box office is ready' : 'Request received'}</div><p class="muted" style="margin:10px 0 18px">${f.active ? `Sign in with ${esc(f.ownerEmail)} to set up <b>${esc(f.name)}</b> — a checklist walks you through payments and your first event.` : `We'll review <b>${esc(f.name)}</b> and email ${esc(f.ownerEmail)} once it's approved.`}</p>${f.active ? '<a class="btn btn-accent" href="#/admin">Sign in</a>' : ''}</div></div>`;
   return `<div class="container section" style="max-width:520px"><div class="card"><h1 class="display" style="font-size:32px">Start selling tickets</h1><p class="muted" style="margin:6px 0 18px">Tell us about your organization. Every new box office is reviewed before it goes live.</p>
     <div class="field"><label class="fl">Organization name</label><input class="inp" data-input="reg.name" value="${esc(f.name)}"></div>
     <div class="grid2"><div class="field"><label class="fl">Your name</label><input class="inp" data-input="reg.ownerName" value="${esc(f.ownerName)}"></div><div class="field"><label class="fl">Work email</label><input class="inp" type="email" data-input="reg.ownerEmail" value="${esc(f.ownerEmail)}"></div></div>
-    <button class="btn btn-accent btn-block btn-lg" data-action="register">Request a box office</button></div></div>`;
+    <div class="field"><label class="fl">Phone (optional)</label><input class="inp" type="tel" data-input="reg.phone" value="${esc(f.phone || '')}"></div>
+    <div class="eyebrow dash" style="margin:14px 0 10px">Choose a plan</div><div class="plans">${(S.platform.planList || DEFAULT_PLANS).map(p => `<label class="plan ${(f.plan || S.platform.defaultPlan || 'pay') === p.id ? 'on' : ''}"><input type="radio" name="plan" data-action="regPlan" data-v="${esc(p.id)}" ${(f.plan || S.platform.defaultPlan || 'pay') === p.id ? 'checked' : ''}> <b>${esc(p.name)}</b>
+      <div class="display" style="font-size:22px">${p.monthly ? money(p.monthly) + '<small>/mo</small>' : 'Free'}</div><div class="small muted">${esc(feeText({ pct: optNum(p.feePct, S.platform.feePct), fixed: optNum(p.feeFixed, S.platform.feeFixed), payer: S.platform.feePayer }))}</div><div class="small">${esc(p.blurb || '')}</div></label>`).join('')}</div>
+    <label class="check" style="margin:12px 0"><input type="checkbox" data-action="regAgree" ${f.agree ? 'checked' : ''}> <span>I agree to the platform's organizer terms and pricing.</span></label>
+    <button class="btn btn-accent btn-block btn-lg" data-action="register">${S.platform.autoApprove ? 'Create my box office' : 'Request a box office'}</button><p class="small muted" style="margin-top:10px;text-align:center">After approval you'll connect payments (Stripe) and publish your first event — a checklist walks you through it.</p></div></div>`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  STAGE 10 — event controls & fees, full event report, versions, risk, customer service, plans & billing, domains, platform health
+// ══════════════════════════════════════════════════════════════════════════════
+function ContactModal(evId, boId, ref) {
+  const ev = evId && evById(evId), f = S.ui.ct = { ev: evId || '', bo: boId || ev?.box_office_id || '', name: S.co.name || S.cust?.name || '', email: S.co.email || S.cust?.email || '', ref: ref || '', subject: '', body: '' };
+  const to = ev?.contact?.team || ev?.contact?.name || (S.bos.find(b => b.id === f.bo)?.name) || 'the box office';
+  modal('Contact the organizer', `<p class="small muted" style="margin-bottom:12px">Your message goes to <b>${esc(to)}</b>${ev ? ` about ${esc(ev.name)}` : ''}. They reply by email.</p>
+    <div class="grid2"><div class="field"><label class="fl">Your name</label><input class="inp" data-input="ct.name" value="${esc(f.name)}"></div><div class="field"><label class="fl">Email</label><input class="inp" type="email" data-input="ct.email" value="${esc(f.email)}"></div></div>
+    <div class="grid2"><div class="field"><label class="fl">Order number (optional)</label><input class="inp" data-input="ct.ref" value="${esc(f.ref)}"></div><div class="field"><label class="fl">Subject</label><input class="inp" data-input="ct.subject"></div></div>
+    <div class="field"><label class="fl">Message</label><textarea class="inp" data-input="ct.body" rows="5"></textarea></div>`,
+    `<button class="btn btn-ghost" data-action="closeModal">Cancel</button><button class="btn btn-accent" data-action="sendContact">Send message</button>`);
+}
+
+// ── Event tab "Controls & fees": emergency controls (act at once) + basket timeout, waiting room, sale windows, fees & tax, checkout form ──
+function EdControls(ev) {
+  const live = S.adm.events.find(e => e.id === ev.id) || ev, c = live.controls || {}, canC = can('events.controls', ev.id), q = { ...QUEUE_DEFAULT, ...(ev.queue || {}) }, f = ev.fees || {};
+  const areas = ev.seating?.enabled ? [...new Set(Object.values(ev.seating.meta || {}).map(m => m[0]).filter(Boolean))] : [];
+  const ruleInputs = (path, per = 'Per ticket ($)') => `<div class="grid3">${inp(path + '.pct', '%', { t: 'text', ph: 'inherit' })}${inp(path + '.fixed', per, { t: 'moneyOpt', ph: 'inherit' })}${sel(path + '.payer', 'Who pays', [['', 'Inherit'], ['buyer', 'Buyer'], ['organizer', 'Organizer absorbs']])}</div>`;
+  return `<div class="cols"><div class="stack">
+    <div class="card"><div class="between"><h3>Emergency controls</h3>${Object.keys(c).some(k => EV_CONTROLS.some(x => x[0] === k) && c[k]) ? '<span class="chip bad">Active</span>' : '<span class="chip ok">Normal</span>'}</div>
+      <p class="small muted" style="margin:4px 0 12px">These act immediately and only on this event — no need to save. Every change is in the History tab.</p>
+      ${EV_CONTROLS.map(([k, t, d]) => `<div class="between ctl-row"><div><b>${t}</b><div class="small muted">${d}</div></div>
+        <button type="button" class="btn ${c[k] ? 'btn-danger' : 'btn-ghost'} btn-sm" data-action="evControl" data-k="${k}" ${canC ? '' : 'disabled title="Needs the Emergency controls permission"'}>${c[k] ? 'On — turn off' : 'Turn on'}</button></div>`).join('')}
+      <div class="field" style="margin-top:10px"><label class="fl">Message buyers see while paused / in maintenance</label><div class="row"><input class="inp" style="flex:1" data-input="ctlMsg" value="${esc(S.ui.ctlMsg ?? c.message ?? '')}" placeholder="e.g. We're adding more seats — back at 2 PM"><button type="button" class="btn btn-ghost btn-sm" data-action="evControlMsg" ${canC ? '' : 'disabled'}>Update</button></div></div>
+      ${c.at ? `<p class="small muted">Last changed ${esc(ago(c.at))} by ${esc(c.by || '')}.</p>` : ''}
+      <p class="small muted">Hide the event: Details → Who can see it. Switch off card payments: Settings → Payments.</p></div>
+    <div class="card"><h3>Basket timeout</h3><p class="small muted" style="margin:4px 0 10px">How long seats picked on the map stay held while the buyer checks out. When it runs out the seats return to sale and the buyer is told.</p>
+      <div class="row wrap">${CART_MINUTES.map(m => `<button type="button" class="btn btn-sm ${cartMinutes(ev) === m ? 'btn-dark' : 'btn-ghost'}" data-action="cartMin" data-v="${m}">${m} min</button>`).join('')}
+        <div style="width:110px">${inp('cartMinutes', '', { t: 'int', ph: 'exact' })}</div></div></div>
+    <div class="card"><h3>Waiting room</h3><p class="small muted" style="margin:4px 0 10px">For big on-sales: buyers join a line and are let in a steady number per minute, first come first served. Only admitted buyers can pick seats or check out.</p>
+      ${chk('queue.on', 'Waiting room on for this event')}
+      <div class="grid2" style="margin-top:10px">${inp('queue.rate', 'Let in per minute', { t: 'int', ph: String(QUEUE_DEFAULT.rate) })}${inp('queue.passMinutes', 'Minutes to buy once in', { t: 'int', ph: String(QUEUE_DEFAULT.passMinutes) })}</div>
+      ${inp('queue.message', 'Message in the line', { ph: 'Presale is busy — you won\'t lose your place.' })}
+      ${q.on ? `<p class="small muted">At ${+q.rate || 60} a minute, 1,000 people take about ${Math.ceil(1000 / (+q.rate || 60))} minutes to get in.</p>` : ''}</div>
+    <div class="card"><h3>Sale windows</h3><p class="small muted" style="margin:4px 0 10px">The event's own open / close times are on the Details tab, ticket types' on Tickets & pricing. Close one showtime or one seating area separately here.</p>
+      <details ${Object.keys(ev.areaSales || {}).length || (ev.timeSlots || []).some(s => s.salesStart || s.salesEnd) ? 'open' : ''}><summary class="small"><b>${(ev.timeSlots || []).length} showtimes · ${areas.length} seating areas</b></summary>
+      ${(ev.timeSlots || []).map((s, i) => `<div class="item-card"><b class="small">${esc(fmtDT(s.start))}${s.label ? ' · ' + esc(s.label) : ''}</b><div class="grid2">${inp(`timeSlots.${i}.salesStart`, 'Opens', { t: 'dt' })}${inp(`timeSlots.${i}.salesEnd`, 'Closes', { t: 'dt' })}</div></div>`).join('')}
+      ${areas.map(a => `<div class="item-card"><b class="small">${esc(a)}</b><div class="grid2">${inp(`areaSales.${a}.from`, 'Opens', { t: 'dt' })}${inp(`areaSales.${a}.until`, 'Closes', { t: 'dt' })}</div></div>`).join('')}
+      </details>${!(ev.timeSlots || []).length && !areas.length ? '<p class="small muted">No showtimes or seating areas on this event.</p>' : ''}</div>
+  </div><div class="stack">
+    <div class="card"><h3>Fees & tax for this event</h3><p class="small muted" style="margin:4px 0 10px">Blank = the box office's settings (${esc(S.adm.bo.settings.feePct || 0)}% + ${money(S.adm.bo.settings.feeFixed || 0)} booking fee, ${esc(S.adm.bo.settings.taxPct || 0)}% tax). The most specific rule wins: seating area → ticket type → this event.</p>
+      <div class="eyebrow" style="margin:6px 0">Booking fee — whole event</div>${ruleInputs('fees')}
+      <details style="margin-top:10px"><summary class="small"><b>By ticket type, seating area or product</b> <span class="muted">(${[...(ev.ticketTypes || []).map(t => t.fee), ...areas.map(a => f.areas?.[a]), ...(ev.addons || []).map(a => a.fee)].filter(hasRule).length} set)</span></summary>
+      ${(ev.ticketTypes || []).map((t, i) => `<div class="eyebrow" style="margin:10px 0 6px">Ticket type · ${esc(t.name)}</div>${ruleInputs(`ticketTypes.${i}.fee`)}`).join('')}
+      ${areas.map(a => `<div class="eyebrow" style="margin:10px 0 6px">Seating area · ${esc(a)}</div>${ruleInputs(`fees.areas.${a}`)}`).join('')}
+      ${(ev.addons || []).map((a, i) => `<div class="eyebrow" style="margin:10px 0 6px">Product · ${esc(a.name)} — no fee unless set</div>${ruleInputs(`addons.${i}.fee`, 'Per item ($)')}`).join('')}</details>
+      <div class="sep"></div><div class="grid2">${inp('taxPct', 'Sales tax % for this event', { t: 'text', ph: String(S.adm.bo.settings.taxPct || 0) })}${sel('fees.passProcessing', 'Card processing fee', [['', 'Box office setting'], ['yes', 'Buyer pays it'], ['no', 'Organizer absorbs it']])}</div></div>
+    <div class="card"><div class="between"><h3>Other fees</h3><button type="button" class="btn btn-ghost btn-sm" data-action="addXFee">${ic('plus', 14)} Add fee</button></div>
+      <p class="small muted" style="margin:4px 0 10px">A facility fee, a levy, optional ticket protection… Mandatory fees are added to every order; optional ones are a checkbox at checkout. Each is stored and reported separately.</p>
+      ${(f.extra || []).map((x, i) => `<div class="item-card">${inp(`fees.extra.${i}.name`, 'Name')}<div class="grid3">${inp(`fees.extra.${i}.pct`, '%', { t: 'text' })}${inp(`fees.extra.${i}.fixed`, 'Amount ($)', { t: 'moneyOpt' })}${sel(`fees.extra.${i}.per`, 'Charged', [['ticket', 'Per ticket'], ['order', 'Per order']])}</div>
+        <div class="between">${chk(`fees.extra.${i}.optional`, 'Optional — the buyer chooses')}<button type="button" class="btn btn-ghost btn-sm" data-action="delXFee" data-i="${i}">Remove</button></div></div>`).join('') || '<p class="small muted">None.</p>'}</div>
+    <div class="card"><h3>Checkout form</h3><p class="small muted" style="margin:4px 0 10px">Ask this event's buyers for more than usual. Questions (per order / per ticket), waivers and signatures are on <a href="#/admin/event/${ev.id}/checkout">Page & checkout</a>.</p>
+      <div class="grid2">${sel('checkout.phone', 'Mobile number', [['', 'Box office setting'], ['optional', 'Optional'], ['required', 'Required']])}${sel('checkout.address', 'Address', [['', 'Box office setting'], ['optional', 'Optional'], ['required', 'Required']])}</div>
+      <div class="row wrap">${['optIn', 'smsOptIn', 'promo'].map(k => `<label class="check"><input type="checkbox" data-bind="draft.checkout.${k}" data-t="bool" ${ev.checkout?.[k] === false ? '' : 'checked'}> <span>${{ optIn: 'Email opt-in', smsOptIn: 'Text opt-in', promo: 'Promo code box' }[k]}</span></label>`).join('')}</div></div>
+    <div class="card"><h3>Donations</h3>${chk('donation.off', 'No donation step for this event')}${inp('donation.purpose', 'What donations to this event support', { ph: S.adm.bo.settings.donationPurpose || 'e.g. Youth music fund' })}</div>
+  </div></div>`;
+}
+
+// ── Full event report (Eli §26): everything about one show, filterable, to Excel / CSV / PDF, compared with earlier events ──
+function eventReportData(ev, f = {}) {
+  const x = { events: S.adm.events, orders: S.adm.orders, tickets: S.adm.tickets, statuses: S.adm.seatStatus || [], expenses: S.adm.expenses || [], expenseFinal: S.adm.expenseFinal || {} };
+  const rep = finReport(x, { ...emptyFin(), eventId: ev.id, slotId: f.slotId || '', from: f.from || '', to: f.to || '' }), t = rep.totals;
+  const tks = S.adm.tickets.filter(k => k.event_id === ev.id && (!f.slotId || k.slot_id === f.slotId)), valid = tks.filter(k => k.status === 'valid');
+  const orders = S.adm.orders.filter(o => o.event_ids.includes(ev.id) && wasPaid(o) && (!f.from || localDay(o.paid_at || o.created_at) >= f.from) && (!f.to || localDay(o.paid_at || o.created_at) <= f.to));
+  const inv = ev.seating?.enabled ? (() => { const st = seatStates(ev, { tickets: S.adm.tickets, statuses: S.adm.seatStatus || [], orders: S.adm.orders, slotId: f.slotId || '' }), n = s => [...st.values()].filter(v => v.state === s).length;
+    return { total: st.size, available: n('available'), blocked: n('blocked'), held: n('held'), checkout: n('checkout') }; })() : null;
+  const v = S.adm.views?.[ev.id] || {}, live = S.adm.live?.[ev.id] || {}, scans = valid.filter(k => k.checked_in_at);
+  const earlier = new Set(); const byEmail = {}; for (const o of S.adm.orders.filter(wasPaid)) (byEmail[o.buyer_email] ||= []).push(o);
+  const buyers = [...new Set(orders.map(o => o.buyer_email))], returning = buyers.filter(e => byEmail[e].some(o => !o.event_ids.includes(ev.id) && D(o.created_at) < D(orders.find(x => x.buyer_email === e).created_at))).length;
+  const by = (list, key) => { const m = {}; for (const i of list) { const k = key(i); (m[k] ||= { n: 0, rev: 0 }); m[k].n++; m[k].rev += i.paid || 0; } return m; };
+  const hours = by(valid.map(k => ({ ...k, h: D(S.adm.orders.find(o => o.id === k.order_id)?.created_at)?.getHours() })), k => String(k.h ?? '?').padStart(2, '0') + ':00');
+  const days = by(valid.map(k => ({ ...k, d: localDay(S.adm.orders.find(o => o.id === k.order_id)?.created_at) })), k => k.d);
+  const promos = {}; for (const o of orders) if (o.data.code) { const p = promos[o.data.code] ||= { orders: 0, tickets: 0, discount: 0, revenue: 0 }; p.orders++; p.discount += o.data.discount || 0; p.revenue += orderMoney(o).collected; p.tickets += tks.filter(k => k.order_id === o.id).length; }
+  const track = {}; for (const o of orders) if (o.data.tracking) { const p = track[o.data.tracking] ||= { orders: 0, tickets: 0, revenue: 0 }; p.orders++; p.revenue += orderMoney(o).collected; p.tickets += tks.filter(k => k.order_id === o.id).length; }
+  const sources = {}; for (const o of orders) { const s = o.data.source || o.data.utm?.source || 'direct'; (sources[s] ||= { orders: 0, revenue: 0 }); sources[s].orders++; sources[s].revenue += orderMoney(o).collected; }
+  const entrances = {}; for (const k of scans) { const e = k.checkin?.entrance || '—'; entrances[e] = (entrances[e] || 0) + 1; }
+  const rc = reconcile(S.adm.orders.filter(o => o.event_ids.includes(ev.id)), (S.adm.procTx || []), {});
+  const allAbandoned = S.adm.orders.filter(o => o.event_ids.includes(ev.id) && o.status === 'expired').length, starts = S.adm.orders.filter(o => o.event_ids.includes(ev.id)).length;
+  return { ev, rep, t, inv, valid, tks, orders, v, live, scans, buyers, returning, hours, days, promos, track, sources, entrances, rc, abandoned: allAbandoned, starts,
+    ticketing: { total: inv ? inv.total : (+ev.capacity || valid.length), issued: tks.filter(k => k.status !== 'replaced').length, paid: valid.filter(k => !k.comp).length, comps: valid.filter(k => k.comp).length,
+      cancelled: tks.filter(k => k.status === 'cancelled' && !k.refunded).length, refunded: tks.filter(k => k.refunded > 0).length } };
+}
+function reportSheets(R) {
+  const $$ = c => (c || 0) / 100, t = R.t, tk = R.ticketing;
+  return [
+    ['Ticketing', [['Measure', 'Value'], ['Total tickets / seats', tk.total], ['Tickets issued', tk.issued], ['Paid tickets', tk.paid], ['Complimentary', tk.comps], ['Cancelled', tk.cancelled], ['Refunded', tk.refunded],
+      ...(R.inv ? [['Available seats', R.inv.available], ['Blocked seats', R.inv.blocked], ['Held seats', R.inv.held]] : [])]],
+    ['By section & price', [['Section / type', 'Tickets', 'Revenue'], ...finGroupRows(R.rep, 'area').map(r => [r.label, r.sold, $$(r.ticketRev)]), [], ['Ticket type / price level', 'Tickets', 'Revenue'], ...finGroupRows(R.rep, 'tt').map(r => [r.label, r.sold, $$(r.ticketRev)])]],
+    ['Revenue', [['Measure', 'Amount'], ['Potential sellout', $$(t.potential)], ['Ticket revenue', $$(t.ticketRev)], ['Booking fees', $$(t.fees)], ['Other fees', $$(t.otherFee)], ['Processing fees', $$(t.processing)], ['Taxes', $$(t.tax)],
+      ['Discounts', $$(t.discount)], ['Complimentary value', $$(t.comp)], ['Refunds', $$(t.refunds)], ['Credits', $$(t.credits)], ['Products', $$(t.productRev)], ['Packages', $$(t.bundleRev)], ['Donations', $$(t.donation)], ['Net collected', $$(t.net)],
+      ...(t.expenses ? [['Event profit' + (t.profitFinal ? '' : ' (estimate — not every expense entered)'), $$(t.profit)]] : [])]],
+    ['Promotions', [['Promo code', 'Orders', 'Tickets', 'Discount', 'Revenue'], ...Object.entries(R.promos).map(([k, p]) => [k, p.orders, p.tickets, $$(p.discount), $$(p.revenue)]), [], ['Tracking code', 'Orders', 'Tickets', 'Revenue'], ...Object.entries(R.track).map(([k, p]) => [k, p.orders, p.tickets, $$(p.revenue)]), [], ['Source', 'Orders', 'Revenue'], ...Object.entries(R.sources).map(([k, p]) => [k, p.orders, $$(p.revenue)])]],
+    ['Traffic', [['Measure', 'Value'], ['Page views', R.v.total || 0], ['Unique visitors', R.v.unique || 0], ['Checkout starts', R.starts], ['Abandoned checkouts', R.abandoned], ['Paid orders', R.orders.length], ['Conversion (orders ÷ visitors)', R.v.unique ? (R.orders.length / R.v.unique * 100).toFixed(1) + '%' : '—']]],
+    ['Attendance', [['Measure', 'Value'], ['Tickets scanned', R.scans.length], ['Attendance %', R.valid.length ? (R.scans.length / R.valid.length * 100).toFixed(1) + '%' : '—'], ['No-shows', D(R.ev.end || R.ev.start) < Date.now() ? R.valid.length - R.scans.length : 'event not over'], [], ['Entrance', 'Check-ins'], ...Object.entries(R.entrances)]],
+    ['Customers', [['Measure', 'Value'], ['Customers', R.buyers.length], ['New', R.buyers.length - R.returning], ['Returning', R.returning], ['With a phone number', R.orders.filter(o => o.data.buyer?.phone && o.data.buyer.phone !== '•••').length], ['Opted in to email', R.orders.filter(o => o.data.optIn).length]]],
+    ['Sales trends', [['Day', 'Tickets', 'Revenue'], ...Object.entries(R.days).sort().map(([k, x]) => [k, x.n, $$(x.rev)]), [], ['Hour', 'Tickets', 'Revenue'], ...Object.entries(R.hours).sort().map(([k, x]) => [k, x.n, $$(x.rev)])]],
+    ['Reconciliation', [['Measure', 'Amount'], ['SET net', $$(R.rc.totals.setNet)], ['Processor net', $$(R.rc.totals.procNet)], ['Difference', $$(R.rc.totals.diff)], ['Refunds', $$(t.refunds)], ['Chargebacks', $$(t.chargebacks)], ['Processing fees', $$(t.processing)], ['Taxes', $$(t.tax)],
+      ['Transactions with differences', R.rc.issues.length]]]];
+}
+function EdReport(ev) {
+  const f = S.ui.er?.id === ev.id ? S.ui.er : (S.ui.er = { id: ev.id, slotId: '', from: '', to: '', cmp: [] }), R = eventReportData(ev, f), t = R.t, tk = R.ticketing, fin = can('finance.reports');
+  const kpi = (l, v, d = '') => `<div class="kpi"><div class="eyebrow">${l}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`;
+  // the export sheets hold plain dollars; on screen, money columns (by their heading) are shown as currency
+  const table = (rows) => { let hd = rows[0]; const isM = (h, c) => typeof c === 'number' && /revenue|amount|discount/i.test(h || '');
+    return `<div class="tbl-wrap"><table class="tbl"><thead><tr>${hd.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.slice(1).map(r => { if (r.length && r.every(c => typeof c === 'string') && rows.indexOf(r) > 0 && /^[A-Z]/.test(r[1] || '') && r.length > 1 && !/\d/.test(r[1])) { hd = r; return `<tr>${r.map(h => `<th>${esc(h)}</th>`).join('')}</tr>`; }
+      return r.length ? `<tr>${r.map((c, i) => `<td class="${i ? 'tnum' : ''}">${esc(isM(hd[i], c) || (hd[1] === 'Amount' && i === 1 && typeof c === 'number') ? money(Math.round(c * 100)) : c)}</td>`).join('')}</tr>` : '<tr><td colspan="9" style="padding:4px"></td></tr>'; }).join('')}</tbody></table></div>`; };
+  const others = S.adm.events.filter(e => e.id !== ev.id && D(e.start) < D(ev.start)).sort((a, b) => D(b.start) - D(a.start)).slice(0, 12), cmp = (f.cmp || []).map(id => S.adm.events.find(e => e.id === id)).filter(Boolean);
+  const cmpRow = e => { const r = eventReportData(e); return [e.name, fmtDate(e.start, { month: 'short', day: 'numeric', year: 'numeric' }), r.ticketing.paid + r.ticketing.comps, money(r.t.ticketRev), money(r.t.net), r.valid.length ? Math.round(r.scans.length / r.valid.length * 100) + '%' : '—', r.v.unique ? (r.orders.length / r.v.unique * 100).toFixed(1) + '%' : '—']; };
+  return `<div class="toolbar no-print">${(ev.timeSlots || []).length ? `<select class="inp" data-input="er.slotId" data-rr="1"><option value="">All showtimes</option>${ev.timeSlots.map(s => `<option value="${s.id}" ${f.slotId === s.id ? 'selected' : ''}>${esc(fmtDT(s.start))}</option>`).join('')}</select>` : ''}
+      <label class="small muted">Sold from</label><input class="inp" type="date" data-input="er.from" data-rr="1" value="${esc(f.from)}"><label class="small muted">to</label><input class="inp" type="date" data-input="er.to" data-rr="1" value="${esc(f.to)}">
+      <span style="flex:1"></span>${can('finance.export') || can('customers.export') ? `<button class="btn btn-ghost btn-sm" data-action="erExport" data-v="xlsx">Excel</button><button class="btn btn-ghost btn-sm" data-action="erExport" data-v="csv">CSV</button>` : ''}<button class="btn btn-ghost btn-sm" data-action="erPrint">PDF</button></div>
+    <div class="print-only"><h1>${esc(ev.name)} — Full event report</h1><p>${esc(fmtDT(ev.start))} · ${esc(ev.venue || '')} · generated ${esc(fmtDT(new Date().toISOString()))}</p></div>
+    <div class="eyebrow dash" style="margin:6px 0 10px">Ticketing</div>
+    <div class="kpis">${kpi('Tickets issued', tk.issued, `${tk.paid} paid · ${tk.comps} comp`)}${kpi('Capacity', tk.total, R.inv ? `${R.inv.available} available · ${R.inv.blocked} blocked · ${R.inv.held} held` : '')}${kpi('Cancelled / refunded', `${tk.cancelled} / ${tk.refunded}`)}${kpi('Checked in', R.scans.length, R.valid.length ? Math.round(R.scans.length / R.valid.length * 100) + '% attendance' : '')}</div>
+    ${fin ? `<div class="eyebrow dash" style="margin:18px 0 10px">Revenue</div><div class="kpis">${kpi('Potential sellout', money(t.potential))}${kpi('Ticket revenue', money(t.ticketRev))}${kpi('Net collected', money(t.net), `${money(t.fees)} fees · ${money(t.tax)} tax · ${money(t.refunds)} refunds`)}${t.expenses ? kpi(t.profitFinal ? 'Event profit' : 'Estimated profit', money(t.profit)) : kpi('Profit', '—', 'Enter expenses in Reports → Profitability')}</div>` : ''}
+    <div class="cols" style="margin-top:18px">${reportSheets(R).filter(([n]) => fin || !['Revenue', 'Reconciliation', 'Promotions'].includes(n)).map(([n, rows]) => `<div class="card"><h3>${esc(n)}</h3>${table(rows)}</div>`).join('')}</div>
+    <div class="card no-print" style="margin-top:18px"><h3>Compare with earlier events</h3><p class="small muted" style="margin:4px 0 10px">Pick up to 5.</p>
+      <div class="row wrap">${others.map(e => `<label class="check small"><input type="checkbox" data-action="erCmp" data-v="${e.id}" ${(f.cmp || []).includes(e.id) ? 'checked' : ''}> <span>${esc(e.name)}</span></label>`).join('') || '<span class="small muted">No earlier events yet.</span>'}</div>
+      ${cmp.length ? table([['Event', 'Date', 'Tickets', 'Ticket revenue', 'Net', 'Attendance', 'Conversion'], cmpRow(ev), ...cmp.map(cmpRow)]) : ''}</div>`;
+}
+
+// ── Versions (Eli §18): every save keeps a snapshot; restore loads it back for review ──
+const SECTION_LABEL = Object.fromEntries([...EVENT_SECTIONS, ...BO_SECTIONS].map(([k, t]) => [k, t]).concat([['created', 'Created']]));
+function VersionsCard(target, restoreAction) {
+  const list = (S.adm.versions || []).filter(v => v.target === target);
+  return `<div class="card"><h3>Version history</h3><p class="small muted" style="margin:4px 0 10px">Every save is kept (the last 40). Restoring loads that version back — review it, then save to make it current.</p>
+    ${list.length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>When</th><th>Who</th><th>What changed</th><th></th></tr></thead><tbody>${list.map((v, i) => `<tr><td class="small">${esc(fmtDT(v.at))}</td><td class="small">${esc(v.by)}</td>
+      <td>${v.sections.map(s => `<span class="chip mini">${esc(SECTION_LABEL[s] || s)}</span>`).join(' ')}</td><td style="text-align:right">${i ? `<button class="btn btn-ghost btn-sm" data-action="${restoreAction}" data-id="${v.id}">Restore</button>` : '<span class="small muted">current</span>'}</td></tr>`).join('')}</tbody></table></div>` : '<p class="small muted">No saved versions yet.</p>'}</div>`;
+}
+
+// ── Risk: flags on orders, review ──
+const flagChips = o => (o.data.flags || []).map(k => `<span class="chip ${o.data.review?.result === 'ok' ? '' : 'warn'} mini" title="${esc(ORDER_FLAGS[k] || k)}">${ic('flag', 11)} ${esc(k)}</span>`).join(' ');
+function FlagsCard(o) {
+  if (!(o.data.flags || []).length) return '';
+  const r = o.data.review;
+  return `<div class="card"><h3>${ic('flag', 15)} Flagged for review</h3><ul class="small" style="margin:8px 0 10px 18px">${o.data.flags.map(k => `<li>${esc(ORDER_FLAGS[k] || k)}</li>`).join('')}</ul>
+    ${r ? `<p class="small"><span class="chip ${r.result === 'fraud' ? 'bad' : 'ok'}">${r.result === 'fraud' ? 'Confirmed fraud' : 'Reviewed — genuine'}</span> by ${esc(r.by)} ${esc(ago(r.at))}${r.note ? ' · ' + esc(r.note) : ''}</p>`
+      : can('orders.edit', o.event_ids[0]) ? `<div class="row wrap"><button class="btn btn-ghost btn-sm" data-action="reviewOrder" data-id="${o.id}" data-v="ok">Looks genuine</button><button class="btn btn-danger btn-sm" data-action="reviewOrder" data-id="${o.id}" data-v="fraud">Fraud</button>
+        ${can('customers.ban') ? `<button class="btn btn-ghost btn-sm" data-action="banAsk" data-v="${esc(o.buyer_email)}">Ban this customer…</button>` : ''}</div>` : ''}</div>`;
+}
+function PoliciesCard(o) {
+  const acc = o.data.accepted || []; if (!acc.length) return '';
+  return `<div class="card"><h3>Policies accepted</h3><div class="small" style="margin-top:8px">${acc.map(a => { const t = S.adm.policyTexts?.[a.version];
+    return `<div class="between" style="padding:5px 0;border-bottom:1px solid var(--line)"><span>${esc(t?.title || POLICY_KINDS[a.kind] || a.kind)} <code>${esc(a.version)}</code></span><span class="muted">${esc(fmtDT(a.at))}${t ? ` · <a href="#" data-action="showAccepted" data-v="${esc(a.version)}">read</a>` : ''}</span></div>`; }).join('')}</div></div>`;
+}
+
+// ── Customers: inbox + banned ──
+function CustomersTabs(cur) {
+  const t = [['list', 'Customers', 'customers.profiles'], ['inbox', 'Inbox', 'customers.inbox'], ['banned', 'Banned', 'customers.ban']].filter(x => can(x[2]) || (x[0] === 'banned' && can('customers.profiles')));
+  const open = (S.adm.inbox || []).filter(m => m.status === 'open').length;
+  return `<div class="tabs" style="margin-bottom:14px">${t.map(([k, l]) => `<a class="${cur === k ? 'on' : ''}" href="#/admin/customers${k === 'list' ? '' : '/~' + k}">${l}${k === 'inbox' && open ? ` <span class="chip warn mini">${open}</span>` : ''}</a>`).join('')}</div>`;
+}
+function CustomerInbox() {
+  const list = S.adm.inbox || [], f = S.ui.inf || 'open';
+  return head('Customer messages', 'Sent with “Contact organizer” — each goes to the event\'s own contact or team') + CustomersTabs('inbox') + `
+  <div class="toolbar">${[['open', 'Open'], ['answered', 'Answered'], ['closed', 'Closed'], ['all', 'All']].map(([k, l]) => `<button class="btn btn-sm ${f === k ? 'btn-dark' : 'btn-ghost'}" data-action="inboxFilter" data-v="${k}">${l}</button>`).join('')}</div>
+  ${list.filter(m => f === 'all' || m.status === f).map(m => `<div class="card" style="margin-bottom:12px"><div class="between"><div><b>${esc(m.subject || '(no subject)')}</b> <span class="chip mini ${m.status === 'open' ? 'warn' : ''}">${esc(m.status)}</span>
+      <div class="small muted">${esc(m.name)} · ${esc(m.email)}${m.ref ? ' · order ' + esc(m.ref) : ''}${m.event_id ? ' · ' + esc(evById(m.event_id)?.name || '') : ''} · to ${esc(m.team)} (${esc(m.routed_to)}) · ${esc(ago(m.at))}</div></div></div>
+    <p style="white-space:pre-line;margin:10px 0">${esc(m.body)}</p>${(m.replies || []).map(r => `<div class="item-card small"><b>${esc(r.by)}</b> <span class="muted">${esc(ago(r.at))}</span><div style="white-space:pre-line">${esc(r.body)}</div></div>`).join('')}
+    <div class="row wrap" style="margin-top:8px">${can('comms.email') ? `<input class="inp" style="flex:1;min-width:220px" data-input="rep_${m.id}" placeholder="Write a reply (emailed to the customer)"><button class="btn btn-accent btn-sm" data-action="inboxReply" data-id="${m.id}">Reply</button>` : ''}
+      <button class="btn btn-ghost btn-sm" data-action="inboxStatus" data-id="${m.id}" data-v="${m.status === 'closed' ? 'reopen' : 'close'}">${m.status === 'closed' ? 'Reopen' : 'Close'}</button></div></div>`).join('') || '<div class="empty">No messages here.</div>'}`;
+}
+function CustomerBans() {
+  const list = S.adm.bans || [], b = S.ui.ban || (S.ui.ban = { email: '', reason: '' });
+  return head('Banned customers', 'They can\'t buy tickets from this box office. Only staff see the reason.') + CustomersTabs('banned') + `
+  ${can('customers.ban') ? `<div class="card" style="margin-bottom:14px"><div class="row wrap"><input class="inp" style="flex:1;min-width:200px" type="email" placeholder="Email address" data-input="ban.email" value="${esc(b.email)}"><input class="inp" style="flex:2;min-width:240px" placeholder="Reason (internal)" data-input="ban.reason" value="${esc(b.reason)}"><button class="btn btn-danger" data-action="banAdd">Ban</button></div></div>` : ''}
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Email</th><th>Reason</th><th>Banned</th><th>By</th><th>Status</th><th></th></tr></thead><tbody>
+  ${list.map(x => `<tr><td><b>${esc(x.email)}</b></td><td class="small">${esc(x.reason)}</td><td class="small">${esc(fmtDT(x.at))}</td><td class="small">${esc(x.by)}</td><td>${x.removed_at ? `<span class="chip mini">Removed ${esc(ago(x.removed_at))} by ${esc(x.removed_by)}</span>` : '<span class="chip bad mini">Banned</span>'}</td>
+    <td style="text-align:right">${!x.removed_at && can('customers.ban') ? `<button class="btn btn-ghost btn-sm" data-action="banRemove" data-id="${x.id}">Remove ban</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">Nobody is banned.</td></tr>'}</tbody></table></div>`;
+}
+
+// ── Settings additions: plan & billing, custom domain, sending domain ──
+function PlanCard() {
+  const bo = S.adm.bo, plans = S.adm.plans?.length ? S.adm.plans : DEFAULT_PLANS, cur = planOf({ planList: plans, defaultPlan: S.adm.platform?.defaultPlan }, bo), owner = S.adm.me.owner || S.adm.me.support;
+  const period = new Date().toISOString().slice(0, 7), b = billingFor(S.adm.orders, bo, { planList: plans, defaultPlan: S.adm.platform?.defaultPlan }, period);
+  return `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Plan & billing</div>
+    <div class="plans">${plans.map(p => `<div class="plan ${cur.id === p.id ? 'on' : ''}"><b>${esc(p.name)}</b><div class="display" style="font-size:24px">${p.monthly ? money(p.monthly) + '<small>/mo</small>' : 'Free'}</div>
+      <div class="small muted">${esc(feeText({ pct: optNum(p.feePct, S.adm.platform?.feePct ?? S.platform.feePct), fixed: optNum(p.feeFixed, S.adm.platform?.feeFixed ?? S.platform.feeFixed), payer: bo.platformFee?.payer || S.adm.platform?.feePayer || 'organizer' }))}</div><p class="small" style="margin:6px 0">${esc(p.blurb || '')}</p>
+      ${cur.id === p.id ? '<span class="chip ok mini">Current plan</span>' : owner ? `<button class="btn btn-ghost btn-sm" data-action="pickPlan" data-v="${esc(p.id)}">Switch</button>` : ''}</div>`).join('')}</div>
+    ${bo.platformFee ? '<p class="small muted">The platform has set a custom fee for this box office, which replaces the plan\'s fee.</p>' : ''}
+    <div class="sep"></div><div class="between small"><span>This month so far: platform fees taken automatically by ${esc(GATEWAYS.stripe.name)}</span><b class="tnum">${money(b.autoFees)}</b></div>
+    <div class="between small"><span>Platform fees on cash / check / invoice / other orders (invoiced monthly)</span><b class="tnum">${money(b.owedFees)}</b></div>
+    <div class="between small"><span>Plan</span><b class="tnum">${money(b.subscription)}</b></div>
+    <div class="eyebrow" style="margin:14px 0 6px">Invoices</div>
+    ${(S.adm.invoices || []).map(i => `<div class="between small" style="padding:6px 0;border-bottom:1px solid var(--line)"><span>${esc(i.number)} · ${esc(i.period)}</span><span><span class="chip mini ${i.status === 'paid' ? 'ok' : i.status === 'open' ? 'warn' : ''}">${esc(INVOICE_STATUS[i.status])}</span> <b class="tnum">${money(i.total)}</b> <a href="#" data-action="viewInvoice" data-id="${i.id}">view</a></span></div>`).join('') || '<p class="small muted">No invoices yet.</p>'}</div>`;
+}
+function invoiceHtml(i) {
+  return `<div class="invoice"><div class="between"><b>${esc(S.platform.name || 'SET')}</b><span>Invoice ${esc(i.number)}</span></div><p class="small muted">${esc(i.bo_name || S.adm?.bo?.name || '')} · ${esc(i.period)} · issued ${esc(fmtDate(i.issued_at))} · due ${esc(fmtDate(i.due_at))}</p>
+    <table class="tbl" style="margin-top:10px"><tbody>${i.lines.map(l => `<tr><td>${esc(l.label)}</td><td class="tnum">${money(l.amount)}</td></tr>`).join('')}<tr><td><b>Total</b></td><td class="tnum"><b>${money(i.total)}</b></td></tr></tbody></table>
+    ${i.info?.autoFees ? `<p class="small muted" style="margin-top:8px">Not included: ${money(i.info.autoFees)} in platform fees already taken automatically on ${i.info.autoOrders} card order(s).</p>` : ''}<p class="small" style="margin-top:8px">Status: ${esc(INVOICE_STATUS[i.status])}${i.paid_at ? ' · paid ' + esc(fmtDate(i.paid_at)) : ''}</p></div>`;
+}
+function DomainCard() {
+  const d = S.adm.bo.domain, target = S.adm.platform?.domainTarget || DEFAULT_PLATFORM.domainTarget;
+  return `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Custom domain</div><p class="small muted" style="margin-bottom:10px">Your box office's site on your own address, e.g. <code>tickets.yourvenue.com</code>, with HTTPS. Event links become <code>https://your-domain/#/e/event-name</code>.</p>
+    <div class="row"><input class="inp" style="flex:1" data-input="domHost" placeholder="tickets.yourvenue.com" value="${esc(S.ui.domHost ?? d?.host ?? '')}"><button class="btn btn-ghost btn-sm" data-action="saveDomain">${d ? 'Change' : 'Add'}</button></div>
+    ${d ? `<div class="item-card" style="margin-top:10px"><div class="between"><b>${esc(d.host)}</b><span class="chip ${d.status === 'verified' ? 'ok' : 'warn'}">${d.status === 'verified' ? 'Connected' : 'Waiting for DNS'}</span></div>
+      <p class="small muted" style="margin:6px 0">Add these records at your domain provider:</p>${dnsTable(domainRecords(d.host, d.token, target))}
+      <div class="row wrap" style="margin-top:8px"><button class="btn btn-ghost btn-sm" data-action="checkDomain" data-v="site">Check DNS</button>${d.host ? '<button class="btn btn-ghost btn-sm" data-action="removeDomain">Remove</button>' : ''}</div>
+      ${d.demo ? '<p class="small muted">Demo mode can\'t look DNS up — marked connected for the walkthrough.</p>' : ''}</div>` : ''}</div>`;
+}
+const dnsTable = recs => `<div class="tbl-wrap"><table class="tbl dns"><thead><tr><th>Type</th><th>Name</th><th>Value</th>${recs[0]?.purpose ? '<th>For</th>' : ''}</tr></thead><tbody>${recs.map(r => `<tr><td>${esc(r.type)}</td><td><code>${esc(r.name)}</code></td><td><code>${esc(r.value)}</code></td>${r.purpose ? `<td class="small">${esc(r.purpose)}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+function MailDomainCard() {
+  const m = S.adm.bo.mailDomain;
+  return `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Sending domain</div><p class="small muted" style="margin-bottom:10px">Send tickets from your own address (e.g. <code>tickets@yourvenue.com</code>). Add the SPF, DKIM and DMARC records below so inboxes trust it; until it's verified, email goes from the platform's domain with your name and reply-to.</p>
+    <div class="row"><input class="inp" style="flex:1" data-input="mailDom" placeholder="yourvenue.com" value="${esc(S.ui.mailDom ?? m?.domain ?? '')}"><button class="btn btn-ghost btn-sm" data-action="saveMailDomain">${m ? 'Change' : 'Add'}</button></div>
+    ${m ? `<div class="item-card" style="margin-top:10px"><div class="between"><b>${esc(m.domain)}</b><span class="chip ${m.status === 'verified' ? 'ok' : 'warn'}">${m.status === 'verified' ? 'Verified' : 'Not verified yet'}</span></div>${dnsTable(m.records || mailRecords(m.domain))}
+      <button class="btn btn-ghost btn-sm" style="margin-top:8px" data-action="checkDomain" data-v="mail">Verify</button>${m.demo ? '<p class="small muted">Demo mode can\'t look DNS up — marked verified for the walkthrough.</p>' : ''}</div>` : ''}
+    <p class="small muted" style="margin-top:10px">Bounces and complaints are tracked automatically (Marketing → Messages); you get one alert a day if emails fail.</p></div>`;
+}
+// ── Getting started (SaaS onboarding) ──
+function Onboarding() {
+  const bo = S.adm.bo, s = bo.settings || {};
+  if (!(S.adm.me.owner || S.adm.me.support) || s.onboarded) return '';
+  const steps = [['Add your logo and colours', !!(bo.branding?.logo || bo.branding?.accent !== DEFAULT_BRANDING.accent), '#/admin/branding'], ['Set your contact email and policies', !!(s.contactEmail && s.terms), '#/admin/branding'],
+    ['Connect payments', bo.gateway?.status === 'connected', '#/admin/settings'], ['Create your first event', S.adm.events.length > 0, '#/admin/events'], ['Publish it', S.adm.events.some(e => e.status === 'published'), '#/admin/events'],
+    ['Invite your team', (S.adm.team || []).length > 1, '#/admin/team']], done = steps.filter(x => x[1]).length;
+  if (done === steps.length) return '';
+  return `<div class="card onboard" style="margin-bottom:18px"><div class="between"><h3>Get started — ${done} of ${steps.length} done</h3><a href="#" class="small" data-action="onboardDone">Hide</a></div>
+    <div class="q-bar" style="margin:10px 0"><span style="width:${Math.round(done / steps.length * 100)}%"></span></div>
+    <div class="row wrap">${steps.map(([t, ok, href]) => `<a class="chip ${ok ? 'ok' : ''}" href="${href}">${ok ? '✓ ' : ''}${esc(t)}</a>`).join('')}</div></div>`;
+}
+// ── Platform (super admin) additions: all events, staff, billing, risk, system health, incidents ──
+function PEvents() {
+  const P = S.plat, q = String(S.ui.peq || '').toLowerCase(), now = Date.now(), f = S.ui.pef || 'upcoming';
+  const list = (P.events || []).filter(e => (f === 'all' || (f === 'upcoming' ? D(e.start) >= now && !e.archived : D(e.start) < now || e.archived)) && (!q || (e.name + ' ' + e.bo).toLowerCase().includes(q)));
+  return head('All events', `${(P.events || []).length} events across ${P.bos.length} box offices`) + `<div class="toolbar"><input class="inp" style="flex:1" data-input="peq" data-rr="1" placeholder="Search events or box offices…" value="${esc(S.ui.peq || '')}">
+    ${[['upcoming', 'Upcoming'], ['past', 'Past'], ['all', 'All']].map(([k, l]) => `<button class="btn btn-sm ${f === k ? 'btn-dark' : 'btn-ghost'}" data-action="pef" data-v="${k}">${l}</button>`).join('')}</div>
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Event</th><th>Box office</th><th>Date</th><th>Status</th><th>Tickets</th><th>Controls</th></tr></thead><tbody>${list.map(e => `<tr><td><b>${esc(e.name)}</b><div class="small muted">/e/${esc(e.slug)}</div></td><td class="small">${esc(e.bo)}</td>
+    <td class="small">${esc(fmtDT(e.start))}</td><td><span class="chip mini">${esc(e.archived ? 'archived' : e.status)}${e.visibility && e.visibility !== 'public' ? ' · ' + esc(e.visibility) : ''}</span></td><td class="tnum">${e.tickets}</td>
+    <td>${EV_CONTROLS.filter(([k]) => e.controls?.[k]).map(([, t]) => `<span class="chip bad mini">${esc(t)}</span>`).join(' ') || '<span class="small muted">—</span>'}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">No events.</td></tr>'}</tbody></table></div>`;
+}
+function PStaff() {
+  const P = S.plat, q = String(S.ui.psq || '').toLowerCase(), list = (P.staff || []).filter(m => !q || (m.email + ' ' + m.name + ' ' + m.bo).toLowerCase().includes(q));
+  return head('Staff & users', `${new Set((P.staff || []).map(m => m.email)).size} people on ${P.bos.length} box offices · ${P.platform.admins.length} super admins`) + `<div class="toolbar"><input class="inp" style="flex:1" data-input="psq" data-rr="1" placeholder="Search…" value="${esc(S.ui.psq || '')}"></div>
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Person</th><th>Box office</th><th>Access</th><th>Last sign-in</th></tr></thead><tbody>${list.map(m => `<tr><td><b>${esc(m.name || m.email)}</b><div class="small muted">${esc(m.email)}</div></td><td class="small">${esc(m.bo)}</td>
+    <td><span class="chip mini">${m.owner ? 'Owner' : esc(tplName(m.template) || 'Custom')}</span></td><td class="small muted">${m.last ? esc(ago(m.last)) : '—'}</td></tr>`).join('')}</tbody></table></div>`;
+}
+function PBilling() {
+  const P = S.plat, plat = P.platform, prev = (() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - 1); return d.toISOString().slice(0, 7); })(), period = S.ui.bp || prev;
+  const fake = id => P.orders.filter(o => o.box_office_id === id).map(o => ({ ...o, data: { platformFee: o.platformFee, total: o.total }, payment: o.provider ? { provider: o.provider, ...(o.marked ? { markedPaidBy: 'staff' } : {}) } : null }));
+  return head('Plans & billing', 'What each box office owes the platform', `<input class="inp" type="month" data-input="bp" value="${esc(period)}"><button class="btn btn-accent" data-action="billingRun">Create invoices for ${esc(period)}</button>`) + `
+  <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Box office</th><th>Plan</th><th>Fees taken automatically</th><th>Fees to invoice</th><th>Plan fee</th><th>Due for ${esc(period)}</th></tr></thead><tbody>
+  ${P.bos.filter(b => ['active', 'suspended'].includes(b.status)).map(b => { const x = billingFor(fake(b.id), b, plat, period); return `<tr><td><b>${esc(b.name)}</b></td><td><select class="inp" data-action-change="boPlan" data-id="${b.id}">${(plat.planList || DEFAULT_PLANS).map(p => `<option value="${esc(p.id)}" ${x.plan.id === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></td>
+    <td class="tnum">${money(x.autoFees)}<div class="small muted">${x.autoOrders} orders</div></td><td class="tnum">${money(x.owedFees)}<div class="small muted">${x.owedOrders} orders</div></td><td class="tnum">${money(x.subscription)}</td><td class="tnum"><b>${money(x.due)}</b></td></tr>`; }).join('')}</tbody></table></div>
+  <div class="card" style="margin-top:18px"><h3>Invoices</h3>${(P.invoices || []).length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Invoice</th><th>Box office</th><th>Month</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${P.invoices.slice().sort((a, b) => D(b.issued_at) - D(a.issued_at)).map(i => `<tr><td><a href="#" data-action="viewInvoice" data-id="${i.id}">${esc(i.number)}</a></td><td class="small">${esc(i.bo_name)}</td><td class="small">${esc(i.period)}</td><td class="tnum">${money(i.total)}</td>
+    <td><span class="chip mini ${i.status === 'paid' ? 'ok' : i.status === 'open' ? 'warn' : ''}">${esc(INVOICE_STATUS[i.status])}</span></td><td style="text-align:right;white-space:nowrap">${i.status === 'open' ? `<button class="btn btn-ghost btn-sm" data-action="invoiceDo" data-id="${i.id}" data-v="paid">Mark paid</button> <button class="btn btn-ghost btn-sm" data-action="invoiceDo" data-id="${i.id}" data-v="void">Void</button>` : i.status === 'void' ? '' : `<button class="btn btn-ghost btn-sm" data-action="invoiceDo" data-id="${i.id}" data-v="open">Reopen</button>`}</td></tr>`).join('')}</tbody></table></div>` : '<p class="small muted">None yet — create them for a month above (the live system also does it on the 1st of every month).</p>'}</div>
+  <p class="small muted" style="margin-top:12px">Card orders through Stripe Connect pay the platform fee automatically (the application fee). Only orders paid another way — cash, check, Zelle / bank transfer, invoice, pay-later marked paid, other processors — are invoiced, plus the plan's monthly price. Change plans and fees in Platform settings.</p>`;
+}
+const HEALTH_CHIP = { ok: ['ok', 'Operational'], degraded: ['warn', 'Degraded'], down: ['bad', 'Down'], off: ['', 'Not connected'] };
+function PHealth() {
+  const P = S.plat, h = P.health || { parts: {} };
+  if (S.version === undefined) { S.version = null; fetch('version.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : { commit: 'local copy', at: null }).catch(() => ({ commit: 'local copy', at: null })).then(v => { S.version = v; render(); }); }
+  return head('System health', 'Live status from what actually happened in the last minutes and hours', `<button class="btn btn-ghost" data-action="platReload">Refresh</button><button class="btn btn-accent" data-action="newIncident">Open an incident</button>`) + `
+  <div class="health-grid">${HEALTH_PARTS.map(([k, t]) => { const [cls, lbl] = HEALTH_CHIP[h.parts[k] || 'ok']; return `<div class="card health"><div class="small muted">${t}</div><span class="chip ${cls}">${lbl}</span></div>`; }).join('')}</div>
+  ${(h.open || []).length ? `<div class="banner warn" style="margin-top:14px"><b>${h.open.length} open incident${h.open.length === 1 ? '' : 's'}:</b> ${h.open.map(i => esc(i.title)).join(', ')} — <a href="#/platform/incidents">Incidents</a></div>` : ''}
+  <div class="cols" style="margin-top:18px"><div class="card"><h3>Failed payments (last hour)</h3><p class="display" style="font-size:30px">${h.failedPayments || 0}<small class="muted" style="font-size:14px"> of ${h.attempts || 0} attempts</small></p></div>
+    <div class="card"><h3>Backups</h3><p class="small">${h.lastBackup ? 'Last good backup ' + esc(ago(h.lastBackup)) : DB.live ? '<span style="color:var(--bad)">No backup recorded</span>' : 'Demo mode — the live system records each nightly backup (see SETUP.md)'}</p></div>
+    <div class="card"><h3>Deployed version</h3><p class="small" id="verBox">${esc(S.version ? `${S.version.commit}${S.version.at ? ' · ' + fmtDT(S.version.at) : ''}${S.version.env ? ' · ' + S.version.env : ''}` : 'loading…')}</p><p class="small muted">History: <code>git tag -l 'deploy-*'</code> · roll back: <code>bash deploy/rollback.sh &lt;tag&gt;</code></p></div></div>
+  <div class="cols" style="margin-top:18px"><div class="card"><h3>Failed emails (24 h)</h3>${(h.failedMail || []).slice(0, 12).map(m => `<div class="small between" style="padding:5px 0;border-bottom:1px solid var(--line)"><span>${esc(m.kind)} · ${esc(m.error || '')}</span><span class="muted">${esc(ago(m.at))}</span></div>`).join('') || '<p class="small muted">None.</p>'}</div>
+    <div class="card"><h3>Failed integrations (24 h)</h3>${(h.failedHooks || []).slice(0, 12).map(d => `<div class="small between" style="padding:5px 0;border-bottom:1px solid var(--line)"><span>${esc(d.type || d.event || '')} · ${esc(d.response || '')}</span><span class="muted">${esc(ago(d.created_at || d.at))}</span></div>`).join('') || '<p class="small muted">None.</p>'}</div></div>
+  <div class="card" style="margin-top:18px"><h3>Recent errors</h3>${(P.errors || []).length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>When</th><th>Where</th><th>Message</th><th>Page</th></tr></thead><tbody>${P.errors.slice(0, 50).map(e => `<tr><td class="small">${esc(fmtDT(e.at))}</td><td><span class="chip mini">${esc(e.where)}</span></td><td class="small">${esc(e.message)}</td><td class="small muted">${esc(e.url || '')}</td></tr>`).join('')}</tbody></table></div>` : '<p class="small muted">No errors recorded.</p>'}</div>`;
+}
+function PIncidents() {
+  const list = S.plat.incidents || [];
+  return head('Incidents', 'Outages and failures: when they started and ended, what they affected, the cause and the fix', `<button class="btn btn-accent" data-action="newIncident">Open an incident</button>`) + `
+  ${list.map(i => `<div class="card" style="margin-bottom:12px"><div class="between"><div><b>${esc(i.title)}</b> <span class="chip mini ${i.status === 'resolved' ? 'ok' : 'bad'}">${esc(i.status)}</span> <span class="chip mini">${esc(INCIDENT_KINDS[i.kind] || i.kind)}</span> ${i.severity === 'major' ? '<span class="chip bad mini">major</span>' : ''}
+      <div class="small muted">${esc(fmtDT(i.started_at))} → ${i.ended_at ? esc(fmtDT(i.ended_at)) : 'ongoing'}${i.events?.length ? ' · ' + i.events.map(id => esc((S.plat.events || []).find(e => e.id === id)?.name || 'event')).join(', ') : ''}</div></div>
+      <button class="btn btn-ghost btn-sm" data-action="editIncident" data-id="${i.id}">${i.status === 'resolved' ? 'Edit' : 'Update / resolve'}</button></div>
+    ${i.cause ? `<p class="small" style="margin-top:8px"><b>Cause:</b> ${esc(i.cause)}</p>` : ''}${i.resolution ? `<p class="small"><b>Resolution:</b> ${esc(i.resolution)}</p>` : ''}
+    ${(i.updates || []).map(u => `<div class="small muted">${esc(fmtDT(u.at))} · ${esc(u.by)}: ${esc(u.text)}</div>`).join('')}</div>`).join('') || '<div class="empty">No incidents recorded.</div>'}`;
+}
+function IncidentModal(id) {
+  const i = id ? (S.plat.incidents || []).find(x => x.id === id) : null;
+  S.ui.inc = { id: i?.id || '', kind: i?.kind || 'checkout', title: i?.title || '', severity: i?.severity || 'minor', events: [...(i?.events || [])], cause: i?.cause || '', resolution: i?.resolution || '', started_at: i?.started_at || new Date().toISOString(), status: i?.status || 'open', update: '' };
+  const f = S.ui.inc;
+  modal(i ? 'Update incident' : 'Open an incident', `<div class="grid2"><div class="field"><label class="fl">Kind</label><select class="inp" data-input="inc.kind">${Object.entries(INCIDENT_KINDS).map(([k, t]) => `<option value="${k}" ${f.kind === k ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+      <div class="field"><label class="fl">Severity</label><select class="inp" data-input="inc.severity"><option value="minor">Minor — degraded</option><option value="major" ${f.severity === 'major' ? 'selected' : ''}>Major — down</option></select></div></div>
+    <div class="field"><label class="fl">Title</label><input class="inp" data-input="inc.title" value="${esc(f.title)}"></div>
+    <div class="field"><label class="fl">Affected events</label><select class="inp" multiple size="4" data-action-change="incEvents">${(S.plat.events || []).filter(e => !e.archived).map(e => `<option value="${e.id}" ${f.events.includes(e.id) ? 'selected' : ''}>${esc(e.name)} · ${esc(e.bo)}</option>`).join('')}</select></div>
+    <div class="field"><label class="fl">Cause (when known)</label><textarea class="inp" data-input="inc.cause">${esc(f.cause)}</textarea></div>
+    <div class="field"><label class="fl">Resolution</label><textarea class="inp" data-input="inc.resolution">${esc(f.resolution)}</textarea></div>
+    <div class="field"><label class="fl">Add an update</label><input class="inp" data-input="inc.update" placeholder="e.g. Provider confirmed the issue"></div>`,
+    `<button class="btn btn-ghost" data-action="closeModal">Cancel</button><button class="btn btn-ghost" data-action="saveIncident" data-v="open">Save (still open)</button><button class="btn btn-accent" data-action="saveIncident" data-v="resolved">Resolved</button>`);
+}
+function PRisk() {
+  const P = S.plat, list = P.flagged || [], open = list.filter(o => !o.review);
+  return head('Risk & fraud', `${open.length} flagged order${open.length === 1 ? '' : 's'} to review · ${P.bans || 0} banned customers`) + `
+  <div class="cols"><div class="card small"><h3>What is checked</h3><p class="muted" style="margin-top:6px">Hard stops: too many checkout attempts per connection, too many orders per email per hour, a hidden form field only bots fill, banned customers, too many seats held per connection, too many declined cards on one order.
+    Flags for review: several orders from one email, a duplicate of a recent order, unusually large orders, automated-looking checkouts, repeated card declines.</p></div>
+    <div class="card small"><h3>Payment attempts</h3><p class="muted" style="margin-top:6px">${P.health?.attempts || 0} in the last hour, ${P.health?.failedPayments || 0} declined. Spikes show on System health.</p></div></div>
+  <div class="tbl-wrap" style="margin-top:18px"><table class="tbl"><thead><tr><th>Order</th><th>Box office</th><th>Customer</th><th>Flags</th><th>Total</th><th>Placed</th><th>Review</th></tr></thead><tbody>
+  ${list.map(o => `<tr><td><b>${esc(o.ref)}</b><div class="small muted">${esc(o.status)}</div></td><td class="small">${esc(o.bo)}</td><td class="small">${esc(o.email)}</td><td>${(o.flags || []).map(k => `<span class="chip warn mini" title="${esc(ORDER_FLAGS[k] || k)}">${esc(k)}</span>`).join(' ')}</td>
+    <td class="tnum">${money(o.total)}</td><td class="small">${esc(ago(o.created_at))}</td><td>${o.review ? `<span class="chip mini ${o.review.result === 'fraud' ? 'bad' : 'ok'}">${o.review.result === 'fraud' ? 'fraud' : 'genuine'}</span>` : `<button class="btn btn-ghost btn-sm" data-action="support" data-id="${o.box_office_id}">Open box office</button>`}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">Nothing flagged.</td></tr>'}</tbody></table></div>`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ACTIONS
 // ══════════════════════════════════════════════════════════════════════════════
-const dirty = () => { S.dirty = true; document.querySelectorAll('[data-action="saveEvent"],[data-action="saveVenue"],[data-action="savePromo"],[data-action="saveTracking"]').forEach(b => { b.disabled = false; }); };
+const dirty = () => { S.dirty = true; autosave(); document.querySelectorAll('[data-action="saveEvent"],[data-action="saveVenue"],[data-action="savePromo"],[data-action="saveTracking"]').forEach(b => { b.disabled = false; }); };
 const newTT = () => ({ id: shortId('tt_'), name: 'General admission', price: 0, qty: 0, min: 1, max: 10, admits: 1, desc: '', hidden: false });
 function upsertLocal(list, item, key = 'id') { const i = list.findIndex(x => x[key] === item[key]); if (i >= 0) list[i] = item; else list.push(item); }
 async function persistEvent(ev) {
@@ -3366,6 +3740,67 @@ function seatMapEdit(key, val, dflt) {
   dirty(); render(); toast(n + ' seat' + (n === 1 ? '' : 's') + ' updated');
 }
 const A = {
+  // ── Stage 10 ──
+  contactOrg: el => ContactModal(el.dataset.id, el.dataset.bo, el.dataset.ref),
+  sendContact: async () => { const f = S.ui.ct; try { const r = await DB.contactOrganizer(f.ev, f.bo, f); closeModal(); toast(`Sent to ${r.routed} — they'll reply by email`); } catch (e) { toast(e.message, true); } },
+  queueRetry: el => { delete S.queue[el.dataset.id]; render(); },
+  evControl: async el => { const ev = S.draft, k = el.dataset.k, cur = !!(S.adm.events.find(e => e.id === ev.id)?.controls || {})[k];
+    if (!cur && !confirm(`${EV_CONTROLS.find(x => x[0] === k)[1]} for “${ev.name}” now?`)) return;
+    try { const c = await DB.eventControl(ev.id, { [k]: !cur, message: S.ui.ctlMsg ?? undefined }); const e = S.adm.events.find(x => x.id === ev.id); if (e) e.controls = c; ev.controls = c; await reloadAdmin(); await refreshPublic(); toast(cur ? 'Back to normal' : 'Done — it applies immediately'); render(); } catch (e) { toast(e.message, true); } },
+  evControlMsg: async () => { const ev = S.draft; try { const c = await DB.eventControl(ev.id, { message: S.ui.ctlMsg || '' }); ev.controls = c; await reloadAdmin(); await refreshPublic(); toast('Message updated'); render(); } catch (e) { toast(e.message, true); } },
+  cartMin: el => { S.draft.cartMinutes = +el.dataset.v; dirty(); render(); },
+  addXFee: () => { ((S.draft.fees ||= {}).extra ||= []).push({ id: shortId('fx_'), name: 'Facility fee', pct: '', fixed: 100, per: 'ticket', optional: false }); dirty(); render(); },
+  delXFee: el => { S.draft.fees.extra.splice(+el.dataset.i, 1); dirty(); render(); },
+  erExport: el => { const R = eventReportData(S.draft, S.ui.er), sheets = reportSheets(R).filter(([n]) => can('finance.reports') || !['Revenue', 'Reconciliation', 'Promotions'].includes(n)), name = slugify(S.draft.name) + '-full-report';
+    if (el.dataset.v === 'xlsx') xpDownload(name, sheets.map(([n, rows]) => ({ name: n, rows })), 'xlsx');
+    else download(name + '.csv', sheets.map(([n, rows]) => [[n], ...rows, []]).flat().map(r => r.map(csvCell).join(',')).join('\n')); },
+  erPrint: () => { document.body.classList.add('print-report'); window.print(); setTimeout(() => document.body.classList.remove('print-report'), 500); },
+  erCmp: el => { const s = new Set(S.ui.er.cmp || []); el.checked ? s.add(el.dataset.v) : s.delete(el.dataset.v); S.ui.er.cmp = [...s].slice(0, 5); render(); },
+  restoreVersion: el => { const v = (S.adm.versions || []).find(x => x.id === el.dataset.id); if (!v) return;
+    const cur = S.draft, snap = clone(v.snapshot);
+    S.draft = normEvent({ ...cur, ...snap, id: cur.id, box_office_id: cur.box_office_id, slug: cur.slug, status: cur.status, secrets: cur.secrets, controls: cur.controls,
+      seating: snap.seating ? { ...snap.seating, bg: cur.seating?.bg } : cur.seating });
+    if (S.draft.seating?.enabled) Object.assign(S.draft.seating, seatDerive(S.draft.seating));
+    dirty(); toast(`Version from ${fmtDT(v.at)} loaded — review it, then Save changes`); render(); },
+  restoreSettings: async el => { const v = (S.adm.versions || []).find(x => x.id === el.dataset.id); if (!v || !confirm(`Restore the box office settings from ${fmtDT(v.at)}?`)) return;
+    try { await DB.saveBoxOffice({ settings: v.snapshot.settings, branding: v.snapshot.branding }); await refreshPublic(); await reloadAdmin(); S.ui.set = null; toast('Settings restored'); render(); } catch (e) { toast(e.message, true); } },
+  autoRestore: () => { const a = autosaved(S.draft.id); if (!a) return; S.draft = normEvent({ ...a.draft, seating: a.draft.seating ? { ...a.draft.seating, bg: S.draft.seating?.bg } : a.draft.seating }); S.dirty = true; toast('Unsaved changes restored — Save to keep them'); render(); },
+  autoDiscard: () => { try { localStorage.removeItem(AUTO_KEY(S.draft.id)); } catch (e) { } render(); },
+  reviewOrder: async el => { try { await DB.orderAction(el.dataset.id, 'review', { result: el.dataset.v }); await reloadAdmin(); toast(el.dataset.v === 'fraud' ? 'Marked as fraud' : 'Flags cleared'); render(); } catch (e) { toast(e.message, true); } },
+  banAsk: el => { S.ui.ban = { email: el.dataset.v, reason: '' }; modal('Ban from buying', `<p class="small muted" style="margin-bottom:10px"><b>${esc(el.dataset.v)}</b> won't be able to buy tickets from ${esc(S.adm.bo.name)}. Existing tickets stay valid. Only staff see the reason.</p>
+    <div class="field"><label class="fl">Reason</label><textarea class="inp" data-input="ban.reason"></textarea></div>`, `<button class="btn btn-ghost" data-action="closeModal">Cancel</button><button class="btn btn-danger" data-action="banAdd">Ban</button>`); },
+  banAdd: async () => { const b = S.ui.ban || {}; try { await DB.banCustomer(b.email, b.reason); closeModal(); S.ui.ban = null; await reloadAdmin(); toast('Banned'); render(); } catch (e) { toast(e.message, true); } },
+  banRemove: async el => { try { await DB.unbanCustomer(el.dataset.id); await reloadAdmin(); toast('Ban removed'); render(); } catch (e) { toast(e.message, true); } },
+  showAccepted: el => { const t = S.adm.policyTexts?.[el.dataset.v]; if (t) modal(esc(t.title), `<p style="white-space:pre-line">${esc(t.text)}</p><p class="small muted" style="margin-top:12px">Version ${esc(el.dataset.v)} · first accepted ${esc(fmtDT(t.first_at))}</p>`); },
+  inboxFilter: el => { S.ui.inf = el.dataset.v; render(); },
+  inboxReply: async el => { try { await DB.supportAction(el.dataset.id, 'reply', { body: S.ui['rep_' + el.dataset.id] || '' }); S.ui['rep_' + el.dataset.id] = ''; await reloadAdmin(); toast('Reply sent'); render(); } catch (e) { toast(e.message, true); } },
+  inboxStatus: async el => { try { await DB.supportAction(el.dataset.id, el.dataset.v); await reloadAdmin(); render(); } catch (e) { toast(e.message, true); } },
+  pickPlan: async el => { const p = (S.adm.plans || DEFAULT_PLANS).find(x => x.id === el.dataset.v); if (!confirm(`Switch to the ${p.name} plan (${p.monthly ? money(p.monthly) + ' a month' : 'no monthly fee'})?`)) return;
+    try { await DB.setPlan(p.id); await reloadAdmin(); await refreshPublic(); toast('Plan changed'); render(); } catch (e) { toast(e.message, true); } },
+  viewInvoice: el => { const i = (S.adm?.invoices || []).concat(S.plat?.invoices || []).find(x => x.id === el.dataset.id); if (i) modal('Invoice ' + esc(i.number), invoiceHtml(i), `<button class="btn btn-ghost" data-action="printInvoice">Print / PDF</button>`); },
+  printInvoice: () => { document.body.classList.add('print-modal'); window.print(); setTimeout(() => document.body.classList.remove('print-modal'), 500); },
+  saveDomain: async () => { try { await DB.saveDomain(S.ui.domHost ?? S.adm.bo.domain?.host ?? ''); S.ui.domHost = undefined; await reloadAdmin(); toast('Saved — now add the DNS records'); render(); } catch (e) { toast(e.message, true); } },
+  removeDomain: async () => { if (!confirm('Remove the custom domain?')) return; try { await DB.saveDomain(''); S.ui.domHost = undefined; await reloadAdmin(); render(); } catch (e) { toast(e.message, true); } },
+  checkDomain: async el => { try { const d = await DB.checkDomain(el.dataset.v); await reloadAdmin(); toast(d.status === 'verified' ? 'Verified' : 'Not found yet — DNS can take up to an hour'); render(); } catch (e) { toast(e.message, true); } },
+  saveMailDomain: async () => { try { await DB.mailDomain(S.ui.mailDom ?? S.adm.bo.mailDomain?.domain ?? ''); S.ui.mailDom = undefined; await reloadAdmin(); toast('Saved — add the DNS records, then Verify'); render(); } catch (e) { toast(e.message, true); } },
+  onboardDone: async () => { try { await DB.saveBoxOffice({ settings: { ...S.adm.bo.settings, onboarded: true } }); await reloadAdmin(); render(); } catch (e) { toast(e.message, true); } },
+  gwPause: async () => { const g = S.adm.bo.gateway; if (!g.disabled && !confirm('Pause card payments for every event? Buyers can still reserve (pay later) if that is on.')) return;
+    try { await DB.pauseGateway(!g.disabled); await reloadAdmin(); await refreshPublic(); toast(g.disabled ? 'Card payments resumed' : 'Card payments paused'); render(); } catch (e) { toast(e.message, true); } },
+  regPlan: el => { S.ui.reg.plan = el.dataset.v; render(); },
+  regAgree: el => { S.ui.reg.agree = el.checked; },
+  pef: el => { S.ui.pef = el.dataset.v; render(); },
+  billingRun: async () => { const p = S.ui.bp || (() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - 1); return d.toISOString().slice(0, 7); })();
+    try { const n = await DB.billingRun(p); S.plat = await DB.loadPlatform(); toast(n ? `${n} invoice${n === 1 ? '' : 's'} created` : 'Nothing to invoice for ' + p); render(); } catch (e) { toast(e.message, true); } },
+  invoiceDo: async el => { try { await DB.invoiceAction(el.dataset.id, el.dataset.v); S.plat = await DB.loadPlatform(); render(); } catch (e) { toast(e.message, true); } },
+  platReload: async () => { S.plat = await DB.loadPlatform(); render(); },
+  newIncident: () => IncidentModal(null),
+  editIncident: el => IncidentModal(el.dataset.id),
+  saveIncident: async el => { const f = S.ui.inc; try { await DB.saveIncident({ ...f, status: el.dataset.v, ended_at: el.dataset.v === 'resolved' ? new Date().toISOString() : '' }); closeModal(); S.plat = await DB.loadPlatform(); toast('Incident saved'); render(); } catch (e) { toast(e.message, true); } },
+  confPreview: () => { const ev = S.draft, o = S.adm.orders.find(x => x.event_ids.includes(ev.id) && x.status === 'paid') || { id: 'preview', ref: 'SET-PREVIEW', buyer_email: 'guest@example.com', box_office_id: ev.box_office_id, event_ids: [ev.id], data: { buyer: { name: 'Sample Guest' }, lines: [{ eventId: ev.id }] } };
+    modal('Confirmation email preview', `<div class="email-pv">${msgPreview({ kind: 'confirmation', channel: 'email', category: 'transactional', order_id: o.id, event_id: ev.id, to: o.buyer_email, _event: ev, _order: o })}</div>`); },
+  addPlan: () => { S.ui.ps.planList.push({ id: shortId('plan_'), name: 'New plan', monthly: 0, feePct: '', feeFixed: '', blurb: '' }); render(); },
+  delPlan: el => { S.ui.ps.planList.splice(+el.dataset.i, 1); render(); },
+  defPlan: el => { S.ui.ps.defaultPlan = el.dataset.v; },
   // ── Stage 9: reports, expenses, chargebacks, exports ──
   repClear: () => { S.ui.rep = emptyFin(); render(); },
   repProfit: el => { S.ui.rep = { ...emptyFin(), eventId: el.dataset.id }; location.hash = '#/admin/reports/profit'; },
@@ -3435,7 +3870,9 @@ const A = {
   },
   removeEv: el => { if (S.cart.holds?.[el.dataset.id] !== undefined) { DB.releaseSeats(el.dataset.id).catch(() => { }); delete S.cart.holds[el.dataset.id]; }
     S.cart.items = S.cart.items.filter(i => i.eventId !== el.dataset.id); S.cart.addons = S.cart.addons.filter(i => i.eventId !== el.dataset.id); saveCart(); render(); },
-  donate: el => { S.cart.donation = +el.dataset.v; saveCart(); render(); },
+  donate: el => { S.cart.donation = +el.dataset.v; S.co.donCustom = false; saveCart(); render(); },
+  optFee: el => { const s = new Set(S.cart.optFees || []); el.checked ? s.add(el.dataset.v) : s.delete(el.dataset.v); S.cart.optFees = [...s]; saveCart(); render(); },
+  showPolicy2: el => { const evs = cartEventIds().map(evById).filter(Boolean), p = policiesFor(cartBo(), evs)[+el.dataset.i]; if (p) modal(esc(p.title), `<p style="white-space:pre-line">${esc(p.text)}</p><p class="small muted" style="margin-top:12px">Version ${esc(p.version)}</p>`); },
   pay: el => { S.co.payment = el.dataset.v; render(); },
   showTerms: () => modal('Terms & conditions', `<p style="white-space:pre-line">${esc(S.settings.terms)}</p>`),
   // one box: a promo code (discount) or a tracking / referral code (credits whoever sent you)
@@ -3457,12 +3894,12 @@ const A = {
   delAddonLine: el => { S.cart.addons = S.cart.addons.filter(x => !(x.eventId === el.dataset.id && x.addonId === el.dataset.v)); saveCart(); render(); },
   placeOrder: async () => {
     pix('InitiateCheckout', { value: cartQuote().total || 0, currency: S.settings.currency || 'USD' });
-    const co = S.co, set = S.settings, ck = { ...DEFAULT_SETTINGS.checkout, ...(set.checkout || {}) }, q = cartQuote(); co.err = '';
+    const co = S.co, set = S.settings, evs = cartEventIds().map(evById).filter(Boolean), ck = checkoutFor(set, evs), q = cartQuote(); co.err = '';
     if (!co.name.trim() || !EMAIL_RE.test(co.email.trim())) co.err = 'Please enter your name and a valid email.';
     else if (ck.phone === 'required' && !String(co.phone || '').trim()) co.err = 'Please enter your mobile number.';
     else if (ck.address === 'required' && !String(co.address || '').trim()) co.err = 'Please enter your address.';
     else co.err = checkAnswers(set.questions, cartEventIds().map(evById).filter(Boolean), co.answers, tAnswers(), ticketsPerEvent(q));
-    if (!co.err && !co.terms) co.err = 'Please accept the terms & conditions.';
+    if (!co.err && !co.terms) co.err = 'Please accept the terms & policies.';
     if (co.err) return render();
     co.busy = true; co.attempt ||= uid(); render();   // one attempt id per checkout: a double click or retry returns the same order
     try {
@@ -3470,7 +3907,9 @@ const A = {
         items: S.cart.items, addons: S.cart.addons, code: co.disc?.code || '', tracking: co.tracking || sessionStorage.getItem('set_ref') || '',
         donation: S.cart.donation || 0, payment: q.total === 0 ? 'free' : co.payment, answers: co.answers, ticketAnswers: tAnswers(), optIn: !!co.optIn, smsOptIn: !!co.smsOptIn && !!normPhone(co.phone),
         source: sessionStorage.getItem('set_src') || null, utm: (() => { try { return JSON.parse(sessionStorage.getItem('set_utm') || 'null'); } catch (e) { return null; } })(), unlock: S.cart.unlock, holdToken: DB.holdToken(), attempt: co.attempt,
-        credit: q.credit ? co.credit?.code || 'account' : '' });
+        credit: q.credit ? co.credit?.code || 'account' : '', optFees: S.cart.optFees || [],
+        accepted: policiesFor(cartBo(), evs).map(({ kind, eventId, version }) => ({ kind, eventId, version })),   // Stage 10: the versions the buyer just agreed to
+        bot: { hp: co.hp || '', ms: Date.now() - (co.t0 || Date.now()), wd: !!navigator.webdriver } });
       if (r.status === 'awaiting_payment') return startPay(r);
       checkoutDone(r);
     } catch (e) { co.busy = false; co.err = e.message; render(); }
@@ -3557,7 +3996,8 @@ const A = {
     if (S.bos.some(x => x.slug === b.slug && x.id !== S.adm.bo.id)) return toast('That link name is taken', true);
     try { await DB.saveBoxOffice({ name: b.name.trim() || S.adm.bo.name, slug: b.slug, branding: b.branding, settings: { ...S.adm.bo.settings, ...b.settings } }); await refreshPublic(); await reloadAdmin(); S.ui.brand = null; toast('Branding saved'); render(); } catch (e) { toast(e.message, true); }
   },
-  saveSettings: async () => { try { await DB.saveBoxOffice({ settings: { ...S.adm.bo.settings, ...JSON.parse(JSON.stringify(S.ui.set)) } }); await refreshPublic(); await reloadAdmin(); S.ui.set = null; setContext(); loadPixels(); toast('Settings saved'); render(); } catch (e) { toast(e.message, true); } },
+  saveSettings: async () => { try { if (S.ui.donAmts != null) S.ui.set.donationAmounts = String(S.ui.donAmts).split(/[,\s]+/).map(x => Math.round(+x * 100)).filter(x => x > 0).slice(0, 6);
+    await DB.saveBoxOffice({ settings: { ...S.adm.bo.settings, ...JSON.parse(JSON.stringify(S.ui.set)) } }); S.ui.donAmts = null; await refreshPublic(); await reloadAdmin(); S.ui.set = null; setContext(); loadPixels(); toast('Settings saved'); render(); } catch (e) { toast(e.message, true); } },
   showPolicy: el => { const k = el.dataset.v, bo = S.bo; modal({ terms: 'Terms & conditions', refundPolicy: 'Refund policy', privacyPolicy: 'Privacy policy' }[k], `<p style="white-space:pre-line">${esc(k === 'terms' ? S.settings.terms : bo?.branding[k] || '')}</p>`); },
   // ── my security ──
   mfaStart: async () => { try { S.ui.sec.enr = await DB.mfaEnroll(S.user.email); render(); } catch (e) { toast(e.message, true); } },
@@ -3574,8 +4014,13 @@ const A = {
     try { await DB.setBoxOfficeStatus(b.id, v); S.plat = null; await refreshPublic(); toast(`${b.name}: ${BO_STATUS[v]}`); render(); } catch (e) { toast(e.message, true); }
   },
   boDelete: async el => { const b = S.plat.bos.find(x => x.id === el.dataset.id); const typed = window.prompt(`Permanently delete ${b.name}? This can't be undone. Type the box office name to confirm.`); if (typed?.trim() !== b.name) return toast('Not deleted'); try { await DB.deleteBoxOffice(b.id); S.plat = null; toast('Deleted'); render(); } catch (e) { toast(e.message, true); } },
-  savePlatform: async () => { const f = S.ui.ps; try { await DB.savePlatform({ name: f.name, publicRegistration: !!f.publicRegistration, feePct: +f.feePct || 0, feeFixed: +f.feeFixed || 0, feePayer: f.feePayer === 'buyer' ? 'buyer' : 'organizer', plans: f.plans, admins: f.adminsText.split(',') }); S.ui.ps = null; S.plat = null; await refreshPublic(); toast('Platform settings saved'); render(); } catch (e) { toast(e.message, true); } },
-  register: async () => { const f = S.ui.reg; try { await DB.createBoxOffice({ name: f.name, ownerEmail: f.ownerEmail, ownerName: f.ownerName }, true); f.done = true; render(); } catch (e) { toast(e.message, true); } },
+  savePlatform: async () => { const f = S.ui.ps; try {
+    const planList = (f.planList || []).filter(p => String(p.name || '').trim()).map(p => ({ id: p.id || slugify(p.name), name: String(p.name).trim().slice(0, 40), monthly: Math.max(0, Math.round((+p.monthly || 0) * 100)), feePct: p.feePct === '' || p.feePct == null ? '' : +p.feePct, feeFixed: p.feeFixed === '' || p.feeFixed == null ? '' : Math.max(0, Math.round(+p.feeFixed * 100)), blurb: String(p.blurb || '').slice(0, 160) }));
+    if (!planList.length) throw new Error('Keep at least one plan');
+    await DB.savePlatform({ name: f.name, publicRegistration: !!f.publicRegistration, autoApprove: !!f.autoApprove, feePct: +f.feePct || 0, feeFixed: +f.feeFixed || 0, feePayer: f.feePayer === 'buyer' ? 'buyer' : 'organizer',
+      planList, defaultPlan: planList.some(p => p.id === f.defaultPlan) ? f.defaultPlan : planList[0].id, gatewaysOff: Object.keys(GATEWAYS).filter(k => f.off?.[k]), domainTarget: String(f.domainTarget || '').trim().toLowerCase(),
+      appHosts: String(f.appHostsText || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean), invoiceDays: Math.max(1, +f.invoiceDays || 14), admins: f.adminsText.split(',') }); S.ui.ps = null; S.plat = null; await refreshPublic(); toast('Platform settings saved'); render(); } catch (e) { toast(e.message, true); } },
+  register: async () => { const f = S.ui.reg; try { if (!f.agree) throw new Error('Please accept the organizer terms'); const r = await DB.createBoxOffice({ name: f.name, ownerEmail: f.ownerEmail, ownerName: f.ownerName, plan: f.plan || S.platform.defaultPlan, phone: f.phone, agree: true }, true); f.done = true; f.active = r?.status === 'active'; render(); } catch (e) { toast(e.message, true); } },
   newEvent: () => { if ((S.adm.bo.eventTemplates || []).length) NewEventModal(); else A.blankEvent(); },
   blankEvent: async () => {
     closeModal(); const start = new Date(Date.now() + 30 * 864e5); start.setHours(20, 0, 0, 0); const end = new Date(start.getTime() + 3 * 3600e3);
@@ -3960,6 +4405,9 @@ const A = {
 };
 const confirmIn = msg => window.confirm(msg);
 const CHANGE = {
+  boPlan: async el => { try { await DB.setPlan(el.value, el.dataset.id); S.plat = await DB.loadPlatform(); toast('Plan changed'); render(); } catch (e) { toast(e.message, true); } },
+  incEvents: el => { S.ui.inc.events = [...el.selectedOptions].map(o => o.value); },
+  donateCustom: el => { S.cart.donation = Math.max(0, Math.round((+el.value || 0) * 100)); S.co.donCustom = S.cart.donation > 0; saveCart(); render(); },
   rr: () => render(),
   // ── Stage 9: reports & exports ──
   repSet: el => { const f = repF(), k = el.dataset.k; f[k] = el.value.trim();
@@ -4027,7 +4475,7 @@ document.addEventListener('input', e => {
     else if (k.startsWith('entr:')) { const [, i, f] = k.split(':'); S.draft.entrances[+i][f] = v; dirty(); return; }
     else if (k.includes('.')) { const [a, b] = k.split('.'); (S.ui[a] ||= {})[b] = v; if (a === 'mo' && b === 'ev') Object.assign(S.ui.mo, { seats: [], adds: {}, tt: '', slot: '', credit: '', level: '' }); if (a === 'mo' && b === 'slot') S.ui.mo.seats = []; if (el.dataset.rr || (a === 'inv' && b === 'template')) render(); return; }
     else S.ui[k] = v;
-    if (['homeq', 'homeWhen', 'q', 'ev', 'status', 'attEv', 'repEv'].includes(k)) render();
+    if (['homeq', 'homeWhen', 'q', 'ev', 'status', 'attEv', 'repEv'].includes(k) || el.dataset.rr === '1') render();
   }
 });
 document.addEventListener('change', e => { const el = e.target; const fn = CHANGE[el.dataset.actionChange]; if (fn) fn(el); });
@@ -4130,15 +4578,29 @@ async function boot() {
   } catch (e) { }
   try {
     await refreshPublic();
+    // Stage 10: on a box office's own domain the site opens on that box office (platform hosts are listed in platform settings)
+    const host = location.hostname.toLowerCase();
+    if (!(S.platform.appHosts || DEFAULT_PLATFORM.appHosts).includes(host) && !DEFAULT_PLATFORM.appHosts.includes(host)) { const b = await DB.boByDomain(host).catch(() => null); if (b) S.domainBo = b.slug; }
     S.user = await DB.session();
     if (S.user && !S.user.mfa) await reloadAdmin().catch(e => { S.user = null; toast(e.message, true); });
     await loadCustomer();
     resumePay();
   } catch (e) { console.error(e); toast('Could not load events: ' + e.message, true); }
   S.sc.queue = loadQueue(); try { const c = JSON.parse(localStorage.getItem('set_scan_ctx') || 'null') || { evId: localStorage.getItem('set_scan_ev') || '' }; Object.assign(S.sc, { evId: c.evId || '', entrance: c.entrance ?? null, slot: c.slot ?? null }); } catch (e) { }
+  if (window.SET_CONFIG?.env === 'staging') document.body.insertAdjacentHTML('afterbegin', '<div class="env-ribbon">Test environment — test payments, test emails only</div>');
   S.loading = false; loadPixels(); onRoute(); flushQueue();
-  setInterval(heartbeat, 15000);
+  setInterval(heartbeat, 15000); setInterval(idleCheck, 30000);
 }
+// Stage 10 secure sessions: staff are signed out after the box office's inactivity limit (Settings → Staff security)
+let _lastAct = Date.now();
+['pointerdown', 'keydown'].forEach(t => document.addEventListener(t, () => { _lastAct = Date.now(); }, { passive: true }));
+function idleCheck() {
+  const mins = +(S.adm?.bo?.settings?.sessionMinutes) || 0;
+  if (S.user && mins > 0 && Date.now() - _lastAct > mins * 6e4) { A.signOut(); toast(`Signed out after ${mins} minutes without activity`); }
+}
+// Stage 10 error logging: anything the page throws goes to the platform's error log (System health), at most 20 per page load
+window.addEventListener('error', e => DB.logError(S.route?.page === 'cart' ? 'checkout' : S.route?.page === 'e' ? 'event' : S.route?.page === 'scan' ? 'scan' : 'app', e.error || e.message));
+window.addEventListener('unhandledrejection', e => DB.logError(S.route?.page === 'cart' ? 'checkout' : 'app', e.reason));
 // every 15s: buyers on an event page / in checkout tell the box office they're here (live activity); staff watching live numbers get fresh ones
 let _beat = 0;
 function heartbeat() {
