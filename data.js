@@ -49,10 +49,22 @@ const hasPerm = (m, key, eventId) => !!m && (m.owner || m.support || (m.perms ||
 const BO_STATUS = { pending: 'Awaiting approval', active: 'Active', suspended: 'Suspended', deactivated: 'Deactivated' };
 // Stage 10: plans are the money model — each has a monthly price and its own platform fee (blank = the platform default). Still undecided,
 // so it's all data the super admin edits; a box office's own override (platformFee) beats its plan, its plan beats the platform default.
+// How a plan charges a box office (PLAN_BASIS). Every basis ends up as the order's platformFee, so card payments (application fee),
+// reports and monthly invoices work the same whatever the plan:
+//   percent — % of the ticket money + a fixed amount per paid ticket (feePct / feeFixed)
+//   credits — like Ticket Tailor: creditGA credits per paid general-admission ticket, creditSeated per reserved seat, free tickets free.
+//             Prepaid packs (packs: [{credits, price per credit}], bought as a 'credits' invoice) are used first; the rest costs creditPrice each.
+//   flat    — no per-ticket fee; `flat` cents per month | year | event (flatPer), added to the monthly invoice
+// All the prices are placeholders until the money model is decided — the super admin edits them (Platform → Settings → Plans).
+const PLAN_BASIS = { percent: 'Percentage per ticket', credits: 'Credits per ticket', flat: 'Flat fee' };
+const FLAT_PER = { month: 'per month', year: 'per year', event: 'per event' };
 const DEFAULT_PLANS = [
-  { id: 'pay', name: 'Pay as you go', monthly: 0, feePct: '', feeFixed: '', blurb: 'No monthly fee — the platform fee on each paid ticket only.' },
-  { id: 'pro', name: 'Pro', monthly: 4900, feePct: 0.5, feeFixed: 15, blurb: 'A lower per-ticket fee for regular sellers.' },
-  { id: 'venue', name: 'Venue', monthly: 19900, feePct: 0, feeFixed: 10, blurb: 'For venues with shows every week.' }];
+  { id: 'pay', name: 'Pay as you go', basis: 'percent', monthly: 0, feePct: '', feeFixed: '', blurb: 'No monthly fee — the platform fee on each paid ticket only.' },
+  { id: 'pro', name: 'Pro', basis: 'percent', monthly: 4900, feePct: 0.5, feeFixed: 15, blurb: 'A lower per-ticket fee for regular sellers.' },
+  { id: 'venue', name: 'Venue', basis: 'percent', monthly: 19900, feePct: 0, feeFixed: 10, blurb: 'For venues with shows every week.' },
+  { id: 'credits', name: 'Credits', basis: 'credits', monthly: 0, creditGA: 1, creditSeated: 2, creditPrice: 75, packs: [{ credits: 1000, price: 60 }, { credits: 5000, price: 40 }],
+    blurb: '1 credit per general-admission ticket, 2 per reserved seat, free tickets free. Prepaid credit packs cost less.' },
+  { id: 'flat', name: 'Flat fee', basis: 'flat', monthly: 0, flat: 200000, flatPer: 'year', blurb: 'One fixed price — no per-ticket fees.' }];
 const DEFAULT_PLATFORM = { name: 'SET', publicRegistration: false, autoApprove: false, feePct: 1, feeFixed: 25, feePayer: 'organizer', planList: DEFAULT_PLANS, defaultPlan: 'pay',
   gatewaysOff: [], domainTarget: 'domains.set-tickets.app', appHosts: ['moishsonn-tech.github.io', 'localhost', '127.0.0.1'], invoiceDays: 14, admins: ['moishsonn@gmail.com'] };
 const DEFAULT_BRANDING = { logo: '', banner: '', ink: '#020a16', accent: '#f4cd5e', font: 'Anton', tagline: '', phone: '', website: '', instagram: '', facebook: '', tiktok: '', x: '',
@@ -107,9 +119,24 @@ const cardBrand = n => /^4/.test(n) ? 'Visa' : /^(5[1-5]|2[2-7])/.test(n) ? 'Mas
 const optNum = (v, d) => v === undefined || v === null || v === '' ? d : +v || 0;
 // the platform's own fee for one box office (super admin may override per box office) and who pays it
 // precedence: this box office's own override → its plan's fee → the platform default (Stage 10 plans)
-const platformFeeFor = (plat, bo) => { const pl = planOf(plat, bo);
-  return { pct: optNum(bo?.platformFee?.pct, optNum(pl?.feePct, +plat?.feePct || 0)), fixed: optNum(bo?.platformFee?.fixed, optNum(pl?.feeFixed, +plat?.feeFixed || 0)),
-    payer: bo?.platformFee?.payer || plat?.feePayer || 'organizer' }; };
+const platformFeeFor = (plat, bo) => { const pl = planOf(plat, bo), basis = PLAN_BASIS[pl?.basis] ? pl.basis : 'percent';
+  return { basis, pct: optNum(bo?.platformFee?.pct, optNum(pl?.feePct, +plat?.feePct || 0)), fixed: optNum(bo?.platformFee?.fixed, optNum(pl?.feeFixed, +plat?.feeFixed || 0)),
+    payer: bo?.platformFee?.payer || plat?.feePayer || 'organizer',
+    ...(basis === 'credits' ? { ga: optNum(pl.creditGA, 1), seated: optNum(pl.creditSeated, 2), unit: optNum(pl.creditPrice, 0) } : {}) }; };
+// credits an order uses on a credits plan: per paid ticket (unit > 0), seated or general admission; prepaid ones first (pf.prepaid = the
+// box office's balance, set only when an order is placed). Mirrors SQL plat_credits().
+function platCredits(lines, pf) {
+  const n = lines.reduce((a, l) => a + (l.unit > 0 && (l.kind === 'ticket' || l.kind === 'bundle')
+    ? (l.kind === 'ticket' ? l.qty : l.qty * (l.perCopy || 1)) * ((l.seats || []).length ? +pf.seated : +pf.ga) : 0), 0);
+  const prepaid = Math.min(n, Math.max(0, Math.floor(+pf.prepaid || 0)));
+  return { n, prepaid, billable: n - prepaid };
+}
+// a box office's prepaid credits: packs bought (credits invoices that aren't void) minus the prepaid credits its orders used. Mirrors SQL plat_credit_balance().
+function platCreditBalance(invoices, orders, boId) {
+  const bought = (invoices || []).filter(x => x.box_office_id === boId && x.kind === 'credits' && x.status !== 'void').reduce((a, x) => a + (+x.credits || 0), 0);
+  const used = (orders || []).filter(o => o.box_office_id === boId && (wasPaid(o) || reservedOrder(o))).reduce((a, o) => a + (o.data.platCredits?.prepaid || 0), 0);
+  return bought - used;
+}
 // everything quote() needs to price a cart for one box office: its settings + the platform fee + its processor's card rate
 function pricingSettings(bo, plat) {
   const g = bo?.gateway, gw = GATEWAYS[g?.provider];
@@ -230,11 +257,18 @@ const planOf = (plat, bo) => (plat?.planList || DEFAULT_PLANS).find(p => p.id ==
 const AUTO_FEE_PROVIDERS = ['stripe', 'demo'];
 const feeAuto = o => AUTO_FEE_PROVIDERS.includes(o.payment?.provider) && !o.payment?.markedPaidBy;
 const monthOf = iso => (iso || '').slice(0, 7);
-function billingFor(orders, bo, plat, period) {
+// flat-fee plans: what one month owes — every month, once a year (in the month the box office joined), or per event starting that month
+function flatFor(plan, bo, events, period) {
+  if (plan?.basis !== 'flat' || !(+plan.flat > 0)) return { amount: 0, n: 0 };
+  const n = plan.flatPer === 'event' ? (events || []).filter(e => e.box_office_id === bo.id && e.status === 'published' && monthOf(e.start) === period).length
+    : plan.flatPer === 'year' ? (monthOf(bo.created_at).slice(5) === period.slice(5) ? 1 : 0) : 1;
+  return { amount: n * +plan.flat, n };
+}
+function billingFor(orders, bo, plat, period, events = []) {
   const paid = orders.filter(o => o.box_office_id === bo.id && wasPaid(o) && monthOf(o.paid_at || o.created_at) === period && (o.data.platformFee || 0) > 0);
-  const auto = paid.filter(feeAuto), owed = paid.filter(o => !feeAuto(o)), plan = planOf(plat, bo), sum = l => l.reduce((a, o) => a + (o.data.platformFee || 0), 0);
-  return { period, plan, subscription: +plan?.monthly || 0, autoFees: sum(auto), autoOrders: auto.length, owedFees: sum(owed), owedOrders: owed.length,
-    due: (+plan?.monthly || 0) + sum(owed), byMethod: owed.reduce((a, o) => { const m = payMethodOf(o); a[m] = (a[m] || 0) + o.data.platformFee; return a; }, {}) };
+  const auto = paid.filter(feeAuto), owed = paid.filter(o => !feeAuto(o)), plan = planOf(plat, bo), sum = l => l.reduce((a, o) => a + (o.data.platformFee || 0), 0), flat = flatFor(plan, bo, events, period);
+  return { period, plan, subscription: +plan?.monthly || 0, flat: flat.amount, flatN: flat.n, autoFees: sum(auto), autoOrders: auto.length, owedFees: sum(owed), owedOrders: owed.length,
+    due: (+plan?.monthly || 0) + flat.amount + sum(owed), byMethod: owed.reduce((a, o) => { const m = payMethodOf(o); a[m] = (a[m] || 0) + o.data.platformFee; return a; }, {}) };
 }
 const INVOICE_STATUS = { open: 'Open', paid: 'Paid', void: 'Void' };
 
@@ -373,7 +407,9 @@ function quote(cart, events, settings, promo, o = {}) {
   // tax (on tickets + products after discounts, plus fees when the box office taxes fees), card processing (the processor's cut,
   // passed to the buyer only when the box office chooses to).
   const pf = settings.platform || { pct: 0, fixed: 0, payer: 'organizer' }, paidTickets = lines.reduce((a, l) => a + (l.unit > 0 ? l.kind === 'ticket' ? l.qty : l.kind === 'bundle' ? l.qty * l.perCopy : 0 : 0), 0);
-  const platformFee = subtotal - disc - giftTotal > 0 ? Math.round((subtotal - disc - giftTotal) * (+pf.pct || 0) / 100) + paidTickets * (+pf.fixed || 0) : 0;
+  const pcr = pf.basis === 'credits' ? platCredits(lines, pf) : null;
+  const platformFee = pf.basis === 'flat' ? 0 : pcr ? Math.round(pcr.billable * (+pf.unit || 0))
+    : subtotal - disc - giftTotal > 0 ? Math.round((subtotal - disc - giftTotal) * (+pf.pct || 0) / 100) + paidTickets * (+pf.fixed || 0) : 0;
   const serviceFee = pf.payer === 'buyer' ? platformFee : 0;
   // Stage 10: other fees an event adds (mandatory, or optional ones the buyer ticked — cart.optFees), per ticket or per order
   const evIds = [...new Set(lines.map(l => l.eventId).filter(Boolean))], evs = evIds.map(byEv), part = (id, f) => lines.filter(l => l.eventId === id).reduce((a, l) => a + f(l), 0);
@@ -396,7 +432,7 @@ function quote(cart, events, settings, promo, o = {}) {
   const credit = Math.min(Math.max(0, Math.round(+o.credit || 0)), pre), owed = pre - credit;   // Stage 6: account / event credit pays first
   const processingFee = o.method === 'card' && owed > 0 ? Math.round(owed * (+card.pct || 0) / 100) + (+card.fixed || 0) : 0, processing = card.pass ? processingFee : 0;
   const sumKind = k => lines.filter(l => k.includes(l.kind)).reduce((a, l) => a + l.unit * l.qty, 0);
-  return { lines, subtotal, ticketsTotal: sumKind(['ticket', 'bundle']), addonsTotal: sumKind(['addon']), giftsTotal: giftTotal, passesTotal: passTotal, passUses, passDiscount: lines.reduce((a, l) => a + (l.passDisc || 0), 0), discount: disc, feeDiscount: feeDisc, fee, serviceFee, otherFees, otherFee, tax, donation,
+  return { lines, subtotal, ...(pcr ? { platCredits: pcr } : {}), ticketsTotal: sumKind(['ticket', 'bundle']), addonsTotal: sumKind(['addon']), giftsTotal: giftTotal, passesTotal: passTotal, passUses, passDiscount: lines.reduce((a, l) => a + (l.passDisc || 0), 0), discount: disc, feeDiscount: feeDisc, fee, serviceFee, otherFees, otherFee, tax, donation,
     processing, processingFee, platformFee, credit, total: owed + processing, promoErr,
     faceValue: lines.reduce((a, l) => a + (l.kind === 'bundle' ? l.value : l.face * l.qty), 0), currency: lines.find(l => l.currency)?.currency || settings.currency };
 }
@@ -1227,7 +1263,8 @@ function demoPlaceOrder(p, asTeam) {
     else throw new Error('That code is not valid');
   }
   if (!tracking && p.tracking) { const f = findCode(st, bo.id, p.tracking); if (f?.tracking && trackingUsable(f.tracking, evIds, st.orders, now)) tracking = f.tracking.code; }  // a stale link never blocks a sale
-  const set = set0;
+  // a credits plan uses the box office's prepaid credits first
+  const set = set0.platform.basis === 'credits' ? { ...set0, platform: { ...set0.platform, prepaid: platCreditBalance(st.invoices, st.orders, bo.id) } } : set0;
   // §3 a membership / season pass (its code + the holder's email): covers or discounts eligible tickets and unlocks members-only ticket types
   let pass = null;
   if (p.pass && !p.comp) { const f = findPass(st, bo.id, p.pass, email, evIds); if (f.error) throw new Error(f.error); pass = f; }
@@ -1268,7 +1305,7 @@ function demoPlaceOrder(p, asTeam) {
     if (!manual) throw new Error('not allowed');
     for (const id of evIds) if (!hasPerm(asTeam, 'tickets.comps', id)) throw new Error('You don\'t have permission to issue complimentary tickets');
     q.lines.forEach(l => Object.assign(l, { unit: 0, fee: 0, unitFee: 0, comp: true }));
-    Object.assign(q, { subtotal: 0, ticketsTotal: 0, addonsTotal: 0, discount: 0, feeDiscount: 0, fee: 0, serviceFee: 0, otherFee: 0, otherFees: [], tax: 0, donation: 0, processing: 0, processingFee: 0, platformFee: 0, total: 0 });
+    Object.assign(q, { subtotal: 0, ticketsTotal: 0, addonsTotal: 0, discount: 0, feeDiscount: 0, fee: 0, serviceFee: 0, otherFee: 0, otherFees: [], tax: 0, donation: 0, processing: 0, processingFee: 0, platformFee: 0, total: 0 }); delete q.platCredits;   // free tickets use no platform credits
   }
   // §5 payment plan: deposit now by card, the rest in installments before the deadline; tickets stay pending until the last payment
   let plan = null;
@@ -1298,7 +1335,7 @@ function demoPlaceOrder(p, asTeam) {
       fee: q.fee, serviceFee: q.serviceFee, otherFee: q.otherFee, otherFees: q.otherFees, tax: q.tax, donation: q.donation, ...(q.donation ? { donationFor: donationPurpose(set, evObjs) } : {}), processing: q.processing, processingFee: q.processingFee, total: q.total, refunded: 0, faceValue: q.faceValue,
       code: promo?.code || null, promo: promo ? { id: promo.id, code: findCode(st, bo.id, promo.code).promo.code } : null, tracking,
       payment: q.total === 0 ? (q.credit ? 'credit' : 'free') : p.payment, credit: credit && q.credit ? { id: credit.id, code: credit.code, amount: q.credit } : null, answers: p.answers || {}, ticketAnswers: p.ticketAnswers || {}, optIn: !!p.optIn, smsOptIn: !!p.smsOptIn && !!normPhone(p.buyer?.phone), source: p.source || null, utm: cleanUtm(p.utm), currency: q.currency,
-      platformFee: q.platformFee, ...(p.comp ? { comp: true } : {}), accepted, flags: orderFlags(st, p, bo, email, evIds, manual, now.getTime()),
+      platformFee: q.platformFee, ...(q.platCredits ? { platCredits: q.platCredits } : {}), ...(p.comp ? { comp: true } : {}), accepted, flags: orderFlags(st, p, bo, email, evIds, manual, now.getTime()),
       channel: p.pos ? 'pos' : manual ? 'box office' : 'online', ...(pass ? { pass: { id: pass.pass.id, code: pass.pass.code, plan: pass.plan.name, uses: q.passUses, discount: q.passDiscount } } : {}), ...(plan ? { plan } : {}) } };
   st.orders.push(order);
   emitEvent(st, bo.id, 'order.created', hookOrder(st, order));
@@ -3418,16 +3455,30 @@ const DB = {
     const was = bo.plan || st.platform.defaultPlan || 'pay'; bo.plan = plan.id;
     audit('billing.plan', `${bo.name}: plan ${planOf(st.platform, { plan: was })?.name || was} → ${plan.name}`, { bo: bo.id, before: { plan: was }, after: { plan: plan.id } }); Demo.save();
   },
+  async buyCredits(pack, boId) {   // credits plan: the owner (or a super admin for any box office) buys a prepaid pack → a 'credits' invoice; usable at once
+    if (LIVE) return must(sb.rpc('buy_credits', { p_bo: boId || DB._bo, p_pack: pack }));
+    const st = Demo.fresh(), id = boId || DB._bo, bo = st.boxOffices.find(b => b.id === id); if (!bo) throw new Error('Box office not found');
+    if (boId && boId !== DB._bo) needSuper(); else { const me = need('admin.settings'); if (!me.owner && !me.support && bo.owner !== DB._actor) throw new Error('Only the owner can buy credits'); }
+    const plan = planOf(st.platform, bo), pk = (plan?.packs || [])[+pack];
+    if (plan?.basis !== 'credits') throw new Error('This box office isn\'t on a credits plan'); if (!pk || !(+pk.credits > 0)) throw new Error('Choose a credit pack');
+    const n = (st.invoices || []).length + 1, period = nowIso().slice(0, 7), total = Math.round(+pk.credits * +pk.price);
+    const inv = { id: uid(), kind: 'credits', credits: +pk.credits, number: `SET-${period.replace('-', '')}-${String(n).padStart(4, '0')}`, box_office_id: bo.id, bo_name: bo.name, period,
+      lines: [{ label: `${(+pk.credits).toLocaleString('en-US')} prepaid credits at ${money_(+pk.price)} each`, amount: total }], total, info: {}, status: 'open', issued_at: nowIso(),
+      due_at: new Date(Date.now() + (+st.platform.invoiceDays || 14) * 864e5).toISOString(), paid_at: null, by: DB._actor };
+    (st.invoices ||= []).push(inv);
+    audit('billing.credits', `${bo.name}: bought ${pk.credits} credits (${money_(total)}) — invoice ${inv.number}`, { bo: bo.id }); Demo.save(); return clone(inv);
+  },
   async billingRun(period) {   // super admin (and pg_cron on the 1st of the month): one invoice per box office that owes something for that month
     if (!/^\d{4}-\d{2}$/.test(period || '')) throw new Error('Pick a month');
     if (LIVE) return must(sb.rpc('billing_run', { p_period: period }));
     needSuper(); const st = Demo.fresh(), plat = st.platform, made = [];
     for (const bo of st.boxOffices.filter(b => b.status === 'active' || b.status === 'suspended')) {
-      if ((st.invoices || []).some(x => x.box_office_id === bo.id && x.period === period && x.status !== 'void')) continue;
-      const b = billingFor(st.orders, bo, plat, period); if (b.due <= 0) continue;
+      if ((st.invoices || []).some(x => x.box_office_id === bo.id && x.period === period && x.status !== 'void' && (x.kind || 'monthly') === 'monthly')) continue;
+      const b = billingFor(st.orders, bo, plat, period, st.events); if (b.due <= 0) continue;
       const n = (st.invoices || []).length + 1, lines = [...(b.subscription ? [{ label: `${b.plan.name} plan — ${period}`, amount: b.subscription }] : []),
+        ...(b.flat ? [{ label: `${b.plan.name} — ${b.plan.flatPer === 'event' ? `${b.flatN} event${b.flatN === 1 ? '' : 's'} starting ${period}` : b.plan.flatPer === 'year' ? 'yearly fee' : period}`, amount: b.flat }] : []),
         ...(b.owedFees ? [{ label: `Platform fees on ${b.owedOrders} order${b.owedOrders === 1 ? '' : 's'} not paid through ${GATEWAYS.stripe.name} (cash, check, invoice, other)`, amount: b.owedFees }] : [])];
-      const inv = { id: uid(), number: `SET-${period.replace('-', '')}-${String(n).padStart(4, '0')}`, box_office_id: bo.id, bo_name: bo.name, period, lines, total: b.due,
+      const inv = { id: uid(), kind: 'monthly', number: `SET-${period.replace('-', '')}-${String(n).padStart(4, '0')}`, box_office_id: bo.id, bo_name: bo.name, period, lines, total: b.due,
         info: { autoFees: b.autoFees, autoOrders: b.autoOrders }, status: 'open', issued_at: nowIso(), due_at: new Date(Date.now() + (+plat.invoiceDays || 14) * 864e5).toISOString(), paid_at: null, by: DB._actor };
       (st.invoices ||= []).push(inv); made.push(inv);
       queueMsg(st, { box_office_id: bo.id, to: bo.owner, kind: 'staff', category: 'staff', subject: `${plat.name} invoice ${inv.number}`, body: `Your ${plat.name} invoice for ${period} is ready: ${money_(inv.total)}, due ${inv.due_at.slice(0, 10)}. See Settings → Plan & billing.`, by: 'system' });
