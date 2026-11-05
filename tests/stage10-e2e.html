@@ -36,7 +36,7 @@ const order=(p,ids)=>`DB.placeOrder(Object.assign(${JSON.stringify(p)},{accepted
 
   // ── SaaS plans, self-serve sign-up, billing ──
   await E(`DB.savePlatform({...Demo.st.platform, publicRegistration:true, autoApprove:true})`);
-  await E('refreshPublic()'); await view('#/register'); ok(W().document.querySelectorAll('.plan').length===3 && has('Choose a plan'),'SaaS: sign-up page offers the plans');
+  await E('refreshPublic()'); await view('#/register'); ok(W().document.querySelectorAll('.plan').length===E('DEFAULT_PLANS.length') && has('Choose a plan'),'SaaS: sign-up page offers the plans');
   E(`S.ui.reg={name:'Pier Comedy',ownerName:'Pat',ownerEmail:'pat@pier.test',plan:'pro',agree:false,done:false}`);
   ok(await throwsP(`DB.createBoxOffice({name:'X',ownerEmail:'x@x.test',agree:false},true)`) && /terms/.test(lastErr),'SaaS: sign-up needs the organizer terms');
   E(`S.ui.reg.agree=true`); await E('A.register()');

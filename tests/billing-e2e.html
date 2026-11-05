@@ -1,0 +1,69 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Platform billing — how SET charges the box offices that sell on it: percentage plans, credits plans (Ticket Tailor style: credits per
+// ticket, prepaid packs cheaper than pay-as-you-go, free tickets free) and flat-fee plans. Run from the local server: /billing-e2e.html.
+// The same rules on Postgres are the "BILL" checks in tests/db-e2e.sql.
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=8000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t);
+let lastErr=''; const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));
+async function throwsP(code){ try{ await E(code); lastErr='(no error)'; return false }catch(e){ lastErr=e.message; return e.message||true } }
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const view=async hash=>{ W().location.hash=hash; await sleep(90); E('render()'); await sleep(40); };
+const O=id=>E(`Demo.st.orders.find(o=>o.id==='${id}')`);
+// a staff (box office) order paid in cash: no card, no policies — just the platform fee under test
+const sell=(items,extra={})=>E(`(()=>{for(const k in RL)delete RL[k];return DB.placeOrder(Object.assign({buyer:{name:'Bill Test',email:'bill${Math.random().toString(36).slice(2,7)}@test.co',phone:''},items:${JSON.stringify(items)},addons:[],payment:'manual',payMethod:'cash'},${JSON.stringify(extra)}),true)})()`);
+const bal=bo=>E(`platCreditBalance(Demo.st.invoices,Demo.st.orders,'${bo}')`);
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  E(`Demo.st.events.find(e=>e.slug==='winter-orchestra-gala').seating.noSingles=false;Demo.save()`);
+  const neon=ev('neon-nights-live'), gala=ev('winter-orchestra-gala'), bo=neon.box_office_id, ga=neon.ticketTypes[0], stalls=gala.ticketTypes.find(t=>t.name==='Stalls');
+  const seats=n=>E(`[...seatStates(Demo.st.events.find(e=>e.slug==='winter-orchestra-gala'),{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt==='${stalls.id}').map(x=>x.p.id).slice(0,${n})`);
+
+  // ── not open to outside organizers yet ──
+  ok(E('DEFAULT_PLATFORM.publicRegistration')===false && E('S.platform.publicRegistration')!==true,'outside organizers can\'t sign up yet (self-registration is off)');
+  ok(E(`DEFAULT_PLANS.map(p=>p.basis).join()`)==='percent,percent,percent,credits,flat','plans: three percentage plans, a credits plan and a flat-fee plan');
+
+  // ── credits counting (pure) ──
+  const pc=E(`platCredits([{kind:'ticket',qty:2,unit:1000},{kind:'ticket',qty:3,unit:2000,seats:['A-1','A-2','A-3']},{kind:'ticket',qty:4,unit:0},{kind:'addon',qty:1,unit:500}],{ga:1,seated:2,prepaid:5})`);
+  ok(pc.n===8 && pc.prepaid===5 && pc.billable===3,'credits: 1 per GA ticket, 2 per reserved seat, free tickets and products free; prepaid first');
+
+  // ── credits plan ──
+  await as('moishsonn@gmail.com'); await E(`DB.setPlan('credits')`); await E('reloadAdmin()');
+  let r=await sell([{eventId:neon.id,ticketTypeId:ga.id,qty:2}]); let o=O(r.id);
+  ok(o.data.platCredits && o.data.platCredits.n===2 && o.data.platCredits.billable===2 && o.data.platformFee===150,'no prepaid credits: 2 GA tickets = 2 credits at the pay-as-you-go $0.75 = $1.50');
+  r=await sell([{eventId:gala.id,ticketTypeId:stalls.id,qty:2,seats:seats(2)}]); o=O(r.id);
+  ok(o.data.platCredits.n===4 && o.data.platformFee===300,'reserved seats: 2 seats = 4 credits');
+  r=await sell([{eventId:neon.id,ticketTypeId:ga.id,qty:3}],{comp:true}); o=O(r.id);
+  ok((o.data.platCredits?.n||0)===0 && o.data.platformFee===0,'free (comp) tickets use no credits');
+  const inv=await E(`DB.buyCredits(0)`);
+  ok(inv.kind==='credits' && inv.credits===1000 && inv.total===60000 && bal(bo)===1000,'owner buys 1,000 credits at $0.60 → a $600 invoice; 1,000 credits available');
+  r=await sell([{eventId:neon.id,ticketTypeId:ga.id,qty:3}]); o=O(r.id);
+  ok(o.data.platCredits.prepaid===3 && o.data.platformFee===0 && bal(bo)===997,'prepaid credits are used first: no per-order fee, balance 997');
+  await E(`DB.buyCredits(1)`); ok(bal(bo)===5997,'a 5,000-credit pack at $0.40 adds to the balance');
+  await E('reloadAdmin()'); await view('#/admin/settings'); ok(has('Prepaid credits left') && has('5,997') && W().document.querySelector('[data-action="buyCredits"]'),'Settings → Plan & billing shows the balance and the packs to buy');
+  ok(!!await throwsP(`DB.buyCredits(7)`),'an unknown pack is refused');
+  await as('manager@skyline.example');
+  ok(!!await throwsP(`DB.buyCredits(0)`),'only the owner buys credits');
+
+  // ── flat-fee plan ──
+  await as('moishsonn@gmail.com'); await E(`DB.setPlan('flat')`);
+  r=await sell([{eventId:neon.id,ticketTypeId:ga.id,qty:2}]); o=O(r.id);
+  ok(o.data.platformFee===0,'flat plan: no platform fee on orders');
+  const b0=E(`(()=>{const b=Demo.st.boxOffices.find(x=>x.id==='${bo}');return [billingFor(Demo.st.orders,b,Demo.st.platform,monthOf(b.created_at),Demo.st.events), billingFor(Demo.st.orders,b,Demo.st.platform,(()=>{const d=new Date(b.created_at);d.setMonth(d.getMonth()+1);return monthOf(d.toISOString())})(),Demo.st.events)]})()`);
+  ok(b0[0].flat===200000 && b0[1].flat===0,'flat $2,000 a year: billed once, in the month the box office joined');
+  E(`Demo.st.platform.planList.find(p=>p.id==='flat').flatPer='event';Demo.save()`);
+  const pe=E(`(()=>{const b=Demo.st.boxOffices.find(x=>x.id==='${bo}'),m=monthOf(Demo.st.events.find(e=>e.slug==='neon-nights-live').start);return [billingFor(Demo.st.orders,b,Demo.st.platform,m,Demo.st.events), Demo.st.events.filter(e=>e.box_office_id===b.id&&e.status==='published'&&monthOf(e.start)===m).length]})()`);
+  ok(pe[0].flat===200000*pe[1] && pe[1]>=1,'flat per event: one fee per event starting that month');
+
+  // ── super admin pages ──
+  await view('#/platform/settings'); ok(has('How it charges') && has('Credits per reserved seat') && has('Flat fee'),'Platform settings: each plan picks percentage, credits or flat fee');
+  await view('#/platform/billing'); ok(has('credits') && has('Plans & billing'),'Platform billing lists the credit-pack invoices');
+  log('DONE');
+}catch(e){log('ERROR '+e.stack)}})();
+</script></body></html>

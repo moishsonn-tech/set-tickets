@@ -781,6 +781,44 @@ select t.ok(pass_action('b0000000-0000-0000-0000-000000000001', 'issue', '{"plan
 select t.ok(credit_action('b0000000-0000-0000-0000-000000000001', 'issue', '{"kind":"voucher","email":"vip@mail.test","amount":2500}')->>'kind' = 'voucher', 'FA §4 staff issue a gift voucher');
 reset role;
 
+-- ════════ Platform billing: credits plan (Ticket Tailor style) and flat-fee plan ════════
+select t.ok(plat_credits('[{"kind":"ticket","qty":2,"unit":1000},{"kind":"ticket","qty":3,"unit":2000,"seats":["A-1","A-2","A-3"]},{"kind":"ticket","qty":4,"unit":0},{"kind":"addon","qty":1,"unit":500}]',
+  '{"ga":1,"seated":2,"prepaid":5}') = '{"n":8,"prepaid":5,"billable":3}', 'BILL credits: 1 per general-admission ticket, 2 per reserved seat, free tickets and products free; prepaid first');
+set role authenticated; select t.who('owner@box.test');
+select set_plan('b0000000-0000-0000-0000-000000000001', 'credits');
+reset role;
+select t.ok((pricing_settings(b)->'platform') @> '{"basis":"credits","ga":1,"seated":2,"unit":75}', 'BILL the credits plan sets how credits are counted and priced') from box_offices b where id = 'b0000000-0000-0000-0000-000000000001';
+select place_order('{"buyer":{"name":"Payg","email":"payg@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":2,"slotId":"mat"}],"payment":"offline"}') as bg1 \gset
+select t.ok((select (data->>'platformFee')::bigint = 150 and data->'platCredits' = '{"n":2,"prepaid":0,"billable":2}' from t.orders where id = ((:'bg1'::jsonb)->>'id')::uuid),
+  'BILL no prepaid credits: 2 GA tickets cost 2 credits at the pay-as-you-go price ($1.50)');
+set role authenticated; select t.who('clerk@box.test');
+select t.err($$select buy_credits('b0000000-0000-0000-0000-000000000001', 0)$$, 'owner', 'BILL only the owner buys credit packs');
+select t.who('owner@box.test');
+select t.ok((buy_credits('b0000000-0000-0000-0000-000000000001', 0)->>'total')::bigint = 60000, 'BILL owner buys 1,000 credits at $0.60 → a $600 credits invoice');
+select t.err($$select buy_credits('b0000000-0000-0000-0000-000000000001', 9)$$, 'credit pack', 'BILL an unknown pack is refused');
+reset role;
+select plat_credit_balance('b0000000-0000-0000-0000-000000000001') as bal0 \gset
+select place_order('{"buyer":{"name":"Pre","email":"pre@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":3,"slotId":"mat"}],"payment":"offline"}') as bg2 \gset
+select t.ok((select (data->>'platformFee')::bigint = 0 and (data->'platCredits'->>'prepaid')::int = 3 from t.orders where id = ((:'bg2'::jsonb)->>'id')::uuid)
+  and plat_credit_balance('b0000000-0000-0000-0000-000000000001') = :bal0 - 3, 'BILL prepaid credits are used first (no per-order fee) and the balance goes down');
+set role authenticated; select t.who('owner@box.test');
+select place_order('{"buyer":{"name":"Guest","email":"comp@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":2,"slotId":"mat"}],"payment":"manual","comp":true}') as bgc \gset
+reset role;
+select t.ok((select not (data ? 'platCredits') and (data->>'platformFee')::bigint = 0 from t.orders where id = ((:'bgc'::jsonb)->>'id')::uuid), 'BILL complimentary tickets use no credits');
+-- flat fee: no per-ticket fee; the yearly fee lands in the month the box office joined
+set role authenticated; select t.who('owner@box.test');
+select set_plan('b0000000-0000-0000-0000-000000000001', 'flat');
+reset role;
+select place_order('{"buyer":{"name":"Flat","email":"flat@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"}],"payment":"offline"}') as bg3 \gset
+select t.ok((select (data->>'platformFee')::bigint from t.orders where id = ((:'bg3'::jsonb)->>'id')::uuid) = 0, 'BILL flat plan: no platform fee on orders');
+select t.ok((billing_for(b, to_char(b.created_at, 'YYYY-MM'))->>'flat')::bigint = 200000 and (billing_for(b, to_char(b.created_at + interval '1 month', 'YYYY-MM'))->>'flat')::bigint = 0,
+  'BILL flat yearly fee ($2,000) is billed once a year, in the joining month') from box_offices b where id = 'b0000000-0000-0000-0000-000000000001';
+set role authenticated; select t.who('root@platform.test');
+select billing_run(to_char(now() + interval '1 year', 'YYYY-MM'));   -- next year's joining month (this month was already invoiced above)
+reset role;
+select t.ok(exists(select 1 from platform_invoices where box_office_id = 'b0000000-0000-0000-0000-000000000001' and kind = 'monthly' and period = to_char(now() + interval '1 year', 'YYYY-MM') and lines::text like '%yearly fee%')
+  and exists(select 1 from platform_invoices where box_office_id = 'b0000000-0000-0000-0000-000000000001' and kind = 'credits'), 'BILL the monthly invoice carries the flat fee, beside the credits invoice');
+
 \o
 \pset tuples_only off
 select count(*) filter (where ok) as passed, count(*) filter (where not ok) as failed from t.results;

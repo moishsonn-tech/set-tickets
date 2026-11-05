@@ -15,7 +15,9 @@ create table if not exists platform_settings (id int primary key default 1 check
 insert into platform_settings (id, data) values (1, '{"name":"SET","publicRegistration":false,"feePct":1,"feeFixed":25}') on conflict (id) do nothing;
 -- Stage 10 defaults (plans = the configurable money model; processors on/off; where custom domains point)
 update platform_settings set data = jsonb_build_object('planList', '[{"id":"pay","name":"Pay as you go","monthly":0,"feePct":"","feeFixed":"","blurb":"No monthly fee — the platform fee on each paid ticket only."},
-  {"id":"pro","name":"Pro","monthly":4900,"feePct":0.5,"feeFixed":15,"blurb":"A lower per-ticket fee for regular sellers."},{"id":"venue","name":"Venue","monthly":19900,"feePct":0,"feeFixed":10,"blurb":"For venues with shows every week."}]'::jsonb,
+  {"id":"pro","name":"Pro","monthly":4900,"feePct":0.5,"feeFixed":15,"blurb":"A lower per-ticket fee for regular sellers."},{"id":"venue","name":"Venue","monthly":19900,"feePct":0,"feeFixed":10,"blurb":"For venues with shows every week."},
+  {"id":"credits","name":"Credits","basis":"credits","monthly":0,"creditGA":1,"creditSeated":2,"creditPrice":75,"packs":[{"credits":1000,"price":60},{"credits":5000,"price":40}],"blurb":"1 credit per general-admission ticket, 2 per reserved seat, free tickets free. Prepaid credit packs cost less."},
+  {"id":"flat","name":"Flat fee","basis":"flat","monthly":0,"flat":200000,"flatPer":"year","blurb":"One fixed price — no per-ticket fees."}]'::jsonb,
   'defaultPlan', 'pay', 'gatewaysOff', '[]'::jsonb, 'domainTarget', 'domains.set-tickets.app', 'appHosts', '[]'::jsonb, 'invoiceDays', 14, 'autoApprove', false) || data - 'plans' where id = 1;
 create table if not exists platform_admins (email text primary key, created_at timestamptz default now());
 
@@ -229,7 +231,10 @@ create table if not exists incidents (id uuid primary key default gen_random_uui
 create table if not exists platform_invoices (id uuid primary key default gen_random_uuid(), number text unique not null, box_office_id uuid not null references box_offices(id), period text not null,
   lines jsonb not null, total bigint not null, info jsonb not null default '{}', status text not null default 'open' check (status in ('open','paid','void')),
   issued_at timestamptz not null default now(), due_at timestamptz, paid_at timestamptz, note text, handled_by text, by text);
-create unique index if not exists platform_invoices_once on platform_invoices(box_office_id, period) where status <> 'void';
+-- kind: monthly (one per box office per month, from billing_run) | credits (a prepaid credit pack, buy_credits — any number)
+alter table platform_invoices add column if not exists kind text not null default 'monthly', add column if not exists credits int;
+drop index if exists platform_invoices_once;
+create unique index if not exists platform_invoices_monthly on platform_invoices(box_office_id, period) where status <> 'void' and kind = 'monthly';
 create table if not exists backup_runs (id bigint generated always as identity primary key, at timestamptz not null default now(), kind text not null default 'database',
   size_bytes bigint, ok boolean not null, verified_at timestamptz, note text);
 create table if not exists pay_attempts (id bigint generated always as identity primary key, at timestamptz not null default now(), box_office_id uuid, order_id uuid, ok boolean not null);
@@ -306,6 +311,23 @@ create or replace function fee_rule(e events, tt jsonb, p_seat text) returns jso
     when has_rule(tt->'fee') then tt->'fee' when has_rule(e.data->'fees') then e.data->'fees' end $$;
 create or replace function rule_key(r jsonb) returns text language sql immutable as $$
   select case when r is null then '' else concat_ws('/', coalesce(r->>'pct', ''), coalesce(r->>'fixed', ''), coalesce(r->>'payer', '')) end $$;
+-- how the plan charges (PLAN_BASIS in data.js): percent (default) | credits {ga, seated, unit = price per credit} | flat (no per-ticket fee)
+create or replace function plan_fee_basis(x jsonb) returns jsonb language sql immutable as $$
+  select case coalesce(x->>'basis', 'percent')
+    when 'credits' then jsonb_build_object('basis', 'credits', 'ga', coalesce(nullif(x->>'creditGA','')::numeric, 1), 'seated', coalesce(nullif(x->>'creditSeated','')::numeric, 2),
+      'unit', coalesce(nullif(x->>'creditPrice','')::numeric, 0))
+    when 'flat' then '{"basis":"flat"}'::jsonb else '{"basis":"percent"}'::jsonb end $$;
+-- credits an order uses on a credits plan: per paid ticket, seated or general admission; prepaid ones first (pf.prepaid). Mirrors platCredits().
+create or replace function plat_credits(lines jsonb, pf jsonb) returns jsonb language sql immutable as $$
+  with c as (select coalesce(sum(case when l->>'kind' = 'ticket' then (l->>'qty')::numeric else (l->>'qty')::numeric * coalesce(nullif(l->>'perCopy','')::numeric, 1) end
+      * case when jsonb_array_length(coalesce(l->'seats','[]')) > 0 then (pf->>'seated')::numeric else (pf->>'ga')::numeric end), 0) n
+    from jsonb_array_elements(lines) l where l->>'kind' in ('ticket','bundle') and (l->>'unit')::bigint > 0),
+  d as (select n, least(n, greatest(0, floor(coalesce((pf->>'prepaid')::numeric, 0)))) pre from c)
+  select jsonb_build_object('n', n, 'prepaid', pre, 'billable', n - pre) from d $$;
+-- prepaid credits left: packs bought (credits invoices not void) minus the prepaid credits orders used. Mirrors platCreditBalance().
+create or replace function plat_credit_balance(p_bo uuid) returns numeric language sql stable security definer set search_path = public as $$
+  select coalesce((select sum(credits) from platform_invoices where box_office_id = p_bo and kind = 'credits' and status <> 'void'), 0)
+       - coalesce((select sum((o.data->'platCredits'->>'prepaid')::numeric) from orders o where o.box_office_id = p_bo and (o.paid_at is not null or o.status in ('paid','pending','refunded') or (o.status = 'awaiting_payment' and o.expires_at > now()))), 0) $$;
 -- the plan a box office is on (plan beats the platform default; the box office's own platform_fee beats both)
 create or replace function plan_of(pl jsonb, p_plan text) returns jsonb language sql immutable as $$
   select coalesce((select x from jsonb_array_elements(coalesce(pl->'planList', '[]')) x where x->>'id' = coalesce(p_plan, pl->>'defaultPlan', 'pay')),
@@ -1017,7 +1039,7 @@ declare
   tts text[]; tf bigint[]; face bigint; unit bigint; uf bigint; ovr boolean; subtotal bigint; disc bigint; fdisc bigint; fee bigint; tax bigint; donation bigint; err text := '';
   paidtk int; pfee bigint := 0; sfee bigint; pre bigint; pfx bigint := 0; proc bigint; cr bigint; pf jsonb := coalesce(st->'platform', '{}'); cd jsonb := coalesce(st->'card', '{}');
   rl jsonb; ofees jsonb := '[]'; ofee bigint := 0; xf jsonb; xb bigint; xt int; amt bigint; tof boolean := coalesce((st->>'taxOnFees')::boolean, false); per_ev boolean; pass boolean;
-  t0 timestamptz; puses int := 0; gtot bigint; ptot bigint;
+  t0 timestamptz; puses int := 0; gtot bigint; ptot bigint; pcr jsonb;
 begin
   for it in select * from jsonb_array_elements(coalesce(p->'items','[]')) loop
     select * into ev from events where id = (it->>'eventId')::uuid;
@@ -1091,7 +1113,9 @@ begin
   -- card processing (the processor's cut; added to the total only when the box office passes it on)
   paidtk := (select coalesce(sum(case when l->>'kind' = 'ticket' then (l->>'qty')::int when l->>'kind' = 'bundle' then (l->>'qty')::int * (l->>'perCopy')::int else 0 end), 0)
              from jsonb_array_elements(lines) l where (l->>'unit')::bigint > 0);
-  if subtotal - disc - gtot > 0 then pfee := round((subtotal - disc - gtot) * coalesce((pf->>'pct')::numeric, 0) / 100) + paidtk * coalesce((pf->>'fixed')::bigint, 0); end if;
+  if pf->>'basis' = 'credits' then pcr := plat_credits(lines, pf); pfee := round((pcr->>'billable')::numeric * coalesce((pf->>'unit')::numeric, 0));
+  elsif pf->>'basis' = 'flat' then pfee := 0;
+  elsif subtotal - disc - gtot > 0 then pfee := round((subtotal - disc - gtot) * coalesce((pf->>'pct')::numeric, 0) / 100) + paidtk * coalesce((pf->>'fixed')::bigint, 0); end if;
   sfee := case when pf->>'payer' = 'buyer' then pfee else 0 end;
   -- Stage 10: other fees an event adds (mandatory, or optional ones the buyer ticked — p.optFees), per ticket or per order
   for ev in select e.* from events e where e.id in (select distinct (l->>'eventId')::uuid from jsonb_array_elements(lines) l) loop
@@ -1131,7 +1155,7 @@ begin
     'ticketsTotal', (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int), 0) from jsonb_array_elements(lines) l where l->>'kind' in ('ticket','bundle')),
     'addonsTotal', (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int), 0) from jsonb_array_elements(lines) l where l->>'kind' = 'addon'),
     'giftsTotal', gtot, 'passesTotal', ptot, 'passUses', puses, 'passDiscount', (select coalesce(sum((l->>'passDisc')::bigint), 0) from jsonb_array_elements(lines) l),
-    'processing', proc, 'processingFee', pfx, 'platformFee', pfee, 'credit', cr, 'total', pre - cr + proc, 'promoErr', err,
+    'processing', proc, 'processingFee', pfx, 'platformFee', pfee, 'platCredits', pcr, 'credit', cr, 'total', pre - cr + proc, 'promoErr', err,
     'faceValue', (select coalesce(sum(case when l->>'kind' = 'bundle' then (l->>'value')::bigint else (l->>'face')::bigint * (l->>'qty')::int end), 0) from jsonb_array_elements(lines) l),
     'currency', coalesce((select l->>'currency' from jsonb_array_elements(lines) l where l ? 'currency' limit 1), st->>'currency', 'USD'));
 end $$;
@@ -1263,7 +1287,7 @@ declare
   manual boolean := coalesce(p->>'payment','') in ('manual','terminal'); terminal boolean := coalesce(p->>'payment','') = 'terminal';   -- staff orders: manual (paid / unpaid) or the door's card reader
   is_comp boolean := coalesce((p->>'comp')::boolean, false); tok text := nullif(p->>'holdToken',''); pass_f jsonb; mtt boolean := false; plan jsonb; unpaid boolean; gf jsonb; pl2 jsonb;
   bo box_offices%rowtype; email text := lower(trim(coalesce(p->'buyer'->>'email',''))); seated boolean; tts text[]; pos jsonb; gaps text[]; all_seats text[]; with_t boolean;
-  f jsonb; err text; promo jsonb; promo_code text; tracking text; q jsonb; status text; total bigint; prev orders%rowtype; cr credits%rowtype; cap bigint;
+  f jsonb; err text; promo jsonb; promo_code text; tracking text; q jsonb; status text; total bigint; prev orders%rowtype; cr credits%rowtype; cap bigint; pst jsonb;
   oid uuid; okey uuid; oref text; l jsonb; c int; u int; j int; adm int; per int; d bigint; w bigint[]; fs bigint[]; ps bigint[]; ds bigint[]; extras jsonb; by_ text;
   req jsonb; acc jsonb := '[]'; ckf jsonb; flags jsonb := '[]'; nrec int; blocked text; pl jsonb := (select data from platform_settings where id = 1);
 begin
@@ -1450,7 +1474,10 @@ begin
       raise exception '% is for members — enter your membership code', tt->>'name'; end if;
     mtt := true;
   end loop;
-  q := price_cart(p, manual, pricing_settings(bo), promo);
+  pst := pricing_settings(bo);
+  if pst->'platform'->>'basis' = 'credits' then   -- a credits plan uses the box office's prepaid credits first (one order at a time per box office)
+    perform pg_advisory_xact_lock(hashtext('platcredits:' || bo.id::text)); pst := jsonb_set(pst, '{platform,prepaid}', to_jsonb(plat_credit_balance(bo.id))); end if;
+  q := price_cart(p, manual, pst, promo);
   if promo is not null and q->>'promoErr' <> '' then raise exception '%', q->>'promoErr'; end if;
   if pass_f is not null and coalesce((q->>'passUses')::int, 0) = 0 and not mtt then raise exception '% doesn''t cover anything in this order', pass_f->'plan'->>'name'; end if;
   -- credit (Stage 6): a credit code, the signed-in customer's own account credit, or one a staff member picks on a manual order
@@ -1468,7 +1495,7 @@ begin
     cap := (credit_state(cr)->>'remaining')::bigint;
     if cr.event_id is not null then cap := least(cap, (select coalesce(sum((l->>'unit')::bigint * (l->>'qty')::int - coalesce((l->>'disc')::bigint, 0) + coalesce((l->>'fee')::bigint, 0) - coalesce((l->>'feeDisc')::bigint, 0)), 0)
       from jsonb_array_elements(q->'lines') l where l->>'eventId' = cr.event_id::text)); end if;
-    q := price_cart(p || jsonb_build_object('creditAvail', cap), manual, pricing_settings(bo), promo);
+    q := price_cart(p || jsonb_build_object('creditAvail', cap), manual, pst, promo);
   end if;
   -- checkout questions: once per order (box office), once per event, once per ticket
   if not manual then
@@ -1490,8 +1517,8 @@ begin
   if is_comp then  -- complimentary: real ticket type + face value kept, $0 collected
     if not manual then raise exception 'not allowed'; end if;
     foreach x in array ev_ids::text[] loop if not has_perm(bo.id, 'tickets.comps', x::uuid) then raise exception 'You don''t have permission to issue complimentary tickets'; end if; end loop;
-    q := q || jsonb_build_object('lines', (select coalesce(jsonb_agg(ln || '{"unit":0,"fee":0,"unitFee":0,"comp":true}'::jsonb order by o), '[]') from jsonb_array_elements(q->'lines') with ordinality z(ln, o)),
-      'subtotal', 0, 'ticketsTotal', 0, 'addonsTotal', 0, 'discount', 0, 'feeDiscount', 0, 'fee', 0, 'serviceFee', 0, 'otherFee', 0, 'otherFees', '[]'::jsonb, 'tax', 0, 'donation', 0, 'processing', 0, 'processingFee', 0, 'platformFee', 0, 'total', 0);
+    q := (q - 'platCredits') || jsonb_build_object('lines', (select coalesce(jsonb_agg(ln || '{"unit":0,"fee":0,"unitFee":0,"comp":true}'::jsonb order by o), '[]') from jsonb_array_elements(q->'lines') with ordinality z(ln, o)),
+      'subtotal', 0, 'ticketsTotal', 0, 'addonsTotal', 0, 'discount', 0, 'feeDiscount', 0, 'fee', 0, 'serviceFee', 0, 'otherFee', 0, 'otherFees', '[]'::jsonb, 'tax', 0, 'donation', 0, 'processing', 0, 'processingFee', 0, 'platformFee', 0, 'total', 0);   -- (and free tickets use no platform credits)
   end if;
   total := (q->>'total')::bigint;
   -- §5 payment plan: deposit now by card, the rest in installments before the deadline; tickets stay pending until the last payment
@@ -1536,7 +1563,8 @@ begin
       'source', p->>'source', 'utm', (select nullif(jsonb_object_agg(uk.n, left(p->'utm'->>uk.n, 80)), '{}'::jsonb) from unnest(array['source','medium','campaign','content','term']) uk(n)
         where jsonb_typeof(p->'utm') = 'object' and coalesce(p->'utm'->>uk.n, '') <> ''),
       'currency', q->'currency', 'platformFee', q->'platformFee', 'channel', case when coalesce((p->>'pos')::boolean, false) then 'pos' when manual then 'box office' else 'online' end)
-      || case when is_comp then '{"comp":true}'::jsonb else '{}'::jsonb end || case when plan is not null then jsonb_build_object('plan', plan) else '{}'::jsonb end
+      || case when is_comp then '{"comp":true}'::jsonb else '{}'::jsonb end || case when q ? 'platCredits' then jsonb_build_object('platCredits', q->'platCredits') else '{}'::jsonb end
+      || case when plan is not null then jsonb_build_object('plan', plan) else '{}'::jsonb end
       || case when pass_f is not null then jsonb_build_object('pass', jsonb_build_object('id', pass_f->'pass'->>'id', 'code', pass_f->'pass'->>'code', 'plan', pass_f->'plan'->>'name', 'uses', q->'passUses', 'discount', q->'passDiscount')) else '{}'::jsonb end)
     returning id, access_key into oid, okey;
   -- the order holds its seats itself now (paid → tickets; unpaid → reserved until paid or expired), so the buyer's seat holds go
@@ -1561,7 +1589,8 @@ create or replace function pricing_settings(b box_offices) returns jsonb languag
   select coalesce(b.settings, '{}') || jsonb_build_object(
     'platform', jsonb_build_object('pct', coalesce(nullif(b.platform_fee->>'pct','')::numeric, nullif(plan_of(pl.data, b.plan)->>'feePct', '')::numeric, (pl.data->>'feePct')::numeric, 0),
                                    'fixed', coalesce(nullif(b.platform_fee->>'fixed','')::bigint, nullif(plan_of(pl.data, b.plan)->>'feeFixed', '')::numeric::bigint, (pl.data->>'feeFixed')::bigint, 0),
-                                   'payer', coalesce(nullif(b.platform_fee->>'payer',''), pl.data->>'feePayer', 'organizer')),
+                                   'payer', coalesce(nullif(b.platform_fee->>'payer',''), pl.data->>'feePayer', 'organizer'))
+                || plan_fee_basis(plan_of(pl.data, b.plan)),
     'card', jsonb_build_object('pct', coalesce((a.data->>'pct')::numeric, case a.provider when 'stripe' then 2.9 else 0 end),
                                'fixed', coalesce((a.data->>'fixed')::bigint, case a.provider when 'stripe' then 30 else 0 end),
                                'pass', coalesce((b.settings->>'passProcessing')::boolean, false)))
@@ -3868,6 +3897,12 @@ begin
   perform log_action(p_bo, 'billing.plan', format('%s: plan %s → %s', b.name, coalesce(b.plan, pl->>'defaultPlan', 'pay'), p_plan), jsonb_build_object('plan', b.plan), jsonb_build_object('plan', p_plan));
 end $$;
 -- what one box office owes the platform for one month: its plan + platform fees on paid orders a processor did NOT collect automatically
+-- flat-fee plans: what one month owes — every month, once a year (the month the box office joined), or per event starting that month. Mirrors flatFor().
+create or replace function flat_for(x jsonb, b box_offices, p_period text) returns jsonb language sql stable security definer set search_path = public as $$
+  select case when coalesce(x->>'basis','') <> 'flat' or coalesce(nullif(x->>'flat','')::bigint, 0) <= 0 then '{"amount":0,"n":0}'::jsonb else
+    (select jsonb_build_object('amount', n * (x->>'flat')::bigint, 'n', n) from (select case x->>'flatPer'
+      when 'event' then (select count(*)::int from events e where e.box_office_id = b.id and e.status = 'published' and left(e.data->>'start', 7) = p_period)
+      when 'year' then case when to_char(b.created_at, 'MM') = right(p_period, 2) then 1 else 0 end else 1 end n) z) end $$;
 create or replace function billing_for(b box_offices, p_period text) returns jsonb language sql stable security definer set search_path = public as $$
   with pl as (select data from platform_settings where id = 1),
   paid as (select o.*, coalesce((o.data->>'platformFee')::bigint, 0) fee, o.payment->>'provider' in ('stripe','demo') and o.payment->>'markedPaidBy' is null auto from orders o
@@ -3875,18 +3910,38 @@ create or replace function billing_for(b box_offices, p_period text) returns jso
   select jsonb_build_object('period', p_period, 'plan', plan_of((select data from pl), b.plan), 'subscription', coalesce((plan_of((select data from pl), b.plan)->>'monthly')::bigint, 0),
     'autoFees', coalesce((select sum(fee) from paid where auto), 0), 'autoOrders', (select count(*) from paid where auto),
     'owedFees', coalesce((select sum(fee) from paid where not auto), 0), 'owedOrders', (select count(*) from paid where not auto),
-    'due', coalesce((plan_of((select data from pl), b.plan)->>'monthly')::bigint, 0) + coalesce((select sum(fee) from paid where not auto), 0)) $$;
+    'flat', (flat_for(plan_of((select data from pl), b.plan), b, p_period)->>'amount')::bigint, 'flatN', (flat_for(plan_of((select data from pl), b.plan), b, p_period)->>'n')::int,
+    'due', coalesce((plan_of((select data from pl), b.plan)->>'monthly')::bigint, 0) + (flat_for(plan_of((select data from pl), b.plan), b, p_period)->>'amount')::bigint
+      + coalesce((select sum(fee) from paid where not auto), 0)) $$;
+-- credits plan: the owner (or a super admin) buys a prepaid pack → a 'credits' invoice; the credits are usable at once (voiding it takes them back)
+create or replace function buy_credits(p_bo uuid, p_pack int) returns jsonb language plpgsql security definer set search_path = public as $$
+declare b box_offices%rowtype; pl jsonb := (select data from platform_settings where id = 1); x jsonb; pk jsonb; tot bigint; num text; r platform_invoices%rowtype;
+begin
+  select * into b from box_offices where id = p_bo; if not found then raise exception 'Box office not found'; end if;
+  if not is_super() and b.owner <> me_email() then raise exception 'Only the owner can buy credits'; end if;
+  x := plan_of(pl, b.plan); if coalesce(x->>'basis','') <> 'credits' then raise exception 'This box office isn''t on a credits plan'; end if;
+  pk := x->'packs'->p_pack; if pk is null or coalesce((pk->>'credits')::int, 0) <= 0 then raise exception 'Choose a credit pack'; end if;
+  tot := round((pk->>'credits')::numeric * (pk->>'price')::numeric);
+  num := 'SET-' || to_char(now(), 'YYYYMM') || '-' || lpad(((select count(*) from platform_invoices) + 1)::text, 4, '0');
+  insert into platform_invoices(number, box_office_id, period, kind, credits, lines, total, due_at, by) values (num, b.id, to_char(now(), 'YYYY-MM'), 'credits', (pk->>'credits')::int,
+    jsonb_build_array(jsonb_build_object('label', format('%s prepaid credits at %s each', pk->>'credits', money_txt((pk->>'price')::bigint)), 'amount', tot)), tot,
+    now() + make_interval(days => coalesce((pl->>'invoiceDays')::int, 14)), me_email()) returning * into r;
+  perform log_action(p_bo, 'billing.credits', format('%s: bought %s credits (%s) — invoice %s', b.name, pk->>'credits', money_txt(tot), num));
+  return to_jsonb(r);
+end $$;
 create or replace function billing_run(p_period text) returns int language plpgsql security definer set search_path = public as $$
 declare b box_offices%rowtype; x jsonb; n int := 0; num text; pl jsonb := (select data from platform_settings where id = 1);
 begin
   if not is_super() and coalesce(auth.jwt() ->> 'role', '') <> 'service_role' then raise exception 'Platform super admins only'; end if;
   if p_period !~ '^\d{4}-\d{2}$' then raise exception 'Pick a month'; end if;
   for b in select * from box_offices where status in ('active','suspended') loop
-    if exists(select 1 from platform_invoices where box_office_id = b.id and period = p_period and status <> 'void') then continue; end if;
+    if exists(select 1 from platform_invoices where box_office_id = b.id and period = p_period and status <> 'void' and kind = 'monthly') then continue; end if;
     x := billing_for(b, p_period); if (x->>'due')::bigint <= 0 then continue; end if;
     num := 'SET-' || replace(p_period, '-', '') || '-' || lpad(((select count(*) from platform_invoices) + 1)::text, 4, '0');
     insert into platform_invoices(number, box_office_id, period, lines, total, info, due_at, by) values (num, b.id, p_period,
       (case when (x->>'subscription')::bigint > 0 then jsonb_build_array(jsonb_build_object('label', (x->'plan'->>'name') || ' plan — ' || p_period, 'amount', (x->>'subscription')::bigint)) else '[]' end)
+      || case when (x->>'flat')::bigint > 0 then jsonb_build_array(jsonb_build_object('label', (x->'plan'->>'name') || ' — ' || case x->'plan'->>'flatPer' when 'event' then (x->>'flatN') || ' event(s) starting ' || p_period
+           when 'year' then 'yearly fee' else p_period end, 'amount', (x->>'flat')::bigint)) else '[]' end
       || case when (x->>'owedFees')::bigint > 0 then jsonb_build_array(jsonb_build_object('label', format('Platform fees on %s order(s) not paid through Stripe (cash, check, invoice, other)', x->>'owedOrders'), 'amount', (x->>'owedFees')::bigint)) else '[]' end,
       (x->>'due')::bigint, jsonb_build_object('autoFees', x->'autoFees', 'autoOrders', x->'autoOrders'), now() + make_interval(days => coalesce((pl->>'invoiceDays')::int, 14)), coalesce(nullif(me_email(), ''), 'system'));
     perform queue_msg(jsonb_build_object('box_office_id', b.id, 'to', b.owner, 'kind', 'staff', 'category', 'staff', 'by', 'system', 'subject', coalesce(pl->>'name', 'SET') || ' invoice ' || num,
@@ -3954,9 +4009,10 @@ begin
     'lastBackup', lb, 'open', inc);
 end $$;
 grant execute on function event_control(uuid,jsonb), support_action(uuid,text,jsonb), ban_customer(uuid,text,text), unban_customer(uuid), policy_texts(uuid,text[]), save_incident(jsonb), set_plan(uuid,text),
-  billing_run(text), invoice_action(uuid,text,text), save_domain(uuid,text), platform_health() to authenticated;
+  billing_run(text), invoice_action(uuid,text,text), save_domain(uuid,text), platform_health(), buy_credits(uuid,int) to authenticated;
 revoke execute on function event_control(uuid,jsonb), support_action(uuid,text,jsonb), ban_customer(uuid,text,text), unban_customer(uuid), policy_texts(uuid,text[]), save_incident(jsonb), set_plan(uuid,text),
-  billing_run(text), invoice_action(uuid,text,text), save_domain(uuid,text), platform_health() from anon, public;
+  billing_run(text), invoice_action(uuid,text,text), save_domain(uuid,text), platform_health(), buy_credits(uuid,int) from anon, public;
+revoke execute on function plat_credit_balance(uuid), flat_for(jsonb,box_offices,text) from anon, authenticated, public;
 grant execute on function queue_status(uuid,text), contact_organizer(uuid,uuid,jsonb), log_client_error(jsonb), bo_by_domain(text) to anon, authenticated;
 revoke execute on function rate_hit(text,int,int), add_version(uuid,text,uuid,jsonb,jsonb), billing_for(box_offices,text), domain_result(uuid,text,jsonb), log_error(text,text,text,uuid) from anon, authenticated, public;
 grant execute on function domain_result(uuid,text,jsonb), log_error(text,text,text,uuid), billing_run(text) to service_role;

@@ -153,6 +153,13 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   §8 customer self-service `settings.selfService` + per-event overrides, all OFF by default (`demoSelfService()` / `self_service()`).
   §9 offline payment methods `PAY_METHODS`. §10 embeds: `frontend/embed.js`, `#/embed/<slug>[?compact=1]`, `#/embed-list/<bo>`.
   §11 product vouchers (`ad.redeemable` → `vouchers`, scanned through `checkin` → item_ok | item_used | item_void). Tests: `tests/final-e2e.html`.
+- **Platform billing (how SET charges box offices):** plans in `platform.planList` with `basis` (`PLAN_BASIS`): percent (feePct /
+  feeFixed, the Stage 10 model) | credits (Ticket Tailor style: `creditGA` per paid GA ticket, `creditSeated` per reserved seat, free / comp
+  tickets 0; prepaid `packs` [{credits, price}] bought with `DB.buyCredits()` / `buy_credits()` → a `kind: 'credits'` invoice; balance =
+  `platCreditBalance()` / `plat_credit_balance()` = packs − `order.data.platCredits.prepaid`; beyond it `creditPrice` per credit) | flat
+  (`flat` cents per month | year | event, `flatFor()` / `flat_for()`, on the monthly invoice). Every basis lands in `order.data.platformFee`
+  (`quote()` / `price_cart()` via `platCredits()` / `plat_credits()`), so Stripe application fees, reports and invoices are unchanged.
+  Prices are placeholders until the money model is decided. Self-registration stays OFF (`publicRegistration: false`). Tests: `tests/billing-e2e.html` + db-e2e "BILL".
 - **Money is integer cents everywhere.**
 - **Not yet wired:** the payments, messaging and api Edge Functions are written but not deployed (no Supabase project yet; need
   Stripe / Resend / Twilio keys in Supabase secrets + pg_cron for `expire_orders()` and `marketing_tick()`; the messaging function sends
