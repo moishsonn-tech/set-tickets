@@ -9,7 +9,7 @@
   'use strict';
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const HEX = /^#[0-9a-f]{6}$/i;
-  const ORDER_KINDS = ['confirmation', 'confirmation_copy', 'tickets', 'updated'];
+  const ORDER_KINDS = ['confirmation', 'confirmation_copy', 'tickets', 'updated', 'transfer'];
   const tzOk = tz => { try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch (e) { return false; } };
   const when = (iso, tz, o) => { if (!iso) return ''; const d = new Date(iso); if (isNaN(d)) return ''; return d.toLocaleString('en-US', { ...o, timeZone: tzOk(tz) ? tz : 'America/New_York' }); };
   const slotStart = (ev, slotId) => (ev?.timeSlots || []).find(s => s.id === slotId)?.start || ev?.start;
@@ -20,7 +20,7 @@
       date: when(start, ev?.timezone, { weekday: 'long', month: 'long', day: 'numeric' }), time: when(start, ev?.timezone, { hour: 'numeric', minute: '2-digit' }),
       venue: [ev?.venue, ev?.address].filter(Boolean).join(', '), doors: ev?.doors || when(start, ev?.timezone, { hour: 'numeric', minute: '2-digit' }), order_ref: o?.ref || '',
       tickets_link: o ? `${app}#/order/${o.id}/${o.key}` : '', event_link: ev?.slug ? `${app}#/e/${ev.slug}` : bo.slug ? `${app}#/b/${bo.slug}` : app,
-      box_office: bo.name || '', promo_code: m.vars?.promo_code || '', link: m.vars?.link || '', unsubscribe_link: ctx.contact?.token ? `${app}#/unsubscribe/${ctx.contact.token}` : '' };
+      box_office: bo.name || '', promo_code: m.vars?.promo_code || '', link: m.vars?.link || '', gift_code: m.data?.credit || '', pass_code: m.data?.pass || '', unsubscribe_link: ctx.contact?.token ? `${app}#/unsubscribe/${ctx.contact.token}` : '' };
   }
   const fill = (s, v) => String(s || '').replace(/\{\{\s*([a-z_]+)\s*\}\}/g, (_, k) => v[k] ?? '');
   // staff text → paragraphs; https links become links (escaped, nothing else becomes HTML)
@@ -31,6 +31,11 @@
     tickets: ['Your tickets — {{event}}', 'Hi {{first_name}}, here are your tickets for order {{order_ref}}.'],
     updated: ['Your updated tickets', 'Your tickets have changed. Your new tickets are below — the old ones no longer work.'],
     waitlist: ['Tickets are available: {{event}}', 'Good news — tickets for {{event}} are available. Book here: {{event_link}}'],
+    gift: ['Your {{box_office}} gift card', 'You have a {{box_office}} gift card. Enter the code at checkout, in the credit box — it works until the balance is used up.'],
+    pass: ['Your {{box_office}} pass', 'Your pass is ready. Enter the code at checkout with this email address and it is applied to your tickets.'],
+    transfer: ['A ticket for {{event}}', '{{name}} sent you a ticket for {{event}}. Show the ticket code below at the door.'],
+    installment: ['Your payment plan — order {{order_ref}}', 'Pay from your ticket page: {{tickets_link}}'],
+    pos: ['Your tickets', 'Your tickets for {{event}}: {{tickets_link}}'],
   };
   function render(m, ctx, opts = {}) {
     const v = vars(m, ctx, opts), d = DEFAULTS[m.kind] || [], bo = ctx.bo || {}, br = bo.branding || {};
@@ -43,7 +48,9 @@
       return { subject: '', html: '', text: t, sms: marketing ? t + ' Reply STOP to opt out.' : t };
     }
     const ink = HEX.test(br.ink || '') ? br.ink : '#020a16', accent = HEX.test(br.accent || '') ? br.accent : '#f4cd5e';
-    const showTickets = ORDER_KINDS.includes(m.kind) && ctx.order, tks = showTickets ? ctx.tickets || [] : [];
+    // a transfer shows only the transferred tickets and never the buyer's private order link
+    const showTickets = ORDER_KINDS.includes(m.kind) && ctx.order, tks = showTickets ? (ctx.tickets || []).filter(t => m.kind !== 'transfer' || (m.data?.tickets || []).includes(t.id)) : [];
+    const code = v.gift_code || v.pass_code, codeBox = code ? `<p style="margin:0 0 14px;font-size:22px;font-weight:800;letter-spacing:.08em;font-family:monospace">${esc(code)}</p>` : '';
     const evs = showTickets ? (ctx.order.events || []) : [];
     const table = evs.map(e => { const mine = tks.filter(t => t.event_id === e.id); if (!mine.length) return '';
       return `<div style="border:1px solid #e3e6ea;border-radius:10px;padding:14px 16px;margin:0 0 14px"><div style="font-weight:700">${esc(e.name)}</div>
@@ -60,10 +67,10 @@
     const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${esc(subject)}</title></head>
 <body style="margin:0;background:#f4f5f7;font-family:Inter,Helvetica,Arial,sans-serif;color:#111827">
 <div style="max-width:600px;margin:0 auto;padding:24px 16px"><div style="background:${ink};color:#fff;border-radius:12px 12px 0 0;padding:16px 22px;font-weight:800;letter-spacing:.04em;border-bottom:3px solid ${accent}">${esc(bo.name || 'SET')}</div>
-<div style="background:#fff;border-radius:0 0 12px 12px;padding:22px;line-height:1.5;font-size:15px"><h1 style="font-size:20px;margin:0 0 14px">${esc(header)}</h1>${paras(body)}${table}
-${showTickets ? btn(v.tickets_link, 'View & download your tickets') : ''}</div>
+<div style="background:#fff;border-radius:0 0 12px 12px;padding:22px;line-height:1.5;font-size:15px"><h1 style="font-size:20px;margin:0 0 14px">${esc(header)}</h1>${paras(body)}${codeBox}${table}
+${showTickets && m.kind !== 'transfer' ? btn(v.tickets_link, 'View & download your tickets') : code ? btn(v.event_link, 'Find events') : ''}</div>
 <p style="font-size:12px;color:#5b6472;text-align:center;margin:16px 8px">${why}</p></div></body></html>`;
-    const text = [subject, '', body, ...(showTickets ? ['', ...tks.map(t => `${t.type || 'Ticket'}${t.area ? ' · ' + t.area : ''}${t.row ? ' · Row ' + t.row : ''}${t.seat ? ' · Seat ' + t.seat : ''} — ${t.code}`), '', 'Your tickets: ' + v.tickets_link] : []),
+    const text = [subject, '', body, ...(code ? ['', 'Code: ' + code] : []), ...(showTickets ? ['', ...tks.map(t => `${t.type || 'Ticket'}${t.area ? ' · ' + t.area : ''}${t.row ? ' · Row ' + t.row : ''}${t.seat ? ' · Seat ' + t.seat : ''} — ${t.code}`), ...(m.kind === 'transfer' ? [] : ['', 'Your tickets: ' + v.tickets_link])] : []),
       '', marketing ? `Unsubscribe: ${v.unsubscribe_link}` : ''].join('\n').trim();
     return { subject, html, text, sms: '' };
   }
