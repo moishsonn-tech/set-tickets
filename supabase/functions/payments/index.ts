@@ -7,6 +7,7 @@
    POST {action:'connect', bo, provider, return}  staff with admin.payments: connect the box office's own processor account
    POST {action:'order', order, op, p}            staff: an order change that refunds the card (Stage 6). Runs order_action() AS the caller, so
                                                   their permissions apply, then refunds each 'processing' refund at the processor (retries any stuck one)
+   POST {action:'installment', order, key}       buyer: pay the next installment of a payment plan → {clientSecret …}; the webhook records it
    POST ?webhook=stripe                           the processor: payment succeeded / failed, account ready  → confirm_payment() issues tickets;
                                                   disputes → record_dispute(); payouts → record_payout(); every charge / refund → record_processor_tx() */
 import { PROVIDERS } from './providers/index.ts';
@@ -54,7 +55,10 @@ Deno.serve(async req => {
       if (ev.type === 'payout') { await rpc('record_payout', { p: { ...ev, provider: hook } }); return new Response('ok'); }
       if (ev.type === 'failed') { await rpc('record_payment_attempt', { p_order: ev.orderId, p: { ok: false, provider: hook, ref: ev.ref, error: ev.error } }); return new Response('ok'); }
       // succeeded: the database issues the tickets (once). Paid too late for seats that are gone, or the wrong amount → refund now.
-      const res = await rpc('confirm_payment', { p_order: ev.orderId, p: { provider: hook, ref: ev.ref, amount: ev.amount, method: ev.method, brand: ev.brand, last4: ev.last4, ...(ev.fee != null ? { fee: ev.fee } : {}) } });
+      // §5 a later installment of a payment plan is its own payment: pay_installment() records it (the last one issues the tickets)
+      const res = ev.installment != null
+        ? await rpc('pay_installment', { p_order: ev.orderId, p: { provider: hook, ref: ev.ref, amount: ev.amount, method: ev.method, brand: ev.brand, last4: ev.last4 }, p_by: null })
+        : await rpc('confirm_payment', { p_order: ev.orderId, p: { provider: hook, ref: ev.ref, amount: ev.amount, method: ev.method, brand: ev.brand, last4: ev.last4, ...(ev.fee != null ? { fee: ev.fee } : {}) } });
       // the processor's own record of the charge (Stage 9 reconciliation), whatever happened to the order
       await rpc('record_processor_tx', { p: { id: ev.charge || ev.ref, payment: ev.ref, type: 'charge', amount: ev.amount, fee: ev.fee ?? 0, app_fee: ev.appFee || 0, provider: hook, account: ev.account } });
       if (res === 'refund' || res === 'mismatch') {
@@ -71,8 +75,19 @@ Deno.serve(async req => {
       if (order.status !== 'awaiting_payment' || new Date(order.expires_at) <= new Date()) return json(req, { error: 'This checkout has expired and its seats were released. Please start again.' }, 409);
       const account = await one(`payment_accounts?box_office_id=eq.${order.box_office_id}&status=eq.connected&select=*`);
       const p = account && PROVIDERS[account.provider]; if (!p) return json(req, { error: 'Card payments are not set up for this box office yet' }, 409);
-      const r = await p.createPayment({ order, account, platformFee: Math.max(0, +order.data.platformFee || 0), env });
-      return json(req, { provider: account.provider, test: account.test, expires_at: order.expires_at, total: order.data.total, currency: order.data.currency, ...r });
+      const due = order.data.plan ? +order.data.plan.schedule[0].amount : order.data.total;   // §5 a payment plan's first charge is its deposit (it carries the platform fee)
+      const r = await p.createPayment({ order, account, platformFee: Math.max(0, +order.data.platformFee || 0), env, amount: due });
+      return json(req, { provider: account.provider, test: account.test, expires_at: order.expires_at, total: due, currency: order.data.currency, ...r });
+    }
+    if (body.action === 'installment') {   // ── buyer: pay the next installment of a payment plan (§5) ──
+      const order = await one(`orders?id=eq.${encodeURIComponent(body.order)}&access_key=eq.${encodeURIComponent(body.key)}&select=*`);
+      if (!order) return json(req, { error: 'Order not found' }, 404);
+      const x = order.status === 'pending' && (order.data.plan?.schedule || []).find(s => !s.paid_at);
+      if (!x) return json(req, { error: 'Nothing is due on this order' }, 409);
+      const account = await one(`payment_accounts?box_office_id=eq.${order.box_office_id}&status=eq.connected&select=*`);
+      const p = account && PROVIDERS[account.provider]; if (!p) return json(req, { error: 'Card payments are not set up for this box office yet' }, 409);
+      const r = await p.createPayment({ order, account, platformFee: 0, env, amount: +x.amount, installment: x.n });
+      return json(req, { provider: account.provider, test: account.test, total: +x.amount, currency: order.data.currency, installment: x.n, ...r });
     }
     if (body.action === 'connect') {  // ── staff: connect this box office's own processor account ──
       if (!(await canManagePayments(await caller(req), body.bo))) return json(req, { error: 'You don\'t have permission to change payment settings' }, 403);
@@ -93,9 +108,17 @@ Deno.serve(async req => {
         const p = PROVIDERS[rf.provider]; let out;
         try {
           if (!p || !account || account.provider !== rf.provider) throw new Error('The processor that took this payment is not connected');
-          const x = await p.refund({ ref: rf.payment, amount: rf.amount, account: account.account, idem: 'set-refund-' + rf.id, env });   // one refund id → never refunded twice
-          out = { ok: true, ref: x.id };
-          await rpc('record_processor_tx', { p: { id: x.id, payment: rf.payment, type: 'refund', amount: -rf.amount, provider: rf.provider, account: account.account } });
+          // a payment-plan refund is split over the installments paid by card (rf.parts); each part has its own idempotency key, so a retry
+          // after a part failed only sends what is still owed
+          const parts = rf.parts || [{ payment: rf.payment, amount: rf.amount }], ids = [];
+          for (const [i, pt] of parts.entries()) {
+            try {
+              const x = await p.refund({ ref: pt.payment, amount: pt.amount, account: account.account, idem: 'set-refund-' + rf.id + (i ? '-' + i : ''), env });   // one refund id → never refunded twice
+              ids.push(x.id);
+              await rpc('record_processor_tx', { p: { id: x.id, payment: pt.payment, type: 'refund', amount: -pt.amount, provider: rf.provider, account: account.account } });
+            } catch (e) { if (ids.length) { out = { ok: false, partial: true, error: String(e.message || e) }; break; } throw e; }
+          }
+          out ||= { ok: true, ref: ids.join(',') };
         } catch (e) { out = { ok: false, error: String(e.message || e) }; }
         await rpc('finish_refund', { p_order: order.id, p_refund: rf.id, p: out });
         if (res.refund?.id === rf.id) res.refund = { ...res.refund, status: out.ok ? 'done' : 'failed', error: out.error || null };

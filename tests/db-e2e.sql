@@ -628,6 +628,159 @@ select t.ok((select api_auth('h10')->'scopes') = '["orders:read"]', 'S10 an API 
 select t.ok(jsonb_typeof(api_read('b0000000-0000-0000-0000-000000000001', 'finance')) = 'array' and jsonb_typeof(api_read('b0000000-0000-0000-0000-000000000001', 'seating')) = 'array', 'S10 API: finance and seating resources');
 update box_offices set settings = settings - 'taxPct' || '{"feeFixed":100}' where id = 'b0000000-0000-0000-0000-000000000001';
 
+-- ════════ Final additions: gift cards, memberships / passes, payment plans, purchase rules, pricing, self-service, POS, offline payments, vouchers, wallet ════════
+reset role; delete from rate_hits;
+update box_offices set branding = branding - 'refundPolicy' - 'privacyPolicy' where id = 'b0000000-0000-0000-0000-000000000001';   -- policies are checked in Stage 10's section
+update box_offices set settings = settings - 'terms' || '{"gifts":{"on":true,"amounts":[2500,5000],"custom":true,"min":1000,"max":20000,"days":365},
+  "passPlans":[{"id":"season","name":"Season Pass","kind":"season","price":10000,"benefit":"free","uses":2,"perEvent":1,"eventIds":[],"ticketTypeIds":["adult"],"validDays":365,"onSale":true,"max":0},
+               {"id":"member","name":"Members","kind":"membership","price":5000,"benefit":"discount","pct":20,"uses":0,"perEvent":0,"eventIds":[],"ticketTypeIds":[],"validDays":365,"onSale":true,"max":0}],
+  "installments":{"on":true,"minTotal":10000,"deposit":25,"count":3,"finalDays":14},
+  "selfService":{"rename":true,"transfer":true,"resend":true,"seatChange":true}}'::jsonb where id = 'b0000000-0000-0000-0000-000000000001';
+insert into events(id, box_office_id, slug, status, data) values ('e0000000-0000-0000-0000-0000000000f1', 'b0000000-0000-0000-0000-000000000001', 'fa-show', 'published', '{
+  "name":"FA Show","start":"2099-03-01T19:00:00Z","timezone":"UTC","currency":"USD","visibility":"public","timeSlots":[{"id":"eve","start":"2099-03-01T19:00:00Z"},{"id":"mat","start":"2099-03-01T13:00:00Z"}],
+  "ticketTypes":[{"id":"adult","name":"Adult","price":3000,"qty":0,"admits":1,"peak":[{"label":"Evening","from":"18:00","to":"23:59","price":4000}]},{"id":"child","name":"Child","price":1000,"qty":0,"admits":1},
+    {"id":"mem","name":"Members lounge","price":2000,"qty":0,"admits":1,"memberOnly":true,"memberPlans":["member"]}],
+  "addons":[{"id":"drink","name":"Drink voucher","price":500,"qty":0,"standalone":false,"redeemable":true}],
+  "rules":[{"id":"r1","kind":"requires","ttIds":["child"],"needs":["adult"],"per":2},{"id":"r2","kind":"limit","ttIds":["adult","child"],"max":8}]}'),
+  ('e0000000-0000-0000-0000-0000000000f2', 'b0000000-0000-0000-0000-000000000001', 'fa-soon', 'published', jsonb_build_object('name', 'FA Soon', 'start', now() + interval '1 day', 'currency', 'USD', 'visibility', 'public', 'timeSlots', '[]'::jsonb,
+    'ticketTypes', '[{"id":"std","name":"Standard","price":3000,"qty":0,"admits":1,"phases":[{"id":"lm","label":"Last-minute","price":3500,"hoursBefore":48}]}]'::jsonb, 'addons', '[]'::jsonb));
+-- §6 pricing: peak showtime price (event timezone), last-minute phase
+select t.ok((price_cart('{"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":2,"slotId":"eve"}]}', false, '{}', null)->'lines'->0->>'unit')::bigint = 4000
+  and (price_cart('{"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"}]}', false, '{}', null)->'lines'->0->>'unit')::bigint = 3000, 'FA §6 peak price for the evening showtime, off-peak for the matinee');
+select t.ok((price_cart('{"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f2","ticketTypeId":"std","qty":1}]}', false, '{}', null)->'lines'->0->>'unit')::bigint = 3500, 'FA §6 last-minute price in the final 48 hours');
+set role anon; select t.who('');
+-- §7 purchase rules
+select t.err($$select place_order('{"buyer":{"name":"Kid","email":"kid@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"child","qty":1,"slotId":"mat"}],"payment":"offline"}')$$, 'need one Adult', 'FA §7 a child ticket needs an adult ticket');
+select t.err($$select place_order('{"buyer":{"name":"Kid","email":"kid@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"},{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"child","qty":3,"slotId":"mat"}],"payment":"offline"}')$$, 'need one Adult', 'FA §7 one adult for every 2 children');
+select t.ok(place_order('{"buyer":{"name":"Fam","email":"fam@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"},{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"child","qty":2,"slotId":"mat"}],"payment":"offline"}')->>'status' = 'pending', 'FA §7 adult + 2 children is allowed');
+select t.err($$select place_order('{"buyer":{"name":"Big","email":"big@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":6,"slotId":"mat"},{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"child","qty":3,"slotId":"mat"}],"payment":"offline"}')$$, 'At most 8', 'FA §7 maximum across a combination of ticket types');
+-- §4 gift cards: bought online (no tax, no fee), issued to the recipient when paid; amount rules
+select t.err($$select place_order('{"buyer":{"name":"Giver","email":"giver@mail.test"},"boxOfficeId":"b0000000-0000-0000-0000-000000000001","gifts":[{"amount":999999}],"payment":"card"}')$$, 'Gift cards are', 'FA §4 gift card amount must be within the limits');
+select place_order('{"buyer":{"name":"Giver","email":"giver@mail.test"},"boxOfficeId":"b0000000-0000-0000-0000-000000000001","gifts":[{"amount":5000,"to":"Pat","toEmail":"pat@mail.test","message":"Enjoy!"}],"payment":"card"}') as gr \gset
+select t.ok((:'gr'::jsonb)->>'status' = 'awaiting_payment' and ((:'gr'::jsonb)->>'total')::bigint = 5000, 'FA §4 a gift-card-only order: $50, no booking fee or tax');
+reset role; set role service_role;
+select t.ok(confirm_payment(((:'gr'::jsonb)->>'id')::uuid, '{"amount":5000,"ref":"pi_gift","provider":"stripe"}') = 'issued', 'FA §4 the processor confirms the gift card order');
+reset role;
+select t.ok(exists(select 1 from t.credits where source_order = ((:'gr'::jsonb)->>'id')::uuid and kind = 'gift' and email = 'pat@mail.test' and amount = 5000 and expires > now() + interval '300 days'), 'FA §4 gift card issued to the recipient, with its expiry');
+select t.ok(exists(select 1 from t.outbox where kind = 'gift' and "to" = 'pat@mail.test' and data->>'credit' like 'CR-%'), 'FA §4 the recipient is emailed the code');
+select code as gcode from t.credits where source_order = ((:'gr'::jsonb)->>'id')::uuid \gset
+set role anon; select t.who('');
+select place_order(('{"buyer":{"name":"Pat","email":"pat@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"}],"payment":"offline","credit":"' || :'gcode' || '"}')::jsonb) as gu \gset
+reset role;
+select t.ok((select (credit_state(c)->>'remaining')::bigint from public.credits c where code = :'gcode') = 5000 - (select (data->'credit'->>'amount')::bigint from t.orders where id = ((:'gu'::jsonb)->>'id')::uuid)
+  and (select (credit_state(c)->>'remaining')::bigint from public.credits c where code = :'gcode') > 0, 'FA §4 partial use: the balance goes down and stays on the card');
+-- §3 memberships / season passes
+set role anon; select t.who('');
+select place_order('{"buyer":{"name":"Mem","email":"mem@mail.test"},"boxOfficeId":"b0000000-0000-0000-0000-000000000001","passes":[{"planId":"season","qty":1},{"planId":"member","qty":1}],"payment":"card"}') as pr \gset
+reset role; set role service_role; select confirm_payment(((:'pr'::jsonb)->>'id')::uuid, '{"amount":15000,"ref":"pi_pass","provider":"stripe"}'); reset role;
+select t.ok((select count(*) from t.orders o where id = ((:'pr'::jsonb)->>'id')::uuid and status = 'paid') = 1 and (select count(*) from passes where order_id = ((:'pr'::jsonb)->>'id')::uuid) = 2, 'FA §3 two passes bought and issued');
+select code as season from passes where order_id = ((:'pr'::jsonb)->>'id')::uuid and plan_id = 'season' \gset
+select code as member from passes where order_id = ((:'pr'::jsonb)->>'id')::uuid and plan_id = 'member' \gset
+set role anon; select t.who('');
+select t.err($$select place_order('{"buyer":{"name":"X","email":"x@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"}],"payment":"offline","pass":"$$ || :'season' || $$"}')$$, 'email the pass belongs', 'FA §3 a pass only works for its holder''s email');
+select t.err($$select place_order('{"buyer":{"name":"Mem","email":"mem@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"mem","qty":1,"slotId":"mat"}],"payment":"offline"}')$$, 'for members', 'FA §3 members-only tickets need a membership');
+select place_order(('{"buyer":{"name":"Mem","email":"mem@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":2,"slotId":"mat"}],"payment":"card","pass":"' || :'season' || '"}')::jsonb) as so \gset
+select t.ok(((:'so'::jsonb)->>'total')::bigint = 3100, 'FA §3 season pass: one ticket (and its booking fee) covered per event, the second one paid ($30 + $1 fee)');
+reset role; set role service_role; select confirm_payment(((:'so'::jsonb)->>'id')::uuid, '{"amount":3100,"ref":"pi_so","provider":"stripe"}'); reset role;
+select t.ok((select count(*) from t.tickets where order_id = ((:'so'::jsonb)->>'id')::uuid and pass is not null) = 1 and (select pass_state(x)->>'used' from passes x where code = :'season') = '1'
+  and (select pass_state(x)->>'left' from passes x where code = :'season') = '1', 'FA §3 usage tracking: the covered ticket carries the pass; 1 of 2 uses left');
+set role anon; select t.who('');
+select t.ok((place_order(('{"buyer":{"name":"Mem","email":"mem@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"mem","qty":1,"slotId":"mat"},{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"}],"payment":"offline","pass":"' || :'member' || '"}')::jsonb)->>'total')::bigint = 4200,
+  'FA §3 membership: unlocks members-only tickets and takes 20% off ($20 + $30 → $40, + $2 booking fees)');
+select t.ok(check_pass('b0000000-0000-0000-0000-000000000001', :'season', 'mem@mail.test')->>'status' = 'active' and check_pass('b0000000-0000-0000-0000-000000000001', 'MP-NOPE', '') ? 'error', 'FA §3 check_pass: public rules of a valid pass, an error for a bad code');
+select t.err($$select * from passes$$, 'permission denied', 'FA buyers cannot read passes');
+select t.err($$select * from vouchers$$, 'permission denied', 'FA buyers cannot read vouchers');
+-- §5 payment plan: deposit, installments, tickets only when paid in full
+select place_order('{"buyer":{"name":"Planner","email":"plan@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":4,"slotId":"mat"}],"payment":"card","installments":true}') as pl \gset
+select t.ok(((:'pl'::jsonb)->>'due')::bigint < ((:'pl'::jsonb)->>'total')::bigint and (:'pl'::jsonb)->>'status' = 'awaiting_payment', 'FA §5 payment plan: only the deposit is due now');
+select t.err($$select place_order('{"buyer":{"name":"P","email":"p2@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"}],"payment":"card","installments":true}')$$, 'payment plan isn', 'FA §5 small orders can''t use a plan (minimum total)');
+reset role; set role service_role;
+select t.ok(confirm_payment(((:'pl'::jsonb)->>'id')::uuid, json_build_object('amount', ((:'pl'::jsonb)->>'due')::bigint, 'ref', 'pi_dep', 'provider', 'stripe')::jsonb) = 'deposit', 'FA §5 the deposit is confirmed');
+reset role;
+select t.ok((select status from t.orders where id = ((:'pl'::jsonb)->>'id')::uuid) = 'pending' and not exists(select 1 from t.tickets where order_id = ((:'pl'::jsonb)->>'id')::uuid), 'FA §5 seats held, no tickets yet');
+set role service_role;
+select pay_installment(((:'pl'::jsonb)->>'id')::uuid, '{"method":"card","ref":"pi_i1","provider":"stripe"}');
+select t.ok(pay_installment(((:'pl'::jsonb)->>'id')::uuid, '{"method":"card","ref":"pi_i1","provider":"stripe"}') = 'already', 'FA §5 the same installment payment arriving twice is recorded once');
+select record_processor_tx('{"id":"ch_i1","payment":"pi_i1","type":"charge","amount":100,"provider":"stripe"}');
+select t.ok((select order_id from processor_tx where id = 'ch_i1') = ((:'pl'::jsonb)->>'id')::uuid, 'FA §5 an installment''s own processor payment is linked to its order');
+reset role;
+set role authenticated; select t.who('owner@box.test');
+select order_action(((:'pl'::jsonb)->>'id')::uuid, 'installment', '{"method":"zelle","ref":"ZL-1"}');
+select t.err($$select order_action('$$ || ((:'pl'::jsonb)->>'id') || $$', 'markPaid', '{}')$$, 'installment', 'FA §5 a part-paid plan is finished by installments, not "mark paid"');
+select order_action(((:'pl'::jsonb)->>'id')::uuid, 'installment', '{"method":"cash"}');
+reset role;
+select t.ok((select status from t.orders where id = ((:'pl'::jsonb)->>'id')::uuid) = 'paid' and (select count(*) from t.tickets where order_id = ((:'pl'::jsonb)->>'id')::uuid and status = 'valid') = 4
+  and plan_paid((select data->'plan' from t.orders where id = ((:'pl'::jsonb)->>'id')::uuid)) = (select (data->>'total')::bigint from t.orders where id = ((:'pl'::jsonb)->>'id')::uuid), 'FA §5 last installment → paid in full, tickets issued');
+-- a card refund on a plan goes back to the card installments (newest first), never more than the card took in
+select (select sum((x->>'amount')::bigint) from t.orders o, jsonb_array_elements(o.data->'plan'->'schedule') x where o.id = ((:'pl'::jsonb)->>'id')::uuid and x->>'ref' in ('pi_dep','pi_i1')) as cardpaid,
+  (select (x->>'amount')::bigint from t.orders o, jsonb_array_elements(o.data->'plan'->'schedule') x where o.id = ((:'pl'::jsonb)->>'id')::uuid and x->>'ref' = 'pi_i1') as i1amt \gset
+set role authenticated; select t.who('owner@box.test');
+select t.err(format($$select order_action('%s', 'refund', '{"mode":"amount","amount":%s,"to":"original"}')$$, (:'pl'::jsonb)->>'id', :cardpaid + 1), 'can go back to the card', 'FA §5 a plan''s card refund can''t exceed what was paid by card');
+select order_action(((:'pl'::jsonb)->>'id')::uuid, 'refund', json_build_object('mode', 'amount', 'amount', :i1amt + 100, 'to', 'original')::jsonb) as prf \gset
+reset role;
+select t.ok((:'prf'::jsonb)->'refund'->'parts' = json_build_array(json_build_object('payment', 'pi_i1', 'amount', :i1amt), json_build_object('payment', 'pi_dep', 'amount', 100))::jsonb,
+  'FA §5 the card refund is split over the installments paid by card, newest first');
+select t.ok(marketing_tick() >= 0, 'FA §5 reminders run without error');
+-- §9 offline / manual payments + §2 door sales
+insert into members(box_office_id, email, name, perms) values ('b0000000-0000-0000-0000-000000000001', 'seller@box.test', 'Seller', '{door.sell,door.scan,door.checkin}');
+insert into auth.users(email, email_confirmed_at) values ('seller@box.test', now());
+set role authenticated; select t.who('owner@box.test');
+select place_order('{"buyer":{"name":"Invoice Co","email":"inv@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":2,"slotId":"mat"}],"payment":"manual","payMethod":"invoice","unpaid":true,"payNotes":"Net 30","payRef":"INV-7"}') as iv \gset
+select t.ok((:'iv'::jsonb)->>'status' = 'pending' and (select payment->>'status' = 'unpaid' and payment->>'notes' = 'Net 30' and payment->>'method' = 'invoice' and (payment->>'amount')::bigint = 6200 and payment->>'by' = 'owner@box.test' and payment ? 'date' from t.orders where id = ((:'iv'::jsonb)->>'id')::uuid), 'FA §9 an unpaid invoice order records amount, method, date, admin, notes and unpaid');
+select order_action(((:'iv'::jsonb)->>'id')::uuid, 'markPaid', '{"method":"zelle","date":"2099-01-05","ref":"ZL-99"}');
+select t.ok((select status = 'paid' and payment->>'status' = 'paid' and payment->>'paidDate' = '2099-01-05' and payment->>'method' = 'zelle' from t.orders where id = ((:'iv'::jsonb)->>'id')::uuid), 'FA §9 marked paid by Zelle: date + reference kept');
+select t.who('seller@box.test');
+select t.err($$select place_order('{"buyer":{"name":"Walk","email":"walk@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"}],"payment":"manual","payMethod":"cash"}')$$, 'permission', 'FA §2 door staff only sell through the door-sales screen (pos)');
+select place_order('{"buyer":{"name":"Walk","email":"walk@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"}],"addons":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","addonId":"drink","qty":2}],"payment":"manual","payMethod":"cash","pos":true}') as ps \gset
+select place_order('{"buyer":{"name":"Tap","email":"tap@mail.test"},"items":[{"eventId":"e0000000-0000-0000-0000-0000000000f1","ticketTypeId":"adult","qty":1,"slotId":"mat"}],"payment":"terminal","pos":true}') as pt \gset
+reset role;
+select t.ok((select status = 'paid' and data->>'channel' = 'pos' from t.orders where id = ((:'ps'::jsonb)->>'id')::uuid) and (select count(*) from t.tickets where order_id = ((:'ps'::jsonb)->>'id')::uuid) = 1, 'FA §2 a cash door sale: paid, tickets issued at once');
+select t.ok((select status = 'awaiting_payment' and (payment->>'terminal')::boolean from t.orders where id = ((:'pt'::jsonb)->>'id')::uuid), 'FA §2 a card-reader door sale waits for the processor');
+-- §11 product vouchers: own QR, redeemed separately, voided when the product is removed
+select t.ok((select count(*) from vouchers where order_id = ((:'ps'::jsonb)->>'id')::uuid and addon_id = 'drink' and status = 'valid') = 2, 'FA §11 one voucher per redeemable product unit');
+select code as vc from vouchers where order_id = ((:'ps'::jsonb)->>'id')::uuid order by created_at limit 1 \gset
+set role authenticated; select t.who('seller@box.test');
+select t.ok(checkin(:'vc', false, 'e0000000-0000-0000-0000-0000000000f1', '{}')->>'result' = 'item_ok', 'FA §11 scanning a drink voucher redeems it');
+select t.ok(checkin(:'vc', false, 'e0000000-0000-0000-0000-0000000000f1', '{}')->>'result' = 'item_used', 'FA §11 a second scan: already redeemed');
+select t.ok(checkin(:'vc', false, 'e0000000-0000-0000-0000-000000000002', '{}')->>'result' = 'wrong_event', 'FA §11 a voucher for another event is refused');
+select t.who('owner@box.test');
+select order_action(((:'ps'::jsonb)->>'id')::uuid, 'removeAddon', jsonb_build_object('line', (select (n - 1)::int from t.orders o, jsonb_array_elements(o.data->'lines') with ordinality z(l, n) where o.id = ((:'ps'::jsonb)->>'id')::uuid and l->>'kind' = 'addon'), 'qty', 1));
+reset role;
+select t.ok((select count(*) filter (where status = 'void') = 1 and count(*) filter (where status = 'redeemed') = 1 from vouchers where order_id = ((:'ps'::jsonb)->>'id')::uuid), 'FA §11 removing a product voids an unredeemed voucher');
+-- §8 customer self-service (order key; only what the box office switched on)
+select id as sso, access_key as ssk from t.orders where id = ((:'so'::jsonb)->>'id')::uuid \gset
+select id as sst, code as ssc from t.tickets where order_id = :'sso' and status = 'valid' order by id limit 1 \gset
+set role anon; select t.who('');
+select self_service(:'sso', :'ssk', 'rename', json_build_object('ticket', :'sst', 'name', 'New Name')::jsonb);
+select t.ok((select holder from t.tickets where id = :'sst') = 'New Name', 'FA §8 the customer changes the name on a ticket');
+select self_service(:'sso', :'ssk', 'transfer', json_build_object('ticket', :'sst', 'name', 'Friend', 'email', 'friend@mail.test')::jsonb) as tr \gset
+select t.ok((select status from t.tickets where id = :'sst') = 'replaced' and (select holder_email = 'friend@mail.test' and status = 'valid' and code <> :'ssc' from t.tickets where id = ((:'tr'::jsonb)->>'ticket')::uuid)
+  and exists(select 1 from t.outbox where kind = 'transfer' and "to" = 'friend@mail.test'), 'FA §8 transfer: new QR for the new holder, emailed; the old one is replaced');
+select t.err($$select self_service('$$ || :'sso' || $$', '$$ || :'ssk' || $$', 'refund', '{}')$$, 'doesn''t offer', 'FA §8 switched-off features are refused (refund requests are off)');
+select t.err($$select self_service('$$ || :'sso' || $$', gen_random_uuid(), 'resend', '{}')$$, 'not found', 'FA §8 the order''s private key is required');
+select self_service(:'sso', :'ssk', 'seatChange', '{"body":"Aisle please"}');
+reset role;
+select t.ok(exists(select 1 from t.support_v where ref = (select ref from t.orders where id = :'sso') and request = 'seatChange' and status = 'open'), 'FA §8 a seat-change request lands in the customer-service inbox');
+set role authenticated; select t.who('seller@box.test');
+select t.ok(checkin(:'ssc', false, 'e0000000-0000-0000-0000-0000000000f1', '{}')->>'result' = 'replaced', 'FA §8 the transferred ticket''s old code no longer scans');
+reset role;
+-- §1 wallet passes
+set role service_role;
+select t.ok(wallet_ticket(:'sso', :'ssk', ((:'tr'::jsonb)->>'ticket')::uuid)->>'holder' = 'Friend' and wallet_ticket(:'sso', gen_random_uuid(), ((:'tr'::jsonb)->>'ticket')::uuid) is null, 'FA §1 the wallet pass data needs the order key');
+reset role;
+insert into wallet_devices(device, push_token, pass_type, serial) values ('dev1', 'tok1', 'pass.test', ((:'tr'::jsonb)->>'ticket')::uuid);
+set role authenticated; select t.who('owner@box.test');
+select order_action(:'sso', 'reissue', json_build_object('tickets', json_build_array(((:'tr'::jsonb)->>'ticket')))::jsonb);
+reset role;
+select t.ok(exists(select 1 from wallet_push where ticket_id = ((:'tr'::jsonb)->>'ticket')::uuid), 'FA §1 a replaced ticket is queued to update the phone wallet');
+-- §3 / §4 staff issue memberships + gift vouchers (own permission)
+set role authenticated; select t.who('clerk@box.test');
+select t.err($$select pass_action('b0000000-0000-0000-0000-000000000001', 'issue', '{"planId":"member","email":"vip@mail.test"}')$$, 'permission', 'FA §3 issuing memberships needs its permission');
+select t.who('owner@box.test');
+select t.ok(pass_action('b0000000-0000-0000-0000-000000000001', 'issue', '{"planId":"member","email":"vip@mail.test","name":"VIP"}')->>'code' like 'MP-%', 'FA §3 staff issue a membership');
+select t.ok(credit_action('b0000000-0000-0000-0000-000000000001', 'issue', '{"kind":"voucher","email":"vip@mail.test","amount":2500}')->>'kind' = 'voucher', 'FA §4 staff issue a gift voucher');
+reset role;
+
 \o
 \pset tuples_only off
 select count(*) filter (where ok) as passed, count(*) filter (where not ok) as failed from t.results;

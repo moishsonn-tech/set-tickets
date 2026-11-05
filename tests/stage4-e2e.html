@@ -31,7 +31,7 @@ const Q=(cart,code)=>E(`quote(${JSON.stringify(cart)},Demo.st.events,{...DEFAULT
 
   // ── §1 ticket types ──
   W().location.hash='#/e/neon-nights-live'; await until(()=>W().document.querySelector('.tt'));
-  ok([...W().document.querySelectorAll('.tt-group')].map(x=>x.textContent).join('|')==='Groups','ticket groups show as headings (hidden VIP group stays hidden)');
+  ok([...W().document.querySelectorAll('.tt-group')].map(x=>x.textContent).join('|')==='Groups|Members','ticket groups show as headings (hidden VIP group stays hidden)');
   ok(!has('Artist guest list'),'box-office-only ticket type is not shown to buyers');
   const guest=tt('neon-nights-live','Artist guest list');
   ok(/box office only/.test(String(await throwsP(place({items:[{eventId:neon.id,ticketTypeId:guest.id,qty:1}]})))),'box-office-only type refused online');

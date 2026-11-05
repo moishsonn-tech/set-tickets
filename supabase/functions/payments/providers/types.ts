@@ -4,7 +4,7 @@
 
    name                      display name
    createPayment(ctx)        → { clientSecret?, redirectUrl?, publishableKey?, account?, ref }   start paying for one order (idempotent per order)
-   parseWebhook(req, raw)    → { type: 'succeeded' | 'failed' | 'account', orderId?, ref?, charge?, amount?, fee?, appFee?, method?, brand?, last4?, error?, account?, ready?, test? }
+   parseWebhook(req, raw)    → { type: 'succeeded' | 'failed' | 'account', orderId?, ref?, charge?, amount?, fee?, appFee?, method?, brand?, last4?, error?, account?, ready?, test?, installment? }
                              | { type: 'dispute', id, payment, amount, reason, status: open|won|lost }       (Stage 9: chargebacks)
                              | { type: 'payout', id, amount, status, created, arrival, failure, tx: [payment ids carried] }   (Stage 9: payouts)
                              | null — verifies the processor's signature; null = ignore
@@ -13,6 +13,7 @@
                              (late payments whose seats are gone, and staff refunds from the order screen — full or partial)
    connect(ctx)              → { url }   send the box office to the processor to connect THEIR account (payouts go to them)
 
-   ctx = { order, account, platformFee, returnUrl, env }  — env holds this processor's secrets from Supabase secrets, never from the client. */
+   ctx = { order, account, platformFee, returnUrl, env, amount?, installment? }  — amount = cents to charge (default order.data.total); installment = n of a
+   payment-plan installment (its own payment, metadata.installment, handed back by parseWebhook). env holds this processor's secrets from Supabase secrets, never from the client. */
 export const REQUIRED = ['name', 'createPayment', 'parseWebhook', 'refund', 'connect'];
 export function checkProvider(p) { for (const k of REQUIRED) if (!(k in p)) throw new Error('payment provider is missing ' + k); return p; }

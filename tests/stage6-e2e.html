@@ -180,7 +180,7 @@ const view=async hash=>{ W().location.hash=hash; await sleep(60); E('render()');
   await E(`DB.custSignIn('maya@example.com','tickets123')`); await E('loadCustomer()');
   E(`S.myCredits=null;S._credReq=0;S.cart={items:[{eventId:'${neon.id}',ticketTypeId:'${neon.ticketTypes[0].id}',qty:1}],addons:[],donation:0,unlock:{}};saveCart()`);
   W().location.hash='#/cart'; await until(()=>E('S.myCredits')); await sleep(60); E('render()');
-  ok(E('S.co.useAcct')===true && E('cartQuote()').credit===Math.min(2500,E('cartQuote()').total+E('cartQuote()').credit) && has('Use my credit'),'signed-in customer: account credit applied automatically');
+  ok(E('S.co.useAcct')===true && E('cartQuote()').credit===Math.min(E("S.myCredits").filter(c=>c.status==="active").reduce((a,c)=>Math.max(a,c.remaining),0),E('cartQuote()').total+E('cartQuote()').credit) && has('Use my credit'),'signed-in customer: account credit applied automatically');
   W().location.hash='#/account'; E('S.wallet=null'); await until(()=>has('applied automatically'));
   ok(has('$25') && has('applied automatically at checkout'),'customer account shows the credit balance');
   await E('DB.custSignOut()'); E('S.cust=null');

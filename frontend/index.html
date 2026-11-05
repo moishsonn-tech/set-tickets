@@ -556,7 +556,7 @@ fieldset{min-width:0}  /* a fieldset otherwise refuses to shrink below its conte
 .upsell{display:flex;justify-content:space-between;align-items:center;gap:10px;border:1px dashed var(--line);border-radius:12px;padding:10px 12px;background:#fdfbf4}
 details.rules{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
 details.rules>summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--text-2)}
-.rule-row{display:grid;grid-template-columns:1.2fr .8fr 1.2fr 1.2fr .8fr auto;gap:8px;align-items:end;margin-bottom:6px}
+.rule-row{display:grid;grid-template-columns:1.2fr .8fr 1.2fr 1.2fr .8fr .8fr auto;gap:8px;align-items:end;margin-bottom:6px}
 .rule-row.two{grid-template-columns:1fr 1fr auto;max-width:420px}
 .rule-row .field{margin:0}.rule-row .icon-btn{margin-bottom:6px}
 .targets{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;margin:10px 0}
@@ -596,6 +596,24 @@ details.rules>summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--
   .admin{display:block} .main{padding:0}
   .e-ticket{box-shadow:none}
 }
+/* ── Final additions: wallet passes, vouchers, door sales, plans, memberships ── */
+.wallet-pv{max-width:340px;margin:0 auto;border-radius:16px;padding:16px 18px;color:#fff;background:var(--ink);box-shadow:var(--sh-2,0 10px 30px rgba(0,0,0,.2))}
+.wallet-pv.google{background:#1f3b5c}.wallet-pv .wp-ev{font-size:20px;font-weight:700;margin:12px 0 10px;line-height:1.2}
+.wallet-pv .wp-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px 10px;font-size:13px;font-weight:600}
+.wallet-pv .wp-grid span{display:block;font-size:10px;letter-spacing:.08em;text-transform:uppercase;opacity:.65;font-weight:500}
+.wallet-pv .wp-venue{font-size:12px;opacity:.75;margin-top:10px}.wallet-pv .wp-qr{background:#fff;border-radius:10px;padding:10px;width:170px;height:170px;margin:14px auto 6px}
+.wallet-pv .wp-qr img,.wallet-pv .wp-qr canvas{width:150px!important;height:150px!important}.wallet-pv .wp-code{text-align:center;font-size:12px;opacity:.8;font-family:ui-monospace,monospace}
+.wallet-pv .wp-void{margin-top:14px;padding:10px;border-radius:8px;background:rgba(255,255,255,.12);text-align:center;font-weight:700}
+.tk-actions{gap:10px;margin-top:12px;align-items:center}
+.voucher-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+.voucher{border:1px solid var(--line);border-radius:12px;padding:12px;background:#fff;display:grid;gap:8px;justify-items:start}.voucher.redeemed,.voucher.void{opacity:.6}
+.voucher .vqr{width:130px;height:130px}.voucher .vqr img,.voucher .vqr canvas{width:130px!important;height:130px!important}
+.kv2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}.kv2 span{display:block;font-size:11px}
+.seg{display:flex;flex-wrap:wrap;gap:6px}.seg button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:8px 14px;font:inherit;font-size:13px;cursor:pointer}
+.seg button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+.rule-box{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:8px 0}
+.plan-card .plan-points{margin:10px 0 14px 18px;display:grid;gap:4px}
+@media (max-width:760px){.wallet-pv .wp-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.kv2{grid-template-columns:1fr}}
 /* ── Stage 5: box office site, event page sections, checkout, payment, customer account ── */
 .ev-filters{margin-bottom:10px}.ev-filters select.pill-inp{width:auto}
 .banner.bad{background:var(--bad-bg);color:var(--bad)}

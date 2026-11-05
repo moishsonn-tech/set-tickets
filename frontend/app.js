@@ -80,13 +80,13 @@ const S = {
   ui: { q: '', ev: '', status: '', picked: {}, attEv: '', repEv: '', login: { email: '', code: '', sent: false, totp: '' } },
   sc: { evId: '', tab: 'scan', last: null, q: '', filter: 'all', recent: [], sound: true, queue: [], err: '', entrance: null, slot: null, pick: null },  // door scanner app (entrance / slot null = not chosen yet)
 };
-function loadCart() { try { return JSON.parse(localStorage.getItem('set_cart')) || { items: [], addons: [], donation: 0, unlock: {} }; } catch (e) { return { items: [], addons: [], donation: 0, unlock: {} }; } }
+function loadCart() { const blank = { items: [], addons: [], gifts: [], passes: [], donation: 0, unlock: {} }; try { return { ...blank, ...(JSON.parse(localStorage.getItem('set_cart')) || {}) }; } catch (e) { return blank; } }
 function saveCart() { try { localStorage.setItem('set_cart', JSON.stringify(S.cart)); } catch (e) { } if (!S.loading) setTimeout(presencePing); }
 const cartCount = () => sum(S.cart.items, i => i.qty);
 const evById = id => S.events.find(e => e.id === id) || S.adm?.events.find(e => e.id === id);
 // The box office whose settings and branding apply to this page — buyers see the organizer's brand, not the platform's.
 const boOf = ev => ev && (S.bos.find(b => b.id === ev.box_office_id) || (S.adm?.bo?.id === ev.box_office_id ? S.adm.bo : null));
-const cartBo = () => boOf(evById((S.cart.items[0] || S.cart.addons[0])?.eventId));
+const cartBo = () => boOf(evById((S.cart.items[0] || S.cart.addons[0])?.eventId)) || ((S.cart.gifts || []).length || (S.cart.passes || []).length ? S.bos.find(b => b.id === S.cart.boId) : null);
 function setContext() {
   const r = S.route, evSlug = ['e', 'embed'].includes(r.page) && r.params[0];
   const bo = ['admin', 'scan'].includes(r.page) ? S.adm?.bo : r.page === 'b' ? S.bos.find(b => b.slug === r.params[0])
@@ -131,7 +131,8 @@ async function onRoute() {
   const next = parseRoute();
   if (next.page !== 'scan') camStop();
   S.route = next;
-  document.body.classList.toggle('embed', S.route.page === 'embed');
+  document.body.classList.toggle('embed', ['embed', 'embed-list'].includes(S.route.page) || (S.route.page === 'cart' && /embed/.test(location.hash)) || (S.route.page === 'order' && sessionStorage.getItem('set_embed') === '1'));
+  if (S.route.page === 'embed' || S.route.page === 'embed-list') sessionStorage.setItem('set_embed', '1'); else if (['e', 'home', 'b'].includes(S.route.page)) sessionStorage.removeItem('set_embed');
   document.body.classList.toggle('scan-mode', S.route.page === 'scan');
   const r = S.route;
   if (r.page === 'e' || r.page === 'embed') {
@@ -172,6 +173,7 @@ function render() {
   else if (r.page === 'platform') html = PlatformShell();
   else html = PubShell();
   $('#app').innerHTML = html;
+  if (document.body.classList.contains('embed') && window.parent !== window) requestAnimationFrame(() => window.parent.postMessage({ setTickets: 'height', h: document.documentElement.scrollHeight }, '*'));   // §10 embed.js sizes the frame
   if (key) { const el = document.querySelector(`[data-bind="${CSS.escape(key)}"],[data-input="${CSS.escape(key)}"],#${CSS.escape(key)}`); if (el && el !== document.activeElement) { el.focus(); try { if (pos != null) el.setSelectionRange(pos, pos); } catch (e) { } } }
   hydrate();
 }
@@ -187,7 +189,7 @@ function hydrate() {
 // ══════════════════════════════════════════════════════════════════════════════
 function PubShell() {
   const r = S.route, solid = !['home', 'e', 'b'].includes(r.page);
-  const body = { home: Home, e: EventPage, embed: EventPage, cart: Checkout, order: OrderPage, tickets: FindTickets, b: BoxOfficePage, register: Register, account: Account, unsubscribe: Unsubscribe }[r.page] || NotFound;
+  const body = { gift: GiftPage, member: MemberPage, 'embed-list': EmbedList, home: Home, e: EventPage, embed: EventPage, cart: Checkout, order: OrderPage, tickets: FindTickets, b: BoxOfficePage, register: Register, account: Account, unsubscribe: Unsubscribe }[r.page] || NotFound;
   const bo = S.bo, brandLogo = bo && safeUrl(bo.branding.logo);
   return `
   <nav class="pub-nav ${solid ? 'solid' : ''}">
@@ -312,6 +314,7 @@ function Calendar(evs) {
 function EventPage() {
   const ev = S.events.find(e => e.slug === S.route.params[0]) || S.adm?.events.find(e => e.slug === S.route.params[0]);
   if (!ev) return NotFound();
+  if (S.route.page === 'embed' && /compact=1/.test(location.hash)) return CompactWidget(ev);   // §10 just the ticket selector
   const sel = S.sel, av = S.avail[ev.id];
   const preview = !eventLive(ev), shows = (ev.timeSlots || []).filter(s => !s.hidden), multiDay = new Set(shows.map(s => fmtDate(s.start))).size > 1;
   const contact = ev.contact?.email || ev.contact?.phone ? ev.contact : { email: S.settings.contactEmail };
@@ -429,7 +432,9 @@ function cartMix(ev, lines) {
 }
 // "Early bird · until Nov 12" / "40 left at this price" / "6+ for $55 each"
 function priceNote(ev, t, slotId, av) {
-  const sold = av?.tt?.[t.id] || 0, ph = activePhase(t, sold, new Date()), out = [];
+  const sold = av?.tt?.[t.id] || 0, st0 = startOf(ev, slotId), ph = activePhase(t, sold, new Date(), st0), pk = !ph && peakRule(t, st0, ev.timezone), out = [];
+  if (pk) out.push(`<b>${esc(pk.label || 'Peak price')}</b> for this showtime`);
+  if (t.memberOnly) out.push('<b>Members only</b> — enter your membership code at checkout');
   if (ph) out.push(`<b>${esc(ph.label || 'Special price')}</b>${ph.until ? ' · until ' + esc(fmtDate(ph.until, { month: 'short', day: 'numeric' })) : ''}${+ph.upTo > 0 ? ` · ${Math.max(0, +ph.upTo - sold)} left at this price` : ''}`);
   for (const b of (t.breaks || []).filter(b => +b.min > 1).sort((a, b) => a.min - b.min)) out.push(`${b.min}+ for ${money(b.price, ev.currency)} each`);
   return out.join(' · ');
@@ -460,7 +465,7 @@ function TicketPanel(ev, sel, av) {
   const groups = [...new Set(tts.map(t => t.group || ''))];
   const ttRow = t => {
     const qn = seated ? inTT(t.id) : (sel.qty[t.id] || 0), l = Math.min(left(t), evLeft), max = Math.min(+t.max || 10, l === Infinity ? 99 : Math.floor(l / (+t.admits || 1)));
-    const notYet = t.salesStart && D(t.salesStart) > now, ended = t.salesEnd && D(t.salesEnd) < now, unit = ttPrices(t, sel.slotId, av.tt[t.id] || 0, 1, 1, now)[0].price, list = listPrice(t, sel.slotId), note = priceNote(ev, t, sel.slotId, av);
+    const notYet = t.salesStart && D(t.salesStart) > now, ended = t.salesEnd && D(t.salesEnd) < now, unit = ttPrices(t, sel.slotId, av.tt[t.id] || 0, 1, 1, now, startOf(ev, sel.slotId), ev.timezone)[0].price, list = listPrice(t, sel.slotId), note = priceNote(ev, t, sel.slotId, av);
     return `<div class="tt ${qn ? 'sel' : ''}"><div><div class="name">${esc(t.name)}</div>
       <div class="desc">${unit < list ? `<s class="muted">${money(list, ev.currency)}</s> ` : ''}${unit ? money(unit, ev.currency) : 'Free'}${t.desc ? ' · ' + esc(t.desc) : ''}${l !== Infinity && l < 25 && l > 0 ? ` · <b style="color:var(--warn)">${l} left</b>` : ''}</div>
       ${note ? `<div class="desc price-note">${note}</div>` : ''}</div>
@@ -492,9 +497,9 @@ function TicketPanel(ev, sel, av) {
     </div>
     ${hasLocked ? `<details style="margin-top:14px"><summary class="small muted" style="cursor:pointer">Have an access code?</summary><div class="row" style="margin-top:8px"><input class="inp" data-input="pw" value="${esc(sel.pw)}" placeholder="Access code"><button class="btn btn-ghost" data-action="unlock">Apply</button></div></details>` : ''}
     <div class="sep"></div>
-    ${sc.err ? `<p class="small" style="color:var(--warn);margin-bottom:10px">${esc(sc.err)}</p>` : ''}
+    ${sc.err || ruleErr(ev, orderTTCounts(ev, sc.items)) ? `<p class="small" style="color:var(--warn);margin-bottom:10px">${esc(sc.err || ruleErr(ev, orderTTCounts(ev, sc.items)))}</p>` : ''}
     <div class="between" style="margin-bottom:12px"><span class="muted">${mix.tickets} ticket${mix.tickets === 1 ? '' : 's'}${count > mix.tickets ? ` + ${count - mix.tickets} add-on${count - mix.tickets === 1 ? '' : 's'}` : ''}</span><b style="font-size:18px">${money(q.subtotal, ev.currency)}</b></div>
-    <button class="btn btn-accent btn-lg btn-block" data-action="addToCart" ${count && !sc.err ? '' : 'disabled'}>Get tickets <span class="arr">→</span></button>
+    <button class="btn btn-accent btn-lg btn-block" data-action="addToCart" ${count && !sc.err && !ruleErr(ev, orderTTCounts(ev, sc.items)) ? '' : 'disabled'}>Get tickets <span class="arr">→</span></button>
     <p class="small muted" style="text-align:center;margin-top:10px">Booking fees and tax shown at checkout.</p>
     ${ev.waitlistMode === 'always' ? `<details style="margin-top:14px"><summary class="small muted" style="cursor:pointer">Can't find what you want? Join the waitlist</summary><div style="margin-top:10px">${Waitlist(ev, 'always')}</div></details>` : ''}`;
 }
@@ -594,7 +599,7 @@ function Waitlist(ev, why) {
 
 // ── Cart & checkout ───────────────────────────────────────────────────────────
 function cartQuote() {
-  const bo = cartBo(), evs = S.events.concat(S.adm?.events || []), set = bo ? pricingSettings(bo, S.platform) : S.settings, o = { avail: S.avail, method: S.co.payment };
+  const bo = cartBo(), evs = S.events.concat(S.adm?.events || []), set = bo ? pricingSettings(bo, S.platform) : S.settings, o = { avail: S.avail, method: S.co.payment, pass: S.co.pass || null };
   const q = quote(S.cart, evs, set, S.co.disc, o), c = coCredit(); if (!c) return q;
   return quote(S.cart, evs, set, S.co.disc, { ...o, credit: Math.min(c.remaining, c.event_id ? eventPortion(q, c.event_id) : Infinity) });
 }
@@ -664,6 +669,7 @@ function Checkout() {
           ${set.donationCustom !== false ? `<input class="inp" style="width:120px" type="number" min="0" step="1" placeholder="Other $" value="${co.donCustom ? esc(S.cart.donation / 100) : ''}" data-action-change="donateCustom" aria-label="Other donation amount">` : ''}</div></div>` : ''}
       <div class="card" style="margin-top:16px"><div class="eyebrow dash" style="margin-bottom:12px">Payment</div>
         ${payOpts.map(p => `<label class="pay-opt ${co.payment === p.v ? 'on' : ''} ${p.off ? 'off' : ''}"><input type="radio" name="pay" ${p.off ? 'disabled' : ''} ${co.payment === p.v ? 'checked' : ''} data-action="pay" data-v="${p.v}"><div><b>${esc(p.t)}</b><div class="small muted">${esc(p.d)}</div></div></label>`).join('') || '<p class="small muted">This box office isn\'t taking payments online right now.</p>'}
+        ${PlanOffer(q, set, evs)}
         <div class="sep"></div>
         <label class="check"><input type="checkbox" data-bind="co.terms" ${co.terms ? 'checked' : ''}> <span>I agree to the ${pols.length ? pols.map((p, i) => `<a href="#" data-action="showPolicy2" data-i="${i}">${esc(evs.length > 1 ? p.title : POLICY_KINDS[p.kind])}</a>`).join(', ') : 'terms'}.</span></label>
         <input class="hp" type="text" name="website" tabindex="-1" autocomplete="off" aria-hidden="true" data-bind="co.hp" value="">
@@ -676,13 +682,15 @@ function Checkout() {
       ${evs.map(ev => `<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)"><div class="between"><b>${esc(ev.name)}</b><button class="icon-btn" style="width:26px;height:26px" data-action="removeEv" data-id="${ev.id}" aria-label="Remove">${ic('x', 13)}</button></div>
         <div class="small muted">${esc(fmtDT(ev.start))} · ${esc(ev.venue || '')}</div>
         ${q.lines.filter(l => l.eventId === ev.id).map(l => SumLine(ev, l, q.currency)).join('')}</div>`).join('')}
+      ${[['gifts', 'gift'], ['passes', 'pass']].map(([k, kind]) => q.lines.filter(l => l.kind === kind).map((l, i) => `<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)"><div class="between"><b>${kind === 'gift' ? 'Gift card' : 'Membership'}</b><button class="icon-btn" style="width:26px;height:26px" data-action="delGP" data-k="${k}" data-i="${i}" aria-label="Remove">${ic('x', 13)}</button></div>
+        ${SumLine(null, l, q.currency)}${l.gift ? `<div class="small muted">${esc(l.gift.toEmail ? 'For ' + (l.gift.to || l.gift.toEmail) + ' · emailed to ' + l.gift.toEmail : 'Emailed to you')}</div>` : ''}</div>`).join('')).join('')}
       ${ups.length ? `<div class="upsells">${ups.map(x => `<div class="upsell"><div><div class="small"><b>${esc(x.u.text || 'Add ' + x.ad.name)}</b></div><div class="small muted">${x.n} × ${esc(x.ad.name)} · ${money(x.ad.price * x.n, q.currency)}</div></div>
         <button class="btn btn-dark btn-sm" data-action="addUpsell" data-id="${x.ev.id}" data-v="${x.ad.id}" data-q="${x.n}">Add</button></div>`).join('')}</div>` : ''}
       <div class="sep"></div>
       ${co.disc ? `<div class="between small"><span class="chip ok">${esc(co.disc.code)}</span><a href="#" data-action="removeCode" class="small">Remove</a></div>${q.promoErr ? `<p class="small" style="color:var(--warn);margin-top:6px">${esc(q.promoErr)}</p>` : ''}`
         : ck.promo !== false ? `<div class="row"><input class="inp" data-bind="co.code" placeholder="Promo or referral code" value="${esc(co.code)}"><button class="btn btn-ghost" data-action="applyCode">Apply</button></div>` : ''}
       ${ref ? `<div class="between small" style="margin-top:8px"><span class="muted">Referral code <b class="tnum">${esc(ref)}</b></span><a href="#" data-action="removeRef" class="small">Remove</a></div>` : ''}
-      ${CreditBox()}
+      ${CreditBox()}${PassBox(q)}
       ${Breakdown(q, co.disc?.code)}
       ${co.err || stopped ? `<div class="banner" style="background:var(--bad-bg);color:var(--bad);margin:12px 0 0">${esc(stopped || co.err)}</div>` : ''}
       <button class="btn btn-accent btn-lg btn-block" style="margin-top:16px" data-action="placeOrder" ${co.busy || stopped || (q.total && !co.payment) ? 'disabled' : ''}>${co.busy ? 'One moment…' : q.total ? (co.payment === 'offline' ? 'Reserve tickets' : 'Continue to payment') : 'Get free tickets'} <span class="arr">→</span></button>
@@ -704,9 +712,10 @@ const ticketsPerEvent = q => q.lines.reduce((m, l) => (m[l.eventId] = (m[l.event
 function Breakdown(q, code) {
   const row = (t, v, cls = '') => v ? `<div class="sum-line ${cls}"><span${cls ? '' : ' class="muted"'}>${t}</span><span class="tnum">${v < 0 ? '−' + money(-v, q.currency) : money(v, q.currency)}</span></div>` : '';
   return `<div class="breakdown" style="margin-top:12px">
-    ${row('Tickets', q.ticketsTotal)}${row('Products & add-ons', q.addonsTotal)}
+    ${row('Tickets', q.ticketsTotal)}${row('Products & add-ons', q.addonsTotal)}${row('Gift cards', q.giftsTotal)}${row('Memberships & passes', q.passesTotal)}
     ${row('Booking fee', (q.fee || 0) + (q.feeDiscount || 0))}${row('Service fee', q.serviceFee)}${(q.otherFees || []).map(x => row(esc(x.name), x.amount)).join('')}${row('Sales tax', q.tax)}
-    ${q.discount + q.feeDiscount ? `<div class="sum-line" style="color:var(--ok)"><span>Discount${code ? ' · ' + esc(code) : ''}</span><span class="tnum">−${money(q.discount + q.feeDiscount, q.currency)}</span></div>` : ''}
+    ${q.passDiscount ? `<div class="sum-line" style="color:var(--ok)"><span>Membership / pass</span><span class="tnum">−${money(q.passDiscount, q.currency)}</span></div>` : ''}
+    ${q.discount - (q.passDiscount || 0) + q.feeDiscount ? `<div class="sum-line" style="color:var(--ok)"><span>Discount${code ? ' · ' + esc(code) : ''}</span><span class="tnum">−${money(q.discount - (q.passDiscount || 0) + q.feeDiscount, q.currency)}</span></div>` : ''}
     ${row('Card processing', q.processing)}${row('Donation', q.donation)}${q.credit ? `<div class="sum-line" style="color:var(--ok)"><span>Credit applied</span><span class="tnum">−${money(q.credit, q.currency)}</span></div>` : ''}${q.refunded ? row('Refunded', -q.refunded) : ''}
     <div class="sum-line total"><span>Total</span><span class="tnum">${money(q.total, q.currency)}</span></div></div>`;
 }
@@ -729,7 +738,7 @@ function PaymentStep() {
   return `<div class="container"><div class="pay-wrap">
     <ol class="co-steps"><li class="done">Tickets</li><li class="done">Add-ons</li><li class="done">Your details</li><li class="on">Pay</li><li>Tickets</li></ol>
     <div class="card pay-card">
-      <div class="between"><div><div class="eyebrow">Order ${esc(p.ref)}</div><h2 style="margin-top:4px">Pay ${money(p.total, cur)}</h2></div>${p.test ? '<span class="chip info">Test mode</span>' : ''}</div>
+      <div class="between"><div><div class="eyebrow">Order ${esc(p.ref)}</div><h2 style="margin-top:4px">Pay ${money(p.total, cur)}</h2>${p.plan ? '<div class="small muted">Deposit for your payment plan</div>' : p.installment ? '<div class="small muted">Next payment of your plan</div>' : ''}</div>${p.test ? '<span class="chip info">Test mode</span>' : ''}</div>
       <div class="banner ${expired ? 'bad' : 'info'}" style="margin:14px 0">${ic('lock', 14)} <span data-pay="${esc(p.expires_at)}">${payText(p.expires_at)}</span></div>
       ${expired ? `<p class="small">Nothing was charged. Your selection is still in your cart.</p><button class="btn btn-accent btn-block" data-action="payRestart">Start again</button>` : demo ? `
         <div class="wallets"><button class="btn btn-dark wallet" data-action="payWallet" data-v="apple_pay" ${co.busy ? 'disabled' : ''}>Apple Pay</button><button class="btn btn-ghost wallet" data-action="payWallet" data-v="google_pay" ${co.busy ? 'disabled' : ''}>Google Pay</button></div>
@@ -763,7 +772,7 @@ function SumLine(ev, l, cur) {
   return `<div class="sum-line"><span>${l.qty} × ${esc(l.name)}${l.slotStart ? ` <span class="muted">@ ${esc(fmtTime(l.slotStart))}</span>` : ''}${l.phase ? ` <span class="chip mini">${esc(l.phase)}</span>` : ''}
     ${inside ? `<br><span class="small muted">${esc(inside)}${l.value > l.unit * l.qty ? ` · save ${money(l.value - l.unit * l.qty, cur)}` : ''}</span>` : ''}
     ${l.seats?.length ? `<br><span class="small muted">${esc(l.seats.map(x => seatName(ev, x, true)).join(', '))}</span>` : ''}
-    ${l.disc || l.feeDisc ? `<br><span class="small" style="color:var(--ok)">−${money((l.disc || 0) + (l.feeDisc || 0), cur)} with code</span>` : ''}
+    ${l.disc || l.feeDisc ? `<br><span class="small" style="color:var(--ok)">−${money((l.disc || 0) + (l.feeDisc || 0), cur)} ${l.passDisc && l.passDisc >= (l.disc || 0) ? 'with your pass' : 'with code'}</span>` : ''}
     ${l.kind === 'addon' && S.route.page === 'cart' ? ` <a href="#" class="small muted" data-action="delAddonLine" data-id="${l.eventId}" data-v="${l.addonId}">remove</a>` : ''}</span><span class="tnum">${money(l.unit * l.qty, cur)}</span></div>`;
 }
 function holdText(exp) { const ms = D(exp) - Date.now(); if (ms <= 0) return 'Your seat hold has ended — the seats are yours if nobody else has taken them. Complete your order now.';
@@ -799,7 +808,7 @@ function endPay() { S.co = { ...S.co, pay: null, busy: false, err: '', attempt: 
 async function checkoutDone(r) {
   pix('Purchase', { value: r.total || 0, currency: S.settings.currency || 'USD', id: r.id, ref: r.ref, n: S.cart.items.reduce((a, i) => a + (+i.qty || 0), 0) });
   cartEventIds().forEach(id => DB.ping(id, 0, true));   // live activity: this visitor's cart became an order
-  S.cart = { items: [], addons: [], donation: 0, unlock: {} }; saveCart(); S.co.credit = null; S.co.creditCode = ''; S.co.useAcct = false; S.myCredits = null; S._credReq = 0;
+  S.cart = { items: [], addons: [], gifts: [], passes: [], donation: 0, unlock: {} }; saveCart(); S.co.credit = null; S.co.pass = null; S.co.plan = false; S.co.creditCode = ''; S.co.useAcct = false; S.myCredits = null; S._credReq = 0;
   S.co = { ...S.co, busy: false, disc: null, code: '', tracking: '', answers: {}, tanswers: {}, terms: false, pay: null, attempt: null, card: null, err: '' };
   try { localStorage.removeItem('set_pay'); } catch (e) { }
   S.avail = {}; _availReq.clear(); S.order = null;
@@ -830,22 +839,23 @@ function OrderPage() {
   const o = S.order;
   if (!o || o.loading) return '<div class="container section"><p class="muted">Loading your order…</p></div>';
   if (o.missing) return `<div class="container section"><div class="empty"><div class="display">Order not found</div><p>Check your link, or <a href="#/tickets">look up your tickets</a>.</p></div></div>`;
-  const ord = o.order, d = ord.data, cur = d.currency;
+  const ord = o.order, d = ord.data, cur = d.currency, self = o.self || {}, xs = OrderPageExtras(o), byEv = id => self.byEvent?.[id] || {};
   return `<div class="container" style="padding:36px 28px 60px;max-width:900px">
     <div class="no-print">
       <span class="chip ${ord.status === 'paid' ? 'ok' : ['pending', 'awaiting_payment'].includes(ord.status) ? 'warn' : 'bad'}">${esc(ORDER_STATUS[ord.status] || ord.status)}</span>
-      <h1 class="display" style="font-size:48px;margin:12px 0 6px">${{ paid: 'You\'re going!', pending: 'Reserved', awaiting_payment: 'Payment not finished', expired: 'Checkout expired', cancelled: 'Order cancelled', refunded: 'Order refunded' }[ord.status] || esc(ord.status)}</h1>
+      <h1 class="display" style="font-size:48px;margin:12px 0 6px">${{ paid: 'You\'re going!', pending: d.plan ? 'On a payment plan' : 'Reserved', awaiting_payment: 'Payment not finished', expired: 'Checkout expired', cancelled: 'Order cancelled', refunded: 'Order refunded' }[ord.status] || esc(ord.status)}</h1>
       <p class="muted">Order <b>${esc(ord.ref)}</b>${ord.status === 'paid' ? ` · confirmation sent to <b>${esc(ord.buyer_email)}</b>` : ''}${ord.paidWith ? ` · paid with ${esc(ord.paidWith)}` : ''}</p>
-      ${ord.status === 'pending' ? `<div class="banner info" style="margin-top:14px">Your tickets are held for you. They're issued here and emailed as soon as ${esc(S.settings.name)} receives your payment.</div>` : ''}
+      ${ord.status === 'pending' && !d.plan ? `<div class="banner info" style="margin-top:14px">Your tickets are held for you. They're issued here and emailed as soon as ${esc(S.settings.name)} receives your payment.</div>` : ''}
       ${ord.status === 'awaiting_payment' ? `<div class="banner info" style="margin-top:14px">This order isn't paid yet, so no tickets were issued. <a href="#/cart" data-action="resumePay">Finish paying</a> before the time runs out.</div>` : ''}
       ${ord.status === 'expired' ? `<div class="banner" style="margin-top:14px">The payment wasn't completed in time, so nothing was charged and the seats were released.</div>` : ''}
       ${S.settings.checkout?.thanks && ord.status === 'paid' ? `<p style="margin-top:12px">${esc(S.settings.checkout.thanks)}</p>` : ''}
       <div class="row wrap" style="margin:18px 0 26px"><button class="btn btn-ghost" data-action="contactOrg" data-id="${esc(ord.event_ids?.[0] || '')}" data-ref="${esc(ord.ref)}">${ic('mail', 14)} Contact organizer</button>
-        ${o.tickets.some(t => t.status === 'valid') ? '<button class="btn btn-dark" data-action="print">Download PDF / print tickets</button>' : ''}
+        ${o.tickets.some(t => t.status === 'valid') && self.download ? '<button class="btn btn-dark" data-action="print">Download PDF / print tickets</button>' : ''}
         ${[...new Set(d.lines.map(l => l.eventId))].map(id => evById(id) ? `<button class="btn btn-ghost" data-action="ics" data-id="${id}">${ic('cal', 14)} Add ${esc(evById(id).name)} to calendar</button>` : '').join('')}
-        ${ord.status === 'paid' ? '<button class="btn btn-ghost" data-action="resendMine">Email my tickets again</button>' : ''}
+        ${ord.status === 'paid' && self.resend ? '<button class="btn btn-ghost" data-action="selfResend">Email my tickets again</button>' : ''}
       </div>
     </div>
+    ${xs.planCard}
     ${o.tickets.filter(t => t.status === 'valid').map(t => {
       const l = { ...d.lines.find(x => x.eventId === t.event_id && (x.ticketTypeId === t.ticket_type_id || (x.kind === 'bundle' && x.bundleId === t.bundle?.id))) }, ev = evById(t.event_id) || { name: l.eventName };
       const tt = (ev.ticketTypes || []).find(x => x.id === t.ticket_type_id) || { name: l.name, admits: l.admits };
@@ -861,8 +871,11 @@ function OrderPage() {
           <div><div class="k">Name</div><div class="v">${esc(t.holder)}</div></div>
           <div><div class="k">Order</div><div class="v">${esc(ord.ref)}${(n => n > 1 ? ` · ticket ${o.tickets.filter(x => x.status === 'valid').indexOf(t) + 1} of ${n}` : '')(o.tickets.filter(x => x.status === 'valid').length)}</div></div>
           <div style="grid-column:span 2"><div class="k">Venue</div><div class="v">${esc([ev.venue, ev.address].filter(Boolean).join(' · '))}</div></div></div>
+        ${ord.status === 'paid' && !t.checked_in_at && (byEv(t.event_id).download || byEv(t.event_id).rename || byEv(t.event_id).transfer) ? `<div class="row wrap no-print tk-actions">${byEv(t.event_id).download ? `<button class="btn btn-dark btn-sm" data-action="walletAdd" data-v="apple" data-id="${t.id}">Add to Apple Wallet</button><button class="btn btn-ghost btn-sm" data-action="walletAdd" data-v="google" data-id="${t.id}">Save to Google Wallet</button>` : ''}
+          ${byEv(t.event_id).rename ? `<a href="#" class="small" data-action="selfRename" data-id="${t.id}">Change name</a>` : ''}${byEv(t.event_id).transfer ? `<a href="#" class="small" data-action="selfTransfer" data-id="${t.id}">Transfer</a>` : ''}</div>` : ''}
       </div><div class="r"><div class="qr" data-qr="${esc(t.code)}"></div><div class="code">${esc(t.code)}</div><div class="small muted">${t.checked_in_at ? 'Checked in ' + esc(fmtDT(t.checked_in_at)) : 'Show at the door'}</div></div></div>`;
     }).join('')}
+    ${xs.vouchers}${xs.bought}${xs.requests}
     <div class="card no-print" style="margin-top:20px"><h3>Receipt</h3>
       ${d.lines.map(l => SumLine(evById(l.eventId), l, cur)).join('')}
       ${Breakdown({ ...d, ticketsTotal: d.ticketsTotal ?? d.subtotal, currency: cur }, d.code)}
@@ -936,7 +949,7 @@ function FindTickets() {
 //  ORGANIZER BACK OFFICE
 // ══════════════════════════════════════════════════════════════════════════════
 const NAV = [
-  ['dashboard', 'Dashboard', 'home'], ['events', 'Events', 'cal', 'events.view'], ['venues', 'Venues', 'pin', 'seating.view'], ['orders', 'Orders', 'cart', 'orders.view'], ['customers', 'Customers', 'users', 'customers.profiles'], ['promos', 'Promotions', 'tag', 'tickets.discounts|tickets.discountsEdit|tickets.tracking|finance.reports'], ['attendees', 'Door list', 'users', 'door.attendees'],
+  ['dashboard', 'Dashboard', 'home'], ['events', 'Events', 'cal', 'events.view'], ['venues', 'Venues', 'pin', 'seating.view'], ['orders', 'Orders', 'cart', 'orders.view'], ['customers', 'Customers', 'users', 'customers.profiles'], ['passes', 'Gift cards & passes', 'tag', 'orders.view|orders.gifts'], ['pos', 'Door sales', 'cart', 'door.sell'], ['promos', 'Promotions', 'tag', 'tickets.discounts|tickets.discountsEdit|tickets.tracking|finance.reports'], ['attendees', 'Door list', 'users', 'door.attendees'],
   ['checkin', 'Scanner app', 'scan', 'door.scan'], ['reports', 'Reports', 'chart', 'finance.reports'], ['marketing', 'Marketing', 'mega', 'comms.email|comms.marketing|comms.lists|comms.automations|admin.integrations|admin.api'],
   ['team', 'Team', 'team', 'admin.invite|admin.perms|admin.remove'], ['branding', 'Branding', 'brush', 'admin.settings'], ['settings', 'Settings', 'gear', 'admin.settings'], ['security', 'My security', 'lock'],
 ];
@@ -950,7 +963,7 @@ function AdminShell() {
   if (!S.adm) return `<div class="empty" style="padding-top:30vh">Loading…</div>`;
   if (!S.adm.bo) return S.adm.super ? (setTimeout(() => { location.hash = '#/platform'; }), '') : Gate('No box office yet', `${esc(S.user.email)} isn't on any box office team. Ask an owner to invite you.`);
   if (S.adm.blocked) return Gate(S.adm.bo.name + ' is ' + BO_STATUS[S.adm.blocked].toLowerCase(), S.adm.blocked === 'pending' ? 'The platform team is reviewing this box office. You\'ll get an email when it\'s approved.' : 'Event pages and checkout are offline and staff access is paused. Contact the platform team.' + (S.adm.me?.owner ? '<br><br>Your records are still yours: <a href="#" data-action="gateXp">download all of your data</a>.' : ''));
-  const sub = S.route.sub, page = { dashboard: Dashboard, events: EventsList, event: EventEditor, venues: Venues, orders: Orders, customers: Customers, promos: Promos, attendees: Attendees, checkin: CheckIn, reports: Reports, marketing: Marketing, team: Team, branding: Branding, settings: Settings, security: Security }[sub] || Dashboard;
+  const sub = S.route.sub, page = { pos: Pos, passes: Passes, dashboard: Dashboard, events: EventsList, event: EventEditor, venues: Venues, orders: Orders, customers: Customers, promos: Promos, attendees: Attendees, checkin: CheckIn, reports: Reports, marketing: Marketing, team: Team, branding: Branding, settings: Settings, security: Security }[sub] || Dashboard;
   const allowed = NAV.filter(navOk), navKey = sub === 'event' ? 'events' : sub, entry = NAV.find(n => n[0] === navKey);
   const body = S.adm.needs2fa && sub !== 'security' ? Gate2fa() : entry && !navOk(entry) ? `<div class="empty"><div class="display" style="font-size:28px">No access</div><p class="muted" style="margin-top:8px">You don't have permission to open ${esc(entry[1])}. Ask a box office admin.</p></div>` : scannerOnly() && (sub || 'dashboard') === 'dashboard' ? ScannerHome() : page();
   return `<div class="admin">
@@ -1097,7 +1110,8 @@ function EdDoor(ev) {
   const rows = (lg?.rows || []).filter(SCAN_FILTERS[lg?.f || 'all'][1]), tk = id => S.adm.tickets.find(t => t.id === id);
   const kpi = (l, v, d = '') => `<div class="kpi"><div class="eyebrow">${l}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`;
   const chk = (i, k, v, on, label) => `<label class="chip-check ${on ? 'on' : ''}"><input type="checkbox" data-action="enPick" data-i="${i}" data-k="${k}" data-v="${esc(v)}" ${on ? 'checked' : ''} ${ro ? 'disabled' : ''}> ${esc(label)}</label>`;
-  return `<div class="kpis">${kpi('Tickets', st.total.toLocaleString())}${kpi('Scanned in', st.inn.toLocaleString())}${kpi('Remaining', (st.total - st.inn).toLocaleString())}${kpi('Checked in', (st.total ? Math.round(st.inn / st.total * 100) : 0) + '%')}</div>
+  const vs = (S.adm.vouchers || []).filter(v => v.event_id === ev.id && v.status !== 'void'), vby = [...new Set(vs.map(v => v.name))].map(n => [n, vs.filter(v => v.name === n)]);
+  return `${vby.length ? `<div class="card" style="margin-bottom:14px"><h3>Product vouchers</h3><p class="small muted" style="margin:2px 0 8px">Scanned at the bar, parking or merch stand — separately from the tickets.</p>${vby.map(([n, l]) => `<div class="between small line"><span>${esc(n)}</span><span class="tnum">${l.filter(v => v.status === 'redeemed').length} of ${l.length} redeemed</span></div>`).join('')}</div>` : ''}<div class="kpis">${kpi('Tickets', st.total.toLocaleString())}${kpi('Scanned in', st.inn.toLocaleString())}${kpi('Remaining', (st.total - st.inn).toLocaleString())}${kpi('Checked in', (st.total ? Math.round(st.inn / st.total * 100) : 0) + '%')}</div>
   <div class="cols"><div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>By entrance</h3></div><table class="tbl"><thead><tr><th>Entrance</th><th>Takes</th><th>Checked in</th></tr></thead><tbody>
     ${by.map(x => `<tr><td><b>${esc(x.name)}</b></td><td class="small muted">${x.en ? esc([...(x.en.ticketTypeIds || []).map(id => saved.ticketTypes.find(t => t.id === id)?.name).filter(Boolean), ...(x.en.areas || [])].join(', ') || 'Everyone') : '—'}</td><td class="tnum">${x.n}</td></tr>`).join('') || '<tr><td colspan="3" class="muted small">No entrances set up — every scanner accepts every ticket.</td></tr>'}</tbody></table></div>
     ${slots.length ? `<div class="card" style="padding:0"><div style="padding:16px 20px 4px"><h3>By showtime</h3></div><table class="tbl"><thead><tr><th>Showtime</th><th>Checked in</th></tr></thead><tbody>
@@ -1603,7 +1617,7 @@ const tog = (path, v, label, num) => { const on = (getPath(S.draft, path) || [])
   return `<label class="check small tog"><input type="checkbox" data-action="togList" data-path="${esc(path)}" data-v="${esc(v)}" ${num ? 'data-num="1"' : ''} ${on ? 'checked' : ''}> <span>${label}</span></label>`; };
 const evAreas = ev => [...new Set(Object.values(ev.seating?.enabled ? ev.seating.meta || {} : {}).map(m => m[0]).filter(Boolean))].sort();
 const PRODUCT_CATS = ['Park admission', 'Parking', 'Dinner', 'Food', 'Merchandise', 'Meet & greet', 'VIP upgrade', 'Transportation', 'Other'];
-const TT_ACCESS = [['public', 'Everyone'], ['code', 'Only with an access code'], ['admin', 'Box office only (not sold online)']];
+const TT_ACCESS = [['public', 'Everyone'], ['code', 'Only with an access code'], ['members', 'Members only (membership / pass holders)'], ['admin', 'Box office only (not sold online)']];
 function EdTickets(ev) {
   const sold = evStats(ev), av = availabilityFrom(S.adm.tickets, ev.id), slots = ev.timeSlots || [];
   return `<div class="between" style="margin-bottom:14px"><p class="muted">${sold.sold} sold. Ticket types, prices, price rules, limits and sale windows. Free tickets are simply priced at $0.</p><button type="button" class="btn btn-dark btn-sm" data-action="addTT">${ic('plus', 14)} Add ticket type</button></div>
@@ -1613,20 +1627,26 @@ function EdTickets(ev) {
     <div class="grid3">${inp(`${P}.name`, 'Name')}${inp(`${P}.price`, 'Price', { t: 'money' })}${inp(`${P}.qty`, 'Inventory', { t: 'int', hint: '0 = unlimited' })}</div>
     <div class="grid3">${inp(`${P}.min`, 'Min per order', { t: 'int' })}${inp(`${P}.max`, 'Max per order', { t: 'int' })}${inp(`${P}.admits`, 'Admits (group ticket)', { t: 'int' })}</div>
     <div class="grid3">${inp(`${P}.group`, 'Ticket group', { ph: 'e.g. VIP, Family, Groups', hint: 'Buyers see types under this heading' })}
-      <div class="field"><label class="fl">Who can buy</label><select class="inp" data-action-change="ttAccess" data-i="${i}">${TT_ACCESS.map(([v, l]) => `<option value="${v}" ${(t.adminOnly ? 'admin' : t.hidden ? 'code' : 'public') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      <div class="field"><label class="fl">Who can buy</label><select class="inp" data-action-change="ttAccess" data-i="${i}">${TT_ACCESS.map(([v, l]) => `<option value="${v}" ${(t.adminOnly ? 'admin' : t.hidden ? 'code' : t.memberOnly ? 'members' : 'public') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
       ${t.hidden && !t.adminOnly ? inp(`secrets.ticketPasswords.${t.id}`, 'Access code', { hint: 'Buyers unlock this type with the code' }) : inp(`${P}.desc`, 'Description')}</div>
     ${t.hidden && !t.adminOnly ? inp(`${P}.desc`, 'Description') : ''}
+    ${t.memberOnly ? `<div class="targets"><div class="fl">Which memberships unlock it <span class="muted">(none = any)</span></div>${(S.adm.bo.settings.passPlans || []).map(pl => tog(`${P}.memberPlans`, pl.id, esc(pl.name))).join('') || '<span class="small muted">Add membership plans in Settings first.</span>'}</div>` : ''}
     <div class="grid2">${inp(`${P}.salesStart`, 'On sale from', { t: 'dt' })}${inp(`${P}.salesEnd`, 'Off sale at', { t: 'dt' })}</div>
     <details class="rules" ${rules || S.ui.rulesOpen === t.id ? 'open' : ''}><summary>Pricing rules — early bird, scheduled changes, price after N sold, group prices${slots.length ? ', showtime prices' : ''}</summary>
       <div class="small muted" style="margin:8px 0">Price phases run top to bottom: the first one that's in its dates and under its sold limit sets the price; after the last, the base price applies.</div>
-      ${(t.phases || []).map((ph, k) => `<div class="rule-row">${inp(`${P}.phases.${k}.label`, k ? '' : 'Phase', { ph: 'Early bird' })}${inp(`${P}.phases.${k}.price`, k ? '' : 'Price', { t: 'money' })}${inp(`${P}.phases.${k}.from`, k ? '' : 'From', { t: 'dt' })}${inp(`${P}.phases.${k}.until`, k ? '' : 'Until', { t: 'dt' })}${inp(`${P}.phases.${k}.upTo`, k ? '' : 'Until N sold', { t: 'int', ph: '0 = no limit' })}<button type="button" class="icon-btn" data-action="delRule" data-path="${P}.phases" data-i="${k}" aria-label="Remove">${ic('x', 13)}</button></div>`).join('')}
+      ${(t.phases || []).map((ph, k) => `<div class="rule-row">${inp(`${P}.phases.${k}.label`, k ? '' : 'Phase', { ph: 'Early bird' })}${inp(`${P}.phases.${k}.price`, k ? '' : 'Price', { t: 'money' })}${inp(`${P}.phases.${k}.from`, k ? '' : 'From', { t: 'dt' })}${inp(`${P}.phases.${k}.until`, k ? '' : 'Until', { t: 'dt' })}${inp(`${P}.phases.${k}.upTo`, k ? '' : 'Until N sold', { t: 'int', ph: '0 = no limit' })}${inp(`${P}.phases.${k}.hoursBefore`, k ? '' : 'Last N hours only', { t: 'int', ph: 'last-minute' })}<button type="button" class="icon-btn" data-action="delRule" data-path="${P}.phases" data-i="${k}" aria-label="Remove">${ic('x', 13)}</button></div>`).join('')}
       <button type="button" class="btn btn-ghost btn-sm" data-action="addRule" data-path="${P}.phases" data-id="${t.id}">${ic('plus', 13)} Price phase</button>
       <div class="sep" style="margin:12px 0"></div>
       ${(t.breaks || []).map((b, k) => `<div class="rule-row two">${inp(`${P}.breaks.${k}.min`, k ? '' : 'Buy at least', { t: 'int' })}${inp(`${P}.breaks.${k}.price`, k ? '' : 'Price each', { t: 'money' })}<button type="button" class="icon-btn" data-action="delRule" data-path="${P}.breaks" data-i="${k}" aria-label="Remove">${ic('x', 13)}</button></div>`).join('')}
       <button type="button" class="btn btn-ghost btn-sm" data-action="addRule" data-path="${P}.breaks" data-id="${t.id}">${ic('plus', 13)} Group / quantity price</button>
+      <div class="sep" style="margin:12px 0"></div><div class="small muted" style="margin-bottom:6px">Peak / off-peak — a different price for showtimes on these days and times (${esc(ev.timezone || 'event time')})</div>
+      ${(t.peak || []).map((r, k) => `<div class="rule-box"><div class="rule-row">${inp(`${P}.peak.${k}.label`, k ? '' : 'Label', { ph: 'Weekend evening' })}${inp(`${P}.peak.${k}.price`, k ? '' : 'Price', { t: 'money' })}${inp(`${P}.peak.${k}.from`, k ? '' : 'From', { t: 'time' })}${inp(`${P}.peak.${k}.to`, k ? '' : 'To', { t: 'time' })}<div></div><button type="button" class="icon-btn" data-action="delRule" data-path="${P}.peak" data-i="${k}" aria-label="Remove">${ic('x', 13)}</button></div>
+        <div class="targets">${WEEKDAYS.map((d, n) => tog(`${P}.peak.${k}.days`, n, d, true)).join('')}<span class="small muted">none = every day</span></div></div>`).join('')}
+      <button type="button" class="btn btn-ghost btn-sm" data-action="addRule" data-path="${P}.peak" data-id="${t.id}">${ic('plus', 13)} Peak / off-peak price</button>
       ${slots.length ? `<div class="sep" style="margin:12px 0"></div><div class="small muted" style="margin-bottom:6px">Showtime prices (blank = base price)</div><div class="grid3">${slots.map(s => inp(`${P}.slotPrices.${s.id}`, esc(fmtDT(s.start)), { t: 'moneyOpt' })).join('')}</div>` : ''}
     </details>
-  </div>`; }).join('')}`;
+  </div>`; }).join('')}
+  ${RulesEditor(ev)}`;
 }
 function EdProducts(ev) {
   const av = availabilityFrom(S.adm.tickets, ev.id, [], '', S.adm.orders), areas = evAreas(ev), ads = ev.addons || [], bds = ev.bundles || [], ups = ev.upsells || [];
@@ -1638,7 +1658,7 @@ function EdProducts(ev) {
     <div class="grid3">${inp(`${P}.name`, 'Product')}${inp(`${P}.price`, 'Price', { t: 'money' })}${sel(`${P}.category`, 'Category', PRODUCT_CATS.map(c => [c, c]))}</div>
     <div class="grid3">${inp(`${P}.qty`, 'Inventory', { t: 'int', hint: '0 = unlimited' })}${inp(`${P}.max`, 'Max per order', { t: 'int', hint: '0 = no limit' })}${inp(`${P}.desc`, 'Description')}</div>
     <div class="grid2">${inp(`${P}.salesStart`, 'On sale from', { t: 'dt' })}${inp(`${P}.salesEnd`, 'Off sale at', { t: 'dt' })}</div>
-    <div class="row wrap">${chk(`${P}.standalone`, 'Can be bought on its own, without a ticket')}${chk(`${P}.hidden`, 'Hidden — only inside packages and offers')}</div>
+    <div class="row wrap">${chk(`${P}.standalone`, 'Can be bought on its own, without a ticket')}${chk(`${P}.hidden`, 'Hidden — only inside packages and offers')}${chk(`${P}.redeemable`, 'Own QR code — scanned and redeemed at the event (parking, drinks, merch pickup…)')}</div>
     <div class="targets"><div class="fl">Only with these ticket types <span class="muted">(none = any)</span></div>${ev.ticketTypes.map(t => tog(`${P}.ticketTypeIds`, t.id, esc(t.name))).join('')}</div>
     ${areas.length ? `<div class="targets"><div class="fl">Only with seats in <span class="muted">(none = any)</span></div>${areas.map(x => tog(`${P}.areas`, x, esc(x))).join('')}</div>` : ''}
   </div>`; }).join('') || '<div class="card empty">No products yet.</div>'}
@@ -1827,6 +1847,11 @@ function EdShare(ev) {
     <div class="card"><h3>Embed on your website</h3><p class="small muted" style="margin:4px 0 10px">Paste into any website builder (Webflow, Wix, Squarespace, WordPress) as an HTML/embed block. Full checkout inside your site.</p>
       <pre class="code">&lt;iframe src="${esc(embed)}" style="width:100%;min-height:900px;border:0" title="${esc(ev.name)} tickets"&gt;&lt;/iframe&gt;</pre>
       <p class="small muted" style="margin:12px 0 8px">Or a "Buy tickets" button:</p><pre class="code">&lt;a href="${esc(url)}" style="background:#f4cd5e;color:#2a2006;padding:14px 26px;border-radius:999px;font-weight:700;text-decoration:none"&gt;Buy tickets&lt;/a&gt;</pre></div>
+    <div class="card"><h3>Widgets for your website</h3><p class="small muted" style="margin:4px 0 10px">Load <code>embed.js</code> once, then use any of these — checkout stays on your site.</p>
+      <pre class="code">&lt;script src="${esc(location.origin + location.pathname.replace(/index\.html$/, ''))}embed.js" async&gt;&lt;/script&gt;
+&lt;a href="${esc(url)}" data-set-tickets="${esc(ev.slug)}"&gt;Buy tickets&lt;/a&gt;
+&lt;div data-set-widget="tickets" data-event="${esc(ev.slug)}"&gt;&lt;/div&gt;
+&lt;div data-set-widget="event" data-event="${esc(ev.slug)}"&gt;&lt;/div&gt;</pre></div>
     <div class="card"><h3>Tracking links</h3><p class="small muted" style="margin:4px 0 10px">Tag links per channel — Reports shows sales by source.</p>
       ${['instagram', 'whatsapp', 'newsletter', 'poster'].map(s => `<div class="row" style="margin-bottom:6px"><span class="chip" style="width:96px;justify-content:center">${s}</span><input class="inp" readonly value="${esc(shareUrl(ev.slug, s))}"></div>`).join('')}</div>
   </div><div class="card" style="text-align:center"><h3>Event QR code</h3><p class="small muted" style="margin-bottom:16px">For posters and flyers.</p><div class="qr" style="display:inline-block" data-qr="${esc(shareUrl(ev.slug, 'poster'))}"></div>
@@ -1903,7 +1928,7 @@ function OrderView(id) {
      <button class="btn btn-ghost btn-sm" data-action="emailPv" data-id="${o.id}">Confirmation email</button>
      ${live.length && can('orders.resend', ev0) ? `<button class="btn btn-ghost btn-sm" data-action="opGo" data-v="resend" data-k="tickets">Resend tickets</button>` : ''}
      ${btn('message', 'Message customer', 'comms.email')}
-     ${['pending', 'awaiting_payment'].includes(o.status) ? btn('markPaid', 'Mark paid & issue tickets', 'orders.edit', 'btn-dark') + btn('cancelUnpaid', 'Cancel reservation', 'orders.cancel', 'btn-danger') : ''}`)}
+     ${['pending', 'awaiting_payment'].includes(o.status) ? (d.plan && planPaid(d.plan) ? btn('installment', 'Record installment', 'orders.edit', 'btn-dark') : btn('markPaid', 'Mark paid & issue tickets', 'orders.edit', 'btn-dark')) + btn('cancelUnpaid', 'Cancel reservation', 'orders.cancel', 'btn-danger') : ''}`)}
   ${S.ui.op ? OpPanel(o, sel, live) : ''}
   <div class="ord-grid"><div class="stack">
     <div class="card" style="padding:0"><div class="between wrap" style="padding:16px 20px 8px;gap:8px"><h3>Tickets <span class="muted small">${live.length} valid${all.length > live.length ? ` · ${all.length - live.length} cancelled / replaced` : ''}</span></h3>
@@ -1946,6 +1971,7 @@ function OrderView(id) {
       ${(pay.attempts || []).filter(a => !a.ok).map(a => `<div class="small" style="color:var(--bad)">${esc(fmtDT(a.at))} · ${esc(a.brand || a.method || '')} ${a.last4 ? '•••• ' + esc(a.last4) : ''} — ${esc(a.error || 'failed')}</div>`).join('')}${pay.note ? `<div class="small" style="color:var(--warn)">${esc(pay.note)}</div>` : ''}
       ${o.status === 'awaiting_payment' ? `<div class="small muted" style="margin-top:6px">Card checkout in progress — seats held until ${esc(fmtTime(o.expires_at))}. No tickets until the payment is confirmed.</div>` : ''}
       ${o.status === 'pending' ? `<div class="small muted" style="margin-top:6px">Pay-later reservation: no tickets yet. “Mark paid” issues them and sends the confirmation.</div>` : ''}</div>` : ''}
+    ${OrderExtras(o)}
     ${(d.chargebacks || []).length || (wasPaid(o) && pay?.provider && pay.provider !== 'manual' && can('orders.refund', ev0)) ? `<div class="card"><div class="between"><h3>Chargebacks</h3>${wasPaid(o) && can('orders.refund', ev0) && !S.ui.cb ? '<button class="btn btn-ghost btn-sm" data-action="cbOpen">Record chargeback</button>' : ''}</div>
       ${(d.chargebacks || []).map(c => `<div class="between small line"><span>${esc(fmtDT(c.at))} · ${money(c.amount, cur)}${c.reason ? ' · ' + esc(c.reason) : ''}${c.ref ? ` · <code>${esc(c.ref)}</code>` : ''}<div class="muted">${esc(CB_STATUS[c.status])}${c.closed_at ? ' · ' + esc(fmtDT(c.closed_at)) : ''}</div></span>
         ${c.status === 'open' && can('orders.refund', ev0) ? `<span class="row"><button class="btn btn-ghost btn-sm" data-action="cbClose" data-id="${c.id}" data-v="won">Won</button><button class="btn btn-ghost btn-sm" data-action="cbClose" data-id="${c.id}" data-v="lost">Lost</button></span>` : `<span class="chip mini ${c.status === 'won' ? 'ok' : c.status === 'lost' ? 'bad' : 'warn'}">${esc(c.status)}</span>`}</div>`).join('') || '<p class="small muted" style="margin-top:6px">None. The processor reports disputes automatically; record one here if it told you another way.</p>'}
@@ -2079,15 +2105,23 @@ function OpPanel(o, sel, live) {
     foot = go('Send message');
   } else if (op.kind === 'markPaid') {
     title = 'Mark paid & issue tickets';
-    body = `${opRow('Paid by', opSel('method', PAY_METHODS, op.method))}<p class="small muted">The tickets are issued now and the confirmation email is queued.</p>${note}`;
+    body = `<div class="grid2">${opRow('Paid by', opSel('method', PAY_METHODS, op.method))}${opRow('Date received', `<input class="inp" type="date" data-bind="ui.op.date" value="${esc(op.date || '')}">`)}</div>
+      <div class="grid2">${opRow('Reference', opText('ref', op.ref, 'receipt / check no. / Zelle id'))}${opRow('Payment notes', opText('notes', op.notes, ''))}</div><p class="small muted">The tickets are issued now and the confirmation email is queued.</p>${note}`;
     foot = go('Mark paid', 'btn-dark');
+  } else if (op.kind === 'installment') {
+    const x = planNext(o.data.plan);
+    title = `Record ${x ? esc(x.label.toLowerCase()) + ' — ' + money(x.amount, o.data.currency) : 'installment'}`;
+    body = `<div class="grid2">${opRow('Paid by', opSel('method', PAY_METHODS, op.method))}${opRow('Reference', opText('ref', op.ref, ''))}</div><p class="small muted">${planNext(o.data.plan) && o.data.plan.schedule.filter(y => !y.paid_at).length === 1 ? 'This is the last payment — the tickets are issued now.' : 'The seats stay held; the tickets come with the last payment.'}</p>${note}`;
+    foot = go('Record payment', 'btn-dark');
   } else if (op.kind === 'reissue') {
     const tks = live.filter(t => op.tickets.includes(t.id));
     title = `Reissue ${tks.length} ticket${tks.length === 1 ? '' : 's'}`;
     body = `<p class="small">${tks.map(t => `<b>${esc(t.code)}</b>`).join(', ')} get new QR codes. Same seat, type and price. <b>The old codes stop working at the door immediately</b> — use this for a lost phone or a forwarded screenshot.</p>${tell}${note}`;
     foot = go('Reissue with new codes', 'btn-dark');
   } else if (op.kind === 'cancelUnpaid') {
-    title = 'Cancel this reservation'; body = `<p class="small">Nothing was paid, so there's nothing to refund. The seats and stock go back on sale.</p>${note}`; foot = go('Cancel reservation', 'btn-danger');
+    const paidSoFar = planPaid(o.data.plan);
+    title = 'Cancel this reservation'; body = paidSoFar ? `<p class="small">${money(paidSoFar, o.data.currency)} of the payment plan was paid. The seats and stock go back on sale.</p>${opRow('What was paid', opSel('keep', { credit: 'Give it back as account credit', keep: 'Keep it (non-refundable deposit)' }, op.keep))}${note}`
+      : `<p class="small">Nothing was paid, so there's nothing to refund. The seats and stock go back on sale.</p>${note}`; foot = go('Cancel reservation', 'btn-danger');
   }
   return `<div class="card op-card"><div class="between"><h3>${title}</h3><button class="icon-btn" data-action="opClose" aria-label="Close">${ic('x', 14)}</button></div><div class="stack" style="margin-top:12px">${body}</div><div class="row wrap" style="margin-top:14px;justify-content:flex-end">${close}${foot}</div></div>`;
 }
@@ -2105,13 +2139,15 @@ function opPayload(o) {
     case 'customer': return { name: op.name, email: op.email, phone: op.phone, note };
     case 'holder': return { ticket: op.ticket, name: op.name, note };
     case 'message': return { subject: op.subject || 'About your order ' + o.ref, body: op.body };
-    case 'markPaid': return { method: op.method, note };
+    case 'markPaid': return { method: op.method, date: op.date || '', ref: op.ref, notes: op.notes, note };
+    case 'installment': return { method: op.method, ref: op.ref, note };
+    case 'cancelUnpaid': return { keep: op.keep, note };
     case 'reissue': return { tickets: op.tickets, note, notify };
     default: return { note };
   }
 }
 const OP_DONE = { change: 'Tickets changed — new tickets issued', cancel: 'Cancelled', refund: 'Refund issued', collect: 'Payment recorded', addAddon: 'Product added', removeAddon: 'Product removed', customer: 'Customer details saved',
-  holder: 'Holder changed', reissue: 'Reissued — the old codes no longer scan', message: 'Message queued', markPaid: 'Marked paid — tickets issued', cancelUnpaid: 'Reservation cancelled', note: 'Note added', resend: 'Tickets re-sent' };
+  holder: 'Holder changed', reissue: 'Reissued — the old codes no longer scan', message: 'Message queued', markPaid: 'Marked paid — tickets issued', cancelUnpaid: 'Reservation cancelled', note: 'Note added', resend: 'Tickets re-sent', installment: 'Installment recorded' };
 
 // ── Customers (Stage 6 §7): one record per email across all of this box office's orders ──
 function customerIndex() {
@@ -2243,7 +2279,7 @@ function ManualOrder() {
   if (ev && (items.length || addons.length)) try { q = quote({ items, addons }, S.adm.events, pricingSettings(S.adm.bo, S.platform), null, { manual: true, avail: { [ev.id]: availabilityFrom(S.adm.tickets, ev.id, [], '', S.adm.orders) } }); } catch (e) { err = e.message; }
   const credits = (S.adm.credits || []).filter(c => c.email === String(m.email || '').trim().toLowerCase() && c.status === 'active' && (!c.event_id || c.event_id === ev?.id));
   S.ui.moItems = { items, addons };
-  return `<a href="#/admin/orders" class="small muted" style="text-decoration:none">← Orders</a>${head('New manual order', 'Phone sales, box-office sales and complimentary tickets')}
+  return `${m.pos ? head('Door sales', 'Sell at the door — cash, card or other. Tickets are issued at once and the seats leave the map immediately.') : `<a href="#/admin/orders" class="small muted" style="text-decoration:none">← Orders</a>${head('New manual order', 'Phone sales, box-office sales and complimentary tickets')}`}
   <div class="ord-grid"><div class="stack">
     <div class="card"><div class="grid2">${opRow('Event', `<select class="inp" data-input="mo.ev" data-rr="1">${evOptions(m.ev, 'Choose…')}</select>`)}
       ${ev?.timeSlots?.length ? opRow('Showtime', `<select class="inp" data-input="mo.slot" data-rr="1">${ev.timeSlots.map(s => `<option value="${s.id}" ${slot === s.id ? 'selected' : ''}>${esc(fmtDT(s.start))}</option>`).join('')}</select>`) : ''}</div>
@@ -2257,10 +2293,14 @@ function ManualOrder() {
       ${ev && can('tickets.comps', ev.id) ? `<label class="check"><input type="checkbox" data-bind="ui.mo.comp" ${m.comp ? 'checked' : ''}> <span>Complimentary — free, keeps the real ticket type and face value</span></label>` : ''}
       ${!m.comp && ev && can('tickets.pricing', ev.id) ? opRow('Price override (each ticket)', `<input class="inp" type="number" min="0" step="0.01" data-input="mo.price" data-rr="1" value="${esc(m.price ?? '')}" placeholder="Normal price">`) : ''}
       ${!m.comp ? `<div class="grid2">${opRow('Promo code', `<input class="inp" data-input="mo.code" value="${esc(m.code)}" placeholder="optional">`)}${credits.length ? opRow('Use credit', `<select class="inp" data-input="mo.credit" data-rr="1"><option value="">No</option>${credits.map(c => `<option value="${c.id}" ${m.credit === c.id ? 'selected' : ''}>${esc(c.code)} · ${money(c.remaining)} left</option>`).join('')}</select>`) : ''}</div>
-        <div class="grid2">${opRow('Paid by', `<select class="inp" data-input="mo.pay" data-rr="1">${Object.entries(PAY_METHODS).map(([k, t]) => `<option value="${k}" ${m.pay === k ? 'selected' : ''}>${t}</option>`).join('')}</select>`)}${opRow('Payment reference', `<input class="inp" data-input="mo.ref" value="${esc(m.ref)}" placeholder="receipt / check no.">`)}</div>` : ''}
+        ${m.pos ? PosPayment(m, q) : `<div class="grid2">${opRow('Paid by', `<select class="inp" data-input="mo.pay" data-rr="1">${Object.entries(PAY_METHODS).map(([k, t]) => `<option value="${k}" ${m.pay === k ? 'selected' : ''}>${t}</option>`).join('')}</select>`)}${opRow('Payment reference', `<input class="inp" data-input="mo.ref" value="${esc(m.ref)}" placeholder="receipt / check no. / Zelle id">`)}</div>
+        <div class="grid2">${opRow('Payment', `<select class="inp" data-input="mo.unpaid" data-rr="1"><option value="" ${!m.unpaid ? 'selected' : ''}>Paid now — issue tickets</option><option value="1" ${m.unpaid ? 'selected' : ''}>Unpaid (invoice) — hold seats, tickets when marked paid</option></select>`)}${opRow(m.unpaid ? 'Invoice date' : 'Date received', `<input class="inp" type="date" data-input="mo.date" value="${esc(m.date || localDay(new Date().toISOString()))}">`)}</div>
+        ${opRow('Payment notes', `<input class="inp" data-input="mo.notes" value="${esc(m.notes || '')}" placeholder="e.g. paid by the company, net 30">`)}`}` : ''}
       ${q ? Breakdown(m.comp ? { ...q, ticketsTotal: 0, addonsTotal: 0, fee: 0, feeDiscount: 0, serviceFee: 0, tax: 0, discount: 0, total: 0 } : q, '') : `<p class="small muted">${esc(err || (seated ? 'Pick seats on the map.' : 'Choose tickets.'))}</p>`}
-      <label class="check" style="margin-top:10px"><input type="checkbox" data-bind="ui.mo.send" ${m.send !== false ? 'checked' : ''}> <span>Send the tickets to the customer now</span></label>
-      <button class="btn btn-accent btn-block" style="margin-top:12px" data-action="saveManual" ${q ? '' : 'disabled'}>Create order</button></div>
+      ${m.pos ? `<div class="field" style="margin-top:10px"><label class="fl">Tickets</label><div class="seg">${[['print', 'Print / show'], ['email', 'Email'], ['text', 'Text'], ['none', 'None']].map(([k, t]) => `<button type="button" class="${m.deliver === k ? 'on' : ''}" data-action="moDeliver" data-v="${k}">${t}</button>`).join('')}</div></div>
+        <button class="btn btn-accent btn-block btn-lg" style="margin-top:12px" data-action="posSell" ${q ? '' : 'disabled'}>${m.pay === 'card' && !m.comp ? 'Charge card' : 'Complete sale'}${q ? ' — ' + money(m.comp ? 0 : q.total, cur) : ''}</button>`
+      : `<label class="check" style="margin-top:10px"><input type="checkbox" data-bind="ui.mo.send" ${m.send !== false ? 'checked' : ''}> <span>Send the tickets to the customer now</span></label>
+      <button class="btn btn-accent btn-block" style="margin-top:12px" data-action="saveManual" ${q ? '' : 'disabled'}>Create order</button>`}</div>
   </div></div>`;
 }
 // The order confirmation: ONE email per order with every ticket and its Area / Row / Seat, plus one PDF of all tickets.
@@ -2395,10 +2435,11 @@ function ScanCam() {
 // [title, colour] for every answer the server can give
 const RES = { ok: ['Valid', 'ok'], already: ['Already scanned', 'warn'], undone: ['Check-in undone', 'info'], paused: ['Scanning stopped', 'bad'], unknown: ['Invalid QR code', 'bad'], cancelled: ['Ticket cancelled', 'bad'],
   refunded: ['Ticket refunded', 'bad'], replaced: ['Replaced ticket', 'bad'], wrong_event: ['Wrong event', 'bad'], wrong_slot: ['Wrong showtime', 'bad'], wrong_entrance: ['Wrong entrance', 'warn'],
-  inactive: ['Ticket not active', 'bad'], device_off: ['Scanner switched off', 'bad'] };
+  inactive: ['Ticket not active', 'bad'], device_off: ['Scanner switched off', 'bad'], item_ok: ['Redeemed', 'ok'], item_used: ['Already redeemed', 'warn'], item_void: ['Voucher not valid', 'bad'] };
 const RES_TITLE = Object.fromEntries(Object.entries(RES).map(([k, v]) => [k, v[0]]));
 const resKind = r => RES[r]?.[1] || 'bad';
 function ScanResult(r) {
+  if (r.item) return ScanItem(r);   // §11 a product voucher (parking, drink, merchandise …)
   const kind = resKind(r.result), t = doorView(r.ticket), show = t && !['unknown', 'wrong_event', 'device_off'].includes(r.result);
   const sp = t?.seat ? { area: t.area || '', row: t.row || '', seat: t.seat_label || '', unit: t.unit || '' } : null, lines = sp ? seatLines(sp) : t ? [t.type || 'General admission'] : [];
   const f = r.first || {}, note = {
@@ -2594,7 +2635,7 @@ function FinDash(t, o = {}) {
   return `<div class="card fin-dash"><div class="between"><h3>${esc(o.title || 'Financial summary')}</h3>${o.partial ? '<span class="chip mini warn">tickets / products matching the filter only</span>' : ''}</div>
     ${o.potential === false ? '' : L('Potential sellout revenue', money(t.potential), 'muted-line', `remaining ${money(t.remaining)}`)}
     <div class="sep"></div>
-    ${L('Gross ticket value sold', money(t.tface))}${opt('Products & add-ons', t.pface)}
+    ${L('Gross ticket value sold', money(t.tface))}${opt('Products & add-ons', t.pface)}${opt('Memberships & passes sold', t.passRev)}${opt('Gift cards sold', t.giftSold)}
     ${L('Discounts', neg(t.discount))}${opt('Package savings & price overrides', t.savings, t.savings > 0 ? '-' : '')}
     ${L('Complimentary ticket value', money(t.comp), 'muted-line', `${t.comps} comp ticket${t.comps === 1 ? '' : 's'} — not collected`)}
     ${L('Booking fees collected', money(t.fees))}${L('Sales tax', money(t.tax))}
@@ -2812,7 +2853,7 @@ function consentChips(c, phone) {
 function msgCtx(m) {
   const o = m.order_id && S.adm.orders.find(x => x.id === m.order_id) || m._order, evOf = id => m._event?.id === id ? m._event : evById(id), ev = evOf(m.event_id || o?.event_ids?.[0]), bo = S.adm.bo, c = contactFor(m.email);
   const tks = o ? S.adm.tickets.filter(t => t.order_id === o.id && t.status === 'valid').map(t => { const e = evById(t.event_id), tt = e?.ticketTypes.find(x => x.id === t.ticket_type_id), sp = t.seat && e ? seatParts(e, t.seat, t) : null;
-    return { event_id: t.event_id, slot_id: t.slot_id, type: tt?.name || 'Ticket', area: sp?.area || t.area || '', row: sp?.row || t.row || '', seat: sp?.seat || t.seat_label || '', unit: t.unit || '', code: t.code }; }) : [];
+    return { id: t.id, event_id: t.event_id, slot_id: t.slot_id, type: tt?.name || 'Ticket', area: sp?.area || t.area || '', row: sp?.row || t.row || '', seat: sp?.seat || t.seat_label || '', unit: t.unit || '', code: t.code }; }) : [];
   return { bo: { name: bo.name, slug: bo.slug, branding: bo.branding, mail: bo.settings?.mail, mailDomain: bo.mailDomain?.status === 'verified' ? bo.mailDomain.domain : null }, event: ev ? { ...ev } : null, tickets: tks, contact: { name: c?.name || '', token: c ? 'preview-token' : '' },
     order: o ? { id: o.id, key: 'private-key', ref: o.ref, buyer: o.data.buyer, events: [...new Set(o.data.lines.map(l => l.eventId))].map(evOf).filter(Boolean).map(e => ({ id: e.id, name: e.name, start: e.start, venue: e.venue, address: e.address, confirmation: e.emails?.confirmation,
       email: e.emails?.confirm || null, policies: e.policies || '', contact: e.contact || null })) } : null };
@@ -3247,6 +3288,7 @@ function Settings() {
       ${c('checkout.promo', 'Show the promo / referral code box')}${c('checkout.optIn', 'Offer the marketing email opt-in')}${c('checkout.smsOptIn', 'Offer the marketing text opt-in (when a mobile number is given)')}
       ${f('checkout.note', 'Message at the top of checkout')}${f('checkout.thanks', 'Message on the confirmation page')}</div>
     <div class="card">${QEditor('set', 'questions', s.questions || [], [])}</div>
+    ${SellingCards(s, f, c)}
     <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Staff security</div>${c('require2fa', 'Require two-factor sign-in for everyone on this team')}
       ${f('sessionMinutes', 'Sign staff out after this many minutes without activity', 'num', '0 = never. Applies to the back office and scanner.')}
       <p class="small muted">People without it are asked to set it up before they can see anything. <a href="#/admin/security">Set up yours</a>.</p></div>
@@ -3378,6 +3420,7 @@ function BoxOfficePage() {
       ${safeUrl(br.logo) ? `<img class="bo-logo" src="${esc(safeUrl(br.logo))}" alt="${esc(bo.name)}">` : ''}<h1 class="display">${esc(bo.name)}</h1>${br.tagline ? `<p>${esc(br.tagline)}</p>` : ''}
       ${soc.length ? `<div class="row wrap" style="margin-top:14px">${soc.map(([k, , u]) => `<a class="btn glass btn-sm" href="${esc(u)}" target="_blank" rel="noopener">${k[0].toUpperCase() + k.slice(1)}</a>`).join('')}</div>` : ''}</div></header>
     <section class="container section"><div class="eyebrow dash" style="margin-bottom:16px">Upcoming events</div>
+      ${giftSettings(bo.settings).on || (bo.settings.passPlans || []).some(p => p.onSale !== false) ? `<div class="row wrap" style="margin-bottom:16px">${giftSettings(bo.settings).on ? `<a class="btn btn-ghost" href="#/gift/${esc(bo.slug)}">${ic('tag', 14)} Gift cards</a>` : ''}${(bo.settings.passPlans || []).some(p => p.onSale !== false) ? `<a class="btn btn-ghost" href="#/member/${esc(bo.slug)}">${ic('users', 14)} Memberships & season passes</a>` : ''}</div>` : ''}
       ${all.length > 1 ? EventFilters(all) : ''}
       ${evs.length ? `<div class="ev-grid">${evs.map(EvCard).join('')}</div>` : `<div class="empty">${all.length ? 'No events match — try a different search.' : 'No events on sale right now — check back soon.'}</div>`}</section>
     <section class="container section" style="padding-top:0"><div class="cols"><div class="card"><h3>Contact</h3><p class="small" style="margin-top:6px">${bo.settings.contactEmail ? `<a href="mailto:${esc(bo.settings.contactEmail)}">${esc(bo.settings.contactEmail)}</a>` : ''}${br.phone ? '<br>' + esc(br.phone) : ''}</p>
@@ -3453,6 +3496,7 @@ function EdControls(ev) {
       <div class="grid2">${sel('checkout.phone', 'Mobile number', [['', 'Box office setting'], ['optional', 'Optional'], ['required', 'Required']])}${sel('checkout.address', 'Address', [['', 'Box office setting'], ['optional', 'Optional'], ['required', 'Required']])}</div>
       <div class="row wrap">${['optIn', 'smsOptIn', 'promo'].map(k => `<label class="check"><input type="checkbox" data-bind="draft.checkout.${k}" data-t="bool" ${ev.checkout?.[k] === false ? '' : 'checked'}> <span>${{ optIn: 'Email opt-in', smsOptIn: 'Text opt-in', promo: 'Promo code box' }[k]}</span></label>`).join('')}</div></div>
     <div class="card"><h3>Donations</h3>${chk('donation.off', 'No donation step for this event')}${inp('donation.purpose', 'What donations to this event support', { ph: S.adm.bo.settings.donationPurpose || 'e.g. Youth music fund' })}</div>
+    ${EventSelfCard(ev)}
   </div></div>`;
 }
 
@@ -3908,6 +3952,7 @@ const A = {
         donation: S.cart.donation || 0, payment: q.total === 0 ? 'free' : co.payment, answers: co.answers, ticketAnswers: tAnswers(), optIn: !!co.optIn, smsOptIn: !!co.smsOptIn && !!normPhone(co.phone),
         source: sessionStorage.getItem('set_src') || null, utm: (() => { try { return JSON.parse(sessionStorage.getItem('set_utm') || 'null'); } catch (e) { return null; } })(), unlock: S.cart.unlock, holdToken: DB.holdToken(), attempt: co.attempt,
         credit: q.credit ? co.credit?.code || 'account' : '', optFees: S.cart.optFees || [],
+        gifts: S.cart.gifts || [], passes: S.cart.passes || [], boxOfficeId: cartBo()?.id || null, pass: co.pass?.code || '', installments: !!co.plan && co.payment === 'card' && q.total > 0,
         accepted: policiesFor(cartBo(), evs).map(({ kind, eventId, version }) => ({ kind, eventId, version })),   // Stage 10: the versions the buyer just agreed to
         bot: { hp: co.hp || '', ms: Date.now() - (co.t0 || Date.now()), wd: !!navigator.webdriver } });
       if (r.status === 'awaiting_payment') return startPay(r);
@@ -3997,6 +4042,7 @@ const A = {
     try { await DB.saveBoxOffice({ name: b.name.trim() || S.adm.bo.name, slug: b.slug, branding: b.branding, settings: { ...S.adm.bo.settings, ...b.settings } }); await refreshPublic(); await reloadAdmin(); S.ui.brand = null; toast('Branding saved'); render(); } catch (e) { toast(e.message, true); }
   },
   saveSettings: async () => { try { if (S.ui.donAmts != null) S.ui.set.donationAmounts = String(S.ui.donAmts).split(/[,\s]+/).map(x => Math.round(+x * 100)).filter(x => x > 0).slice(0, 6);
+    if (S.ui.giftAmts != null) { S.ui.set.gifts ||= {}; S.ui.set.gifts.amounts = String(S.ui.giftAmts).split(/[,\s]+/).map(x => Math.round(+x * 100)).filter(x => x > 0).slice(0, 8); S.ui.giftAmts = null; }
     await DB.saveBoxOffice({ settings: { ...S.adm.bo.settings, ...JSON.parse(JSON.stringify(S.ui.set)) } }); S.ui.donAmts = null; await refreshPublic(); await reloadAdmin(); S.ui.set = null; setContext(); loadPixels(); toast('Settings saved'); render(); } catch (e) { toast(e.message, true); } },
   showPolicy: el => { const k = el.dataset.v, bo = S.bo; modal({ terms: 'Terms & conditions', refundPolicy: 'Refund policy', privacyPolicy: 'Privacy policy' }[k], `<p style="white-space:pre-line">${esc(k === 'terms' ? S.settings.terms : bo?.branding[k] || '')}</p>`); },
   // ── my security ──
@@ -4218,7 +4264,7 @@ const A = {
   // generic list rows inside the draft: price phases, quantity breaks, package parts / products
   addRule: el => { const path = el.dataset.path, list = getPath(S.draft, path) || []; setPath(S.draft, path, list);
     list.push(path.endsWith('phases') ? { id: shortId('ph_'), label: list.length ? 'Phase ' + (list.length + 1) : 'Early bird', price: getPath(S.draft, path.replace(/\.phases$/, '.price')) || 0, from: '', until: '', upTo: 0 }
-      : path.endsWith('breaks') ? { min: 4, price: getPath(S.draft, path.replace(/\.breaks$/, '.price')) || 0 } : path.endsWith('parts') ? { ticketTypeIds: [], qty: 1 } : { addonId: S.draft.addons?.[0]?.id || '', qty: 1 });
+      : path.endsWith('breaks') ? { min: 4, price: getPath(S.draft, path.replace(/\.breaks$/, '.price')) || 0 } : path.endsWith('peak') ? { label: 'Peak', days: [5, 6], from: '18:00', to: '23:59', price: getPath(S.draft, path.replace(/\.peak$/, '.price')) || 0 } : path.endsWith('parts') ? { ticketTypeIds: [], qty: 1 } : { addonId: S.draft.addons?.[0]?.id || '', qty: 1 });
     if (el.dataset.id) S.ui.rulesOpen = el.dataset.id; dirty(); render(); },
   delRule: el => { getPath(S.draft, el.dataset.path).splice(+el.dataset.i, 1); dirty(); render(); },
   togList: el => { const path = el.dataset.path, v = el.dataset.num ? +el.dataset.v : el.dataset.v, list = (getPath(S.draft, path) || []).filter(x => String(x) !== String(v));
@@ -4258,7 +4304,8 @@ const A = {
       : k === 'removeAddon' ? { ...base, line: +el.dataset.id, refund: '' }
       : k === 'addAddon' ? { ...base, eventId: o.event_ids[0], qty: 1, settle: 'collect', method: 'cash' }
       : k === 'collect' ? { ...base, amount: m.due ? (m.due / 100).toFixed(2) : '', method: 'cash' }
-      : k === 'markPaid' ? { ...base, method: 'cash' } : { ...base };
+      : k === 'markPaid' ? { ...base, method: o.payment?.method && PAY_METHODS[o.payment.method] ? o.payment.method : 'cash', date: localDay(new Date().toISOString()), ref: o.payment?.ref || '', notes: o.payment?.notes || '' }
+      : k === 'installment' ? { ...base, method: 'cash' } : k === 'cancelUnpaid' ? { ...base, keep: 'credit' } : { ...base };
     render(); window.scrollTo({ top: 0, behavior: 'smooth' });
   },
   opClose: () => { S.ui.op = null; render(); },
@@ -4296,7 +4343,7 @@ const A = {
     if (!items?.length && !addons?.length) return toast(ev.seating?.enabled ? 'Pick seats on the map' : 'Choose tickets', true);
     if (items.some(i => i.price !== undefined && !(i.price >= 0))) return toast('Enter a valid price', true);
     try { const r = await DB.placeOrder({ buyer: { name: m.name, email: m.email, phone: m.phone || '' }, items, addons, payment: 'manual', comp: !!m.comp, code: m.comp ? '' : m.code, creditId: m.comp ? '' : m.credit || '',
-        payMethod: m.pay, payRef: m.ref, send: m.send !== false, source: 'box office' }, true);
+        payMethod: m.pay, payRef: m.ref, send: m.send !== false, source: 'box office', unpaid: !!m.unpaid, payDate: m.date || '', payNotes: m.notes || '' }, true);
       S.ui.mo = null; await reloadAdmin(); toast('Order created'); location.hash = '#/admin/orders/' + r.id; } catch (e) { toast(e.message, true); }
   },
   exportOrders: () => download('orders.csv', csv([['Order', 'Placed', 'Status', 'Name', 'Email', 'Phone', 'Events', 'Tickets & packages', 'Products', 'Face value', 'Subtotal', 'Discount', 'Fee discount', 'Code', 'Tracking code', 'Fees', 'Tax', 'Donation', 'Total', 'Payment', 'Source', 'Marketing opt-in'],
@@ -4426,7 +4473,7 @@ const CHANGE = {
       const b = layoutOf(S.draft.seating).bounds; S.draft.seating.bg = { src: c.toDataURL('image/jpeg', .72), x: Math.round(b.x0), y: Math.round(b.y0), w: Math.round(b.x1 - b.x0), opacity: .35 }; dirty(); render(); };
     img.onerror = () => toast('That image could not be read', true); img.src = url; },
   bPick: el => { const p = (S.sel.picks ||= {})[el.dataset.id] ||= []; p[+el.dataset.i] = el.value; render(); },
-  ttAccess: el => { const t = S.draft.ticketTypes[+el.dataset.i]; t.hidden = el.value === 'code'; t.adminOnly = el.value === 'admin'; dirty(); render(); },
+  ttAccess: el => { const t = S.draft.ticketTypes[+el.dataset.i]; t.hidden = el.value === 'code'; t.adminOnly = el.value === 'admin'; t.memberOnly = el.value === 'members'; dirty(); render(); },
   switchBo: async el => { try { S.ui.support = null; S.ui.set = S.ui.brand = S.ui.pe = null; await reloadAdmin(el.value); location.hash = '#/admin/dashboard'; setContext(); render(); } catch (e) { toast(e.message, true); } },
   opPrice: el => { const m = S.ui.op.map[el.dataset.id] ||= {}; m.price = el.value === '' ? '' : Math.round(parseFloat(el.value) * 100); render(); },
   moAdd: el => { (S.ui.mo.adds ||= {})[el.dataset.id] = Math.max(0, parseInt(el.value, 10) || 0); render(); },
@@ -4615,5 +4662,289 @@ function presencePing() {
   const ids = new Set(S.route.page === 'e' && S.sel?.eventId ? [S.sel.eventId] : []); cartEventIds().forEach(id => ids.add(id));
   ids.forEach(id => DB.ping(id, cartTicketsFor(id)));
 }
+// checkout: a membership / season pass code (§3)
+function PassBox(q) {
+  const co = S.co, bo = cartBo(); if (!(bo?.settings?.passPlans || []).length) return '';
+  if (co.pass) return `<div class="between small" style="margin-top:8px"><span class="chip ok">${esc(co.pass.plan?.name || 'Pass')} ${esc(co.pass.code)}${co.pass.left != null ? ` · ${co.pass.left} left` : ''}</span><a href="#" data-action="removePass" class="small">Remove</a></div>
+    ${!q.passUses && !q.lines.some(l => evById(l.eventId)?.ticketTypes.find(t => t.id === l.ticketTypeId)?.memberOnly) ? '<p class="small" style="color:var(--warn);margin-top:4px">Your pass doesn\'t cover anything in this cart.</p>' : ''}`;
+  return co.passOpen ? `<div class="row" style="margin-top:8px"><input class="inp" data-bind="co.passCode" placeholder="Membership / pass code, MP-…" value="${esc(co.passCode || '')}"><button class="btn btn-ghost" data-action="applyPass">Apply</button></div><p class="small muted">Use the email the pass belongs to.</p>`
+    : `<a href="#" class="small" style="display:inline-block;margin-top:8px;margin-left:12px" data-action="openPass">Have a membership or season pass?</a>`;
+}
+// checkout: the payment-plan offer (§5) — shown when the box office allows it and the order is big enough and early enough
+function PlanOffer(q, set, evs) {
+  const starts = q.lines.filter(l => l.eventId).map(l => D(l.slotStart || evById(l.eventId)?.start)?.getTime()).filter(Boolean);
+  const pl = S.co.payment === 'card' && starts.length ? planSchedule(q.total, installFor(cartBo()?.settings || set, evs), new Date(Math.min(...starts)).toISOString()) : null;
+  if (!pl) { S.co.plan = false; return ''; }
+  return `<label class="pay-opt ${S.co.plan ? 'on' : ''}" style="margin-top:8px"><input type="checkbox" data-bind="co.plan" data-t="bool" data-action-change="rr" ${S.co.plan ? 'checked' : ''}><div><b>Pay in ${pl.schedule.length} parts</b>
+    <div class="small muted">${money(pl.deposit, q.currency)} today, then ${pl.schedule.slice(1).map(x => `${money(x.amount, q.currency)} on ${esc(fmtDate(x.due, { month: 'short', day: 'numeric' }))}`).join(', ')}. Seats held; tickets issued with the last payment.</div></div></label>`;
+}
+// door sales: how it's paid — cash (with change), the card reader, or another method (§2)
+function PosPayment(m, q) {
+  const total = q && !m.comp ? q.total : 0, tender = Math.round(parseFloat(m.tender || 0) * 100);
+  return `<div class="field"><label class="fl">Payment</label><div class="seg">${[['cash', 'Cash'], ['card', 'Card reader'], ['zelle', 'Zelle'], ['check', 'Check'], ['other', 'Other']].map(([k, t]) => `<button type="button" class="${m.pay === k ? 'on' : ''}" data-action="posPay" data-v="${k}">${t}</button>`).join('')}</div></div>
+    ${m.pay === 'cash' ? `<div class="grid2">${opRow('Cash received ($)', `<input class="inp" type="number" min="0" step="0.01" data-input="mo.tender" data-rr="1" value="${esc(m.tender || '')}">`)}<div class="field"><label class="fl">Change due</label><div class="display" style="font-size:26px">${tender >= total && tender ? money(tender - total) : '—'}</div></div></div>`
+      : m.pay === 'card' ? opRow('Card reader', `<select class="inp" data-input="mo.reader">${(S.readers || []).map(r => `<option value="${esc(r.id)}" ${m.reader === r.id ? 'selected' : ''}>${esc(r.label)}${r.status && r.status !== 'online' ? ' (' + esc(r.status) + ')' : ''}</option>`).join('') || '<option value="">No card reader connected</option>'}</select>`)
+      : opRow('Reference', `<input class="inp" data-input="mo.ref" value="${esc(m.ref)}" placeholder="Zelle id / check no.">`)}`;
+}
+// scanner: a product voucher result (§11)
+function ScanItem(r) {
+  const kind = resKind(r.result), it = r.item, f = r.first || {};
+  const note = { item_used: `Redeemed at ${fmtTime(f.at || it.redeemed_at)}${f.entrance ? ' · ' + f.entrance : ''}${f.device_name ? ' · ' + f.device_name : ''}`, item_void: 'This voucher was cancelled or refunded.',
+    wrong_event: `This voucher is for ${it.event_name}`, undone: 'Redemption undone — the voucher can be used again.' }[r.result];
+  return `<div class="sc-result ${kind}" data-action="scDismiss" role="alert"><div class="sc-res-icon">${ic(kind === 'ok' ? 'check' : kind === 'bad' ? 'x' : 'alert', 50)}</div>
+    <div class="sc-res-t">${esc(RES_TITLE[r.result] || r.result)}</div><div class="sc-seat"><div>${esc(it.name)}</div></div>${it.from ? `<div class="sc-res-type">in ${esc(it.from)}</div>` : ''}
+    <div class="sc-res-name">${esc(it.holder || '')}</div><div class="sc-res-code">${esc(it.code)}${it.order_ref ? ' · ' + esc(it.order_ref) : ''}</div>${note ? `<div class="sc-res-note">${esc(note)}</div>` : ''}
+    <div class="sc-res-actions">${r.result === 'item_ok' && can('door.undo', it.event_id) ? `<button class="btn glass" data-action="scUndo" data-v="${esc(it.code)}">Undo</button>` : ''}<button class="btn glass" data-action="scDismiss">Next scan</button></div></div>`;
+}
+// ══════════════════════════════════════════════════════════════════════════════
+//  FINAL ADDITIONS — gift cards, memberships, payment plans, self-service, door sales, wallet passes, embeds, product vouchers
+// ══════════════════════════════════════════════════════════════════════════════
+const boBySlug = slug => S.bos.find(b => b.slug === slug);
+const startOf = (ev, slotId) => (ev.timeSlots || []).find(s => s.id === slotId)?.start || ev.start;
+// a cart holds one organizer's things: gift cards and passes join it only when it's empty or already that box office's
+function cartFor(bo) {
+  const cur = cartBo();
+  if (cur && cur.id !== bo.id && (S.cart.items.length || S.cart.addons.length || (S.cart.gifts || []).length || (S.cart.passes || []).length)) { toast('Your cart has another organizer\'s tickets — finish that order first', true); return false; }
+  S.cart.boId = bo.id; S.cart.gifts ||= []; S.cart.passes ||= []; return true;
+}
+// §4 buy a gift card (box office page → #/gift/<slug>)
+function GiftPage() {
+  const bo = boBySlug(S.route.params[0]); if (!bo) return NotFound();
+  const gs = giftSettings(bo.settings), g = S.ui.gift ||= { amount: gs.amounts?.[0] || gs.min, custom: '', to: '', toEmail: '', message: '' };
+  if (!gs.on) return `<div class="container section"><div class="empty"><div class="display">No gift cards here</div><p>${esc(bo.name)} doesn't sell gift cards online.</p></div></div>`;
+  const amt = g.custom ? Math.round(parseFloat(g.custom) * 100) : g.amount;
+  return `<div class="container section" style="max-width:760px"><a href="#/b/${esc(bo.slug)}" class="small muted" style="text-decoration:none">← ${esc(bo.name)}</a>
+    <h1 class="display" style="font-size:44px;margin:10px 0 6px">Gift cards</h1><p class="muted">Send a ${esc(bo.name)} gift card by email. It works for any of their events${+gs.days > 0 ? ` for ${Math.round(+gs.days / 30) >= 12 ? Math.round(+gs.days / 365) + ' year' + (Math.round(+gs.days / 365) > 1 ? 's' : '') : gs.days + ' days'}` : ''}, and the balance carries over if it isn't all used at once.</p>
+    <div class="card stack" style="margin-top:18px"><div class="eyebrow dash">Amount</div>
+      <div class="row wrap">${(gs.amounts || []).map(a => `<button class="btn ${!g.custom && g.amount === a ? 'btn-dark' : 'btn-ghost'}" data-action="giftAmt" data-v="${a}">${money(a)}</button>`).join('')}
+        ${gs.custom ? `<input class="inp" style="width:150px" type="number" min="${gs.min / 100}" max="${gs.max / 100}" step="1" placeholder="Other $" data-input="gift.custom" data-rr="1" value="${esc(g.custom)}" aria-label="Other amount">` : ''}</div>
+      ${gs.custom ? `<div class="small muted">Any amount from ${money(gs.min)} to ${money(gs.max)}.</div>` : ''}
+      <div class="grid2"><div><label class="fl">Recipient's name</label><input class="inp" data-input="gift.to" value="${esc(g.to)}"></div><div><label class="fl">Recipient's email</label><input class="inp" type="email" data-input="gift.toEmail" value="${esc(g.toEmail)}" placeholder="Leave blank to send it to yourself"></div></div>
+      <div><label class="fl">Message (optional)</label><textarea class="inp" rows="2" data-input="gift.message" maxlength="300">${esc(g.message)}</textarea></div>
+      <button class="btn btn-accent btn-lg" data-action="giftAdd" data-bo="${esc(bo.id)}">Add ${amt > 0 ? money(amt) + ' ' : ''}gift card to cart <span class="arr">→</span></button></div></div>`;
+}
+// §3 memberships & season passes (#/member/<slug>)
+function MemberPage() {
+  const bo = boBySlug(S.route.params[0]); if (!bo) return NotFound();
+  const plans = (bo.settings.passPlans || []).filter(p => p.onSale !== false);
+  return `<div class="container section" style="max-width:900px"><a href="#/b/${esc(bo.slug)}" class="small muted" style="text-decoration:none">← ${esc(bo.name)}</a>
+    <h1 class="display" style="font-size:44px;margin:10px 0 6px">Memberships & passes</h1><p class="muted">Buy once, then use your pass code at checkout — it covers or discounts your tickets automatically.</p>
+    ${plans.length ? `<div class="ev-grid" style="margin-top:18px">${plans.map(p => `<div class="card plan-card"><span class="chip">${esc(PASS_KINDS[p.kind] || 'Pass')}</span><h3 style="margin-top:8px">${esc(p.name)}</h3>
+      <div class="display" style="font-size:30px;margin:6px 0">${money(p.price)}</div><p class="small muted">${esc(p.desc || '')}</p>
+      <ul class="small plan-points"><li>${p.benefit === 'free' ? `${+p.uses ? p.uses + ' visits included' : 'Unlimited visits'}${+p.perEvent ? ` · ${p.perEvent} per event` : ''}` : `${+p.pct || 0}% off ${(p.ticketTypeIds || []).length ? 'selected' : 'every'} ticket`}</li>
+        <li>${p.validUntil ? 'Valid until ' + esc(fmtDate(p.validUntil, { month: 'short', day: 'numeric', year: 'numeric' })) : +p.validDays ? `Valid for ${p.validDays >= 365 ? Math.round(p.validDays / 365) + ' year' : p.validDays + ' days'}` : 'No expiry'}</li></ul>
+      <button class="btn btn-accent btn-block" data-action="passAdd" data-bo="${esc(bo.id)}" data-v="${esc(p.id)}">Add to cart</button></div>`).join('')}</div>` : '<div class="empty">No memberships on sale right now.</div>'}</div>`;
+}
+// §10 embeds: an event list for another website (#/embed-list/<box office slug>)
+function EmbedList() {
+  const bo = boBySlug(S.route.params[0]); if (!bo) return NotFound();
+  const evs = listedEvents().filter(e => e.box_office_id === bo.id);
+  return `<div class="container" style="padding:16px"><div class="ev-grid">${evs.map(e => EvCard(e).replace(/href="#\/e\//g, 'href="#/embed/')).join('') || '<div class="empty">No events on sale right now.</div>'}</div></div>`;
+}
+// §10 just the ticket selector (#/embed/<slug>?compact=1) — checkout continues inside the widget
+function CompactWidget(ev) {
+  const av = S.avail[ev.id], stop = eventLive(ev) && controlBlock(ev, 'sales');
+  return `<div class="container" style="padding:12px;max-width:${ev.seating?.enabled ? 1000 : 560}px"><div class="between"><b>${esc(ev.name)}</b><span class="small muted">${esc(fmtDT(ev.start))}</span></div>
+    ${ev.seating?.enabled && S.sel && av ? `<div class="card" style="margin-top:10px">${BuyerSeatMap(ev, av, S.sel)}</div>` : ''}
+    <div class="card" style="margin-top:10px">${stop ? `<h3>Sales paused</h3><p class="small muted">${esc(stop)}</p>` : TicketPanel(ev, S.sel, av)}</div></div>`;
+}
+// §1 the phone-wallet card (DEMO preview; LIVE the wallet Edge Function builds the real .pkpass / Google Wallet pass)
+function WalletPreview(c, kind) {
+  return `<div class="wallet-pv ${kind}"><div class="between"><b>${esc(c.org || 'SET')}</b><span class="small">${kind === 'apple' ? 'Apple Wallet' : 'Google Wallet'}</span></div>
+    <div class="wp-ev">${esc(c.event)}</div><div class="wp-grid"><div><span>Date</span>${esc(fmtDT(c.start))}</div><div><span>Ticket</span>${esc(c.type)}</div>
+    ${c.unit ? `<div><span>${esc(unitParts(c.unit)[0])}</span>${esc(unitParts(c.unit)[1])}</div>` : ''}${c.row ? `<div><span>Row</span>${esc(c.row)}</div>` : ''}${c.seat ? `<div><span>Seat</span>${esc(c.seat)}</div>` : ''}<div><span>Name</span>${esc(c.holder)}</div></div>
+    <div class="wp-venue">${esc(c.venue)}</div>${c.void ? '<div class="wp-void">VOID — this ticket was cancelled or replaced</div>' : `<div class="qr wp-qr" data-qr="${esc(c.code)}"></div><div class="wp-code">${esc(c.code)} · ${esc(c.ref)}</div>`}</div>`;
+}
+// the buyer's ticket page extras: payment plan, product vouchers, gift cards / passes bought, self-service
+function OrderPageExtras(o) {
+  const ord = o.order, d = ord.data, pl = d.plan, self = o.self || {}, nx = planNext(pl), cur = d.currency;
+  const planCard = pl ? `<div class="card no-print" style="margin-bottom:18px"><div class="between"><h3>Payment plan</h3><span class="chip ${planState(pl) === 'overdue' ? 'bad' : planState(pl) === 'paid' ? 'ok' : 'info'}">${esc(planState(pl))}</span></div>
+      <p class="small muted" style="margin:4px 0 10px">${nx ? `Your seats are held. Your tickets are issued when the last payment is made — by ${esc(fmtDate(pl.deadline, { month: 'short', day: 'numeric', year: 'numeric' }))}.` : 'Paid in full — your tickets are below.'}</p>
+      ${pl.schedule.map(x => `<div class="sum-line small"><span>${esc(x.label)} <span class="muted">· ${x.paid_at ? 'paid ' + esc(fmtDate(x.paid_at, { month: 'short', day: 'numeric' })) : 'due ' + esc(fmtDate(x.due, { month: 'short', day: 'numeric' }))}</span></span><span class="tnum">${x.paid_at ? '✓ ' : ''}${money(x.amount, cur)}</span></div>`).join('')}
+      ${nx && ord.status === 'pending' ? `<div class="sep"></div>${DB.live ? '' : `<div class="grid3"><input class="inp tnum" placeholder="Card number" data-bind="ui.inst.number" value="${esc(S.ui.inst?.number || '')}"><input class="inp tnum" placeholder="MM/YY" data-bind="ui.inst.exp" value="${esc(S.ui.inst?.exp || '')}"><input class="inp tnum" placeholder="CVC" data-bind="ui.inst.cvc" value="${esc(S.ui.inst?.cvc || '')}"></div>
+        <p class="small muted">Demo processor: use 4242 4242 4242 4242.</p>`}<button class="btn btn-accent" style="margin-top:8px" data-action="payInst">Pay ${esc(nx.label.toLowerCase())} — ${money(nx.amount, cur)}</button>` : ''}</div>` : '';
+  const vouchers = (o.vouchers || []).length && ['paid', 'refunded'].includes(ord.status) ? `<h3 style="margin:24px 0 10px">Product vouchers</h3><p class="small muted" style="margin-bottom:10px">Show each code to staff — it's scanned and redeemed separately from your ticket.</p>
+    <div class="voucher-grid">${o.vouchers.map(v => `<div class="voucher ${v.status}"><div><b>${esc(v.name)}</b><div class="small muted">${esc(evById(v.event_id)?.name || '')}${v.from ? ' · in ' + esc(v.from) : ''}</div>
+      <div class="small">${v.status === 'valid' ? 'Not redeemed yet' : v.status === 'redeemed' ? 'Redeemed ' + esc(fmtDT(v.redeemed_at)) : 'Void'}</div></div>${v.status === 'valid' ? `<div class="qr vqr" data-qr="${esc(v.code)}"></div>` : ''}<div class="code small">${esc(v.code)}</div></div>`).join('')}</div>` : '';
+  const bought = [...(o.gifts || []).map(g => `<div class="sum-line small"><span>Gift card ${money(g.amount, cur)} for ${esc(g.to || g.email)}${g.code ? ` · <b class="tnum">${esc(g.code)}</b> · ${money(g.remaining, cur)} left` : ` · emailed to ${esc(g.email)}`}</span><span class="chip mini">${esc(g.status)}</span></div>`),
+    ...(o.passes || []).map(x => `<div class="sum-line small"><span>${esc(x.plan)} for ${esc(x.name || x.email)}${x.code ? ` · <b class="tnum">${esc(x.code)}</b>` : ` · emailed to ${esc(x.email)}`}${x.expires ? ' · valid until ' + esc(fmtDate(x.expires, { month: 'short', day: 'numeric', year: 'numeric' })) : ''}</span><span class="chip mini">${esc(x.status)}</span></div>`)];
+  const reqs = ['seatChange', 'cancel', 'refund'].filter(k => self[k]);
+  return { planCard, vouchers, bought: bought.length ? `<div class="card no-print" style="margin-top:20px"><h3>Gift cards & memberships</h3>${bought.join('')}<p class="small muted" style="margin-top:8px">Use a code at checkout — gift cards in the credit box, passes in the membership box.</p></div>` : '',
+    requests: ord.status === 'paid' && reqs.length ? `<div class="card no-print" style="margin-top:16px"><h3>Need a change?</h3><p class="small muted" style="margin:4px 0 10px">Send a request to ${esc(S.settings.name)} — nothing changes until they reply.</p>
+      <div class="row wrap">${reqs.map(k => `<button class="btn btn-ghost btn-sm" data-action="selfReq" data-v="${k}">${esc(SELF_REQUESTS[k])}</button>`).join('')}</div></div>` : '' };
+}
+// back office: the order page's extra cards — payment record (offline), payment plan, gift cards / passes sold, product vouchers
+function OrderExtras(o) {
+  const d = o.data, pay = o.payment, cur = d.currency, pl = d.plan, ev0 = o.event_ids[0], vs = (S.adm.vouchers || []).filter(v => v.order_id === o.id);
+  const gifts = (S.adm.credits || []).filter(c => c.source_order === o.id && c.kind === 'gift'), passes = (S.adm.passes || []).filter(x => x.order_id === o.id);
+  return [
+    pay?.provider === 'manual' ? `<div class="card"><h3>Payment record</h3><div class="kv2 small" style="margin-top:8px">
+      <div><span class="muted">Amount</span>${money(pay.amount ?? d.total, cur)}</div><div><span class="muted">Method</span>${esc(PAY_LABEL[pay.method] || pay.method || '')}</div>
+      <div><span class="muted">Date</span>${esc(pay.paidDate || pay.date || fmtDate(o.created_at))}</div><div><span class="muted">By</span>${esc(pay.markedPaidBy || pay.by || '')}</div>
+      <div><span class="muted">Status</span>${o.status === 'pending' ? '<span class="chip warn mini">Unpaid</span>' : '<span class="chip ok mini">Paid</span>'}</div>${pay.ref ? `<div><span class="muted">Reference</span>${esc(pay.ref)}</div>` : ''}</div>
+      ${pay.notes ? `<p class="small" style="margin-top:8px">${esc(pay.notes)}</p>` : ''}${d.channel === 'pos' ? '<p class="small muted" style="margin-top:6px">Sold at the door.</p>' : ''}</div>` : '',
+    pl ? `<div class="card"><div class="between"><h3>Payment plan</h3><span class="chip ${planState(pl) === 'overdue' ? 'bad' : planState(pl) === 'paid' ? 'ok' : 'info'}">${esc(planState(pl))}</span></div>
+      ${pl.schedule.map(x => `<div class="sum-line small"><span>${esc(x.label)} <span class="muted">· ${x.paid_at ? `paid ${esc(fmtDT(x.paid_at))} · ${esc(PAY_LABEL[x.method] || x.method || '')}${x.last4 ? ' •••• ' + esc(x.last4) : ''}` : 'due ' + esc(fmtDate(x.due, { month: 'short', day: 'numeric' }))}</span></span><span class="tnum">${money(x.amount, cur)}</span></div>`).join('')}
+      <div class="sum-line"><span class="muted">Paid so far</span><span class="tnum">${money(planPaid(pl), cur)} of ${money(d.total, cur)}</span></div><div class="small muted">Deadline ${esc(fmtDate(pl.deadline, { month: 'short', day: 'numeric', year: 'numeric' }))} · tickets are issued with the last payment.</div></div>` : '',
+    gifts.length || passes.length ? `<div class="card"><h3>Gift cards & passes sold</h3>${gifts.map(c => `<div class="between small line"><span><code>${esc(c.code)}</code> · ${money(c.amount, cur)} → ${esc(c.email)}</span><span class="muted">${money(c.remaining, cur)} left</span></div>`).join('')}
+      ${passes.map(x => `<div class="between small line"><span><code>${esc(x.code)}</code> · ${esc(x.plan_name)} → ${esc(x.email)}</span><span class="muted">${esc(x.status)}</span></div>`).join('')}</div>` : '',
+    vs.length ? `<div class="card"><h3>Product vouchers</h3>${vs.map(v => `<div class="between small line"><span><code>${esc(v.code)}</code> · ${esc(v.name)}${v.from ? ' <span class="muted">in ' + esc(v.from) + '</span>' : ''}</span><span class="chip mini ${v.status === 'redeemed' ? 'ok' : v.status === 'void' ? 'bad' : ''}">${esc(VOUCHER_STATUS[v.status])}${v.redeemed_at ? ' ' + esc(fmtTime(v.redeemed_at)) : ''}</span></div>`).join('')}</div>` : ''].join('');
+}
+// §3 / §4 back office: memberships, season passes and gift cards (#/admin/passes)
+function Passes() {
+  const set = S.adm.bo.settings, plans = set.passPlans || [], tab = S.route.params[0] === 'gifts' ? 'gifts' : 'passes', f = S.ui.pf ||= { planId: plans[0]?.id || '', email: '', name: '', kind: 'gift', amount: '', eventId: '', expires: '' };
+  const passes = S.adm.passes || [], gifts = (S.adm.credits || []).filter(c => c.kind === 'gift' || c.kind === 'voucher'), canIssue = can('orders.gifts');
+  const tabs = `<div class="tabs" style="margin-bottom:16px"><a class="${tab === 'passes' ? 'on' : ''}" href="#/admin/passes">Memberships & passes</a><a class="${tab === 'gifts' ? 'on' : ''}" href="#/admin/passes/gifts">Gift cards & vouchers</a></div>`;
+  if (tab === 'gifts') return head('Gift cards & passes', 'Gift cards and vouchers are credit codes with a balance — partial use, expiry and event limits', canIssue ? '<a class="btn btn-ghost" href="#/admin/settings">Gift card settings</a>' : '') + tabs + `
+    ${canIssue ? `<div class="card" style="margin-bottom:16px"><h3>Issue a gift card or voucher</h3><div class="grid3" style="margin-top:10px">
+      ${opRow('Type', `<select class="inp" data-bind="ui.pf.kind"><option value="gift" ${f.kind === 'gift' ? 'selected' : ''}>Gift card</option><option value="voucher" ${f.kind === 'voucher' ? 'selected' : ''}>Gift voucher</option></select>`)}
+      ${opRow('Amount ($)', `<input class="inp" type="number" min="1" step="0.01" data-bind="ui.pf.amount" value="${esc(f.amount)}">`)}${opRow('Recipient email', `<input class="inp" data-bind="ui.pf.email" value="${esc(f.email)}">`)}</div>
+      <div class="grid3">${opRow('Name', `<input class="inp" data-bind="ui.pf.name" value="${esc(f.name)}">`)}${opRow('Only for event', `<select class="inp" data-bind="ui.pf.eventId">${evOptions(f.eventId, 'Any event')}</select>`)}${opRow('Expires', `<input class="inp" type="date" data-bind="ui.pf.expires" value="${esc(f.expires)}">`)}</div>
+      <button class="btn btn-dark btn-sm" data-action="giftIssue">Issue & email it</button></div>` : ''}
+    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Code</th><th>Type</th><th>Holder</th><th>Amount</th><th>Left</th><th>Limits</th><th>Status</th></tr></thead><tbody>
+      ${gifts.map(c => `<tr><td class="tnum"><b>${esc(c.code)}</b></td><td>${esc(CREDIT_KINDS[c.kind])}${c.from_name ? `<div class="small muted">from ${esc(c.from_name)}</div>` : ''}</td><td class="small">${esc(c.name || '')}<div class="muted">${esc(c.email)}</div></td>
+        <td class="tnum">${money(c.amount)}</td><td class="tnum">${money(c.remaining)}</td><td class="small">${c.event_id ? esc(evById(c.event_id)?.name || 'one event') : 'Any event'}${c.expires ? '<div class="muted">until ' + esc(fmtDate(c.expires)) + '</div>' : ''}</td><td><span class="chip mini">${esc(c.status)}</span></td></tr>`).join('') || '<tr><td colspan="7" class="muted">No gift cards yet.</td></tr>'}
+    </tbody></table></div>`;
+  const sold = id => passes.filter(x => x.plan_id === id && x.status !== 'cancelled').length;
+  return head('Gift cards & passes', 'Season passes, memberships and multi-event passes — issued, used and tracked', canIssue ? '<a class="btn btn-ghost" href="#/admin/settings">Edit plans</a>' : '') + tabs + `
+    <div class="kpis" style="margin-bottom:16px">${plans.map(p => `<div class="kpi"><div class="k">${esc(p.name)}</div><div class="v">${sold(p.id)}</div><div class="small muted">${money(p.price)} · ${esc(PASS_KINDS[p.kind] || '')}</div></div>`).join('') || '<p class="muted">No plans yet — add one in Settings.</p>'}</div>
+    ${canIssue && plans.length ? `<div class="card" style="margin-bottom:16px"><h3>Issue a pass</h3><p class="small muted">Comp memberships, or ones paid at the counter. It's emailed to the holder.</p><div class="grid3" style="margin-top:10px">
+      ${opRow('Plan', `<select class="inp" data-bind="ui.pf.planId">${plans.map(p => `<option value="${esc(p.id)}" ${f.planId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}${opRow('Holder email', `<input class="inp" data-bind="ui.pf.email" value="${esc(f.email)}">`)}${opRow('Holder name', `<input class="inp" data-bind="ui.pf.name" value="${esc(f.name)}">`)}</div>
+      <button class="btn btn-dark btn-sm" data-action="passIssue">Issue pass</button></div>` : ''}
+    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Code</th><th>Plan</th><th>Holder</th><th>Used</th><th>Left</th><th>Expires</th><th>Status</th><th></th></tr></thead><tbody>
+      ${passes.map(x => `<tr><td class="tnum"><b>${esc(x.code)}</b></td><td>${esc(x.plan_name)}</td><td class="small">${esc(x.name || '')}<div class="muted">${esc(x.email)}</div></td><td class="tnum">${x.used}</td><td class="tnum">${x.left == null ? '∞' : x.left}</td>
+        <td class="small">${x.expires ? esc(fmtDate(x.expires, { month: 'short', day: 'numeric', year: 'numeric' })) : '—'}</td><td><span class="chip mini ${x.status === 'active' ? 'ok' : ''}">${esc(x.status)}</span></td>
+        <td>${canIssue && x.status !== 'cancelled' ? `<a href="#" class="small" data-action="passCancel" data-id="${x.id}">cancel</a>` : ''}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">No passes issued yet.</td></tr>'}
+    </tbody></table></div>`;
+}
+// §2 door sales: the manual-order screen in point-of-sale mode, then a receipt with the tickets to print or send
+function Pos() {
+  S.ui.mo ||= null;
+  if (S.ui.posDone) return PosDone(S.ui.posDone);
+  if (!S.ui.mo?.pos) S.ui.mo = { ev: posEvents()[0]?.id || S.adm.events[0]?.id, tt: '', qty: 1, slot: '', seats: [], adds: {}, name: '', email: '', phone: '', pay: 'cash', ref: '', send: true, code: '', price: '', comp: false, credit: '', pos: true, tender: '', deliver: 'print', reader: '' };
+  if (!S.readers && !S._rdReq) { S._rdReq = 1; DB.readers().then(r => { S.readers = r; render(); }).catch(() => { S.readers = []; }); }
+  return ManualOrder();
+}
+const posEvents = () => S.adm.events.filter(e => e.status === 'published' && !e.archived && D(e.end || e.start) > Date.now() - 864e5 && (can('door.sell', e.id) || can('orders.edit', e.id))).sort((a, b) => D(a.start) - D(b.start));
+function PosDone(r) {
+  const o = S.adm.orders.find(x => x.id === r.id), tks = S.adm.tickets.filter(t => t.order_id === r.id && t.status === 'valid'), vs = (S.adm.vouchers || []).filter(v => v.order_id === r.id);
+  return `<div class="no-print">${head('Sale complete', `Order ${esc(o?.ref || r.ref)} · ${money(o?.data.total ?? r.total)}${r.change ? ` · <b>change due ${money(r.change)}</b>` : ''}`, `<button class="btn btn-dark" data-action="print">Print tickets</button><button class="btn btn-accent" data-action="posNew">New sale</button>`)}
+    <p class="muted" style="margin-bottom:14px">${r.deliver === 'email' ? 'Tickets emailed to the customer.' : r.deliver === 'text' ? 'Ticket link texted to the customer.' : r.deliver === 'print' ? 'Print the tickets or show them on screen.' : ''} Inventory is already updated.</p></div>
+    <div class="pos-print">${tks.map(t => { const ev = evById(t.event_id), sp = t.seat ? seatParts(ev, t.seat, t) : null;
+      return `<div class="e-ticket"><div class="l"><div class="eyebrow" style="color:var(--accent)">${esc(ev?.ticketTypes.find(x => x.id === t.ticket_type_id)?.name || 'Ticket')}</div><h3 style="margin-top:6px">${esc(ev?.name || '')}</h3>
+        <div class="small">${esc(fmtDT(startOf(ev, t.slot_id)))} · ${sp ? esc([sp.area, sp.unit, sp.row && 'Row ' + sp.row, sp.seat && 'Seat ' + sp.seat].filter(Boolean).join(' · ')) : 'General admission'}</div></div>
+        <div class="r"><div class="qr" data-qr="${esc(t.code)}"></div><div class="code">${esc(t.code)}</div></div></div>`; }).join('')}
+      ${vs.map(v => `<div class="e-ticket"><div class="l"><div class="eyebrow">Product voucher</div><h3 style="margin-top:6px">${esc(v.name)}</h3></div><div class="r"><div class="qr" data-qr="${esc(v.code)}"></div><div class="code">${esc(v.code)}</div></div></div>`).join('')}</div>`;
+}
+// Settings cards: gift cards, memberships, payment plans, self-service, selling on your own website
+function SellingCards(s, f, c) {
+  const plans = s.passPlans || [], ss = s.selfService || {}, emb = location.origin + location.pathname.replace(/index\.html$/, ''), slug = S.adm.bo.slug;
+  const allTT = S.adm.events.flatMap(e => e.ticketTypes.map(t => ({ id: t.id, name: t.name, ev: e.name })));
+  return `<div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Gift cards</div>${c('gifts.on', 'Sell gift cards on your box office page')}
+      ${s.gifts?.on ? `<div class="grid2"><div class="field"><label class="fl">Fixed amounts ($)</label><input class="inp" data-input="giftAmts" value="${esc(S.ui.giftAmts ?? (s.gifts.amounts || []).map(v => v / 100).join(', '))}" placeholder="25, 50, 100"></div>${f('gifts.days', 'Valid for (days)', 'num', '0 = never expires')}</div>
+        ${c('gifts.custom', 'Let buyers choose their own amount')}${s.gifts.custom ? `<div class="grid2">${f('gifts.min', 'Minimum', 'money')}${f('gifts.max', 'Maximum', 'money')}</div>` : ''}
+        <p class="small muted">Gift cards work like credit: partial use, the balance carries over. Staff can also issue gift cards and vouchers in <a href="#/admin/passes/gifts">Gift cards & passes</a>.</p>` : ''}</div>
+    <div class="card"><div class="between" style="margin-bottom:12px"><div class="eyebrow dash">Memberships & season passes</div><button class="btn btn-ghost btn-sm" data-action="planAdd">${ic('plus', 13)} Plan</button></div>
+      ${plans.map((p, i) => `<div class="item-card"><div class="between"><b>${esc(p.name || 'Plan')}</b><button class="icon-btn" data-action="planDel" data-i="${i}" aria-label="Remove">${ic('x', 13)}</button></div>
+        <div class="grid3">${f(`passPlans.${i}.name`, 'Name')}${f(`passPlans.${i}.price`, 'Price', 'money')}<div class="field"><label class="fl">Kind</label><select class="inp" data-bind="set.passPlans.${i}.kind">${Object.entries(PASS_KINDS).map(([k, t]) => `<option value="${k}" ${p.kind === k ? 'selected' : ''}>${t}</option>`).join('')}</select></div></div>
+        <div class="grid3"><div class="field"><label class="fl">Benefit</label><select class="inp" data-bind="set.passPlans.${i}.benefit" data-action-change="rr">${Object.entries(PASS_BENEFITS).map(([k, t]) => `<option value="${k}" ${p.benefit === k ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+          ${p.benefit === 'discount' ? f(`passPlans.${i}.pct`, 'Discount %', 'num') : f(`passPlans.${i}.perEvent`, 'Per event (0 = no limit)', 'num')}${f(`passPlans.${i}.uses`, 'Number of uses (0 = unlimited)', 'num')}</div>
+        <div class="grid3">${f(`passPlans.${i}.validDays`, 'Valid for (days)', 'num')}${f(`passPlans.${i}.validUntil`, 'Or valid until', 'date')}${f(`passPlans.${i}.max`, 'How many can be sold (0 = no limit)', 'num')}</div>
+        ${f(`passPlans.${i}.desc`, 'Description')}
+        <div class="targets"><div class="fl">Eligible events <span class="muted">(none = all)</span></div>${S.adm.events.map(e => setTog(`passPlans.${i}.eventIds`, e.id, esc(e.name))).join('')}</div>
+        <div class="targets"><div class="fl">Eligible ticket types <span class="muted">(none = any)</span></div>${allTT.map(t => setTog(`passPlans.${i}.ticketTypeIds`, t.id, `${esc(t.name)} <span class="muted">· ${esc(t.ev)}</span>`)).join('')}</div>
+        ${c(`passPlans.${i}.onSale`, 'On sale on the box office page')}</div>`).join('') || '<p class="small muted">Season passes (visits included), memberships (a member discount), multi-event and VIP passes. Members-only ticket types are set on each event.</p>'}</div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:12px">Payment plans</div>${c('installments.on', 'Let buyers pay in installments (card)')}
+      ${s.installments?.on ? `<div class="grid2">${f('installments.minTotal', 'For orders from', 'money')}${f('installments.deposit', 'Deposit %', 'num')}</div><div class="grid2">${f('installments.count', 'Installments after the deposit', 'num')}${f('installments.finalDays', 'Paid in full this many days before the event', 'num')}</div>
+        <p class="small muted">Seats stay held and tickets are issued with the last payment. Buyers get reminders 3 days before each one; you hear if the deadline passes. An event can switch it off (Controls & fees).</p>` : ''}</div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:6px">Customer self-service</div><p class="small muted" style="margin-bottom:10px">Everything is off unless you switch it on. Each event can override these (Controls & fees). Requests arrive in Customers → Inbox.</p>
+      ${SELF_SERVICE.map(([k, t]) => `<label class="check" style="margin-bottom:6px"><input type="checkbox" data-bind="set.selfService.${k}" data-t="bool" ${ss[k] ? 'checked' : ''}> <span>${esc(t)}</span></label>`).join('')}</div>
+    <div class="card"><div class="eyebrow dash" style="margin-bottom:6px">Sell on your own website</div><p class="small muted" style="margin-bottom:10px">Paste one line on any site (WordPress, Wix, Squarespace, Webflow). Buyers pick tickets and check out without leaving your site.</p>
+      <div class="small"><b>1. Load the widget</b> (once per page)</div><pre class="code">&lt;script src="${esc(emb)}embed.js" async&gt;&lt;/script&gt;</pre>
+      <div class="small"><b>Buy Tickets button</b> — opens checkout over your page</div><pre class="code">&lt;a href="${esc(emb)}#/e/EVENT-SLUG" data-set-tickets="EVENT-SLUG"&gt;Buy tickets&lt;/a&gt;</pre>
+      <div class="small"><b>Event list</b></div><pre class="code">&lt;div data-set-widget="list" data-box-office="${esc(slug)}"&gt;&lt;/div&gt;</pre>
+      <div class="small"><b>Ticket selector</b> (compact) or <b>full event widget</b></div><pre class="code">&lt;div data-set-widget="tickets" data-event="EVENT-SLUG"&gt;&lt;/div&gt;
+&lt;div data-set-widget="event" data-event="EVENT-SLUG"&gt;&lt;/div&gt;</pre><p class="small muted">Each event's own snippets are on its Share & embed tab.</p></div>`;
+}
+const setTog = (path, v, label) => { const on = (getPath(S.ui.set, path) || []).map(String).includes(String(v));
+  return `<label class="check small tog"><input type="checkbox" data-action="setTog" data-path="${esc(path)}" data-v="${esc(v)}" ${on ? 'checked' : ''}> <span>${label}</span></label>`; };
+// event editor: purchase rules (§7)
+function RulesEditor(ev) {
+  const rules = ev.rules || [];
+  return `<div class="item-card"><div class="between"><div><b>Purchase rules</b><div class="small muted">Ticket B only with ticket A, children need an adult, minimum / maximum across several types. Product rules (e.g. only with VIP) are on Products & packages.</div></div>
+      <button type="button" class="btn btn-ghost btn-sm" data-action="ruleAdd">${ic('plus', 13)} Rule</button></div>
+    ${rules.map((r, i) => `<div class="rule-box"><div class="between"><select class="inp inp-sm" style="width:auto" data-bind="draft.rules.${i}.kind" data-action-change="rr">${Object.entries(RULE_KINDS).map(([k, t]) => `<option value="${k}" ${r.kind === k ? 'selected' : ''}>${t}</option>`).join('')}</select>
+      <button type="button" class="icon-btn" data-action="delRule" data-path="rules" data-i="${i}" aria-label="Remove">${ic('x', 13)}</button></div>
+      <div class="targets"><div class="fl">${r.kind === 'requires' ? 'These tickets…' : 'Ticket types counted together'}</div>${ev.ticketTypes.map(t => tog(`rules.${i}.ttIds`, t.id, esc(t.name))).join('')}</div>
+      ${r.kind === 'requires' ? `<div class="targets"><div class="fl">…need one of these in the same order</div>${ev.ticketTypes.map(t => tog(`rules.${i}.needs`, t.id, esc(t.name))).join('')}</div>
+        <div class="grid2">${inp(`rules.${i}.per`, 'One needed ticket for every', { t: 'int', hint: '0 = just at least one; 2 = one adult per 2 children' })}${inp(`rules.${i}.message`, 'Message to buyers (optional)')}</div>`
+        : `<div class="grid3">${inp(`rules.${i}.min`, 'Minimum in total', { t: 'int' })}${inp(`rules.${i}.max`, 'Maximum in total', { t: 'int' })}${inp(`rules.${i}.message`, 'Message (optional)')}</div>`}</div>`).join('')}</div>`;
+}
+// event Controls & fees tab: payment plans + self-service for this event
+function EventSelfCard(ev) {
+  const bo = S.adm.bo.settings, v = k => ev.selfService?.[k] === true ? 'on' : ev.selfService?.[k] === false ? 'off' : '';
+  return `<div class="card"><h3>Payment plans & customer self-service</h3>
+    <label class="check" style="margin:8px 0"><input type="checkbox" data-bind="draft.installments.off" data-t="bool" ${ev.installments?.off ? 'checked' : ''}> <span>No payment plans for this event${bo.installments?.on ? '' : ' <span class="muted">(off for the whole box office anyway)</span>'}</span></label>
+    <div class="grid2">${SELF_SERVICE.map(([k, t]) => `<div class="field"><label class="fl">${esc(t)}</label><select class="inp" data-action-change="evSelf" data-k="${k}"><option value="" ${!v(k) ? 'selected' : ''}>Box office setting (${bo.selfService?.[k] ? 'on' : 'off'})</option><option value="on" ${v(k) === 'on' ? 'selected' : ''}>On for this event</option><option value="off" ${v(k) === 'off' ? 'selected' : ''}>Off for this event</option></select></div>`).join('')}</div></div>`;
+}
+
+Object.assign(A, {
+  giftAmt: el => { S.ui.gift.amount = +el.dataset.v; S.ui.gift.custom = ''; render(); },
+  giftAdd: el => { const bo = S.bos.find(b => b.id === el.dataset.bo), g = S.ui.gift, amount = g.custom ? Math.round(parseFloat(g.custom) * 100) : g.amount;
+    const e = giftErr(bo.settings, { amount, toEmail: g.toEmail }); if (e) return toast(e, true); if (!cartFor(bo)) return;
+    S.cart.gifts.push({ amount, to: g.to.trim(), toEmail: g.toEmail.trim(), message: g.message.trim() }); S.ui.gift = null; saveCart(); location.hash = '#/cart'; },
+  passAdd: el => { const bo = S.bos.find(b => b.id === el.dataset.bo); if (!cartFor(bo)) return; const x = S.cart.passes.find(p => p.planId === el.dataset.v);
+    if (x) x.qty++; else S.cart.passes.push({ planId: el.dataset.v, qty: 1 }); saveCart(); location.hash = '#/cart'; },
+  delGP: el => { (S.cart[el.dataset.k] || []).splice(+el.dataset.i, 1); saveCart(); render(); },
+  openPass: () => { S.co.passOpen = true; render(); },
+  applyPass: async () => { const bo = cartBo(); try { const r = await DB.checkPass(bo?.id, S.co.passCode, S.co.email); if (!r || r.error) return toast(r?.error || 'That code is not valid', true); S.co.pass = r; S.co.passOpen = false; render(); } catch (e) { toast(e.message, true); } },
+  removePass: () => { S.co.pass = null; render(); },
+  payInst: async () => { const o = S.order; if (!o?.order) return;
+    try { const r = await DB.payInstallment(o.order.id, S.route.params[1], S.ui.inst || {});
+      if (r?.clientSecret) { S.co.pay = { ...r, id: o.order.id, key: S.route.params[1], ref: o.order.ref, installment: true, expires_at: new Date(Date.now() + 36e5).toISOString() }; location.hash = '#/cart'; return; }
+      S.ui.inst = null; toast(r?.status === 'paid' ? 'Paid in full — your tickets are issued' : 'Payment received — thank you'); loadOrder(o.order.id, S.route.params[1]); } catch (e) { toast(e.message, true); } },
+  walletAdd: el => { const o = S.order, t = o?.tickets.find(x => x.id === el.dataset.id); if (!t) return;
+    if (DB.live) { location.href = walletUrl(el.dataset.v, o.order.id, S.route.params[1], t.id); return; }
+    const ev = evById(t.event_id) || { name: '', ticketTypes: [] }, c = { ...walletCard(ev, t, o.order), org: S.settings.name };
+    modal(el.dataset.v === 'apple' ? 'Add to Apple Wallet' : 'Save to Google Wallet', `${WalletPreview(c, el.dataset.v)}<p class="small muted" style="margin-top:12px">Demo preview. On the live site this downloads the real pass; if the ticket is cancelled or replaced, the pass on the phone updates to show it's no longer valid.</p>`, '<button class="btn btn-dark" data-action="closeModal">Done</button>'); hydrate(); },
+  selfRename: el => { const t = S.order?.tickets.find(x => x.id === el.dataset.id); S.ui.ss = { action: 'rename', ticket: el.dataset.id, name: t?.holder || '' };
+    modal('Change the name on this ticket', `<div class="field"><label class="fl">New name</label><input class="inp" data-input="ss.name" value="${esc(S.ui.ss.name)}"></div>`, '<button class="btn btn-dark" data-action="selfGo">Save</button>'); },
+  selfTransfer: el => { S.ui.ss = { action: 'transfer', ticket: el.dataset.id, name: '', email: '' };
+    modal('Transfer this ticket', `<p class="small muted" style="margin-bottom:10px">The new holder gets a new ticket by email. Your copy of this ticket stops working.</p><div class="field"><label class="fl">Their name</label><input class="inp" data-input="ss.name"></div><div class="field"><label class="fl">Their email</label><input class="inp" type="email" data-input="ss.email"></div>`, '<button class="btn btn-dark" data-action="selfGo">Transfer ticket</button>'); },
+  selfReq: el => { S.ui.ss = { action: el.dataset.v, body: '' };
+    modal(SELF_REQUESTS[el.dataset.v], `<div class="field"><label class="fl">Tell the box office what you need</label><textarea class="inp" rows="4" data-input="ss.body"></textarea></div>`, '<button class="btn btn-dark" data-action="selfGo">Send request</button>'); },
+  selfResend: async () => { S.ui.ss = { action: 'resend' }; return A.selfGo(); },
+  selfGo: async () => { const o = S.order, ss = S.ui.ss; if (!o?.order || !ss) return;
+    try { await DB.selfService(o.order.id, S.route.params[1], ss.action, ss); $('#modal').innerHTML = ''; S.ui.ss = null;
+      toast({ rename: 'Name changed', transfer: 'Ticket transferred — the new holder has been emailed', resend: 'Your tickets are on their way', seatChange: 'Request sent', cancel: 'Request sent', refund: 'Request sent' }[ss.action]); loadOrder(o.order.id, S.route.params[1]); } catch (e) { toast(e.message, true); } },
+  planAdd: () => { (S.ui.set.passPlans ||= []).push({ id: shortId('pp_'), name: 'New membership', kind: 'membership', price: 5000, desc: '', benefit: 'discount', pct: 10, uses: 0, perEvent: 0, eventIds: [], ticketTypeIds: [], validDays: 365, onSale: true, max: 0 }); render(); },
+  planDel: el => { S.ui.set.passPlans.splice(+el.dataset.i, 1); render(); },
+  setTog: el => { const path = el.dataset.path, v = el.dataset.v, list = (getPath(S.ui.set, path) || []).filter(x => String(x) !== String(v)); if (el.checked) list.push(v); setPath(S.ui.set, path, list); render(); },
+  ruleAdd: () => { (S.draft.rules ||= []).push({ id: shortId('ru_'), kind: 'requires', ttIds: [], needs: [], per: 0, message: '' }); dirty(); render(); },
+  passIssue: async () => { const f = S.ui.pf; try { const r = await DB.passAction('issue', { planId: f.planId, email: f.email, name: f.name }); S.ui.pf = null; await reloadAdmin(); toast(`Pass ${r.code} issued`); } catch (e) { toast(e.message, true); } },
+  passCancel: async el => { try { await DB.passAction('cancel', { id: el.dataset.id }); await reloadAdmin(); toast('Pass cancelled'); } catch (e) { toast(e.message, true); } },
+  giftIssue: async () => { const f = S.ui.pf; try { const r = await DB.creditAction('issue', { kind: f.kind, email: f.email, name: f.name, amount: opDollars(f.amount), eventId: f.eventId || null, expires: f.expires ? new Date(f.expires + 'T23:59').toISOString() : null });
+    S.ui.pf = null; await reloadAdmin(); toast(`${CREDIT_KINDS[r.kind] || 'Gift card'} ${r.code} issued`); } catch (e) { toast(e.message, true); } },
+  posPay: el => { S.ui.mo.pay = el.dataset.v; render(); },
+  moDeliver: el => { S.ui.mo.deliver = el.dataset.v; render(); },
+  posNew: () => { S.ui.posDone = null; S.ui.mo = null; render(); },
+  posSell: async () => {
+    const m = S.ui.mo, ev = evById(m.ev), { items, addons } = S.ui.moItems || {}; if (!ev) return;
+    if (!items?.length && !addons?.length) return toast(ev.seating?.enabled ? 'Pick seats on the map' : 'Choose tickets', true);
+    if (m.deliver === 'email' && !EMAIL_RE.test(m.email.trim())) return toast('Enter the customer\'s email to email the tickets', true);
+    if (m.deliver === 'text' && !normPhone(m.phone)) return toast('Enter the customer\'s mobile number', true);
+    const card = m.pay === 'card' && !m.comp, email = m.email.trim() || `door-sale@${S.adm.bo.slug}.invalid`;
+    try {
+      const r = await DB.placeOrder({ buyer: { name: m.name.trim() || 'Walk-up guest', email, phone: m.phone || '' }, items, addons, payment: card ? 'terminal' : 'manual', pos: true, comp: !!m.comp, code: m.comp ? '' : m.code,
+        payMethod: m.pay === 'card' ? 'terminal' : m.pay, payRef: m.ref, send: m.deliver === 'email', smsTickets: m.deliver === 'text', source: 'door' }, true);
+      if (card && r.status === 'awaiting_payment') { toast('Tap, insert or swipe the card on the reader…'); await DB.terminalPay(r.id, m.reader || S.readers?.[0]?.id); }
+      await reloadAdmin(); const total = S.adm.orders.find(o => o.id === r.id)?.data.total ?? r.total;
+      S.ui.posDone = { ...r, deliver: m.deliver, change: m.pay === 'cash' && m.tender ? Math.max(0, Math.round(parseFloat(m.tender) * 100) - total) : 0 }; S.ui.mo = null; render();
+    } catch (e) { toast(e.message, true); }
+  },
+});
+Object.assign(CHANGE, {
+  evSelf: el => { const ss = S.draft.selfService ||= {}; if (el.value === 'on') ss[el.dataset.k] = true; else if (el.value === 'off') ss[el.dataset.k] = false; else delete ss[el.dataset.k]; dirty(); render(); },
+});
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
 boot();

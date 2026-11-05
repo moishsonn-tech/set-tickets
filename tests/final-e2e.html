@@ -1,0 +1,126 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">running</pre><iframe id="f" style="width:1300px;height:900px"></iframe><script>
+// Final additions (Eli's "Final Additions Before Development") — the browser / DEMO side. Run from the local server: /final-e2e.html.
+// The same rules on Postgres (passes, gift cards, plans, rules, pricing, self-service, POS, offline payments, vouchers, wallet) are in tests/db-e2e.sql.
+const out=[], log=m=>{out.push(m);document.getElementById('out').textContent=out.join('\n')};
+const f=document.getElementById('f'); const W=()=>f.contentWindow;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const E=x=>W().eval(x);
+const until=async(fn,ms=8000)=>{const t=Date.now();while(Date.now()-t<ms){try{const v=fn();if(v)return v}catch(e){}await sleep(40)}throw new Error('timeout '+fn)};
+const has=t=>W().document.body.textContent.includes(t);
+let lastErr=''; const ok=(c,m)=>log((c?'PASS ':'FAIL ')+m+(c?'':'  [hash '+W().location.hash+'] last error: '+lastErr));
+async function throwsP(code){ try{ await E(code); lastErr='(no error)'; return false }catch(e){ lastErr=e.message; return e.message||true } }
+async function as(email){ await E('A.signOut()'); await sleep(80); W().location.hash='#/admin'; await until(()=>W().document.querySelector('[data-action="demoAs"]'));
+  E(`S.ui.login.email=${JSON.stringify(email)}`); await E('A.login()'); await until(()=>E('S.adm')); await sleep(60); }
+const ev=slug=>E(`Demo.st.events.find(e=>e.slug==='${slug}')`);
+const view=async hash=>{ W().location.hash=hash; await sleep(90); E('render()'); await sleep(40); };
+const acc=ids=>`policiesFor(Demo.st.boxOffices.find(b=>b.id===Demo.st.events.find(e=>e.id==='${ids[0]}').box_office_id),[${ids.map(i=>`Demo.st.events.find(e=>e.id==='${i}')`).join(',')}]).map(({kind,eventId,version})=>({kind,eventId,version}))`;
+const RL='for(const k in RL)delete RL[k];';
+const order=(p,ids)=>`(()=>{${RL}return DB.placeOrder(Object.assign(${JSON.stringify(p)},{accepted:${ids.length?acc(ids):`policiesFor(Demo.st.boxOffices.find(b=>b.id==='${p.boxOfficeId}'),[]).map(({kind,eventId,version})=>({kind,eventId,version}))`},holdToken:DB.holdToken()}))})()`;
+const CARD={number:'4242424242424242',exp:'12/34',cvc:'123'};
+const O=id=>E(`Demo.st.orders.find(o=>o.id==='${id}')`);
+const pay=async r=>{ await E(`DB.payOrder('${r.id}','${O(r.id).access_key}',${JSON.stringify(CARD)})`); return O(r.id); };
+(async()=>{try{
+  f.src='/index.html#/'; await until(()=>E('!S.loading')); W().localStorage.clear(); W().sessionStorage.clear(); W().location.reload(); await sleep(300);
+  await until(()=>E('!S.loading') && W().document.querySelector('.ev-card'));
+  W().onerror=(e)=>log('PAGE ERROR '+e); W().onunhandledrejection=(e)=>log('PAGE REJECTION '+(e.reason&&e.reason.stack||e.reason)); W().confirm=()=>true;
+  const neon=ev('neon-nights-live'), gala=ev('winter-orchestra-gala'), food=ev('city-food-festival'), summit=ev('founders-summit'), kids=ev('kids-science-show');
+  const bo1=neon.box_office_id, ga=neon.ticketTypes[0], lounge=neon.ticketTypes.find(t=>t.memberOnly);
+  const buyer=n=>({name:'Fa '+n,email:'fa'+n+'@test.co',phone:''});
+
+  // ── §4 gift cards ──
+  let r=await E(order({buyer:buyer(1),boxOfficeId:bo1,gifts:[{amount:5000,toName:'Rae',toEmail:'rae@test.co',message:'Enjoy!'}],payment:'card'},[]));
+  let o=await pay(r); const gift=E(`Demo.st.credits.find(c=>c.order_id==='${r.id}'||c.order==='${r.id}'||(c.kind==='gift'&&c.email==='rae@test.co'))`);
+  ok(o.status==='paid' && gift && gift.kind==='gift' && gift.amount===5000 && gift.email==='rae@test.co','§4 a customer buys a $50 gift card; it goes to the recipient');
+  ok(o.data.fee===0 && (o.data.tax||0)===0,'§4 no booking fee or tax on a gift card (they apply when it is spent)');
+  ok(!!await throwsP(order({buyer:buyer(2),boxOfficeId:bo1,gifts:[{amount:5}],payment:'card'},[])),'§4 gift card amount outside the allowed range is refused');
+  r=await E(order({buyer:buyer(3),items:[{eventId:neon.id,ticketTypeId:ga.id,qty:1}],addons:[],payment:'card',credit:gift.code},[neon.id])); o=await pay(r);
+  let cs=E(`creditState(Demo.st.credits.find(c=>c.code==='${gift.code}'),Demo.st.orders)`);
+  ok(o.data.credit && o.data.credit.code===gift.code && cs.remaining===5000-o.data.credit.amount && cs.remaining>0,'§4 partial use: the gift card pays part of an order, the balance is kept');
+
+  // ── §3 memberships & season passes ──
+  const maya=E(`Demo.st.passes.find(p=>p.email==='maya@example.com')`), sam=E(`Demo.st.passes.find(p=>p.email==='sam.season@example.com')`);
+  ok(maya && sam,'§3 sample membership and season pass exist');
+  const cp=await E(`DB.checkPass('${bo1}','${maya.code}','maya@example.com')`);
+  ok(cp && !cp.error,'§3 a membership code checks out at checkout');
+  ok((await E(`DB.checkPass('${bo1}','${maya.code}','someone@else.co')`)).error,'§3 the pass only works with its own email');
+  ok(!!await throwsP(order({buyer:buyer(4),items:[{eventId:neon.id,ticketTypeId:lounge.id,qty:1}],addons:[],payment:'card'},[neon.id])),'§3 member-only ticket refused without a membership');
+  r=await E(order({buyer:{name:'Maya Gold',email:'maya@example.com',phone:''},items:[{eventId:neon.id,ticketTypeId:lounge.id,qty:1}],addons:[],payment:'card',pass:maya.code,useAcct:false},[neon.id]));
+  o=O(r.id); ok(o && o.data.pass && o.data.pass.discount>0,'§3 a member buys a members-only ticket with the member discount');
+  const sq=E(`DB.checkPass('${bo1}','${sam.code}','sam.season@example.com')`); const before=E(`passState(Demo.st,Demo.st.passes.find(p=>p.code==='${sam.code}'))`);
+  const stalls=gala.ticketTypes.find(t=>t.name==='Stalls');
+  const seat=E(`(()=>{const e=Demo.st.events.find(e=>e.slug==='winter-orchestra-gala');e.seating.noSingles=false;Demo.save();return [...seatStates(e,{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt==='${stalls.id}').map(x=>x.p.id).slice(0,1)})()`);
+  r=await E(order({buyer:{name:'Sam Rivera',email:'sam.season@example.com',phone:''},items:[{eventId:gala.id,ticketTypeId:stalls.id,qty:1,seats:seat}],addons:[],payment:'card',pass:sam.code},[gala.id]));
+  o=O(r.id); if(o.status==='awaiting_payment') o=await pay(r);
+  const after=E(`passState(Demo.st,Demo.st.passes.find(p=>p.code==='${sam.code}'))`);
+  ok(o.data.pass && o.data.pass.uses===1 && (o.data.ticketsTotal-o.data.discount<=0 || o.data.pass.discount>0),'§3 the season pass covers a ticket (free)');
+  ok(after.used===before.used+1,'§3 usage tracked: one visit used');
+  ok(!!await throwsP(order({buyer:{name:'Sam Rivera',email:'sam.season@example.com',phone:''},items:[{eventId:gala.id,ticketTypeId:stalls.id,qty:2,seats:E(`[...seatStates(Demo.st.events.find(e=>e.slug==='winter-orchestra-gala'),{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt==='${stalls.id}').map(x=>x.p.id).slice(0,2)`)}],addons:[],payment:'card',pass:sam.code,passOnly:true},[gala.id]))
+    || E(`Demo.st.orders.slice(-1)[0].data.pass`)?.uses<=1,'§3 one use per event: a second ticket for the same event isn\'t covered');
+
+  // ── §5 payment plans ──
+  const vip=gala.ticketTypes.reduce((a,t)=>t.price>a.price?t:a);
+  const vseats=E(`[...seatStates(Demo.st.events.find(e=>e.slug==='winter-orchestra-gala'),{tickets:Demo.st.tickets,statuses:Demo.st.seatStatus,orders:Demo.st.orders}).values()].filter(x=>x.state==='available'&&x.p.tt==='${vip.id}').map(x=>x.p.id).slice(0,2)`);
+  r=await E(order({buyer:buyer(5),items:[{eventId:gala.id,ticketTypeId:vip.id,qty:2,seats:vseats}],addons:[],payment:'card',installments:true},[gala.id]));
+  o=O(r.id); const pl=o.data.plan;
+  ok(pl && pl.schedule.length>=2 && pl.schedule[0].amount<o.data.total && pl.schedule.reduce((a,x)=>a+x.amount,0)===o.data.total && new Date(pl.deadline)<new Date(gala.start),'§5 deposit + installments add up to the total, all before the deadline');
+  o=await pay(r); ok(o.status==='pending' && !E(`Demo.st.tickets.some(t=>t.order_id==='${r.id}')`),'§5 deposit paid: seats held, no tickets yet');
+  await E(`DB.payInstallment('${r.id}','${o.access_key}',${JSON.stringify(CARD)})`); o=O(r.id);
+  ok(o.data.plan.schedule[1].paid_at && o.data.plan.schedule[1].ref!==o.payment.ref,'§5 the customer pays an installment by card (its own payment)');
+  let rc=E(`reconcile(Demo.st.orders.filter(o=>o.id==='${r.id}'),Demo.st.procTx.filter(x=>x.order_id==='${r.id}'))`);
+  ok(rc.rows.length===2 && rc.issues.length===0 && rc.totals.diff===0,'§5 reconciliation matches each plan payment to the processor');
+  await as('moishsonn@gmail.com');
+  for(let i=0;i<6&&O(r.id).status==='pending';i++){ if(await throwsP(`DB.orderAction('${r.id}','installment',{method:'zelle',ref:'ZL-${i}'})`)) log('installment error: '+lastErr); await sleep(20); }
+  o=O(r.id); ok(o.status==='paid' && E(`Demo.st.tickets.filter(t=>t.order_id==='${r.id}'&&t.status==='valid').length`)===2,'§5 last installment (recorded by staff) → paid in full, tickets issued');
+  const cardPaid=o.data.plan.schedule.filter(x=>x.provider==='demo').reduce((a,x)=>a+x.amount,0);
+  ok(!!await throwsP(`DB.orderAction('${r.id}','refund',{mode:'amount',amount:${cardPaid+1},to:'original'})`) && /back to the card/.test(lastErr),'§5 a card refund can\'t exceed what the plan took by card');
+  await E(`DB.orderAction('${r.id}','refund',{mode:'amount',amount:${cardPaid},to:'original'})`); o=O(r.id);
+  const rf=o.data.refunds.slice(-1)[0]; ok(rf.parts && rf.parts.length===2 && rf.parts.reduce((a,x)=>a+x.amount,0)===cardPaid,'§5 the card refund is split over the card installments');
+  rc=E(`reconcile(Demo.st.orders.filter(o=>o.id==='${r.id}'),Demo.st.procTx.filter(x=>x.order_id==='${r.id}'))`);
+  ok(rc.issues.length===0 && rc.totals.diff===0,'§5 reconciliation still matches after the split refund'); if(rc.issues.length||rc.totals.diff) log('DBG '+JSON.stringify(rc.rows.map(r=>[r.status,r.ref,r.diffs,r.diff])));
+
+  // ── §6 pricing rules ──
+  const evening=food.ticketTypes[1]; const slot=(food.timeSlots||[]).find(s=>new Date(s.start).getHours()>=16) || null;
+  ok(E(`peakRule(Demo.st.events.find(e=>e.slug==='city-food-festival').ticketTypes[1],'2026-07-04T21:00:00Z','America/New_York')`)?.price===2400,'§6 peak price applies to an evening start');
+  ok(E(`peakRule(Demo.st.events.find(e=>e.slug==='city-food-festival').ticketTypes[1],'2026-07-04T15:00:00Z','America/New_York')`)===null,'§6 off-peak start: list price');
+  const lm=summit.ticketTypes[0]; ok(lm.phases.some(p=>p.hoursBefore>0) && E(`quote({items:[{eventId:'${summit.id}',ticketTypeId:'${lm.id}',qty:1}],addons:[],donation:0},[Demo.st.events.find(e=>e.slug==='founders-summit')],pricingSettings(Demo.st.boxOffices.find(b=>b.id==='${summit.box_office_id}'),Demo.st.platform)).ticketsTotal`)!==22900,'§6 last-minute price waits for its window (event is weeks away)');
+
+  // ── §7 purchase rules ──
+  const adult=kids.ticketTypes[0], child=kids.ticketTypes[1], kAns=Object.fromEntries((kids.questions||[]).filter(q=>q.scope!=='ticket').map(q=>[q.id,q.type==='terms'||q.type==='waiver'?true:q.type==='signature'?'Test Parent':q.type==='select'?q.options.split(',')[0].trim():'Test'])), ks=((kids.timeSlots||[]).find(x=>!x.hidden&&!x.unavailable&&!x.soldOut&&new Date(x.start||kids.start)>new Date())||{}).id||'';
+  ok(!!await throwsP(order({buyer:buyer(6),items:[{eventId:kids.id,ticketTypeId:child.id,qty:2,slotId:ks}],addons:[],payment:'offline',answers:kAns},[kids.id])) && /only be bought with/.test(lastErr),'§7 a child ticket needs an adult ticket');
+  ok(!!await throwsP(order({buyer:buyer(7),items:[{eventId:kids.id,ticketTypeId:adult.id,qty:6,slotId:ks},{eventId:kids.id,ticketTypeId:child.id,qty:6,slotId:ks}],addons:[],payment:'offline',answers:kAns},[kids.id])) && /At most 10/.test(lastErr),'§7 maximum across a combination of ticket types');
+  ok(!await throwsP(order({buyer:buyer(8),items:[{eventId:kids.id,ticketTypeId:adult.id,qty:1,slotId:ks},{eventId:kids.id,ticketTypeId:child.id,qty:2,slotId:ks}],addons:[],payment:'offline',answers:kAns},[kids.id])),'§7 adult + children: allowed');
+
+  // ── §2 door sales / §9 offline payments / §11 product vouchers ──
+  const drink=neon.addons.find(a=>a.name==='Drink voucher');
+  r=await E(`(()=>{${RL}return DB.placeOrder({buyer:{name:'Walk-up',email:'walk@test.co',phone:''},items:[{eventId:'${neon.id}',ticketTypeId:'${ga.id}',qty:2}],addons:[{eventId:'${neon.id}',addonId:'${drink.id}',qty:2}],payment:'manual',payMethod:'cash',pos:true,source:'door'},true)})()`);
+  o=O(r.id); ok(o.status==='paid' && o.data.channel==='pos' && E(`Demo.st.tickets.filter(t=>t.order_id==='${r.id}').length`)===2,'§2 a door sale is paid at once and issues its tickets');
+  ok(JSON.stringify(o).includes('cash'),'§9 the payment method (cash) is recorded on the order');
+  const vs=E(`Demo.st.vouchers.filter(v=>v.order_id==='${r.id}')`); ok(vs.length===2 && vs.every(v=>v.status==='valid' && v.code),'§11 each drink voucher has its own QR code');
+  let sc=await E(`DB.checkin('${vs[0].code}',false,'${neon.id}',{})`); ok(sc.result==='item_ok','§11 scanning a voucher redeems it');
+  sc=await E(`DB.checkin('${vs[0].code}',false,'${neon.id}',{})`); ok(sc.result==='item_used','§11 a redeemed voucher can\'t be used twice');
+  ok(E(`Demo.st.tickets.filter(t=>t.order_id==='${r.id}').every(t=>!t.checked_in_at)`),'§11 redeeming a product doesn\'t check in the ticket');
+
+  // ── §8 customer self-service (off unless the box office turns it on) ──
+  const po=E(`Demo.st.orders.find(o=>o.status==='paid'&&o.box_office_id==='${bo1}'&&Demo.st.tickets.some(t=>t.order_id===o.id&&t.status==='valid'&&!t.checked_in_at&&t.event_id==='${neon.id}'))`);
+  const tk=E(`Demo.st.tickets.find(t=>t.order_id==='${po.id}'&&t.status==='valid'&&!t.checked_in_at)`);
+  await E(`DB.selfService('${po.id}','${po.access_key}','transfer',{ticket:'${tk.id}',name:'New Holder',email:'newholder@test.co'})`);
+  ok(E(`Demo.st.tickets.find(t=>t.id==='${tk.id}').status`)==='replaced' && E(`Demo.st.tickets.some(t=>t.replaces==='${tk.id}'&&t.holder==='New Holder')`),'§8 transfer: new holder gets a new code, the old one stops working');
+  ok(!!await throwsP(`DB.selfService('${po.id}','${po.access_key}','refund',{})`) && /doesn't offer/.test(lastErr),'§8 refund requests stay off when the box office hasn\'t enabled them');
+  const harbor=E(`Demo.st.orders.find(o=>o.status==='paid'&&o.box_office_id!=='${bo1}'&&Demo.st.tickets.some(t=>t.order_id===o.id&&t.status==='valid'&&!t.checked_in_at))`);
+  if(harbor){ const ht=E(`Demo.st.tickets.find(t=>t.order_id==='${harbor.id}'&&t.status==='valid'&&!t.checked_in_at)`);
+    ok(!!await throwsP(`DB.selfService('${harbor.id}','${harbor.access_key}','transfer',{ticket:'${ht.id}',name:'X Y',email:'xy@test.co'})`),'§8 a box office that only allows downloads refuses transfers'); }
+  ok(E(`DEFAULT_SETTINGS.selfService && Object.values(DEFAULT_SETTINGS.selfService).every(v=>!v)`),'§8 every self-service switch is off by default');
+
+  // ── pages render ──
+  await view('#/admin/passes'); ok(has('Season Pass 2026') && has('Skyline Members'),'§3 back office: memberships & passes page');
+  await view('#/admin/passes/gifts'); ok(has('Gift'),'§4 back office: gift cards page');
+  await view(`#/admin/orders/new?pos=1`); await sleep(60);
+  await view(`#/admin/orders/${po.id}`); ok(has(po.ref),'order page renders with Final Additions extras');
+  await E('A.signOut()'); await sleep(60);
+  await view('#/gift/skyline-live'); ok(has('gift card')||has('Gift card'),'§4 public gift card page');
+  await view('#/member/skyline-live'); ok(has('Season Pass 2026'),'§3 public membership page');
+  await view('#/embed-list/skyline-live'); ok(has('Neon Nights Live'),'§10 embeddable event list');
+  await view('#/embed/neon-nights-live?compact=1'); ok(W().document.querySelector('.tt'),'§10 embeddable ticket selector');
+  await view(`#/order/${po.id}/${po.access_key}`); ok(has('Wallet')||has('wallet'),'§1 ticket page offers phone wallet passes');
+  log('DONE');
+}catch(e){log('ERROR '+e.stack)}})();
+</script></body></html>

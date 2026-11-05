@@ -140,6 +140,19 @@ logo lettering (`frontend/set-logo.svg`); navy `#020a16` + one gold accent `#f4c
   `Demo.fresh()` first (other tabs' changes). `deploy/publish.sh` writes `version.json` + a `deploy-…` tag; `deploy/rollback.sh`,
   `deploy/backup.sh`, `deploy/restore-test.sh`, `tests/load/onsale.js`. Older test suites wrap `DB.placeOrder` with `acceptAll()` (current
   policy versions + reset demo rate limit) because they call it directly.
+- **Final additions (Eli's list, §1–§11):** one block in data.js ("Final additions") mirrored in schema.sql's "Final additions" section.
+  §1 wallet passes (`WalletPreview` in DEMO; `wallet_ticket()` / `wallet_devices` / `wallet_push` ready for a wallet Edge Function, not
+  written — needs Apple Pass Type ID cert + Google Wallet issuer). §2 door sales = manual order in POS mode (`pos: true`, `payMethod`,
+  `DB.terminalPay` card reader). §3 memberships / season passes = `settings.passPlans` + `passes` (`findPass()` / `find_pass()`,
+  `applyPass()` / `apply_pass()`, `passState()`; member-only ticket types `memberOnly` + `memberPlans`). §4 gift cards = `credits` rows with
+  `kind` gift|voucher (no fee / tax when bought; `giftErr()`). §5 payment plans = `order.data.plan` (`planSchedule()`, `payInstallment()` /
+  `pay_installment()`; order stays `pending` until the last installment). Each card installment is its own processor payment (own ref,
+  payments function `{action:'installment'}` + webhook `metadata.installment`); card refunds on a plan split over them
+  (`planRefundParts()` / `plan_refund_parts()` → `refund.parts`), and `platformTx()` reconciles each separately. §6 peak / off-peak
+  (`tt.peak`, `peakRule()` / `peak_rule()`) + last-minute phases (`hoursBefore`). §7 purchase rules `ev.rules` (`ruleErr()` / `rule_err()`).
+  §8 customer self-service `settings.selfService` + per-event overrides, all OFF by default (`demoSelfService()` / `self_service()`).
+  §9 offline payment methods `PAY_METHODS`. §10 embeds: `frontend/embed.js`, `#/embed/<slug>[?compact=1]`, `#/embed-list/<bo>`.
+  §11 product vouchers (`ad.redeemable` → `vouchers`, scanned through `checkin` → item_ok | item_used | item_void). Tests: `tests/final-e2e.html`.
 - **Money is integer cents everywhere.**
 - **Not yet wired:** the payments, messaging and api Edge Functions are written but not deployed (no Supabase project yet; need
   Stripe / Resend / Twilio keys in Supabase secrets + pg_cron for `expire_orders()` and `marketing_tick()`; the messaging function sends

@@ -17,13 +17,14 @@ function safeEq(a, b) { if (a.length !== b.length) return false; let x = 0; for 
 
 export default {
   name: 'Stripe',
-  async createPayment({ order, account, platformFee, env }) {
-    // one PaymentIntent per order: retries / reloads reuse it (Idempotency-Key), so a buyer can never be charged twice for one order
+  async createPayment({ order, account, platformFee, env, amount, installment }) {
+    // one PaymentIntent per order (per installment of a payment plan): retries / reloads reuse it (Idempotency-Key), so a buyer can never be charged twice
+    const inst = installment != null ? { installment: String(installment) } : {};
     const pi = await call(env, 'POST', 'payment_intents', {
-      amount: order.data.total, currency: String(order.data.currency || 'usd').toLowerCase(),
+      amount: amount ?? order.data.total, currency: String(order.data.currency || 'usd').toLowerCase(),
       automatic_payment_methods: { enabled: true }, application_fee_amount: platformFee || undefined,
-      receipt_email: order.buyer_email, description: 'Order ' + order.ref, metadata: { order_id: order.id, ref: order.ref, box_office_id: order.box_office_id },
-    }, { account: account.account, idem: 'set-order-' + order.id });
+      receipt_email: order.buyer_email, description: 'Order ' + order.ref, metadata: { order_id: order.id, ref: order.ref, box_office_id: order.box_office_id, ...inst },
+    }, { account: account.account, idem: 'set-order-' + order.id + (installment != null ? '-i' + installment : '') });
     return { clientSecret: pi.client_secret, publishableKey: env.STRIPE_PUBLISHABLE_KEY, account: account.account, ref: pi.id };
   },
   async parseWebhook(req, raw, env) {
@@ -57,7 +58,8 @@ export default {
         fee = ch.balance_transaction?.fee ?? null; const pm = ch.payment_method_details || {}; method = pm.card?.wallet?.type || pm.type || method;
         brand = pm.card?.wallet?.type === 'apple_pay' ? 'Apple Pay' : pm.card?.wallet?.type === 'google_pay' ? 'Google Pay' : (pm.card?.brand || '').replace(/^./, c => c.toUpperCase()); last4 = pm.card?.last4 || '';
       } catch (e) { /* fee stays the estimate */ }
-      return { type: 'succeeded', orderId: o.metadata.order_id, ref: o.id, charge: o.latest_charge, amount: o.amount_received, fee, appFee: o.application_fee_amount || 0, method, brand, last4, account: ev.account };
+      return { type: 'succeeded', orderId: o.metadata.order_id, ref: o.id, charge: o.latest_charge, amount: o.amount_received, fee, appFee: o.application_fee_amount || 0, method, brand, last4, account: ev.account,
+        installment: o.metadata.installment != null ? +o.metadata.installment : null };
     }
     if (ev.type === 'payment_intent.payment_failed') return { type: 'failed', orderId: o.metadata.order_id, ref: o.id, error: o.last_payment_error?.message || 'Payment failed' };
     return null;

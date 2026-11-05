@@ -194,7 +194,7 @@ const seatTaken=(slug,seat)=>E(`offSeats(availabilityFrom(Demo.st.tickets,Demo.s
   W().location.hash='#/'; await sleep(40); E(`S.cart={items:[{eventId:'${neon.id}',ticketTypeId:'${ga.id}',qty:1}],addons:[],donation:0,unlock:{}};saveCart()`);
   W().location.hash='#/cart'; await until(()=>W().document.querySelector('[data-action="placeOrder"]'));
   ok(E('S.co.email')==='maya@example.com' && has('Signed in as'),'signed-in checkout pre-fills the details');
-  E('S.co.terms=true'); await E('A.placeOrder()'); await until(()=>W().document.querySelector('[data-action="payWallet"]'));
+  E('S.co.terms=true;S.co.useAcct=false'); await E('A.placeOrder()'); await until(()=>W().document.querySelector('[data-action="payWallet"]'));   // Maya's account credit + gift card would cover it all
   await E(`A.payWallet({dataset:{v:'apple_pay'}})`); await until(()=>W().location.hash.startsWith('#/order/'));
   const mine2=await E('DB.myOrders()'); ok(mine2.orders.length===mine.orders.length+1 && !has('Save your tickets'),'Apple Pay (demo) → paid; order lands in the account automatically');
   await until(()=>E('S.order&&S.order.order')); ok(E('S.order.order.paidWith')==='Apple Pay','wallet payment recorded');

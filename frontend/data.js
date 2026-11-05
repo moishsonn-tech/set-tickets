@@ -25,10 +25,10 @@ const PERMS = [
   ['events', 'Events', [['view', 'View events', 'v'], ['edit', 'Edit events'], ['create', 'Create events'], ['publish', 'Publish / unpublish'], ['settings', 'Edit event settings'], ['controls', 'Emergency controls (pause sales, checkout or scanning)']]],
   ['seating', 'Seating', [['view', 'View seating chart', 'v'], ['edit', 'Edit seating chart'], ['block', 'Block seats'], ['unblock', 'Unblock seats'], ['move', 'Move customers between seats'], ['assign', 'Change seat assignments']]],
   ['tickets', 'Tickets & pricing', [['view', 'View ticket types', 'v'], ['create', 'Create ticket types'], ['edit', 'Edit ticket types'], ['pricing', 'Change pricing'], ['comps', 'Create complimentary tickets'], ['discounts', 'Create discount codes'], ['discountsEdit', 'Edit discount codes'], ['tracking', 'Manage tracking codes']]],
-  ['orders', 'Orders', [['view', 'View orders', 'v'], ['edit', 'Edit orders'], ['cancel', 'Cancel orders'], ['cancelTicket', 'Cancel individual tickets'], ['resend', 'Resend tickets'], ['customer', 'Change customer information'], ['seats', 'Change seats'], ['refund', 'Issue refunds'], ['override', 'Override normal order restrictions']]],
+  ['orders', 'Orders', [['view', 'View orders', 'v'], ['edit', 'Edit orders'], ['cancel', 'Cancel orders'], ['cancelTicket', 'Cancel individual tickets'], ['resend', 'Resend tickets'], ['customer', 'Change customer information'], ['seats', 'Change seats'], ['refund', 'Issue refunds'], ['override', 'Override normal order restrictions'], ['gifts', 'Issue gift cards, vouchers & memberships']]],
   ['customers', 'Customer data', [['names', 'View customer names', 'v'], ['emails', 'View email addresses', 'v'], ['phones', 'View phone numbers', 'v'], ['profiles', 'View full customer profiles', 'v'], ['export', 'Export customer information'], ['ban', 'Ban customers from buying'], ['inbox', 'Read customer-service messages', 'v']]],
   ['finance', 'Sales & finance', [['totals', 'View ticket sales totals', 'v'], ['reports', 'View financial reports', 'v'], ['fees', 'View fees', 'v'], ['processing', 'View payment processing information', 'v'], ['payouts', 'View payouts', 'v'], ['export', 'Export financial reports'], ['expenses', 'Enter event expenses']]],
-  ['door', 'Event-day access', [['scan', 'Scan tickets'], ['checkin', 'Check customers in'], ['undo', 'Undo check-in'], ['override', 'Override scanner warnings'], ['search', 'Look up guests at the door (name, email, phone, order)'], ['log', 'View scan history', 'v'], ['attendees', 'View attendee lists', 'v'], ['devices', 'Manage scanner devices'], ['staff', 'Manage door staff']]],
+  ['door', 'Event-day access', [['scan', 'Scan tickets'], ['checkin', 'Check customers in'], ['undo', 'Undo check-in'], ['override', 'Override scanner warnings'], ['search', 'Look up guests at the door (name, email, phone, order)'], ['log', 'View scan history', 'v'], ['attendees', 'View attendee lists', 'v'], ['devices', 'Manage scanner devices'], ['staff', 'Manage door staff'], ['sell', 'Sell tickets at the door (point of sale)']]],
   ['comms', 'Communication', [['email', 'Send customer emails'], ['notify', 'Send event notifications'], ['lists', 'Access attendee mailing lists', 'v'], ['marketing', 'Send marketing campaigns'], ['sms', 'Send text messages'], ['automations', 'Manage automations'], ['consent', 'Manage consent, suppression & customer tags']]],
   ['admin', 'Administration', [['invite', 'Invite team members'], ['remove', 'Remove team members'], ['perms', 'Edit team permissions'], ['integrations', 'Access integrations'], ['api', 'Access API settings'], ['payments', 'Access payment settings'], ['settings', 'Access box office settings']]],
 ];
@@ -80,6 +80,9 @@ const DEFAULT_SETTINGS = {
   checkout: { phone: 'optional', address: 'off', promo: true, optIn: true, smsOptIn: true, note: '', thanks: '' },
   // Stage 10: donation amounts + purpose, staff sign-out after inactivity, where failed-email alerts go
   donationAmounts: [1800, 3600, 10000], donationCustom: true, donationPurpose: '', sessionMinutes: 120,
+  // Final additions: gift cards, memberships / season passes, payment plans, customer self-service (every switch off by default)
+  gifts: { on: false, amounts: [2500, 5000, 10000], custom: true, min: 1000, max: 50000, days: 365 }, passPlans: [],
+  installments: { on: false, minTotal: 15000, deposit: 25, count: 3, finalDays: 14 }, selfService: {},
 };
 
 /* ── Payments (Stage 5): one gateway interface, many processors ──
@@ -202,7 +205,7 @@ function queueEntry(q, ev, token, now) {
 }
 const queuePass = (q, ev, token, now) => { const e = q?.entries?.[token]; return !!e && e.admit <= now && now <= e.admit + Math.max(5, +ev.queue?.passMinutes || 30) * 6e4; };
 // Abuse protection (Eli §4). Hard limits stop a request; flags mark an order for review (Orders → Flagged; Platform → Risk).
-const ORDER_FLAGS = { velocity: 'Many orders from this email in a short time', duplicate: 'Looks like a duplicate of an earlier order', declines: 'Several declined card attempts',
+const ORDER_FLAGS = { plan_overdue: 'Payment plan not finished by its deadline', velocity: 'Many orders from this email in a short time', duplicate: 'Looks like a duplicate of an earlier order', declines: 'Several declined card attempts',
   bulk: 'Unusually large order', bot: 'Automated-looking checkout (too fast, or a scripted browser)', banned_try: 'A banned customer tried to buy' };
 const LIMITS = { holdPerMin: 60, holdSeatsPerIp: 40, ordersPerMin: 20, ordersPerEmailHour: 15, declinesFlag: 3, declinesStop: 8, bulkTickets: 20, botMs: 2500 };
 const RL = {};   // DEMO stand-in for SQL rate_hit(): key → recent hit times
@@ -301,12 +304,14 @@ function spread(total, weights) {
 }
 const listPrice = (tt, slotId) => tt ? cents(slotId && tt.slotPrices?.[slotId] !== undefined && tt.slotPrices[slotId] !== '' && tt.slotPrices[slotId] !== null ? tt.slotPrices[slotId] : tt.price) : 0;
 // the price phase selling right now (sold = tickets of this type already sold)
-const activePhase = (tt, sold, now) => (tt.phases || []).find(p => inWindow(p.from, p.until, now) && !(+p.upTo > 0 && sold >= +p.upTo)) || null;
+// a phase with hoursBefore is last-minute pricing: it only runs in the last N hours before the showtime / event starts
+const activePhase = (tt, sold, now, start) => (tt.phases || []).find(p => inWindow(p.from, p.until, now) && !(+p.upTo > 0 && sold >= +p.upTo)
+  && !(+p.hoursBefore > 0 && (!start || now < new Date(start).getTime() - +p.hoursBefore * 36e5))) || null;
 // price of each of n units, given how many are already sold and how many of this type the order holds (for quantity breaks)
-function ttPrices(tt, slotId, sold, n, inOrder, now) {
-  const br = (tt.breaks || []).filter(b => +b.min > 1 && inOrder >= +b.min).sort((a, b) => +b.min - +a.min)[0], adm = +tt.admits || 1;
+function ttPrices(tt, slotId, sold, n, inOrder, now, start, tz) {
+  const br = (tt.breaks || []).filter(b => +b.min > 1 && inOrder >= +b.min).sort((a, b) => +b.min - +a.min)[0], adm = +tt.admits || 1, pk = peakRule(tt, start, tz);
   return Array.from({ length: n }, (_, k) => {
-    const ph = activePhase(tt, sold + k * adm, now); let price = ph ? cents(ph.price) : listPrice(tt, slotId), label = ph ? ph.label || 'Special price' : '';
+    const ph = activePhase(tt, sold + k * adm, now, start); let price = ph ? cents(ph.price) : pk ? cents(pk.price) : listPrice(tt, slotId), label = ph ? ph.label || 'Special price' : pk ? pk.label || 'Peak price' : '';
     if (br && cents(br.price) < price) { price = cents(br.price); label = `${br.min}+ price`; }
     return { price, label };
   });
@@ -339,7 +344,7 @@ function quote(cart, events, settings, promo, o = {}) {
     const tt = (ev.ticketTypes || []).find(t => t.id === it.ticketTypeId); if (!tt) continue;
     const k = ev.id + '|' + tt.id, adm = +tt.admits || 1, sold = (o.avail?.[ev.id]?.tt?.[tt.id] || 0) + (seen[k] || 0);
     const inOrder = (cart.items || []).filter(x => x.eventId === ev.id && x.ticketTypeId === tt.id && !x.bundleId).reduce((a, x) => a + (+x.qty || 0), 0);
-    const prices = ttPrices(tt, it.slotId, sold, +it.qty, inOrder, now); seen[k] = (seen[k] || 0) + +it.qty * adm;
+    const prices = ttPrices(tt, it.slotId, sold, +it.qty, inOrder, now, slot?.start || ev.start, ev.timezone); seen[k] = (seen[k] || 0) + +it.qty * adm;
     const ovr = !!o.manual && it.price !== undefined && it.price !== null && it.price !== '';
     const rule = i => feeRuleFor(ev, tt, (it.seats || [])[i * adm]);   // Stage 10: a seating area / ticket type / event can set its own booking fee
     for (let i = 0; i < prices.length;) {  // a phase can end inside one order: one line per run of equal prices (and equal fee rule)
@@ -356,7 +361,11 @@ function quote(cart, events, settings, promo, o = {}) {
     const uf = hasRule(ad.fee) ? feeOf(cents(ad.price), 0, feeSet(settings, ad.fee)) : 0;   // products carry a booking fee only when they set one
     lines.push({ kind: 'addon', eventId: ev.id, eventName: ev.name, addonId: ad.id, name: ad.name, qty: +a.qty, unit: cents(ad.price), face: cents(ad.price), unitFee: uf, fee: +a.qty * uf });
   }
+  // Final additions: gift cards (no fee, no tax — they're paid for again when used) and memberships / season passes, sold by the box office itself
+  for (const g of cart.gifts || []) { const a = cents(g.amount); if (a > 0) lines.push({ kind: 'gift', name: 'Gift card', qty: 1, unit: a, face: a, unitFee: 0, fee: 0, gift: { to: String(g.to || '').slice(0, 120), toEmail: String(g.toEmail || '').trim().toLowerCase().slice(0, 200), message: String(g.message || '').slice(0, 300) } }); }
+  for (const x of cart.passes || []) { const pl = passPlan(settings, x.planId); if (pl && +x.qty >= 1) lines.push({ kind: 'pass', planId: pl.id, name: pl.name, qty: +x.qty, unit: cents(pl.price), face: cents(pl.price), unitFee: 0, fee: 0, holder: String(x.holder || '').slice(0, 120), holderEmail: String(x.holderEmail || '').trim().toLowerCase().slice(0, 200) }); }
   const subtotal = lines.reduce((a, l) => a + l.unit * l.qty, 0), promoErr = promo ? applyPromo(lines, promo, events, subtotal) : '';
+  const passUses = o.pass ? applyPass(lines, o.pass) : 0, giftTotal = lines.filter(l => l.kind === 'gift').reduce((a, l) => a + l.unit * l.qty, 0), passTotal = lines.filter(l => l.kind === 'pass').reduce((a, l) => a + l.unit * l.qty, 0);
   const disc = lines.reduce((a, l) => a + (l.disc || 0), 0), feeDisc = lines.reduce((a, l) => a + (l.feeDisc || 0), 0);
   const fee = lines.reduce((a, l) => a + l.fee, 0) - feeDisc, donation = Math.max(0, Math.round(+cart.donation || 0));
   // Stage 5 money breakdown, each part stored separately on the order:
@@ -364,10 +373,10 @@ function quote(cart, events, settings, promo, o = {}) {
   // tax (on tickets + products after discounts, plus fees when the box office taxes fees), card processing (the processor's cut,
   // passed to the buyer only when the box office chooses to).
   const pf = settings.platform || { pct: 0, fixed: 0, payer: 'organizer' }, paidTickets = lines.reduce((a, l) => a + (l.unit > 0 ? l.kind === 'ticket' ? l.qty : l.kind === 'bundle' ? l.qty * l.perCopy : 0 : 0), 0);
-  const platformFee = subtotal - disc > 0 ? Math.round((subtotal - disc) * (+pf.pct || 0) / 100) + paidTickets * (+pf.fixed || 0) : 0;
+  const platformFee = subtotal - disc - giftTotal > 0 ? Math.round((subtotal - disc - giftTotal) * (+pf.pct || 0) / 100) + paidTickets * (+pf.fixed || 0) : 0;
   const serviceFee = pf.payer === 'buyer' ? platformFee : 0;
   // Stage 10: other fees an event adds (mandatory, or optional ones the buyer ticked — cart.optFees), per ticket or per order
-  const evIds = [...new Set(lines.map(l => l.eventId))], evs = evIds.map(byEv), part = (id, f) => lines.filter(l => l.eventId === id).reduce((a, l) => a + f(l), 0);
+  const evIds = [...new Set(lines.map(l => l.eventId).filter(Boolean))], evs = evIds.map(byEv), part = (id, f) => lines.filter(l => l.eventId === id).reduce((a, l) => a + f(l), 0);
   const otherFees = [];
   for (const ev of evs) for (const x of ev.fees?.extra || []) {
     if (x.optional && !(cart.optFees || []).includes(x.id)) continue;
@@ -379,15 +388,15 @@ function quote(cart, events, settings, promo, o = {}) {
   const otherFee = otherFees.reduce((a, x) => a + x.amount, 0);
   // tax: one rate for the order, unless an event sets its own — then each event's part is taxed at its rate (the service fee at the box office's)
   const tof = !!settings.taxOnFees, perEv = evs.some(e => e.taxPct !== '' && e.taxPct != null);
-  const tax = !perEv ? Math.round((subtotal - disc + (tof ? fee + serviceFee + otherFee : 0)) * (+settings.taxPct || 0) / 100)
+  const tax = !perEv ? Math.round((subtotal - disc - giftTotal + (tof ? fee + serviceFee + otherFee : 0)) * (+settings.taxPct || 0) / 100)
     : evs.reduce((a, e) => a + Math.round((part(e.id, l => l.unit * l.qty - (l.disc || 0)) + (tof ? part(e.id, l => l.fee - (l.feeDisc || 0)) + otherFees.filter(x => x.eventId === e.id).reduce((s, x) => s + x.amount, 0) : 0)) * evTax(e, settings) / 100), 0)
-      + (tof ? Math.round(serviceFee * (+settings.taxPct || 0) / 100) : 0);
+      + (tof ? Math.round(serviceFee * (+settings.taxPct || 0) / 100) : 0) + Math.round(passTotal * (+settings.taxPct || 0) / 100);
   const pre = subtotal - disc + fee + serviceFee + otherFee + tax + donation, card = { pct: 0, fixed: 0, pass: false, ...(settings.card || {}) };
   card.pass = passFor(evs, card);
   const credit = Math.min(Math.max(0, Math.round(+o.credit || 0)), pre), owed = pre - credit;   // Stage 6: account / event credit pays first
   const processingFee = o.method === 'card' && owed > 0 ? Math.round(owed * (+card.pct || 0) / 100) + (+card.fixed || 0) : 0, processing = card.pass ? processingFee : 0;
   const sumKind = k => lines.filter(l => k.includes(l.kind)).reduce((a, l) => a + l.unit * l.qty, 0);
-  return { lines, subtotal, ticketsTotal: sumKind(['ticket', 'bundle']), addonsTotal: sumKind(['addon']), discount: disc, feeDiscount: feeDisc, fee, serviceFee, otherFees, otherFee, tax, donation,
+  return { lines, subtotal, ticketsTotal: sumKind(['ticket', 'bundle']), addonsTotal: sumKind(['addon']), giftsTotal: giftTotal, passesTotal: passTotal, passUses, passDiscount: lines.reduce((a, l) => a + (l.passDisc || 0), 0), discount: disc, feeDiscount: feeDisc, fee, serviceFee, otherFees, otherFee, tax, donation,
     processing, processingFee, platformFee, credit, total: owed + processing, promoErr,
     faceValue: lines.reduce((a, l) => a + (l.kind === 'bundle' ? l.value : l.face * l.qty), 0), currency: lines.find(l => l.currency)?.currency || settings.currency };
 }
@@ -400,6 +409,7 @@ function applyPromo(lines, p, events, subtotal) {
   if (+p.maxQty > 0 && tickets > +p.maxQty) return `Code ${p.code} is only for orders of up to ${p.maxQty} tickets`;
   if (+p.minSpend > 0 && subtotal < +p.minSpend) return `Code ${p.code} needs a minimum purchase of $${(+p.minSpend / 100).toFixed(2)}`;
   for (const l of lines) {
+    if (l.kind === 'gift' || l.kind === 'pass') continue;   // gift cards and passes are never discounted by a promo code
     if (!anyOf(p.eventIds, l.eventId)) continue;
     if (l.kind !== 'addon' && (p.slotIds || []).length && !(p.slotIds || []).includes(l.slotId)) continue;
     const ev = events.find(e => e.id === l.eventId);
@@ -806,7 +816,209 @@ function singleGaps(ev, isFree, chosen) {
 }
 
 /* ════════════ DEMO backend (localStorage) ════════════ */
-const DEMO_KEY = 'set_demo_v14';
+/* ════════════ Final additions (Eli's "Final Additions") ════════════
+   §1 wallet passes · §2 door sales (POS) · §3 memberships & season passes · §4 gift cards & vouchers · §5 payment plans · §6 more pricing
+   rules · §7 purchase rules between ticket types · §8 customer self-service (all OFF unless the box office turns them on) · §9 offline /
+   manual payments · §10 embeddable sales (frontend/embed.js) · §11 products with their own QR code. Mirrored in schema.sql's
+   "Final additions" section — keep both in step. */
+
+// §6 peak / off-peak: a ticket type can price showtimes by their day and time (in the event's timezone): tt.peak = [{label, days, from, to, price}].
+// Last-minute pricing is a price phase with hoursBefore (it only runs in the last N hours before the start).
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+function localDT(iso, tz) {
+  const d = new Date(iso); if (!iso || isNaN(d)) return null;
+  try {
+    const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz || 'America/New_York', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(d).map(x => [x.type, x.value]));
+    return { dow: WEEKDAYS.indexOf(p.weekday), hm: `${String(p.hour).replace(/^24/, '00')}:${p.minute}` };
+  } catch (e) { return { dow: d.getDay(), hm: `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` }; }
+}
+function peakRule(tt, start, tz) {
+  if (!start || !(tt?.peak || []).length) return null;
+  const l = localDT(start, tz); if (!l) return null;
+  return tt.peak.find(r => (!(r.days || []).length || r.days.map(Number).includes(l.dow)) && (!r.from || l.hm >= r.from) && (!r.to || l.hm <= r.to)) || null;
+}
+
+// §7 purchase rules: ev.rules = [{id, kind: 'requires', ttIds (B), needs (A), per (0 = at least one A; N = one A for every N of B)} |
+//   {id, kind: 'limit', ttIds, min, max} (across a combination of ticket types)]. counts = {ticketTypeId: tickets in this order}.
+const RULE_KINDS = { requires: 'Needs another ticket type in the same order', limit: 'Minimum / maximum across ticket types' };
+function ruleErr(ev, counts) {
+  const nm = ids => (ids || []).map(id => ev.ticketTypes.find(t => t.id === id)?.name).filter(Boolean).join(' or ') || 'ticket';
+  const n = ids => (ids || []).reduce((a, id) => a + (counts[id] || 0), 0);
+  for (const r of ev.rules || []) {
+    if (r.kind === 'requires') {
+      const b = n(r.ttIds), a = n(r.needs), per = Math.max(0, Math.floor(+r.per || 0)); if (!b) continue;
+      if (per > 0 ? a * per < b : a < 1) return r.message || (per > 0 ? `Every ${per} ${nm(r.ttIds)} ticket${per === 1 ? '' : 's'} need${per === 1 ? 's' : ''} one ${nm(r.needs)} ticket in the same order`
+        : `${nm(r.ttIds)} tickets can only be bought with a ${nm(r.needs)} ticket`);
+    } else if (r.kind === 'limit') {
+      const t = n(r.ttIds); if (!t) continue;
+      if (+r.min > 0 && t < +r.min) return r.message || `Choose at least ${r.min} ${nm(r.ttIds)} tickets in total`;
+      if (+r.max > 0 && t > +r.max) return r.message || `At most ${r.max} ${nm(r.ttIds)} tickets per order`;
+    }
+  }
+  return '';
+}
+// tickets of each type an order holds for one event (ticket lines + the tickets inside packages)
+function orderTTCounts(ev, items) {
+  const c = {};
+  for (const it of items || []) {
+    if (it.eventId !== ev.id || !(+it.qty >= 1)) continue;
+    if (it.bundleId) { const b = (ev.bundles || []).find(x => x.id === it.bundleId); if (b) for (const id of bundleTicketTypes(ev, b, it)) c[id] = (c[id] || 0) + 1; }
+    else c[it.ticketTypeId] = (c[it.ticketTypeId] || 0) + +it.qty;
+  }
+  return c;
+}
+
+// §3 memberships / season passes. Plans live on the box office (settings.passPlans): {id, name, kind, price, desc, benefit: free | discount,
+// pct, uses (0 = unlimited), perEvent (0 = no limit), eventIds, ticketTypeIds ([] = any), validDays | validUntil, onSale, max (stock)}.
+// A bought or staff-issued pass is a `passes` row (code MP-…, holder email, expiry, uses). It is used at checkout with its code by its
+// holder's email; every ticket it paid for (or unlocked, for members-only ticket types) carries `pass` → usage = those tickets.
+const PASS_KINDS = { season: 'Season pass', membership: 'Membership', multi: 'Multi-event pass', vip: 'VIP membership' };
+const PASS_BENEFITS = { free: 'Each visit is included (uses one)', discount: 'Member discount on tickets' };
+const passPlan = (set, id) => (set?.passPlans || []).find(p => p.id === id) || null;
+function passUse(st, p) {   // tickets the pass covered + the passes held by unpaid checkouts
+  const tk = st.tickets.filter(t => t.pass === p.id && t.status === 'valid'), byEvent = {};
+  for (const t of tk) byEvent[t.event_id] = (byEvent[t.event_id] || 0) + 1;
+  let held = 0;
+  for (const o of st.orders) if (reservedOrder(o) && o.data.pass?.id === p.id) for (const l of o.data.lines) { const k = (l.pu || []).filter(Boolean).length; held += k; byEvent[l.eventId] = (byEvent[l.eventId] || 0) + k; }
+  return { used: tk.length + held, byEvent, tickets: tk.map(t => t.id) };
+}
+function passState(st, p, now = Date.now()) {
+  const u = passUse(st, p), left = +p.uses > 0 ? Math.max(0, +p.uses - u.used) : Infinity;
+  return { ...u, left, status: p.cancelled_at ? 'cancelled' : p.expires && new Date(p.expires) <= now ? 'expired' : left <= 0 ? 'used' : 'active' };
+}
+// what a checkout may know about a pass: the plan's rules and what's left, never other customers
+const publicPass = (p, plan, s) => ({ id: p.id, code: p.code, plan: plan && (({ id, name, kind, benefit, pct, perEvent, eventIds, ticketTypeIds }) => ({ id, name, kind, benefit, pct, perEvent, eventIds, ticketTypeIds }))(plan),
+  left: s.left === Infinity ? null : s.left, byEvent: s.byEvent, status: s.status, expires: p.expires, holder: p.name });
+// a pass on the cart's ticket lines (after promo codes): "free" covers the ticket and its booking fee; "discount" takes pct off. l.pu marks the units it covered.
+function applyPass(lines, ps) {
+  const pl = ps?.plan; if (!pl) return 0;
+  let left = ps.left == null ? Infinity : ps.left, used = 0; const by = { ...(ps.byEvent || {}) };
+  for (const l of lines) {
+    if (l.kind !== 'ticket' || !anyOf(pl.eventIds, l.eventId) || !anyOf(pl.ticketTypeIds, l.ticketTypeId)) continue;
+    for (let u = 0; u < l.qty; u++) {
+      if (left <= 0 || (+pl.perEvent > 0 && (by[l.eventId] || 0) >= +pl.perEvent)) break;
+      const base = l.unit - (l.discs?.[u] || 0), free = pl.benefit === 'free';
+      const d = free ? base : Math.round(base * Math.min(100, Math.max(0, +pl.pct || 0)) / 100), fd = free ? Math.max(0, (l.unitFee || 0) - (l.feeDiscs?.[u] || 0)) : 0;
+      l.discs ||= Array(l.qty).fill(0); l.feeDiscs ||= Array(l.qty).fill(0); l.pdiscs ||= Array(l.qty).fill(0); l.pu ||= Array(l.qty).fill(0);
+      l.discs[u] += d; l.feeDiscs[u] += fd; l.pdiscs[u] += d; l.pu[u] = 1;
+      l.disc = (l.disc || 0) + d; l.feeDisc = (l.feeDisc || 0) + fd; l.passDisc = (l.passDisc || 0) + d;
+      used++; by[l.eventId] = (by[l.eventId] || 0) + 1; if (left !== Infinity) left--;
+    }
+  }
+  return used;
+}
+const passExpiry = (plan, now = new Date()) => plan.validUntil ? new Date(plan.validUntil).toISOString() : +plan.validDays > 0 ? new Date(now.getTime() + +plan.validDays * 864e5).toISOString() : null;
+
+// §4 gift cards & vouchers are credits (Stage 6) with kind gift | voucher (kind credit = an ordinary account / store credit): a code, an amount,
+// optional event restriction and expiry, partial use and a remaining balance. Customers buy gift cards (settings.gifts: fixed amounts and / or a
+// custom amount); staff issue any kind. A gift card goes to its recipient's email; its code works for anyone who has it.
+const CREDIT_KINDS = { credit: 'Store credit', gift: 'Gift card', voucher: 'Gift voucher' };
+const GIFT_DEFAULT = { on: false, amounts: [2500, 5000, 10000], custom: true, min: 1000, max: 50000, days: 365 };
+const giftSettings = set => ({ ...GIFT_DEFAULT, ...(set?.gifts || {}) });
+function giftErr(set, g) {
+  const gs = giftSettings(set), a = cents(g.amount);
+  if (!gs.on) return 'Gift cards are not sold here';
+  if (!(gs.amounts || []).map(Number).includes(a) && !(gs.custom && a >= cents(gs.min) && a <= cents(gs.max))) return gs.custom ? `Gift cards are ${money_(cents(gs.min))}–${money_(cents(gs.max))}` : 'Choose one of the gift card amounts';
+  if (g.toEmail && !EMAIL_RE.test(String(g.toEmail).trim())) return 'Enter the recipient\'s email';
+  return '';
+}
+
+// §5 payment plans: a deposit now, the rest in installments, all paid before a deadline; the tickets stay pending (seats held) until the last payment.
+// settings.installments = {on, minTotal, deposit (%), count, finalDays (deadline = days before the event)}; an event can switch it off.
+const INSTALL_DEFAULT = { on: false, minTotal: 15000, deposit: 25, count: 3, finalDays: 14 };
+function installFor(set, evs) {
+  const o = { ...INSTALL_DEFAULT, ...(set?.installments || {}) };
+  if (!o.on || !evs.length || evs.some(e => e.installments?.off)) return null;
+  return o;
+}
+function planSchedule(total, opts, start, now = new Date()) {
+  if (!opts || !(total >= cents(opts.minTotal)) || !start) return null;
+  const deadline = new Date(new Date(start).getTime() - Math.max(0, +opts.finalDays || 0) * 864e5), span = deadline - now, wk = 7 * 864e5;
+  if (span < wk) return null;   // too close to the event to spread the payments
+  const dep = Math.min(total, Math.max(100, Math.round(total * Math.min(90, Math.max(5, +opts.deposit || 25)) / 100))), n = Math.max(1, Math.min(Math.floor(+opts.count || 1), 12, Math.floor(span / wk)));
+  const parts = spread(total - dep, Array(n).fill(1));
+  return { deposit: dep, deadline: deadline.toISOString(), schedule: [{ n: 0, label: 'Deposit', due: now.toISOString(), amount: dep },
+    ...parts.map((a, i) => ({ n: i + 1, label: `Payment ${i + 1} of ${n}`, due: new Date(now.getTime() + Math.round(span * (i + 1) / n)).toISOString(), amount: a }))] };
+}
+const planPaid = pl => (pl?.schedule || []).filter(x => x.paid_at).reduce((a, x) => a + x.amount, 0);
+const planNext = pl => (pl?.schedule || []).find(x => !x.paid_at) || null;
+const planState = (pl, now = Date.now()) => { const nx = planNext(pl); return !pl ? null : !nx ? 'paid' : new Date(nx.due) < now - 864e5 ? 'overdue' : 'on track'; };
+
+// §8 customer self-service — every switch OFF unless the box office (settings.selfService) or the event (ev.selfService, overrides) turns it on.
+const SELF_SERVICE = [['download', 'Download / print tickets and add them to a phone wallet'], ['resend', 'Email the tickets again'], ['rename', 'Change the name on a ticket'],
+  ['transfer', 'Transfer a ticket to someone else (new QR code)'], ['seatChange', 'Request a seat change'], ['cancel', 'Request a cancellation'], ['refund', 'Request a refund']];
+const SELF_REQUESTS = { seatChange: 'Seat change request', cancel: 'Cancellation request', refund: 'Refund request' };
+const selfOn = (set, ev, k) => ev?.selfService?.[k] === true || (ev?.selfService?.[k] !== false && !!set?.selfService?.[k]);
+
+// §9 offline / manual payments: every staff order records amount, method, date, who, notes and paid / unpaid (unpaid = reserved until marked paid)
+const PAY_STATUS = { paid: 'Paid', unpaid: 'Unpaid' };
+
+// §11 products with their own QR code (ad.redeemable): one voucher per unit, scanned and redeemed separately from the ticket.
+const VOUCHER_STATUS = { valid: 'Not redeemed', redeemed: 'Redeemed', void: 'Void' };
+function issueVouchers(st, order) {
+  if ((st.vouchers ||= []).some(v => v.order_id === order.id)) return;
+  const mk = (l, ad, n, from) => { for (let i = 0; i < n; i++) st.vouchers.push({ id: uid(), box_office_id: order.box_office_id, order_id: order.id, event_id: l.eventId, addon_id: ad.id, name: ad.name,
+    code: randCode(10), status: 'valid', holder: order.data.buyer?.name || '', from: from || null, redeemed_at: null, redeemed: null, created_at: nowIso() }); };
+  for (const l of order.data.lines) {
+    const ev = st.events.find(e => e.id === l.eventId); if (!ev) continue;
+    if (l.kind === 'addon') { const ad = (ev.addons || []).find(a => a.id === l.addonId); if (ad?.redeemable) mk(l, ad, l.qty - (l.removed || 0)); }
+    if (l.kind === 'bundle') for (const x of l.addons || []) { const ad = (ev.addons || []).find(a => a.id === x.addonId); if (ad?.redeemable) mk(l, ad, x.qty * l.qty, l.name); }
+  }
+}
+// void unredeemed vouchers of an order (all, or n of one product)
+function voidVouchers(st, orderId, addonId, n = Infinity) {
+  let k = 0;
+  for (const v of (st.vouchers || []).filter(v => v.order_id === orderId && v.status === 'valid' && (!addonId || v.addon_id === addonId)).reverse()) { if (k >= n) break; v.status = 'void'; v.voided_at = nowIso(); k++; }
+  return k;
+}
+// gift cards and passes an order bought: issued when it is paid (once)
+function issueOrderExtras(st, order) {
+  const d = order.data, set = pricingSettings(st.boxOffices.find(b => b.id === order.box_office_id) || {}, st.platform);
+  if (d.lines.some(l => l.kind === 'gift') && !(st.credits || []).some(c => c.source_order === order.id && c.kind === 'gift')) {
+    for (const l of d.lines.filter(x => x.kind === 'gift')) for (let i = 0; i < l.qty; i++) {
+      const gs = giftSettings(set), c = issueCreditRow(st, order.box_office_id, { email: l.gift?.toEmail || order.buyer_email, name: l.gift?.to || d.buyer.name, amount: l.unit,
+        expires: +gs.days > 0 ? new Date(Date.now() + +gs.days * 864e5).toISOString() : null, order, by: order.buyer_email, note: l.gift?.message ? 'Message: ' + l.gift.message : '' });
+      Object.assign(c, { kind: 'gift', from_name: d.buyer.name, message: String(l.gift?.message || '').slice(0, 300) });
+      queueMsg(st, { box_office_id: order.box_office_id, order_id: order.id, kind: 'gift', to: c.email, email: c.email, subject: `${d.buyer.name} sent you a ${money_(c.amount)} gift card`, body: c.message, data: { credit: c.code }, by: 'system' });
+    }
+  }
+  if (d.lines.some(l => l.kind === 'pass') && !(st.passes || []).some(p => p.order_id === order.id)) {
+    for (const l of d.lines.filter(x => x.kind === 'pass')) for (let i = 0; i < l.qty; i++) {
+      const plan = passPlan(set, l.planId); if (!plan) continue;
+      const p = issuePassRow(st, order.box_office_id, plan, { email: l.holderEmail || order.buyer_email, name: l.holder || d.buyer.name, order, by: order.buyer_email });
+      queueMsg(st, { box_office_id: order.box_office_id, order_id: order.id, kind: 'pass', to: p.email, email: p.email, subject: `Your ${plan.name}`, body: '', data: { pass: p.code }, by: 'system' });
+    }
+  }
+}
+function issuePassRow(st, boId, plan, o) {
+  const email = String(o.email || '').trim().toLowerCase();
+  if (!EMAIL_RE.test(email)) throw new Error('The pass needs the holder\'s email');
+  let code; do { code = 'MP-' + randCode(8); } while ((st.passes ||= []).some(x => x.code === code));
+  const row = { id: uid(), box_office_id: boId, code, plan_id: plan.id, plan_name: plan.name, email, name: String(o.name || '').slice(0, 120), uses: Math.max(0, Math.floor(+plan.uses || 0)),
+    expires: o.expires || passExpiry(plan), order_id: o.order?.id || null, order_ref: o.order?.ref || null, issued_by: o.by, issued_at: nowIso(), cancelled_at: null, cancelled_by: null, note: String(o.note || '').slice(0, 300) };
+  st.passes.push(row); return row;
+}
+// the pass a checkout uses (code + the buyer's email), or why not
+function findPass(st, boId, code, email, evIds) {
+  const p = (st.passes || []).find(x => x.box_office_id === boId && x.code === String(code || '').trim().toUpperCase());
+  if (!p) return { error: 'That membership / pass code is not valid' };
+  const s = passState(st, p), plan = passPlan(pricingSettings(st.boxOffices.find(b => b.id === boId), st.platform), p.plan_id);
+  if (!plan) return { error: 'That pass\'s plan no longer exists' };
+  if (s.status !== 'active') return { error: s.status === 'expired' ? 'That pass has expired' : s.status === 'used' ? 'That pass has no visits left' : 'That pass was cancelled' };
+  if (email && p.email !== String(email).trim().toLowerCase()) return { error: 'Use the email the pass belongs to' };
+  if (evIds && !evIds.some(id => anyOf(plan.eventIds, id))) return { error: `${plan.name} isn't valid for this event` };
+  return { pass: p, plan, state: s };
+}
+
+// §1 wallet passes: what a phone wallet card shows (Apple Wallet .pkpass / Google Wallet event ticket — built by the `wallet` Edge Function, LIVE)
+function walletCard(ev, t, o) {
+  const sp = t.seat ? seatInfo(ev, t.seat, t) : null, slot = t.slot_id && (ev.timeSlots || []).find(s => s.id === t.slot_id), tt = ev.ticketTypes.find(x => x.id === t.ticket_type_id);
+  return { event: ev.name, start: slot?.start || ev.start, venue: [ev.venue, ev.address].filter(Boolean).join(' · '), type: [tt?.name, sp?.area && sp.area !== tt?.name ? sp.area : ''].filter(Boolean).join(' · '),
+    unit: sp?.unit || '', row: sp?.row || '', seat: sp?.seat || '', holder: t.holder, code: t.code, ref: o?.ref || '', void: t.status !== 'valid' };
+}
+const walletUrl = (kind, orderId, key, ticketId) => (CFG.supabaseUrl || '') + `/functions/v1/wallet?kind=${kind}&o=${encodeURIComponent(orderId)}&k=${encodeURIComponent(key)}&t=${encodeURIComponent(ticketId)}`;
+
+const DEMO_KEY = 'set_demo_v15';
 const Demo = {
   st: null,
   load() {
@@ -861,7 +1073,8 @@ function logSeatEdits(prev, row) {
 }
 const gapMsg = (ev, gaps) => `Please don't leave a single empty seat next to your selection (${gaps.map(g => seatText(ev, g)).join('; ')}). Move over one seat, or include it.`;
 function demoPlaceOrder(p, asTeam) {
-  const st = Demo.st, manual = p.payment === 'manual', now = new Date();
+  // staff orders: 'manual' (paid now, or unpaid = reserved until marked paid) and 'terminal' (a card on the door's card reader — paid when the processor confirms)
+  const st = Demo.st, terminal = p.payment === 'terminal', manual = p.payment === 'manual' || terminal, now = new Date();
   if (manual && !asTeam) throw new Error('not allowed');
   expireOrders(st);
   // the same checkout submitted twice (double click, retry, flaky network) returns the first order — never a second one
@@ -869,8 +1082,8 @@ function demoPlaceOrder(p, asTeam) {
   if (again) return { id: again.id, key: again.access_key, ref: again.ref, status: again.status, expires_at: again.expires_at, total: again.data.total, again: true };
   if (!String(p.buyer?.name || '').trim()) throw new Error('Name is required');
   if (!EMAIL_RE.test(p.buyer?.email || '')) throw new Error('A valid email is required');
-  const items = p.items || [], addons = (p.addons || []).filter(a => +a.qty >= 1);
-  if (!items.length && !addons.length) throw new Error('Your cart is empty');
+  const items = p.items || [], addons = (p.addons || []).filter(a => +a.qty >= 1), gifts = (p.gifts || []).filter(g => cents(g.amount) > 0), passes = (p.passes || []).filter(x => +x.qty >= 1);
+  if (!items.length && !addons.length && !gifts.length && !passes.length) throw new Error('Your cart is empty');
   let bo = null;
   const pending = { tt: {}, slots: {}, seats: [], total: {}, bd: {}, ad: {} }, evIds = [], avs = {}, mine = {};  // mine: ticket types + seat areas in this order, per event
   const evOf = id => {
@@ -926,7 +1139,7 @@ function demoPlaceOrder(p, asTeam) {
   };
   for (const it of items) {
     const ev = evOf(it.eventId), sec = ev.secrets || {}, pw = p.unlock?.[ev.id] || '';
-    if (asTeam && !hasPerm(asTeam, 'orders.edit', ev.id)) throw new Error('You don\'t have permission to create orders for ' + ev.name);
+    if (asTeam && !hasPerm(asTeam, 'orders.edit', ev.id) && !(p.pos && hasPerm(asTeam, 'door.sell', ev.id))) throw new Error('You don\'t have permission to create orders for ' + ev.name);
     if (!(+it.qty >= 1)) throw new Error('Bad quantity');
     if (it.price !== undefined && it.price !== null && it.price !== '') {  // manual price override
       if (!manual) throw new Error('not allowed');
@@ -983,6 +1196,19 @@ function demoPlaceOrder(p, asTeam) {
     if (!ad) throw new Error('Unknown add-on');
     if (+ad.qty > 0 && sold + n > +ad.qty) throw new Error(`Only ${Math.max(0, +ad.qty - sold)} ${ad.name} left`);
   }
+  // Final additions: an order of only gift cards / passes belongs to the box office that sells them
+  if (!bo) { bo = st.boxOffices.find(b => b.id === p.boxOfficeId && (b.status === 'active' || manual)); if (!bo) throw new Error('This box office is not selling right now'); }
+  if (asTeam && !items.length && !addons.length && !hasPerm(asTeam, 'orders.gifts')) throw new Error('You don\'t have permission to sell gift cards or passes');
+  const set0 = pricingSettings(bo, st.platform);
+  if (!manual) for (const g of gifts) { const e = giftErr(set0, g); if (e) throw new Error(e); }
+  for (const x of passes) {
+    const pl = passPlan(set0, x.planId); if (!pl) throw new Error('Unknown membership');
+    if (!manual && pl.onSale === false) throw new Error(pl.name + ' is not on sale right now');
+    const sold = (st.passes || []).filter(r => r.box_office_id === bo.id && r.plan_id === pl.id && !r.cancelled_at).length + st.orders.filter(o => reservedOrder(o)).reduce((a, o) => a + o.data.lines.filter(l => l.kind === 'pass' && l.planId === pl.id).reduce((b, l) => b + l.qty, 0), 0);
+    if (+pl.max > 0 && sold + +x.qty > +pl.max) throw new Error(`Only ${Math.max(0, +pl.max - sold)} ${pl.name} left`);
+  }
+  // §7 purchase rules between ticket types (child needs an adult, B only with A, min / max across a combination)
+  if (!manual) for (const id of evIds) { const ev = st.events.find(e => e.id === id), e = ruleErr(ev, orderTTCounts(ev, items)); if (e) throw new Error(e); }
   // Stage 10 abuse protection: honeypot, banned customers, request rate, order velocity → hard stops; the rest become review flags
   const email = p.buyer.email.trim().toLowerCase();
   if (!manual && !asTeam && !Demo._seeding) {   // (asTeam on a non-manual order = the demo's own sample data)
@@ -1001,9 +1227,16 @@ function demoPlaceOrder(p, asTeam) {
     else throw new Error('That code is not valid');
   }
   if (!tracking && p.tracking) { const f = findCode(st, bo.id, p.tracking); if (f?.tracking && trackingUsable(f.tracking, evIds, st.orders, now)) tracking = f.tracking.code; }  // a stale link never blocks a sale
-  const set = pricingSettings(bo, st.platform);
-  const qOpts = { avail: avs, manual, now, method: p.payment };
-  let q = quote({ items, addons, donation: p.donation, optFees: p.optFees || [] }, st.events, set, promo, qOpts);
+  const set = set0;
+  // §3 a membership / season pass (its code + the holder's email): covers or discounts eligible tickets and unlocks members-only ticket types
+  let pass = null;
+  if (p.pass && !p.comp) { const f = findPass(st, bo.id, p.pass, email, evIds); if (f.error) throw new Error(f.error); pass = f; }
+  const memberTT = new Set();
+  for (const it of items) { const ev = st.events.find(e => e.id === it.eventId), tt = ev?.ticketTypes.find(t => t.id === it.ticketTypeId); if (!tt?.memberOnly) continue;
+    if (!manual && (!pass || ((tt.memberPlans || []).length && !tt.memberPlans.includes(pass.plan.id)) || !anyOf(pass.plan.eventIds, ev.id))) throw new Error(`${tt.name} is for members — enter your membership code`); memberTT.add(tt.id); }
+  const qOpts = { avail: avs, manual, now, method: terminal ? 'card' : p.payment, pass: pass ? publicPass(pass.pass, pass.plan, pass.state) : null }, cartIn = { items, addons, gifts, passes, donation: p.donation, optFees: p.optFees || [] };
+  let q = quote(cartIn, st.events, set, promo, qOpts);
+  if (pass && !q.passUses && !memberTT.size) throw new Error(`${pass.plan.name} doesn't cover anything in this order`);
   if (promo && q.promoErr) throw new Error(q.promoErr);
   // credit (Stage 6): a credit code, the signed-in customer's own account credit, or one a staff member picks on a manual order
   let credit = null;
@@ -1016,7 +1249,7 @@ function demoPlaceOrder(p, asTeam) {
       if (!credit) throw new Error('You have no credit that can be used on this order');
     } else credit = cs.find(c => c.code === String(p.credit).trim().toUpperCase());
     const why = creditProblem(credit, credit && cst(credit), evIds); if (why) throw new Error(why);
-    q = quote({ items, addons, donation: p.donation, optFees: p.optFees || [] }, st.events, set, promo, { ...qOpts, credit: Math.min(cst(credit).remaining, credit.event_id ? eventPortion(q, credit.event_id) : Infinity) });
+    q = quote(cartIn, st.events, set, promo, { ...qOpts, credit: Math.min(cst(credit).remaining, credit.event_id ? eventPortion(q, credit.event_id) : Infinity) });
   }
   // checkout questions: once per order (box office), once per event, once per ticket
   const perEv = {}; q.lines.forEach(l => { perEv[l.eventId] = (perEv[l.eventId] || 0) + lineUnits(l).length; });
@@ -1037,23 +1270,36 @@ function demoPlaceOrder(p, asTeam) {
     q.lines.forEach(l => Object.assign(l, { unit: 0, fee: 0, unitFee: 0, comp: true }));
     Object.assign(q, { subtotal: 0, ticketsTotal: 0, addonsTotal: 0, discount: 0, feeDiscount: 0, fee: 0, serviceFee: 0, otherFee: 0, otherFees: [], tax: 0, donation: 0, processing: 0, processingFee: 0, platformFee: 0, total: 0 });
   }
+  // §5 payment plan: deposit now by card, the rest in installments before the deadline; tickets stay pending until the last payment
+  let plan = null;
+  if (p.installments && q.total > 0) {
+    if (manual) throw new Error('Payment plans are for online orders');
+    if (p.payment !== 'card') throw new Error('Payment plans are paid by card');
+    const starts = q.lines.filter(l => l.eventId).map(l => new Date(l.slotStart || st.events.find(e => e.id === l.eventId)?.start).getTime()).filter(x => x > 0);
+    plan = planSchedule(q.total, installFor(set, evObjs), starts.length ? new Date(Math.min(...starts)).toISOString() : null, now);
+    if (!plan) throw new Error('A payment plan isn\'t available for this order');
+  }
+  if (terminal && q.total > 0 && !cardReady(bo, st.platform)) throw new Error(cardOffWhy(bo, st.platform));
   // how it's paid: free and staff orders are paid now; a card checkout waits for the processor; pay-later reserves without tickets
   if (q.total > 0 && !manual) {
     if (p.payment === 'card') { if (set.payments?.card === false || !cardReady(bo, st.platform)) throw new Error(set.payments?.card === false ? 'Card payments are not set up for this box office yet' : cardOffWhy(bo, st.platform)); }
     else if (p.payment === 'offline') { if (set.payments?.offline === false) throw new Error('Pay later is not available for this box office'); }
     else throw new Error('Choose a payment method');
   }
-  const status = q.total === 0 || manual ? 'paid' : p.payment === 'card' ? 'awaiting_payment' : 'pending';
+  const unpaid = manual && !terminal && !!p.unpaid && q.total > 0;   // §9 an invoice / pay-later staff order: reserved until marked paid
+  const status = q.total === 0 || (manual && !terminal && !unpaid) ? 'paid' : p.payment === 'card' || terminal ? 'awaiting_payment' : 'pending';
   let ref; do { ref = 'SET-' + randCode(6); } while (st.orders.some(o => o.ref === ref));
   const order = { id: uid(), box_office_id: bo.id, ref, access_key: uid(), status, buyer_email: email, event_ids: evIds, created_at: now.toISOString(),
     attempt_key: p.attempt || null, paid_at: status === 'paid' ? now.toISOString() : null, expires_at: status === 'awaiting_payment' ? new Date(now.getTime() + PAY_MINUTES * 6e4).toISOString() : null,
-    payment: status === 'awaiting_payment' ? { provider: bo.gateway.provider, test: !!bo.gateway.test, attempts: [] }
-      : manual && q.total > 0 ? { provider: 'manual', method: PAY_METHODS[p.payMethod] ? p.payMethod : 'other', ref: String(p.payRef || '').slice(0, 80), by: asTeam?.email || DB._actor } : null,
+    payment: status === 'awaiting_payment' ? { provider: bo.gateway.provider, test: !!bo.gateway.test, attempts: [], ...(terminal ? { terminal: true, by: asTeam?.email || DB._actor } : {}) }
+      : manual && q.total > 0 ? { provider: 'manual', method: PAY_METHODS[p.payMethod] ? p.payMethod : 'other', ref: String(p.payRef || '').slice(0, 80), by: asTeam?.email || DB._actor,
+        amount: q.total, date: /^\d{4}-\d{2}-\d{2}$/.test(p.payDate || '') ? p.payDate : localDay(now.toISOString()), notes: String(p.payNotes || '').slice(0, 300), status: unpaid ? 'unpaid' : 'paid' } : null,
     data: { buyer: p.buyer, lines: q.lines, subtotal: q.subtotal, ticketsTotal: q.ticketsTotal, addonsTotal: q.addonsTotal, discount: q.discount, feeDiscount: q.feeDiscount,
       fee: q.fee, serviceFee: q.serviceFee, otherFee: q.otherFee, otherFees: q.otherFees, tax: q.tax, donation: q.donation, ...(q.donation ? { donationFor: donationPurpose(set, evObjs) } : {}), processing: q.processing, processingFee: q.processingFee, total: q.total, refunded: 0, faceValue: q.faceValue,
       code: promo?.code || null, promo: promo ? { id: promo.id, code: findCode(st, bo.id, promo.code).promo.code } : null, tracking,
       payment: q.total === 0 ? (q.credit ? 'credit' : 'free') : p.payment, credit: credit && q.credit ? { id: credit.id, code: credit.code, amount: q.credit } : null, answers: p.answers || {}, ticketAnswers: p.ticketAnswers || {}, optIn: !!p.optIn, smsOptIn: !!p.smsOptIn && !!normPhone(p.buyer?.phone), source: p.source || null, utm: cleanUtm(p.utm), currency: q.currency,
-      platformFee: q.platformFee, ...(p.comp ? { comp: true } : {}), accepted, flags: orderFlags(st, p, bo, email, evIds, manual, now.getTime()) } };
+      platformFee: q.platformFee, ...(p.comp ? { comp: true } : {}), accepted, flags: orderFlags(st, p, bo, email, evIds, manual, now.getTime()),
+      channel: p.pos ? 'pos' : manual ? 'box office' : 'online', ...(pass ? { pass: { id: pass.pass.id, code: pass.pass.code, plan: pass.plan.name, uses: q.passUses, discount: q.passDiscount } } : {}), ...(plan ? { plan } : {}) } };
   st.orders.push(order);
   emitEvent(st, bo.id, 'order.created', hookOrder(st, order));
   if (status === 'pending') orderContact(st, order);
@@ -1062,14 +1308,16 @@ function demoPlaceOrder(p, asTeam) {
   if (p.holdToken) st.seatStatus = (st.seatStatus || []).filter(r => !(r.status === 'checkout' && r.token === p.holdToken));
   if (status === 'paid') issueOrderTickets(st, order, { manual, by: asTeam?.email || DB._actor || email });
   if (manual && p.send === false) (st.outbox || []).forEach(m => { if (m.order_id === order.id && m.kind === 'confirmation') m.status = 'not sent (staff choice)'; });
+  if (manual && p.smsTickets && normPhone(p.buyer?.phone)) queueMsg(st, { box_office_id: bo.id, order_id: order.id, event_id: evIds[0] || null, kind: 'pos', channel: 'sms', to: p.buyer.phone, email, body: '', by: asTeam?.email || DB._actor });   // §2 door sale: ticket link by text
   Demo.save();
-  const res = { id: order.id, key: order.access_key, ref, status, expires_at: order.expires_at, total: q.total };
+  const res = { id: order.id, key: order.access_key, ref, status, expires_at: order.expires_at, total: q.total, due: plan ? plan.deposit : q.total };
   if (status === 'awaiting_payment' && p.card) { const r = demoCharge(st, order, p.card); Demo.save(); if (r.error) throw new Error(r.error); res.status = 'paid'; }  // demo shortcut: place + pay in one call
   return res;
 }
 // Paid → tickets. Every ticket keeps: real ticket type, face value, amount collected, its discount + code, comp, tracking code, products,
 // package, and its own checkout answers. Runs once per order (placing a free/staff order, the processor confirming, or staff marking paid).
 function issueOrderTickets(st, order, o = {}) {
+  issueOrderExtras(st, order);   // gift cards and passes it bought (once)
   if (st.tickets.some(t => t.order_id === order.id)) return;
   const d = order.data, comp = !!d.comp, tracking = d.tracking || null, code = d.code || null, by = o.by || order.buyer_email, idx = {};
   const extras = evId => d.lines.filter(l => l.eventId === evId && l.kind === 'addon').map(l => `${l.name} × ${l.qty}`);
@@ -1085,7 +1333,9 @@ function issueOrderTickets(st, order, o = {}) {
   for (const l of d.lines) {
     if (l.kind === 'ticket') for (let u = 0; u < l.qty; u++) {
       const dd = l.discs?.[u] || 0, fs = spread(l.face, Array(l.admits).fill(1)), ps = spread(l.unit - dd, Array(l.admits).fill(1)), ds = spread(dd, Array(l.admits).fill(1));
-      for (let j = 0; j < l.admits; j++) issue(l, l.ticketTypeId, l.seats[u * l.admits + j] || null, fs[j], ps[j], ds[j]);
+      // §3 the pass that covered (or unlocked — members-only types) this ticket; the promo code only when the code itself discounted it
+      const mtt = st.events.find(e => e.id === l.eventId)?.ticketTypes.find(t => t.id === l.ticketTypeId)?.memberOnly, more = { pass: (l.pu?.[u] || mtt) && d.pass ? d.pass.id : null, promo: dd - (l.pdiscs?.[u] || 0) > 0 ? code : null };
+      for (let j = 0; j < l.admits; j++) issue(l, l.ticketTypeId, l.seats[u * l.admits + j] || null, fs[j], ps[j], ds[j], more);
     }
     if (l.kind === 'bundle') for (let c = 0; c < l.qty; c++) {  // the bundle price is shared over its tickets and products by their normal prices
       const n = l.perCopy, tf = l.tfaces.slice(c * n, c * n + n), w = [...tf, ...l.addons.map(a => a.face * a.qty)], dd = l.discs?.[c] || 0;
@@ -1095,6 +1345,7 @@ function issueOrderTickets(st, order, o = {}) {
     }
   }
   allocTicketMoney(order, st.tickets.filter(t => t.order_id === order.id));   // Stage 9: each ticket's booking fee, tax and processing share
+  issueVouchers(st, order);   // §11 products with their own QR code
   // ONE confirmation email per order, with every ticket (the sender delivers it; transactional — never held back for marketing consent)
   if (!(st.outbox ||= []).some(m => m.order_id === order.id && m.kind === 'confirmation')) queueMail(st, order, 'confirmation', '', '', 'system');
   orderContact(st, order);
@@ -1108,6 +1359,16 @@ function demoCharge(st, order, card = {}) {
   if (order.status !== 'awaiting_payment' || new Date(order.expires_at) <= Date.now()) { expireOrders(st); return { error: 'This checkout has expired and its seats were released. Please start again.' }; }
   const atts = order.payment.attempts;
   if (atts.length >= 8) return { error: 'Too many payment attempts on this order. Please start again.' };
+  const { err, last4, brand } = demoCardCheck(card);
+  atts.push({ at: nowIso(), ok: !err, method: card.wallet || 'card', brand, last4, error: err || null });
+  (st.payAttempts ||= []).unshift({ at: nowIso(), ok: !err, box_office_id: order.box_office_id }); if (st.payAttempts.length > 2000) st.payAttempts.length = 2000;   // payment-attempt monitoring
+  if (err && atts.filter(a => !a.ok).length >= LIMITS.declinesFlag && !(order.data.flags || []).includes('declines')) (order.data.flags ||= []).push('declines');
+  if (err) return { error: err };
+  const r = confirmPayment(st, order, { provider: 'demo', ref: 'pi_demo_' + randCode(12).toLowerCase(), method: card.wallet || (order.payment?.terminal ? 'card_present' : 'card'), brand, last4, fee: order.data.processingFee });
+  return { status: r === 'deposit' ? 'pending' : 'paid' };
+}
+// Stripe's test card numbers behave like Stripe test mode (DEMO only). → {err, brand, last4}
+function demoCardCheck(card = {}) {
   let err = '', last4 = '', brand = card.wallet === 'apple_pay' ? 'Apple Pay' : card.wallet === 'google_pay' ? 'Google Pay' : '';
   if (!card.wallet) {
     const n = String(card.number || '').replace(/\D/g, ''), [mm, yy] = String(card.exp || '').split('/').map(x => +x);
@@ -1118,16 +1379,22 @@ function demoCharge(st, order, card = {}) {
     else if (!(n in TEST_CARDS)) err = 'Demo mode only accepts test cards — use 4242 4242 4242 4242.';
     else err = TEST_CARDS[n];
   }
-  atts.push({ at: nowIso(), ok: !err, method: card.wallet || 'card', brand, last4, error: err || null });
-  (st.payAttempts ||= []).unshift({ at: nowIso(), ok: !err, box_office_id: order.box_office_id }); if (st.payAttempts.length > 2000) st.payAttempts.length = 2000;   // payment-attempt monitoring
-  if (err && atts.filter(a => !a.ok).length >= LIMITS.declinesFlag && !(order.data.flags || []).includes('declines')) (order.data.flags ||= []).push('declines');
-  if (err) return { error: err };
-  confirmPayment(st, order, { provider: 'demo', ref: 'pi_demo_' + randCode(12).toLowerCase(), method: card.wallet || 'card', brand, last4, fee: order.data.processingFee });
-  return { status: 'paid' };
+  return { err, last4, brand };
+}
+// §5 one installment of a payment plan is paid (card: buyer / processor; staff: cash, check …). The last one issues the tickets.
+function payInstallment(st, o, pay, by) {
+  const pl = o.data.plan, x = planNext(pl);
+  if (pay.ref && (pl?.schedule || []).some(y => y.ref === pay.ref)) return 'already';   // the same processor payment arriving twice is recorded once
+  if (!pl || o.status !== 'pending' || !x) throw new Error('Nothing is due on this order');
+  Object.assign(x, { paid_at: nowIso(), method: pay.method, ref: pay.ref || '', by: by || o.buyer_email, ...(pay.provider ? { provider: pay.provider } : {}), ...(pay.last4 ? { brand: pay.brand, last4: pay.last4 } : {}) });
+  // each installment is its own processor payment (its own ref), so reconciliation matches it on its own
+  if (pay.provider === 'demo') procTx(st, o, { type: 'charge', id: 'ch_demo_' + randCode(12).toLowerCase(), payment: pay.ref, amount: x.amount, fee: 0, app_fee: 0 });
+  if (!planNext(pl)) { Object.assign(o, { status: 'paid', paid_at: nowIso() }); issueOrderTickets(st, o, { by: by || o.buyer_email }); return 'paid'; }
+  return 'pending';
 }
 // the demo processor's own ledger of what it charged, refunded and took back (LIVE: processor_tx, written by the payments Edge Function)
 function procTx(st, o, r) {
-  (st.procTx ||= []).push({ id: r.id, box_office_id: o.box_office_id, provider: 'demo', payment: o.payment?.ref || null, type: r.type, amount: r.amount, fee: r.fee || 0, app_fee: r.app_fee || 0,
+  (st.procTx ||= []).push({ id: r.id, box_office_id: o.box_office_id, provider: 'demo', payment: r.payment || o.payment?.ref || null, type: r.type, amount: r.amount, fee: r.fee || 0, app_fee: r.app_fee || 0,
     at: r.at || nowIso(), payout_id: null, order_id: o.id });
 }
 // The processor says the money arrived. Idempotent. A payment that lands after the checkout expired still gets its tickets if every seat /
@@ -1143,9 +1410,16 @@ function confirmPayment(st, order, pay) {
       order.data.refunded = order.data.total; return 'refunded';
     }
   }
+  const pl = order.data.plan;
+  if (pl && !planPaid(pl)) {   // §5 the deposit of a payment plan: seats stay held (pending), tickets come with the last installment
+    Object.assign(pl.schedule[0], { paid_at: nowIso(), method: pay.method, ref: pay.ref, brand: pay.brand, last4: pay.last4, provider: pay.provider });
+    Object.assign(order, { payment: { ...(order.payment || {}), ...pay } });
+    if (pay.provider === 'demo') procTx(st, order, { type: 'charge', id: 'ch_demo_' + randCode(12).toLowerCase(), amount: pl.schedule[0].amount, fee: order.data.processingFee || 0, app_fee: order.data.platformFee || 0 });
+    if (planNext(pl)) { Object.assign(order, { status: 'pending', expires_at: null }); orderContact(st, order); queueMail(st, order, 'installment', 'Your payment plan', 'Deposit received — your seats are held.', 'system'); return 'deposit'; }
+  }
   Object.assign(order, { status: 'paid', paid_at: nowIso(), payment: { ...(order.payment || {}), ...pay } });
   if (pay.fee != null) order.data.processingFee = pay.fee;
-  if (pay.provider === 'demo') procTx(st, order, { type: 'charge', id: 'ch_demo_' + randCode(12).toLowerCase(), amount: order.data.total, fee: order.data.processingFee || 0, app_fee: order.data.platformFee || 0 });
+  if (pay.provider === 'demo' && !pl) procTx(st, order, { type: 'charge', id: 'ch_demo_' + randCode(12).toLowerCase(), amount: order.data.total, fee: order.data.processingFee || 0, app_fee: order.data.platformFee || 0 });
   issueOrderTickets(st, order, { by: order.buyer_email });
   return 'issued';
 }
@@ -1174,7 +1448,7 @@ function buyerOrder(o) {
    and price, the difference, what was refunded / credited / collected, who did it, when and why. Staff never write orders or tickets
    directly — every change goes through orderAction() (DEMO) / order_action() (SQL), which checks permissions first. */
 const REFUND_TO = { original: 'Original payment method', credit: 'Account credit (any event)', eventCredit: 'Credit for one future event', cash: 'Cash', other: 'Other — recorded only' };
-const PAY_METHODS = { cash: 'Cash', terminal: 'Card terminal', check: 'Check', transfer: 'Bank transfer', other: 'Other' };
+const PAY_METHODS = { cash: 'Cash', terminal: 'Card terminal', check: 'Check', zelle: 'Zelle / manual transfer', transfer: 'Bank transfer', invoice: 'Invoice', other: 'Other' };
 const UPGRADE_SETTLE = { collect: 'Collect the difference now', due: 'Add it to the balance due', waive: 'No charge' };
 const DOWNGRADE_SETTLE = { refund: 'Refund the difference', credit: 'Account credit', eventCredit: 'Future-event credit', none: 'No refund' };
 const SEAT_AFTER_CANCEL = { release: 'Release the seats for sale', hold: 'Keep the seats held', block: 'Keep the seats blocked' };
@@ -1227,13 +1501,13 @@ const orderExtras = (o, evId) => o.data.lines.filter(l => l.eventId === evId && 
    card fees passed on, credit used, later order changes, refunds / credits not tied to a ticket, chargebacks, the platform fee). The items of
    an order always add up to exactly what the order collected, so every filter, total and export reconciles. */
 const CB_STATUS = { open: 'Open — the bank is holding the money', won: 'Won — money returned', lost: 'Lost' };
-const PAY_LABEL = { card: 'Card', apple_pay: 'Apple Pay', google_pay: 'Google Pay', cash: 'Cash', terminal: 'Card terminal', check: 'Check', transfer: 'Bank transfer', other: 'Other (offline)',
+const PAY_LABEL = { card: 'Card', apple_pay: 'Apple Pay', google_pay: 'Google Pay', card_present: 'Card at the door', cash: 'Cash', terminal: 'Card terminal', check: 'Check', zelle: 'Zelle / manual transfer', transfer: 'Bank transfer', invoice: 'Invoice', other: 'Other (offline)',
   offline: 'Pay later (marked paid)', free: 'Free', comp: 'Complimentary', credit: 'Paid with credit' };
-const OFFLINE_PAY = ['cash', 'terminal', 'check', 'transfer', 'other', 'offline'];
+const OFFLINE_PAY = ['cash', 'terminal', 'check', 'zelle', 'transfer', 'invoice', 'other', 'offline'];
 const EXPENSE_CATS = ['Venue', 'AV', 'Security', 'Marketing', 'Talent', 'Staffing', 'Food', 'Transportation', 'Insurance', 'Other'];
 const emptyFin = () => ({ eventId: '', slotId: '', from: '', to: '', ttId: '', area: '', price: '', promo: '', tracking: '', addonId: '', bundleId: '', method: '', customer: '' });
 const FIN_SUM = ['tface', 'pface', 'comp', 'discount', 'savings', 'fees', 'otherFee', 'tax', 'donation', 'cardFee', 'creditUsed', 'changes', 'collected', 'refunds', 'credits', 'chargebacks', 'processing', 'platform',
-  'offline', 'ticketRev', 'productRev', 'bundleRev', 'sold', 'comps', 'refundedTickets'];
+  'offline', 'ticketRev', 'productRev', 'bundleRev', 'giftSold', 'passRev', 'sold', 'comps', 'refundedTickets'];
 const localDay = iso => { const d = new Date(iso); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 function payMethodOf(o) {
   const d = o.data || {}, p = o.payment || {};
@@ -1270,6 +1544,7 @@ function finItems(x) {
     const extra = [];   // products, and the products' share of package prices
     for (const l of d.lines) {
       if (l.kind === 'addon') extra.push({ ...base, kind: 'addon', eventId: l.eventId, addonId: l.addonId, name: l.name, qty: l.qty - (l.removed || 0), pface: l.face * l.qty, discount: l.disc || 0, paid: l.unit * l.qty - (l.disc || 0) });
+      if (l.kind === 'gift' || l.kind === 'pass') extra.push({ ...base, kind: l.kind, eventId: '', addonId: '', name: l.name, qty: l.qty, pface: 0, discount: 0, paid: l.unit * l.qty, untaxed: l.kind === 'gift' });   // gift cards: money held for later; passes: membership revenue
       if (l.kind === 'bundle') {
         const mine = made.filter(i => i.bundleId === l.bundleId && i.eventId === l.eventId), lineDisc = l.disc || 0, paid = l.unit * l.qty - lineDisc - mine.reduce((a, i) => a + i.ticketRev, 0);
         const pface = l.qty * (l.addons || []).reduce((a, x) => a + x.face * x.qty, 0), disc = Math.max(0, lineDisc - mine.reduce((a, i) => a + i.discount, 0));
@@ -1277,8 +1552,9 @@ function finItems(x) {
       }
     }
     const tTax = made.reduce((a, i) => a + i.tax, 0), tProc = made.reduce((a, i) => a + i.processing, 0);
-    const xTax = spread(Math.max(0, (d.tax || 0) - tTax), extra.map(e => e.paid)), xProc = spread(Math.max(0, (d.processingFee || 0) - tProc), [...extra.map((e, j) => e.paid + (extra.length ? xTax[j] : 0)), d.donation || 0]);
-    extra.forEach((e, j) => { const tax = xTax[j] || 0; Object.assign(e, { savings: e.pface - e.paid - e.discount, tax, collected: e.paid + tax, processing: xProc[j] || 0, productRev: e.paid, bundleRev: e.bundle ? e.paid : 0 }); made.push(e); });
+    const xTax = spread(Math.max(0, (d.tax || 0) - tTax), extra.map(e => e.untaxed ? 0 : e.paid)), xProc = spread(Math.max(0, (d.processingFee || 0) - tProc), [...extra.map((e, j) => e.paid + (extra.length ? xTax[j] : 0)), d.donation || 0]);
+    extra.forEach((e, j) => { const tax = xTax[j] || 0, gp = e.kind === 'gift' || e.kind === 'pass'; Object.assign(e, { savings: gp ? 0 : e.pface - e.paid - e.discount, tax, collected: e.paid + tax, processing: xProc[j] || 0, productRev: gp ? 0 : e.paid, bundleRev: e.bundle ? e.paid : 0,
+      giftSold: e.kind === 'gift' ? e.paid : 0, passRev: e.kind === 'pass' ? e.paid : 0 }); made.push(e); });
     const S = k => made.reduce((a, i) => a + (i[k] || 0), 0), credUsed = m.creditUsed;
     const rest = { ...base, kind: 'order', eventId: o.event_ids[0], slotId: '', ttId: '', area: '', price: '', bundleId: '', addonId: '',
       fees: (d.fee || 0) + (d.serviceFee || 0) - S('fees'), otherFee: d.otherFee || 0, tax: extra.length ? 0 : (d.tax || 0) - tTax, donation: d.donation || 0, donationFor: d.donationFor || '', cardFee: d.processing || 0, creditUsed: -credUsed,
@@ -1358,10 +1634,18 @@ const ticketFin = t => ({ face: t.face || 0, paid: t.paid || 0, discount: t.disc
 function platformTx(orders) {
   const out = {};
   for (const o of orders) {
-    const p = o.payment || {}; if (!p.ref || p.provider === 'manual' || !wasPaid(o)) continue;
-    const refunds = (o.data.refunds || []).filter(r => r.to === 'original' && r.status === 'done' && (r.provider || r.payment)).reduce((a, r) => a + r.amount, 0);
+    const p = o.payment || {}, pl = o.data.plan;
+    const cardRefunds = (o.data.refunds || []).filter(r => r.to === 'original' && r.status === 'done' && (r.provider || r.payment)), refunds = () => cardRefunds.reduce((a, r) => a + r.amount, 0);
+    if (pl) {   // §5 a payment plan: every installment paid at the processor is its own payment (split refunds land on theirs); the deposit carries the fees and chargebacks
+      const refundedOn = ref => cardRefunds.reduce((a, r) => a + (r.parts ? r.parts.filter(x => x.payment === ref).reduce((b, x) => b + x.amount, 0) : (r.payment || p.ref) === ref ? r.amount : 0), 0);
+      for (const x of pl.schedule) if (x.paid_at && x.ref && (x.provider || (x.ref === p.ref && p.provider)) && (x.provider || p.provider) !== 'manual') { const first = x.ref === p.ref;
+        out[x.ref] = { ref: x.ref, orderId: o.id, orderRef: o.ref, eventId: o.event_ids[0], day: localDay(x.paid_at), charged: x.amount, fee: first ? o.data.processingFee || 0 : 0,
+          app: first ? o.data.platformFee || 0 : 0, refunded: refundedOn(x.ref), disputed: first ? chargebacksOf(o) : 0 }; }
+      continue;
+    }
+    if (!p.ref || p.provider === 'manual' || !wasPaid(o)) continue;
     out[p.ref] = { ref: p.ref, orderId: o.id, orderRef: o.ref, eventId: o.event_ids[0], day: localDay(o.paid_at || o.created_at), charged: o.data.total || 0, fee: o.data.processingFee || 0,
-      app: o.data.platformFee || 0, refunded: refunds, disputed: chargebacksOf(o) };
+      app: o.data.platformFee || 0, refunded: refunds(), disputed: chargebacksOf(o) };
   }
   return out;
 }
@@ -1482,19 +1766,34 @@ function applyRefund(st, o, plan, p, by) {
     r.credit = c.code; d.credited = (d.credited || 0) + plan.amount;
   } else {
     // the processor refunds the card: DEMO's test processor at once; LIVE the payments Edge Function (order_action leaves it 'processing')
-    if (to === 'original' && o.payment?.ref) { r.provider = o.payment.provider; r.ref = 're_demo_' + randCode(12).toLowerCase(); }
+    if (to === 'original' && o.payment?.ref) { r.provider = o.payment.provider; r.ref = 're_demo_' + randCode(12).toLowerCase();
+      if (d.plan) { r.parts = planRefundParts(o, plan.amount); r.payment = r.parts[0].payment; } }
     d.refunded = (d.refunded || 0) + plan.amount;
   }
   d.refundedFees = (d.refundedFees || 0) + plan.fees;
   for (const [id, v] of Object.entries(plan.per)) { const t = st.tickets.find(x => x.id === id); if (t) { t.refunded = (t.refunded || 0) + v; if (r.credit) t.credited = (t.credited || 0) + v; } }
   (d.refunds ||= []).push(r);
-  if (r.provider === 'demo') procTx(st, o, { type: 'refund', id: r.ref, amount: -r.amount });
+  if (r.provider === 'demo') for (const [i, x] of (r.parts || [{ payment: null, amount: r.amount }]).entries()) procTx(st, o, { type: 'refund', id: r.ref + (i ? '_' + i : ''), payment: x.payment, amount: -x.amount });
   return r;
+}
+// §5 a card refund on a payment plan goes back to the installments paid by card (each its own processor payment), newest first,
+// never more than any one of them took in. Mirrors SQL plan_refund_parts().
+function planRefundParts(o, amount) {
+  const p = o.payment || {}, left = {};
+  for (const x of o.data.plan?.schedule || []) { const prov = x.provider || (x.ref && x.ref === p.ref ? p.provider : '');
+    if (x.paid_at && x.ref && prov && prov !== 'manual') left[x.ref] = x.amount; }
+  for (const r of o.data.refunds || []) if (['done', 'processing'].includes(r.status)) for (const x of r.parts || (r.payment ? [{ payment: r.payment, amount: r.amount }] : []))
+    if (x.payment in left) left[x.payment] -= x.amount;
+  const parts = []; let rest = amount;
+  for (const ref of Object.keys(left).reverse()) { const a = Math.min(rest, Math.max(0, left[ref])); if (a > 0) { parts.push({ payment: ref, amount: a }); rest -= a; } }
+  if (rest > 0) throw new Error(`Only ${money_(amount - rest)} of this payment plan can go back to the card — refund the rest as cash, credit or other`);
+  return parts;
 }
 const refundText = r => `${money_(r.amount)} ${r.to === 'credit' || r.to === 'eventCredit' ? `as credit ${r.credit}` : 'to ' + REFUND_TO[r.to].toLowerCase()}`;
 // all tickets voided and no products left → the order is cancelled (refunded when everything collected went back)
 function settleOrderStatus(st, o) {
   if (st.tickets.some(t => t.order_id === o.id && t.status === 'valid') || o.data.lines.some(l => l.kind === 'addon' && l.qty - (l.removed || 0) > 0)) return;
+  if ((st.credits || []).some(c => c.source_order === o.id && c.kind === 'gift' && !c.revoked_at) || (st.passes || []).some(x => x.order_id === o.id && !x.cancelled_at)) return;   // gift cards / passes it sold still stand
   const m = orderMoney(o); o.status = m.collected > 0 && m.refunded + m.credited >= m.collected ? 'refunded' : 'cancelled';
 }
 // Move / upgrade / downgrade / change type, section or showtime — one ticket or many. Old ticket → 'replaced'; a new ticket is issued.
@@ -1624,14 +1923,24 @@ function demoOrderAction(id, action, p = {}) {
     }
     case 'markPaid': {
       need('orders.edit', ev0); if (!['pending', 'awaiting_payment'].includes(o.status)) throw new Error('This order is not waiting for payment');
-      const was = o.status; Object.assign(o, { status: 'paid', paid_at: nowIso(), payment: { ...(o.payment || {}), markedPaidBy: by, method: PAY_METHODS[p.method] ? p.method : o.payment?.method } });
+      if (d.plan && planPaid(d.plan)) throw new Error('This order is on a payment plan — record the next installment instead');
+      const was = o.status; Object.assign(o, { status: 'paid', paid_at: nowIso(), payment: { ...(o.payment || {}), markedPaidBy: by, method: PAY_METHODS[p.method] ? p.method : o.payment?.method,
+        ...(o.payment?.provider === 'manual' ? { status: 'paid', paidDate: /^\d{4}-\d{2}-\d{2}$/.test(p.date || '') ? p.date : localDay(nowIso()), ref: String(p.ref ?? o.payment.ref ?? '').slice(0, 80), notes: String(p.notes ?? o.payment.notes ?? '').slice(0, 300) } : {}) } });
       issueOrderTickets(st, o, { manual: true, by }); log('paid', `marked paid (${was} → paid)${PAY_METHODS[p.method] ? ' · ' + PAY_METHODS[p.method] : ''} — tickets issued`, {}, { status: was }, { status: 'paid' }); break;
+    }
+    case 'installment': {   // §5 staff record a payment-plan installment (cash, check, Zelle, card terminal …)
+      need('orders.edit', ev0); if (!PAY_METHODS[p.method]) throw new Error('Choose how it was paid');
+      const x = planNext(d.plan); if (!x || o.status !== 'pending') throw new Error('Nothing is due on this order');
+      const r = payInstallment(st, o, { method: p.method, ref: String(p.ref || '').slice(0, 80) }, by);
+      log('installment', `${x.label} of ${money_(x.amount)} recorded (${PAY_METHODS[p.method]})${r === 'paid' ? ' — paid in full, tickets issued' : ''}`, { n: x.n, amount: x.amount }, null, { status: o.status }); break;
     }
     case 'cancelUnpaid': {
       need('orders.cancel', ev0); if (!['pending', 'awaiting_payment'].includes(o.status)) throw new Error('This order is not an unpaid reservation');
-      const was = o.status; o.status = 'cancelled';
+      const was = o.status, paidSoFar = planPaid(d.plan); o.status = 'cancelled';
       for (const l of d.lines) for (const u of lineUnits(l)) if (u.seat) seatLog(st.events.find(e => e.id === l.eventId), l.slotId, u.seat, 'released', `Reservation ${o.ref} cancelled — seat released`, { ref: o.ref, by });
-      log('cancelled', 'unpaid reservation cancelled — seats released', {}, { status: was }, { status: 'cancelled' }); break;
+      let kept = '';   // §5 a cancelled payment plan: what was paid becomes account credit, or is kept as a non-refundable deposit
+      if (paidSoFar > 0) { if (p.keep === 'credit') { need('orders.refund', ev0); const c = issueCreditRow(st, o.box_office_id, { email: o.buyer_email, name: d.buyer.name, amount: paidSoFar, order: o, by, note: 'Payment plan cancelled' }); d.credited = (d.credited || 0) + paidSoFar; kept = ` · ${money_(paidSoFar)} paid → credit ${c.code}`; } else kept = ` · ${money_(paidSoFar)} paid kept as a non-refundable deposit`; }
+      log('cancelled', 'unpaid reservation cancelled — seats released' + kept, {}, { status: was }, { status: 'cancelled' }); break;
     }
     case 'change': {
       need('orders.seats', ev0); paidOnly();
@@ -1647,6 +1956,8 @@ function demoOrderAction(id, action, p = {}) {
       const plan = p.refund ? refundPlan(o, st.tickets, { ...p.refund, mode: p.refund.mode || 'tickets', tickets: all ? live().map(t => t.id) : p.tickets }) : null;
       const list = cancelOrderTickets(st, o, { ...p, all }, by);
       const r = plan ? applyRefund(st, o, plan, { ...p.refund, note: p.note }, by) : null;
+      if (all) { voidVouchers(st, o.id); for (const c of (st.credits || []).filter(c => c.source_order === o.id && c.kind === 'gift' && !c.revoked_at)) Object.assign(c, { revoked_at: nowIso(), revoked_by: by, revoke_note: 'Order ' + o.ref + ' cancelled' });
+        for (const x of (st.passes || []).filter(x => x.order_id === o.id && !x.cancelled_at)) Object.assign(x, { cancelled_at: nowIso(), cancelled_by: by }); }
       settleOrderStatus(st, o);
       log('cancel', `${all ? 'order cancelled' : `cancelled ${list.length} ticket${list.length === 1 ? '' : 's'}`} (${list.map(t => t.code).join(', ') || 'products'}) — ${SEAT_AFTER_CANCEL[p.seat || 'release'].toLowerCase()}${r ? ' · refunded ' + refundText(r) : ' · no refund'}`,
         { tickets: list.map(t => t.code), seat: p.seat || 'release', refund: r }, null, { status: o.status });
@@ -1692,7 +2003,7 @@ function demoOrderAction(id, action, p = {}) {
       if (!l || l.kind !== 'addon') throw new Error('Choose a product'); if (!(qty >= 1) || qty > l.qty - (l.removed || 0)) throw new Error('Enter how many to remove');
       const amount = Math.min(l.unit * qty, orderMoney(o).refundable); let r = null;
       if (p.refund && amount > 0) { need('orders.refund', ev0); r = applyRefund(st, o, { amount, fees: 0, per: {} }, { to: p.to || 'original', creditEvent: p.creditEvent, note: p.note }, by); }
-      l.removed = (l.removed || 0) + qty;
+      l.removed = (l.removed || 0) + qty; voidVouchers(st, o.id, l.addonId, qty);
       live().filter(t => t.event_id === l.eventId).forEach(t => { t.extras = orderExtras(o, l.eventId); });
       settleOrderStatus(st, o);
       log('addon', `removed ${l.name} × ${qty}${r ? ' · refunded ' + refundText(r) : ' · no refund'}`, { addonId: l.addonId, qty, refund: r }); break;
@@ -1757,12 +2068,62 @@ function demoOrderAction(id, action, p = {}) {
   }
   return { ...res, status: o.status };
 }
+// §8 the customer's own changes from their ticket page (order id + its private key). Each one only when the box office / event switched it on.
+function demoSelfService(id, key, action, p = {}) {
+  const st = Demo.fresh(), o = st.orders.find(x => x.id === id && x.access_key === key); if (!o) throw new Error('Order not found');
+  const bo = st.boxOffices.find(b => b.id === o.box_office_id), set = { ...DEFAULT_SETTINGS, ...bo.settings }, d = o.data, who = o.buyer_email + ' (customer)';
+  const evOn = (evId, k) => selfOn(set, st.events.find(e => e.id === evId), k), anyOn = k => (o.event_ids.length ? o.event_ids : [null]).some(e => evOn(e, k));
+  const live = st.tickets.filter(t => t.order_id === o.id && t.status === 'valid');
+  const log = (kind, summary, data = {}) => { (st.orderLog ||= []).unshift({ id: uid(), at: nowIso(), box_office_id: o.box_office_id, order_id: o.id, ref: o.ref, event_id: o.event_ids[0] || null, kind, summary, by: who, note: '', data, before: null, after: null }); };
+  const off = 'The box office doesn\'t offer this online — please contact them';
+  if (o.status !== 'paid') throw new Error('Only paid orders can be changed here');
+  const tk = () => { const t = live.find(x => x.id === p.ticket); if (!t) throw new Error('That ticket is no longer valid'); if (!evOn(t.event_id, action)) throw new Error(off); if (t.checked_in_at) throw new Error('This ticket has already been used'); return t; };
+  let res = {};
+  switch (action) {
+    case 'rename': { const t = tk(), name = String(p.name || '').trim().slice(0, 120); if (!name) throw new Error('Enter the new name'); const was = t.holder; t.holder = name;
+      log('holder', `customer put ticket ${t.code} in the name of ${name} (was ${was})`, { ticket: t.code }); break; }
+    case 'transfer': {   // a new ticket + QR code for the new holder; the old code stops working at the door at once
+      const t = tk(), name = String(p.name || '').trim().slice(0, 120), email = String(p.email || '').trim().toLowerCase();
+      if (!name || !EMAIL_RE.test(email)) throw new Error('Enter the new holder\'s name and email');
+      const nt = { ...clone(t), id: uid(), code: randCode(10), holder: name, holder_email: email, status: 'valid', replaces: t.id, issued_at: nowIso(), transferred: { from: t.holder, at: nowIso() } };
+      delete nt.replaced_by; delete nt.changed_at; Object.assign(t, { status: 'replaced', replaced_by: nt.id, changed_at: nowIso() }); st.tickets.push(nt);
+      queueMsg(st, { box_office_id: o.box_office_id, order_id: o.id, event_id: t.event_id, kind: 'transfer', to: email, email, subject: `${d.buyer.name} sent you a ticket`, body: '', data: { tickets: [nt.id] }, by: who });
+      log('transfer', `customer transferred ticket ${t.code} to ${name} <${email}> — new code ${nt.code}; the old one no longer scans`, { from: t.code, to: nt.code }); res = { ticket: nt.id }; break;
+    }
+    case 'resend': {
+      if (!anyOn('resend')) throw new Error(off); if (!live.length) throw new Error('This order has no valid tickets');
+      if ((st.outbox || []).filter(m => m.order_id === o.id && m.kind === 'tickets' && m.by === who && Date.now() - new Date(m.at) < 864e5).length >= 3) throw new Error('Your tickets were already sent again several times today — please check your spam folder');
+      queueMail(st, o, 'tickets', 'Your tickets', '', who); log('resend', 'customer asked for the tickets by email again'); break;
+    }
+    case 'seatChange': case 'cancel': case 'refund': {   // a request to the box office — nothing changes until staff act on it
+      if (!anyOn(action)) throw new Error(off);
+      if ((st.support || []).some(x => x.box_office_id === o.box_office_id && x.ref === o.ref && x.request === action && x.status === 'open')) throw new Error('You already sent this request — the box office will reply by email');
+      const ev = st.events.find(e => e.id === o.event_ids[0]), to = (ev?.contact?.email || set.contactEmail || bo.owner).toLowerCase(), team = ev?.contact?.team || ev?.contact?.name || 'Box office';
+      const body = String(p.body || '').trim().slice(0, 2000) || SELF_REQUESTS[action];
+      (st.support ||= []).unshift({ id: uid(), box_office_id: o.box_office_id, event_id: ev?.id || null, name: d.buyer.name, email: o.buyer_email, ref: o.ref, subject: SELF_REQUESTS[action], body, request: action, routed_to: to, team, status: 'open', at: nowIso(), replies: [] });
+      queueMsg(st, { box_office_id: o.box_office_id, event_id: ev?.id || null, to, kind: 'staff', category: 'staff', subject: `${SELF_REQUESTS[action]}: order ${o.ref}`, body: `From ${d.buyer.name} <${o.buyer_email}>\n\n${body}\n\nAnswer in SET (Customers → Inbox).`, by: who });
+      log('request', `customer sent a ${SELF_REQUESTS[action].toLowerCase()}`, { request: action }); break;
+    }
+    default: throw new Error('Unknown action');
+  }
+  Demo.save(); return res;
+}
+// what self-service a buyer's ticket page offers (per order: the order-level switches; per ticket: its event's switches)
+function selfServiceFor(st, o) {
+  const bo = st.boxOffices.find(b => b.id === o.box_office_id), set = { ...DEFAULT_SETTINGS, ...bo?.settings }, out = {};
+  for (const [k] of SELF_SERVICE) out[k] = (o.event_ids.length ? o.event_ids : [null]).some(id => selfOn(set, st.events.find(e => e.id === id), k));
+  out.byEvent = Object.fromEntries(o.event_ids.map(id => [id, Object.fromEntries(SELF_SERVICE.map(([k]) => [k, selfOn(set, st.events.find(e => e.id === id), k)]))]));
+  return out;
+}
 // Credits outside an order: issue a goodwill / future-event credit, revoke what's left, or apply one to an order's balance due.
 function demoCreditAction(action, p = {}) {
   const st = Demo.st, by = DB._actor;
   if (action === 'issue') {
-    need('orders.refund'); const o = p.order ? st.orders.find(x => x.id === p.order && x.box_office_id === DB._bo) : null;
+    const gift = p.kind === 'gift' || p.kind === 'voucher';   // §4 staff-issued gift cards / vouchers need their own permission; store credit needs refunds
+    need(gift ? 'orders.gifts' : 'orders.refund'); const o = p.order ? st.orders.find(x => x.id === p.order && x.box_office_id === DB._bo) : null;
     const c = issueCreditRow(st, DB._bo, { email: p.email || o?.buyer_email, name: p.name || o?.data.buyer.name, amount: p.amount, eventId: p.eventId || null, expires: p.expires || null, order: o, note: p.note, by });
+    c.kind = gift ? p.kind : 'credit';
+    if (gift && p.send !== false) queueMsg(st, { box_office_id: DB._bo, kind: 'gift', to: c.email, email: c.email, subject: `Your ${CREDIT_KINDS[c.kind].toLowerCase()} — ${money_(c.amount)}`, body: String(p.message || '').slice(0, 300), data: { credit: c.code }, by });
     audit('credit.issued', `Issued ${money_(c.amount)} credit ${c.code} to ${c.email}${c.event_id ? ' for ' + st.events.find(e => e.id === c.event_id)?.name : ''}`, { target: c.event_id || o?.event_ids[0] });
     if (o) (st.orderLog ||= []).unshift({ id: uid(), at: nowIso(), box_office_id: o.box_office_id, order_id: o.id, ref: o.ref, event_id: o.event_ids[0], kind: 'credit', summary: `credit ${c.code} issued: ${money_(c.amount)}`, by, note: String(p.note || ''), data: { credit: c.code } });
     return clone(c);
@@ -1878,7 +2239,7 @@ function eventDiff(a, b) {
 // ── Door / scanning (Stage 7) ─────────────────────────────────────────────────
 // A ticket's QR holds only its random code. Every scan is checked by the "server" (DEMO: here; LIVE: checkin()), logged in
 // scanLog / scan_log, and answered with doorTicket(): where the guest belongs — never money, email or phone.
-const SCAN_RESULTS = ['ok', 'already', 'undone', 'paused', 'unknown', 'cancelled', 'refunded', 'replaced', 'wrong_event', 'wrong_slot', 'wrong_entrance', 'inactive', 'device_off'];
+const SCAN_RESULTS = ['ok', 'already', 'undone', 'paused', 'unknown', 'cancelled', 'refunded', 'replaced', 'wrong_event', 'wrong_slot', 'wrong_entrance', 'inactive', 'device_off', 'item_ok', 'item_used', 'item_void'];
 function doorTicket(st, t, P) {
   const ev = st.events.find(e => e.id === t.event_id), tt = ev?.ticketTypes.find(x => x.id === t.ticket_type_id), o = st.orders.find(x => x.id === t.order_id);
   const sibs = st.tickets.filter(x => x.order_id === t.order_id && x.status === 'valid'), sp = t.seat ? seatInfo(ev, t.seat, t) : null, slot = t.slot_id && (ev?.timeSlots || []).find(x => x.id === t.slot_id);
@@ -1910,7 +2271,18 @@ function demoCheckin(code, undo, eventId, o) {
   };
   if (ev && controlBlock(ev, 'scan') && !undo) return done('paused');
   if (dev?.disabled) return done('device_off');
-  if (!t) return done('unknown');
+  if (!t) {   // §11 not a ticket — maybe a product voucher (parking, drink, merchandise pickup …), redeemed separately from the ticket
+    const v = c && (st.vouchers || []).find(x => x.code === c && x.box_office_id === DB._bo); if (!v) return done('unknown');
+    const item = { code: v.code, name: v.name, event_id: v.event_id, event_name: st.events.find(e => e.id === v.event_id)?.name || '', holder: P('customers.names') ? v.holder : 'Guest', order_ref: st.orders.find(x => x.id === v.order_id)?.ref || '', from: v.from };
+    const vdone = (result, extra = {}) => { const r = done(result, extra); return { ...r, item: { ...item, status: v.status, redeemed_at: v.redeemed_at, redeemed: v.redeemed } }; };
+    if (eventId && v.event_id !== eventId) return vdone('wrong_event');
+    need(undo ? 'door.undo' : 'door.checkin', v.event_id);
+    if (v.status === 'void') return vdone('item_void');
+    if (undo) { if (v.status === 'redeemed') { Object.assign(v, { status: 'valid', redeemed_at: null, redeemed: null }); audit('door.undo', 'Undid redemption of ' + v.name + ' ' + v.code, { target: v.event_id }); } return vdone('undone'); }
+    if (v.status === 'redeemed') return vdone('item_used', { first: { at: v.redeemed_at, ...(v.redeemed || {}) } });
+    Object.assign(v, { status: 'redeemed', redeemed_at: nowIso(), redeemed: { entrance: en?.name || '', device: dev?.id || '', device_name: dev?.name || '', by: DB._actor, manual: !!o.manual } });
+    return vdone('item_ok');
+  }
   if (eventId && t.event_id !== eventId) { need('door.checkin', eventId); return done('wrong_event'); }   // says which event it is for, nothing more
   need(undo ? 'door.undo' : 'door.checkin', t.event_id);
   if (t.status === 'replaced') return done('replaced');
@@ -1958,7 +2330,8 @@ const MSG_KINDS = {
   updated: ['Updated tickets', 'transactional'], cancelled: ['Cancellation', 'transactional'], refund: ['Refund', 'transactional'], credit: ['Credit issued', 'transactional'],
   message: ['Message from the box office', 'transactional'], reminder: ['Event reminder', 'transactional'], update: ['Event update', 'transactional'],
   waitlist: ['Waitlist notice', 'transactional'], followup: ['After the event', 'transactional'], campaign: ['Campaign', 'marketing'], automation: ['Automation', 'transactional'],
-  staff: ['Staff notification', 'staff'] };
+  staff: ['Staff notification', 'staff'], gift: ['Gift card / voucher', 'transactional'], pass: ['Membership / pass', 'transactional'], installment: ['Payment plan', 'transactional'],
+  transfer: ['Ticket transferred to you', 'transactional'], pos: ['Tickets from the door', 'transactional'] };
 const MSG_STATUS = { queued: 'Queued', sending: 'Sending', sent: 'Sent', failed: 'Failed', suppressed: 'Not sent — no consent', cancelled: 'Cancelled', 'not sent (staff choice)': 'Not sent (staff choice)' };
 const MSG_VARS = [['first_name', 'First name'], ['name', 'Full name'], ['event', 'Event name'], ['date', 'Event date'], ['time', 'Start time'], ['venue', 'Venue'], ['doors', 'Doors open'],
   ['order_ref', 'Order number'], ['tickets_link', 'Link to their tickets'], ['event_link', 'Event page link'], ['box_office', 'Box office name'], ['promo_code', 'Promo code (automation)'], ['link', 'Your link (automation)']];
@@ -2229,6 +2602,19 @@ function marketingTick(st, now = Date.now()) {
       }
     }
   }
+  // §5 payment plans: a reminder 3 days before each installment, one when it is late, and staff hear once when the final deadline passes
+  for (const o of st.orders) {
+    const pl = o.data?.plan, x = o.status === 'pending' && planNext(pl); if (!x) continue;
+    const due = new Date(x.due).getTime(), msg = (k, subject) => queueMsg(st, { box_office_id: o.box_office_id, order_id: o.id, event_id: o.event_ids[0] || null, kind: 'installment', to: o.buyer_email, email: o.buyer_email,
+      subject, body: `${x.label}: ${money_(x.amount)} due ${new Date(x.due).toLocaleDateString()}. Pay from your ticket page — your seats are held until the plan is paid.`, dedupe: `inst:${o.id}:${x.n}:${k}` });
+    if (now >= due - 3 * 864e5 && now < due && msg('soon', 'Your next payment is due soon')) n++;
+    if (now >= due + 864e5 && msg('late', 'Your payment is overdue')) n++;
+    if (now > new Date(pl.deadline).getTime() && !pl.overdue) {
+      pl.overdue = new Date(now).toISOString(); if (!(o.data.flags ||= []).includes('plan_overdue')) o.data.flags.push('plan_overdue');
+      const bo = st.boxOffices.find(b => b.id === o.box_office_id), to = bo?.settings?.contactEmail || bo?.owner;
+      if (to) queueMsg(st, { box_office_id: o.box_office_id, order_id: o.id, kind: 'staff', category: 'staff', to, subject: `Payment plan ${o.ref} missed its deadline`, body: `${money_(o.data.total - planPaid(pl))} is still unpaid. Cancel it (seats go back on sale) or record the payment.`, dedupe: `inst:${o.id}:deadline` });
+    }
+  }
   return n;
 }
 // the standard workflows (Eli Step 8 §7) every box office starts with — ordinary automations, so they can be edited or switched off
@@ -2459,7 +2845,7 @@ const DB = {
     const evIds = new Set(events.map(e => e.id));
     const seeOrders = P('orders.view') || P('finance.totals') || P('finance.reports') || P('comms.lists') || P('customers.profiles');
     events.forEach(normEvent);
-    const orders = seeOrders ? clone(st.orders.filter(o => o.box_office_id === bo.id && o.event_ids.some(id => evIds.has(id)))) : [];
+    const orders = seeOrders ? clone(st.orders.filter(o => o.box_office_id === bo.id && (o.event_ids.some(id => evIds.has(id)) || (!o.event_ids.length && (m.owner || m.support || m.events === 'all' || !(m.events || []).length))))) : [];   // gift-card / pass-only orders: box-office-wide staff
     const tickets = clone(st.tickets.filter(t => evIds.has(t.event_id)));
     // Customer-data and money permissions are applied here, before data leaves the "server".
     if (!P('customers.names')) { orders.forEach(o => o.data.buyer.name = 'Guest'); tickets.forEach(t => t.holder = 'Guest'); }
@@ -2514,6 +2900,9 @@ const DB = {
       inbox: P('customers.inbox') ? clone((st.support || []).filter(x => x.box_office_id === bo.id && (!x.event_id || evIds.has(x.event_id)))).map(mask) : [],
       invoices: P('admin.settings') ? clone((st.invoices || []).filter(x => x.box_office_id === bo.id)) : [],
       plans: clone(st.platform.planList || DEFAULT_PLANS), platform: { feePct: st.platform.feePct, feeFixed: st.platform.feeFixed, feePayer: st.platform.feePayer, domainTarget: st.platform.domainTarget, defaultPlan: st.platform.defaultPlan },
+      // Final additions: memberships / season passes (with their usage), product vouchers (redeemable QR codes)
+      passes: P('orders.view') || P('orders.gifts') ? clone((st.passes || []).filter(x => x.box_office_id === bo.id)).map(x => mask({ ...x, ...(({ used, left, status, byEvent }) => ({ used, left: left === Infinity ? null : left, status, byEvent }))(passState(st, x)) })) : [],
+      vouchers: P('orders.view') || P('door.log') ? clone((st.vouchers || []).filter(v => evIds.has(v.event_id))) : [],
       policyTexts: P('orders.view') ? clone(Object.fromEntries(Object.entries(st.policyTexts || {}).filter(([h]) => orders.some(o => (o.data.accepted || []).some(a => a.version === h))))) : {} };
   },
   async stillAllowed() { if (LIVE) return true; try { need(); return true; } catch (e) { return !e.revoked; } },
@@ -3218,7 +3607,7 @@ const DB = {
     await must(sb.rpc('join_waitlist', { p_event: eventId, p_name: name, p_email: email, p_phone: phone }));
   },
   async placeOrder(payload, asTeam = false) {
-    if (!LIVE) { Demo.fresh(); return demoPlaceOrder(clone(payload), asTeam ? need('orders.edit') : null); }
+    if (!LIVE) { Demo.fresh(); return demoPlaceOrder(clone(payload), asTeam ? need(payload.pos ? 'door.sell' : (payload.items || []).length || (payload.addons || []).length ? 'orders.edit' : 'orders.gifts') : null); }
     return must(sb.rpc('place_order', { p: payload }));
   },
   // ── Payments (Stage 5). DEMO: the built-in test processor. LIVE: the box office's processor through the `payments` Edge Function
@@ -3229,8 +3618,47 @@ const DB = {
     const r = demoCharge(st, o, card); Demo.save(); if (r.error) throw new Error(r.error); return r;
   },
   async startPayment(id, key) {   // LIVE: {provider, publishableKey, account, clientSecret}
-    if (!LIVE) { const o = Demo.fresh().orders.find(x => x.id === id && x.access_key === key); if (!o) throw new Error('Order not found'); return { provider: 'demo', expires_at: o.expires_at, total: o.data.total }; }
+    if (!LIVE) { const o = Demo.fresh().orders.find(x => x.id === id && x.access_key === key); if (!o) throw new Error('Order not found'); return { provider: 'demo', expires_at: o.expires_at, total: o.data.plan ? o.data.plan.schedule[0].amount : o.data.total, plan: !!o.data.plan }; }
     const { data, error } = await sb.functions.invoke('payments', { body: { action: 'intent', order: id, key } }); if (error || data?.error) throw new Error(data?.error || error.message); return data;
+  },
+  // ── Final additions ──
+  async checkPass(boId, code, email) {   // §3 a membership / season pass code at checkout → its public rules + what's left, or {error}
+    if (LIVE) return must(sb.rpc('check_pass', { p_bo: boId, p_code: code, p_email: email || '' }));
+    const st = Demo.fresh(), f = findPass(st, boId, code, email || '', null); return f.error ? { error: f.error } : publicPass(f.pass, f.plan, f.state);
+  },
+  async payInstallment(id, key, card) {   // §5 the buyer pays the next installment of a payment plan (LIVE: the payments function → processor → webhook)
+    if (LIVE) { const { data, error } = await sb.functions.invoke('payments', { body: { action: 'installment', order: id, key } }); if (error || data?.error) throw new Error(data?.error || error.message); return data; }
+    const st = Demo.fresh(), o = st.orders.find(x => x.id === id && x.access_key === key); if (!o) throw new Error('Order not found');
+    const x = planNext(o.data.plan); if (!x || o.status !== 'pending') throw new Error('Nothing is due on this order');
+    const c = demoCardCheck(card); (st.payAttempts ||= []).unshift({ at: nowIso(), ok: !c.err, box_office_id: o.box_office_id }); if (c.err) { Demo.save(); throw new Error(c.err); }
+    const r = payInstallment(st, o, { provider: 'demo', method: card.wallet || 'card', ref: 'pi_demo_' + randCode(12).toLowerCase(), brand: c.brand, last4: c.last4 }); Demo.save(); return { status: r, provider: 'demo' };
+  },
+  async selfService(id, key, action, p = {}) {   // §8 rename · transfer · resend · seatChange / cancel / refund requests
+    if (LIVE) return must(sb.rpc('self_service', { p_order: id, p_key: key, p_action: action, p }));
+    return demoSelfService(id, key, action, p);
+  },
+  async readers() {   // §2 the box office's card readers (Stripe Terminal); DEMO: one simulated reader
+    if (!LIVE) return [{ id: 'tmr_demo', label: 'Demo card reader (simulated)', status: 'online' }];
+    const { data, error } = await sb.functions.invoke('payments', { body: { action: 'readers', bo: this._bo } }); if (error || data?.error) throw new Error(data?.error || error.message); return data.readers || [];
+  },
+  async terminalPay(orderId, reader) {   // §2 a door sale paid on the card reader; the processor confirms it (that issues the tickets)
+    if (LIVE) { const { data, error } = await sb.functions.invoke('payments', { body: { action: 'terminal', order: orderId, reader } }); if (error || data?.error) throw new Error(data?.error || error.message); return data; }
+    const me = need('door.sell'), st = Demo.fresh(), o = st.orders.find(x => x.id === orderId && x.box_office_id === this._bo); if (!o || !o.payment?.terminal) throw new Error('Order not found');
+    if (!o.event_ids.every(id => hasPerm(me, 'door.sell', id) || hasPerm(me, 'orders.edit', id))) throw new Error('You don\'t have permission to sell for this event');
+    const r = demoCharge(st, o, { number: '4242424242424242', exp: '12/' + String(new Date().getFullYear() + 3).slice(2), cvc: '123' }); Demo.save(); if (r.error) throw new Error(r.error); return r;
+  },
+  async passAction(action, p = {}) {   // §3 staff: issue (a comp membership, or one paid at the counter) · cancel
+    if (LIVE) return must(sb.rpc('pass_action', { p_bo: this._bo, p_action: action, p }));
+    need('orders.gifts'); const st = Demo.st, by = this._actor, bo = st.boxOffices.find(b => b.id === this._bo);
+    if (action === 'issue') {
+      const plan = passPlan(bo.settings, p.planId); if (!plan) throw new Error('Choose a membership plan');
+      const r = issuePassRow(st, bo.id, plan, { email: p.email, name: p.name, expires: p.expires || null, by, note: p.note });
+      audit('pass.issued', `Issued ${plan.name} ${r.code} to ${r.email}`); if (p.send !== false) queueMsg(st, { box_office_id: bo.id, kind: 'pass', to: r.email, email: r.email, subject: `Your ${plan.name}`, body: '', data: { pass: r.code }, by });
+      Demo.save(); return clone(r);
+    }
+    const r = (st.passes || []).find(x => x.id === p.id && x.box_office_id === bo.id); if (!r) throw new Error('Pass not found');
+    if (action === 'cancel') { if (r.cancelled_at) throw new Error('Already cancelled'); Object.assign(r, { cancelled_at: nowIso(), cancelled_by: by }); audit('pass.cancelled', `Cancelled pass ${r.code} (${r.email})`); Demo.save(); return clone(r); }
+    throw new Error('Unknown action');
   },
   async cancelCheckout(id, key) {  // the buyer gives up: seats go back on sale now instead of when the timer runs out
     if (LIVE) return must(sb.rpc('cancel_checkout', { p_id: id, p_key: key }));
@@ -3311,7 +3739,10 @@ const DB = {
     if (!LIVE) {
       const st = Demo.fresh(); if (expireOrders(st)) Demo.save();
       const o = st.orders.find(x => x.id === id && x.access_key === key); if (!o) return null;
-      return { order: buyerOrder(o), tickets: clone(st.tickets.filter(t => t.order_id === id && t.status !== 'replaced')) };
+      return { order: buyerOrder(o), tickets: clone(st.tickets.filter(t => t.order_id === id && t.status !== 'replaced')),
+        vouchers: clone((st.vouchers || []).filter(v => v.order_id === id)).map(({ redeemed, ...v }) => v), self: selfServiceFor(st, o),
+        gifts: (st.credits || []).filter(c => c.source_order === id && c.kind === 'gift').map(c => ({ code: c.email === o.buyer_email ? c.code : null, to: c.name, email: c.email, amount: c.amount, ...(({ remaining, status }) => ({ remaining, status }))(creditState(c, st.orders)) })),
+        passes: (st.passes || []).filter(x => x.order_id === id).map(x => ({ code: x.email === o.buyer_email ? x.code : null, plan: x.plan_name, name: x.name, email: x.email, expires: x.expires, status: passState(st, x).status })) };
     }
     return must(sb.rpc('get_order', { p_id: id, p_key: key }));
   },
@@ -3443,6 +3874,24 @@ function seedDemo() {
     emails: { confirmation: '', reminders: [], confirm: { subject: 'You\'re going to Skyline Summer Fest!', header: 'See you on the rooftop', instructions: 'Show the QR code at the Pier 17 entrance. Have your photo ID ready.',
       venue: 'Enter from South St; the rooftop lift is on the left. Doors 2:30 PM.', sponsor: 'Presented with Harbor Brewing Co.', contact: 'Questions? Reply to this email or write to fest@skyline.example.', policies: true } } });
   const events = [ev1, ev2, ev3, ev4, ev5, ev6, ev7, ev8]; ev7.box_office_id = bo1.id; ev8.box_office_id = bo1.id;
+  // Final additions sample set-up: Skyline sells gift cards, two membership plans, payment plans; customers may manage their own tickets there
+  bo1.settings.gifts = { ...GIFT_DEFAULT, on: true };
+  bo1.settings.passPlans = [
+    { id: 'pp_season', name: 'Season Pass 2026', kind: 'season', price: 24900, desc: 'Six concerts of your choice — one Stalls, Circle or general admission ticket each', benefit: 'free', pct: 0, uses: 6, perEvent: 1,
+      eventIds: [], ticketTypeIds: [stallsTT.id, circleTT.id, ev2.ticketTypes[0].id], validDays: 365, onSale: true, max: 200 },
+    { id: 'pp_member', name: 'Skyline Members', kind: 'membership', price: 6000, desc: '15% off every ticket for a year, plus members-only tickets', benefit: 'discount', pct: 15, uses: 0, perEvent: 0,
+      eventIds: [], ticketTypeIds: [], validDays: 365, onSale: true, max: 0 }];
+  bo1.settings.installments = { ...INSTALL_DEFAULT, on: true };
+  bo1.settings.selfService = { download: true, resend: true, rename: true, transfer: true, seatChange: true, cancel: true, refund: false };
+  bo2.settings.gifts = { ...GIFT_DEFAULT, on: true, amounts: [2000, 4000], min: 1500, max: 20000 };
+  bo2.settings.selfService = { download: true };
+  ev2.ticketTypes.push(tt('Members lounge', 3000, 40, { desc: 'Members only — balcony lounge with its own bar', memberOnly: true, memberPlans: ['pp_member'], group: 'Members' }));
+  ev2.addons[0].redeemable = true; ev2.addons[1].redeemable = true; ev2.addons[1].desc = 'Pick it up at the merch stand — show the QR code';
+  ev2.addons.push(prod('Drink voucher', 800, 0, { category: 'Food & drink', redeemable: true, max: 6, desc: 'One drink at the bar' }));
+  ev3.ticketTypes[1].peak = [{ label: 'Evening session', days: [], from: '16:00', to: '23:59', price: 2400 }];
+  ev3.addons[0].redeemable = true;
+  ev4.ticketTypes[0].phases = [{ id: shortId('ph_'), label: 'Last-minute', price: 22900, from: '', until: '', upTo: 0, hoursBefore: 48 }];
+  ev5.rules = [{ id: 'ru_child', kind: 'requires', ttIds: [ev5.ticketTypes[1].id], needs: [ev5.ticketTypes[0].id], per: 0 }, { id: 'ru_max', kind: 'limit', ttIds: [ev5.ticketTypes[0].id, ev5.ticketTypes[1].id], min: 0, max: 10 }];
   bo1.eventTemplates = [
     eventToTemplate(ev2, 'Standard Concert'), eventToTemplate(ev1, 'Reserved Seating Event'),
     eventToTemplate({ ...ev2, name: 'General Admission Event', ticketTypes: [tt('General admission', 3000, 0)], capacity: 300 }, 'General Admission Event'),
@@ -3673,6 +4122,22 @@ function seedDemo() {
       ['Marketing', 'Social ads', 20000], ['Insurance', 'Event liability cover', 6000]]
       .map(([category, description, amount], i) => ({ id: uid(), box_office_id: bo1.id, event_id: ev1.id, category, description, vendor: '', amount, date: localDay(day(-24 + i * 3)), by: bo1.owner, at: day(-24 + i * 3) }));
     st.expenseFinal = {};
+  }
+  // Final additions sample: memberships and a gift card held by customers, a payment plan with its deposit paid, a door sale, redeemed vouchers
+  { const st = Demo.st;
+    issuePassRow(st, bo1.id, bo1.settings.passPlans[1], { email: 'maya@example.com', name: 'Maya Gold', by: bo1.owner });
+    issuePassRow(st, bo1.id, bo1.settings.passPlans[0], { email: 'sam.season@example.com', name: 'Sam Rivera', by: bo1.owner });
+    const g = issueCreditRow(st, bo1.id, { email: 'maya@example.com', name: 'Maya Gold', amount: 5000, by: bo1.owner, note: 'Happy birthday!' }); Object.assign(g, { kind: 'gift', from_name: 'Leah Gold' });
+    try {
+      const off = offSeats(availabilityFrom(st.tickets, ev1.id, st.seatStatus, '', st.orders), ''), seats = Object.keys(ev1.seating.index).filter(id => ev1.seating.index[id] === vipTT.id && !off.has(id)).slice(5, 7);
+      const r = demoPlaceOrder({ buyer: { name: 'Dana Plan', email: 'dana.plan@example.com', phone: '' }, items: [{ eventId: ev1.id, ticketTypeId: vipTT.id, qty: 2, seats }], addons: [], payment: 'card', installments: true, answers: qAns(ev1), accepted: acc(ev1) }, { owner: true });
+      demoCharge(st, st.orders.find(x => x.id === r.id), card);
+    } catch (e) { /* skip */ }
+    try {
+      const r = demoPlaceOrder({ buyer: { name: 'Walk-up Guest', email: 'door@skyline.example', phone: '' }, items: [{ eventId: ev2.id, ticketTypeId: ev2.ticketTypes[0].id, qty: 2 }], addons: [{ eventId: ev2.id, addonId: ev2.addons[2].id, qty: 2 }],
+        payment: 'manual', payMethod: 'cash', pos: true, source: 'door' }, { owner: true });
+      (st.vouchers || []).filter(v => v.order_id === r.id).slice(0, 1).forEach(v => Object.assign(v, { status: 'redeemed', redeemed_at: day(0, 19, 40), redeemed: { entrance: 'Main entrance', device: '', device_name: 'Bar tablet', by: bo1.owner, manual: false } }));
+    } catch (e) { /* skip */ }
   }
   // Stage 10 sample: a banned customer, a customer-service message, a flagged order to review, a past incident, a client error, the pending box office's plan
   { const st = Demo.st;
